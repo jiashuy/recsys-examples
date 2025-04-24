@@ -6,4 +6,5 @@ export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
 export LOCAL_WORLD_SIZE=1
 
-python example.py
+python example.py --use_embedding_collection
+python example.py --use_embedding_bag_collection

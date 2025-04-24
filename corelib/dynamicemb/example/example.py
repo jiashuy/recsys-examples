@@ -1,3 +1,4 @@
+import argparse
 import warnings
 
 # Filter FBGEMM warning, make notebook clean
@@ -9,6 +10,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torchrec
+
+parser = argparse.ArgumentParser(description="example of dynamicemb")
+parser.add_argument("--use_embedding_collection", action="store_true")
+parser.add_argument("--use_embedding_bag_collection", action="store_true")
+args = parser.parse_args()
 
 backend = "nccl"
 dist.init_process_group(backend=backend)
@@ -27,19 +33,38 @@ total_num_embedding = 1000
 embedding_feature_name = "cate_0"
 batch_size = 16
 
-eb_configs = [
-    torchrec.EmbeddingConfig(
-        name=embedding_table_name,
-        embedding_dim=embedding_table_dim,
-        num_embeddings=total_num_embedding,
-        feature_names=[embedding_feature_name],
-    )
-]
+if args.use_embedding_collection:
+    eb_configs = [
+        torchrec.EmbeddingConfig(
+            name=embedding_table_name,
+            embedding_dim=embedding_table_dim,
+            num_embeddings=total_num_embedding,
+            feature_names=[embedding_feature_name],
+        )
+    ]
 
-ebc = torchrec.EmbeddingCollection(
-    device=torch.device("meta"),
-    tables=eb_configs,
-)
+    ebc = torchrec.EmbeddingCollection(
+        device=torch.device("meta"),
+        tables=eb_configs,
+    )
+elif args.use_embedding_bag_collection:
+    eb_configs = [
+        torchrec.EmbeddingBagConfig(
+            name=embedding_table_name,
+            embedding_dim=embedding_table_dim,
+            num_embeddings=total_num_embedding,
+            feature_names=[embedding_feature_name],
+        )
+    ]
+
+    ebc = torchrec.EmbeddingBagCollection(
+        device=torch.device("meta"),
+        tables=eb_configs,
+    )
+else:
+    argparse.ArgumentTypeError(
+        "Please select using EmbeddingCollection(--use_embedding_collection) or EmbeddingBagCollection(--use_embedding_bag_collection)."
+    )
 
 import math
 
@@ -136,7 +161,10 @@ def get_planner(device, eb_configs, batch_size):
 
 planner = get_planner(device, eb_configs, batch_size)
 
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+)
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
@@ -184,11 +212,21 @@ qcomm_codecs_registry = (
 
 # Create a sharder , same usage with TorchREC , but need Use DynamicEmb function, because for index_dedup
 # DynamicEmb overload this process to fit HKV
-sharder = DynamicEmbeddingCollectionSharder(
-    qcomm_codecs_registry=qcomm_codecs_registry,
-    fused_params=fused_params,
-    use_index_dedup=True,
-)
+if args.use_embedding_collection:
+    sharder = DynamicEmbeddingCollectionSharder(
+        qcomm_codecs_registry=qcomm_codecs_registry,
+        fused_params=fused_params,
+        use_index_dedup=True,
+    )
+elif args.use_embedding_bag_collection:
+    sharder = DynamicEmbeddingBagCollectionSharder(
+        qcomm_codecs_registry=qcomm_codecs_registry,
+        fused_params=fused_params,
+    )
+else:
+    argparse.ArgumentTypeError(
+        "Please select using EmbeddingCollection(--use_embedding_collection) or EmbeddingBagCollection(--use_embedding_bag_collection)."
+    )
 
 # Same usage of TorchREC
 plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
@@ -255,13 +293,18 @@ for i in range(num_iterations):
     sparse_feature = sparse_features[i]
     ret = model(sparse_feature)
 
-    feature_names = []
-    tensors = []
-    for k, v in ret.items():
-        feature_names.append(k)
-        tensors.append(v.values())
-
-    cat_tensor = torch.cat(tensors, dim=1)
-    print(f"iter : {i} , cat_tensor = {cat_tensor}")
-    loss = cat_tensor.sum()
+    vals = []
+    if args.use_embedding_collection:
+        for k, v in ret.items():
+            vals.append(v.values())
+    elif args.use_embedding_bag_collection:
+        for _name, param in ret.to_dict().items():
+            vals.append(param)
+    else:
+        argparse.ArgumentTypeError(
+            "Please select using EmbeddingCollection(--use_embedding_collection) or EmbeddingBagCollection(--use_embedding_bag_collection)."
+        )
+    cat_vals = torch.cat(vals, dim=1)
+    print(f"iter : {i} , cat_vals = {cat_vals}")
+    loss = cat_vals.sum()
     loss.backward()
