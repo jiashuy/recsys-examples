@@ -34,13 +34,13 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
+from dynamicemb.shard import DynamicEmbeddingBagCollectionSharder
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     QCommsConfig,
@@ -256,7 +256,7 @@ def run(args):
     if not args.use_torch_opt:
         fused_params.update(optimizer_kwargs)
 
-    sharder = EmbeddingBagCollectionSharder(
+    sharder = DynamicEmbeddingBagCollectionSharder(
         qcomm_codecs_registry=qcomm_codecs_registry, fused_params=fused_params
     )
 

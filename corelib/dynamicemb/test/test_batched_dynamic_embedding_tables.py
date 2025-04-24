@@ -15,7 +15,6 @@
 
 import torch
 from dynamicemb import (
-    BatchedDynamicEmbeddingTables,
     DynamicEmbEvictStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -23,6 +22,7 @@ from dynamicemb import (
     DynamicEmbStorageConfig,
     EmbOptimType,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
 
 
 def test_embedding_optimizer(opt_type, opt_params):

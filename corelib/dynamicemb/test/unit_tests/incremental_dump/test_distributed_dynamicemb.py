@@ -34,17 +34,19 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+)
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.comm import intra_and_cross_node_pg
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
 
 
 @pytest.fixture
@@ -263,7 +265,8 @@ def backend_session():
 @pytest.mark.parametrize(
     "is_pooled, pooling_mode",
     [
-        # (True, PoolingType.SUM), (False, None),
+        (True, PoolingType.SUM),
+        (False, None),
         (False, None),
     ],
 )
@@ -335,7 +338,7 @@ def test_incremental_dump_api(
     )
 
     if is_pooled:
-        sharder = EmbeddingBagCollectionSharder(fused_params=optimizer_kwargs)
+        sharder = DynamicEmbeddingBagCollectionSharder(fused_params=optimizer_kwargs)
     else:
         sharder = DynamicEmbeddingCollectionSharder(
             fused_params=optimizer_kwargs, use_index_dedup=False

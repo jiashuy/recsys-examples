@@ -34,12 +34,14 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+)
 from dynamicemb_extensions import insert_or_assign
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch import nn
 from torchrec import EmbeddingBagCollection, EmbeddingCollection
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     QCommsConfig,
@@ -305,7 +307,7 @@ class ConstructTwinModule:
         )
 
         if isinstance(collection, EmbeddingBagCollection):
-            sharder = EmbeddingBagCollectionSharder(
+            sharder = DynamicEmbeddingBagCollectionSharder(
                 qcomm_codecs_registry=qcomm_codecs_registry,
                 fused_params=fused_params,
             )
@@ -401,7 +403,7 @@ class ConstructTwinModule:
         )
 
         if isinstance(collection, EmbeddingBagCollection):
-            sharder = EmbeddingBagCollectionSharder(
+            sharder = DynamicEmbeddingBagCollectionSharder(
                 qcomm_codecs_registry=qcomm_codecs_registry,
                 fused_params=fused_params,
             )

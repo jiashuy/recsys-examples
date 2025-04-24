@@ -46,7 +46,7 @@ from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
-from ..planner.rw_sharding import RwDynamicEmbeddingSharding
+from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from ..unique_op import UniqueOp
 
 
@@ -70,7 +70,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         override this function to provide customized EmbeddingSharding
         """
         if sharding_type == ShardingType.ROW_WISE.value:
-            return RwDynamicEmbeddingSharding(
+            return RwSequenceDynamicEmbeddingSharding(
                 sharding_infos=sharding_infos,
                 env=env,
                 device=device,
@@ -87,7 +87,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
     def _create_lookups(self) -> None:
         for sharding in self._sharding_type_to_sharding.values():
-            if isinstance(sharding, RwDynamicEmbeddingSharding):
+            if isinstance(sharding, RwSequenceDynamicEmbeddingSharding):
                 for config in sharding._grouped_embedding_configs:
                     if (
                         config.compute_kernel

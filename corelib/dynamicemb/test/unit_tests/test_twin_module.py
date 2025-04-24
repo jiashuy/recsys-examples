@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import torchrec
 from dynamicemb.construct_twin_module import ConstructTwinModule
+from torchrec.modules.embedding_configs import PoolingType
 
 
 def init_fn(x: torch.Tensor):
@@ -142,8 +143,9 @@ def backend_session():
         pytest.param(4, [i * 128 * 1024 for i in [1, 2, 3, 4]], [1] * 4),
     ],
 )
-# @pytest.mark.parametrize("is_pooled, pooling_mode", [(True, PoolingType.SUM),(False,None)])
-@pytest.mark.parametrize("is_pooled, pooling_mode", [(False, None)])
+@pytest.mark.parametrize(
+    "is_pooled, pooling_mode", [(True, PoolingType.SUM), (False, None)]
+)
 @pytest.mark.parametrize("batch_size", [32, 2048])
 @pytest.mark.parametrize("num_iteration", [10])
 @pytest.mark.parametrize("dim", [128])

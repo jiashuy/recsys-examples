@@ -17,8 +17,14 @@ from .embedding import (
     DynamicEmbeddingCollectionSharder,
     ShardedDynamicEmbeddingCollection,
 )
+from .embeddingbag import (
+    DynamicEmbeddingBagCollectionSharder,
+    ShardedDynamicEmbeddingBagCollection,
+)
 
 __all__ = [
     "ShardedDynamicEmbeddingCollection",
     "DynamicEmbeddingCollectionSharder",
+    "ShardedDynamicEmbeddingBagCollection",
+    "DynamicEmbeddingBagCollectionSharder",
 ]
