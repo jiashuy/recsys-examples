@@ -14,10 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
- ******************************************************************************/
 
 #ifndef LOOKUP_BACKWARD_H
 #define LOOKUP_BACKWARD_H
