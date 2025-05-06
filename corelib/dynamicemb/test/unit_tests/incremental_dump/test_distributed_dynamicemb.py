@@ -23,8 +23,6 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
@@ -119,9 +117,6 @@ def get_planner(
             use_dynamicemb=use_dynamicembs[i],
             dynamicemb_options=DynamicEmbTableOptions(
                 global_hbm_for_values=1024**3,
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.UNIFORM,
-                ),
                 score_strategy=score_strategies[i],
             ),
         )

@@ -23,11 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torchrec
-from dynamicemb import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
-    DynamicEmbTableOptions,
-)
+from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -156,9 +152,6 @@ def get_planner(
                 use_dynamicemb=True,
                 dynamicemb_options=DynamicEmbTableOptions(
                     global_hbm_for_values=1024**3,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.UNIFORM,
-                    ),
                 ),
             )
         else:

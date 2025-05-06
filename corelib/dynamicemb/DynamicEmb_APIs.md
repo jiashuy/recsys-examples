@@ -255,8 +255,8 @@ Parameters for each random initialization method in DynamicEmbInitializerMode.
         mode: DynamicEmbInitializerMode
         mean: float = 0.0
         std_dev: float = 1.0
-        lower: float = 0.0
-        upper: float = 1.0
+        lower: float = None
+        upper: float = None
         value: float = 0.0
     ```
 
@@ -327,7 +327,8 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         num_of_buckets_per_alloc : int
             Number of buckets allocated per memory allocation request. Default is 1.
         initializer_args : DynamicEmbInitializerArgs
-            Arguments for initializing dynamic embedding vector values. Default is uniform distribution.
+            Arguments for initializing dynamic embedding vector values.
+            Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
         safe_check_mode : DynamicEmbCheckMode
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
@@ -338,8 +339,12 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         https://github.com/NVIDIA-Merlin/HierarchicalKV.
         """
 
-        initializer_args: DynamicEmbInitializerArgs = DynamicEmbInitializerArgs(mode=DynamicEmbInitializerMode.UNIFORM)
+        initializer_args: DynamicEmbInitializerArgs = field(
+            default_factory=DynamicEmbInitializerArgs
+        )
     ```
+If using `DynamicEmbInitializerMode.UNIFORM`, `DynamicEmbeddingShardingPlanner` will set the `initializer_args.upper` and `initializer_args.lower` to +/- sqrt(1 / eb_config.num_embeddings)
+by default(except users provide them explicitly).
 
 ## DynamicEmbDump
 
