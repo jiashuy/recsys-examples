@@ -49,7 +49,11 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbedding,
     BatchedDynamicEmbeddingBag,
 )
-from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbTableOptions
+from ..dynamicemb_config import (
+    DynamicEmbKernel,
+    DynamicEmbTableOptions,
+    validate_initializer_args,
+)
 
 HBM_CAP: int = 32 * 1024 * 1024 * 1024
 DDR_CAP: int = 128 * 1024 * 1024 * 1024
@@ -175,6 +179,9 @@ def _validate_configs(
         if not tmp_constraint.use_dynamicemb:
             continue
         tmp_config = eb_configs[i]
+        validate_initializer_args(
+            tmp_constraint.dynamicemb_options.initializer_args, tmp_config
+        )
         # modify num_embeddings per rank to power of 2
         num_embeddings_per_rank = int(
             _next_power_of_2(math.ceil(tmp_config.num_embeddings / world_size))

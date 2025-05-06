@@ -428,9 +428,6 @@ def test_optimizer(
             local_hbm_for_values=4 * 1024**3,
             bucket_capacity=1024,
             device_id=-1,
-            initializer_args=DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.UNIFORM,
-            ),
         )
         for i in range(num_tables)
     ]

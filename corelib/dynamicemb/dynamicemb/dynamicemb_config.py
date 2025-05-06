@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import enum
+import os
 from dataclasses import dataclass, field, fields
+from math import sqrt
 from typing import Optional
 
 import torch
@@ -24,6 +26,7 @@ from dynamicemb_extensions import (
     EvictStrategy,
     InitializerArgs,
 )
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
 DEFAULT_INDEX_TYPE = torch.int64
@@ -87,8 +90,8 @@ class DynamicEmbInitializerArgs:
     mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.UNIFORM
     mean: float = 0.0
     std_dev: float = 1.0
-    lower: float = 0.0
-    upper: float = 1.0
+    lower: float = None
+    upper: float = None
     value: float = 0.0
 
     def __eq__(self, other):
@@ -109,7 +112,12 @@ class DynamicEmbInitializerArgs:
 
     def as_ctype(self) -> InitializerArgs:
         return InitializerArgs(
-            self.mode.value, self.mean, self.std_dev, self.lower, self.upper, self.value
+            self.mode.value,
+            self.mean,
+            self.std_dev,
+            self.lower if self.lower else 0.0,
+            self.upper if self.upper else 1.0,
+            self.value,
         )
 
 
@@ -167,14 +175,25 @@ class DynamicEmbEvictStrategy(enum.Enum):
 
 class DynamicEmbScoreStrategy(enum.IntEnum):
     """
-    Enumeration for different modes to set index-embedding's score. The index-embedding pair with smaller scores will be more likely to be evicted from the embedding table when the table is full.
+    Enumeration for different modes to set index-embedding's score.
+    The index-embedding pair with smaller scores will be more likely to be evicted from the embedding table when the table is full.
 
-    dynamicemb allows configuring scores by table. For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP. Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+    dynamicemb allows configuring scores by table.
+    For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
+    Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
     Attributes
     ----------
-    TIMESTAMP: In a forward pass, embedding table's scores will be set to global nanosecond timer of device, and due to the timing of GPU scheduling, different scores may have slight differences. Users must not set scores under TIMESTAMP mode.
-    STEP: Each embedding table has a member `step` which will increment for every forward pass. All scores in each forward pass are the same which is step's value. Users must not set scores under STEP mode.
-    CUSTOMIZED: Each embedding table's score are managed by users. Users have to set the score before every forward pass using `set_score` interface.
+    TIMESTAMP:
+        In a forward pass, embedding table's scores will be set to global nanosecond timer of device, and due to the timing of GPU scheduling,
+          different scores may have slight differences.
+        Users must not set scores under TIMESTAMP mode.
+    STEP:
+        Each embedding table has a member `step` which will increment for every forward pass.
+        All scores in each forward pass are the same which is step's value.
+        Users must not set scores under STEP mode.
+    CUSTOMIZED:
+        Each embedding table's score are managed by users.
+        Users have to set the score before every forward pass using `set_score` interface.
     """
 
     TIMESTAMP = 0
@@ -274,8 +293,11 @@ class DynamicEmbTableOptions(HKVConfig):
     num_of_buckets_per_alloc : int
         Number of buckets allocated per memory allocation request. Default is 1.
     initializer_args : DynamicEmbInitializerArgs
-        Arguments for initializing dynamic embedding vector values. Default is uniform distribution.
-    score_strategy(DynamicEmbScoreStrategy): For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table, as they are the same table, but stored on different ranks.
+        Arguments for initializing dynamic embedding vector values.
+        Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
+    score_strategy(DynamicEmbScoreStrategy):
+        For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
+          as they are the same table, but stored on different ranks.
     safe_check_mode : DynamicEmbCheckMode
         Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
         Please refer to the API documentation for DynamicEmbCheckMode for more information.
@@ -428,3 +450,15 @@ def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmb
         table_options.initializer_args.as_ctype(),
         table_options.safe_check_mode.value,
     )
+
+
+def validate_initializer_args(
+    initializer_args: DynamicEmbInitializerArgs, eb_config: BaseEmbeddingConfig = None
+) -> None:
+    if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM:
+        default_lower = -sqrt(1 / eb_config.num_embeddings) if eb_config else 0.0
+        default_upper = sqrt(1 / eb_config.num_embeddings) if eb_config else 1.0
+        if initializer_args.lower is None:
+            initializer_args.lower = default_lower
+        if initializer_args.upper is None:
+            initializer_args.upper = default_upper

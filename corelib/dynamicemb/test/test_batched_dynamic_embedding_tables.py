@@ -16,8 +16,6 @@
 import torch
 from dynamicemb import (
     DynamicEmbEvictStrategy,
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
     DynamicEmbStorageConfig,
     EmbOptimType,
@@ -55,9 +53,6 @@ def test_embedding_optimizer(opt_type, opt_params):
         evict_strategy=DynamicEmbEvictStrategy.LRU,
         feature_table_map=[0, 0, 1, 2],
         pooling_mode=DynamicEmbPoolingMode.MEAN,
-        initializer_args=DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.UNIFORM,
-        ),
         optimizer=opt_type,
         **opt_params,
     )
