@@ -296,8 +296,10 @@ class DynamicEmbTableOptions(HKVConfig):
         Arguments for initializing dynamic embedding vector values.
         Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
     score_strategy(DynamicEmbScoreStrategy):
+        The strategy to set the score for each indices in forward and backward per table.
+        Default to DynamicEmbScoreStrategy.TIMESTAMP.
         For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
-          as they are the same table, but stored on different ranks.
+            as they are the same table, but stored on different ranks.
     safe_check_mode : DynamicEmbCheckMode
         Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
         Please refer to the API documentation for DynamicEmbCheckMode for more information.

@@ -260,6 +260,47 @@ Parameters for each random initialization method in DynamicEmbInitializerMode.
         value: float = 0.0
     ```
 
+## DynamicEmbScoreStrategy
+
+The storage space is limited, but the value range of sparse features is relatively large, 
+so HKV introduces the concept of score to perform customized evcition of sparse features within the limited storage space.
+Based on the score of HKV, dynamicemb provides the following strategies to set the score.
+
+    ```python
+    #How to import
+    from dynamicemb import DynamicEmbScoreStrategy
+
+    #API arguments
+    class DynamicEmbScoreStrategy(enum.IntEnum):
+        """
+        Enumeration for different modes to set index-embedding's score.
+        The index-embedding pair with smaller scores will be more likely to be evicted from the embedding table when the table is full.
+
+        dynamicemb allows configuring scores by table.
+        For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
+        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+        Attributes
+        ----------
+        TIMESTAMP:
+            In a forward pass, embedding table's scores will be set to global nanosecond timer of device, and due to the timing of GPU scheduling,
+            different scores may have slight differences.
+            Users must not set scores under TIMESTAMP mode.
+        STEP:
+            Each embedding table has a member `step` which will increment for every forward pass.
+            All scores in each forward pass are the same which is step's value.
+            Users must not set scores under STEP mode.
+        CUSTOMIZED:
+            Each embedding table's score are managed by users.
+            Users have to set the score before every forward pass using `set_score` interface.
+        """
+
+        TIMESTAMP = 0
+        STEP = 1
+        CUSTOMIZED = 2
+    ```
+
+Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
+
 ## DynamicEmbTableOptions
 
 Dynamic embedding table parameter class, used to configure the parameters for each dynamic embedding table, to be input into `DynamicEmbParameterConstraints`.
@@ -330,8 +371,10 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
             Arguments for initializing dynamic embedding vector values.
             Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
         score_strategy(DynamicEmbScoreStrategy):
+            The strategy to set the score for each indices in forward and backward per table.
+            Default to DynamicEmbScoreStrategy.TIMESTAMP.
             For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
-            as they are the same table, but stored on different ranks.
+                as they are the same table, but stored on different ranks.
         safe_check_mode : DynamicEmbCheckMode
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
@@ -478,45 +521,6 @@ Given a model contains one or more `ShardedDynamicEmbeddingCollection`, this API
     ```
 
 More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main/corelib/dynamicemb/test/unit_tests/incremental_dump/test_distributed_dynamicemb.py)
-
-## DynamicEmbScoreStrategy
-
-Incremental dump’s workflow is related to how we configure the score for each index-embedding pair. dynamicemb provides three strategies to set the score.
-
-    ```python
-    #How to import
-    from dynamicemb import DynamicEmbScoreStrategy
-
-    #API arguments
-    class DynamicEmbScoreStrategy(enum.IntEnum):
-        """
-        Enumeration for different modes to set index-embedding's score.
-        The index-embedding pair with smaller scores will be more likely to be evicted from the embedding table when the table is full.
-
-        dynamicemb allows configuring scores by table.
-        For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
-        Attributes
-        ----------
-        TIMESTAMP:
-            In a forward pass, embedding table's scores will be set to global nanosecond timer of device, and due to the timing of GPU scheduling,
-            different scores may have slight differences.
-            Users must not set scores under TIMESTAMP mode.
-        STEP:
-            Each embedding table has a member `step` which will increment for every forward pass.
-            All scores in each forward pass are the same which is step's value.
-            Users must not set scores under STEP mode.
-        CUSTOMIZED:
-            Each embedding table's score are managed by users.
-            Users have to set the score before every forward pass using `set_score` interface.
-        """
-
-        TIMESTAMP = 0
-        STEP = 1
-        CUSTOMIZED = 2
-    ```
-
-Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
 
 ## get_score
 
