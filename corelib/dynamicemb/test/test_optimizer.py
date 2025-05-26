@@ -419,7 +419,7 @@ def get_optimizer_state_dim(dynemb_optimizer, dim, dtype):
 
 
 def find_and_insert_missed(table, batch, keys, values):
-    founds = torch.zeros_like(keys, dtype=torch.bool, device=keys.device)
+    founds = torch.empty_like(keys, dtype=torch.bool, device=keys.device)
     tmp_values = torch.zeros_like(values, dtype=values.dtype, device=values.device)
     find(table, batch, keys, tmp_values, founds)
     missed = ~founds
