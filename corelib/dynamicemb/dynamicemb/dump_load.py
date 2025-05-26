@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
-from dynamicemb.dynamicemb_config import dyn_emb_to_torch
+from dynamicemb.dynamicemb_config import dtype_to_bytes, dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -115,7 +115,6 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
 
         key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
         value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-        dim = dyn_emb_cols(dynamic_table)
         optstate_dim = dynamic_table.optstate_dim()
 
         keys = torch.empty(local_max_rows, dtype=key_dtype, device=device)
@@ -149,7 +148,9 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
             )
 
         keys_int64 = keys.to(torch.int64)
-        values_float = values.to(torch.float)
+        values_float = values.reshape(-1, dim + optstate_dim)[
+            :, : dim + optstate_dim if optim else dim
+        ].to(torch.float)
 
         fkey.write(keys_int64.cpu().numpy().tobytes())
         fvalue.write(values_float.cpu().numpy().tobytes())
@@ -292,7 +293,20 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
         value_path = os.path.join(debug_root_path, value_name)
 
         key_file_size = os.path.getsize(key_path)
-        os.path.getsize(value_path)
+        value_file_size = os.path.getsize(value_path)
+
+        key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
+        value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
+
+        key_bytes = dtype_to_bytes(key_dtype)
+        value_bytes = dtype_to_bytes(value_dtype)
+
+        total_keys = key_file_size // key_bytes
+        total_dim = value_file_size // (total_keys * value_bytes)
+
+        dim = dyn_emb_cols(dynamic_table)
+        optstate_dim = dynamic_table.optstate_dim()
+        exist_optstate: bool = total_dim > dim
 
         if need_dump_score:
             score_name = dump_name + "_" + str(rank) + "_scores"
@@ -303,9 +317,6 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
             return
 
         local_max_rows = dyn_emb_rows(dynamic_table)
-
-        dim = dyn_emb_cols(dynamic_table)
-        optstate_dim = dynamic_table.optstate_dim()
 
         key_dtype_in_table = dyn_emb_to_torch(dynamic_table.key_type())
         value_dtype_in_table = dyn_emb_to_torch(dynamic_table.value_type())
@@ -378,8 +389,8 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
         )
 
         sorted_values_device = values_device.view(
-            local_max_rows, dim + optstate_dim if optim else dim
-        )[sorted_indices_device].view(-1)
+            local_max_rows, dim + optstate_dim if exist_optstate else dim
+        )[:, : dim + optstate_dim if optim else dim][sorted_indices_device].view(-1)
         sorted_values_in_dynemb_float = values_in_dynemb_float.view(
             local_max_rows, dim + optstate_dim if optim else dim
         )[sorted_indices_in_dynemb_int64].view(-1)
@@ -796,21 +807,29 @@ def load_table(
     if not os.path.exists(value_path):
         raise Exception("can't find path to load, path:", value_path)
 
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    if optim:
-        dim += optstate_dim
-    dyn_emb_capacity(dynamic_table)
-    # reserve(dynamic_table,table_capacity)
+    key_file_size = os.path.getsize(key_path)
+    value_file_size = os.path.getsize(value_path)
 
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
 
-    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
-    values_read_bytes = batch_size * dim * 4  # value in file always float , so is 4
+    key_bytes = dtype_to_bytes(key_dtype)
+    value_bytes = dtype_to_bytes(value_dtype)
 
-    key_file_size = os.path.getsize(key_path)
-    value_file_size = os.path.getsize(value_path)
+    total_keys = key_file_size // key_bytes
+    total_dim = value_file_size // (total_keys * value_bytes)
+
+    dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+    if total_dim < dim or ((total_dim != dim + optstate_dim) and optim):
+        raise Exception(
+            "Can't load as mismatch of embedding dtype, dim or optimizer type"
+        )
+
+    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
+    values_read_bytes = (
+        batch_size * total_dim * 4
+    )  # value in file always float , so is 4
 
     if debug_mode:
         debug_check_dynamic_table_is_zero(dynamic_table)
@@ -842,7 +861,9 @@ def load_table(
             num_keys = len(key_bytes) // 8  # key in file always int64 ,so is 8
 
             key_array = np.frombuffer(key_bytes, dtype=np.int64)
-            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(-1, dim)
+            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(
+                -1, total_dim
+            )
 
             if need_dump_score:
                 remaining_score_bytes = score_file_size - fscore.tell()
@@ -861,7 +882,7 @@ def load_table(
                 values_tensor = torch.tensor(
                     masked_values, dtype=value_dtype, device=device
                 )
-                if dim < dyn_emb_cols(dynamic_table) + optstate_dim:
+                if not optim:
                     optstate = torch.zeros(
                         values_tensor.size(0),
                         optstate_dim,
@@ -869,7 +890,7 @@ def load_table(
                         device=device,
                     )
                     values_tensor = torch.cat(
-                        (values_tensor, optstate), dim=1
+                        (values_tensor[:, :dim], optstate), dim=1
                     ).contiguous()
                 if need_dump_score:
                     scores_tensor = torch.tensor(

@@ -429,6 +429,27 @@ def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
         raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
 
 
+def dtype_to_bytes(dtype: torch.dtype) -> int:
+    dtype_size_map = {
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        torch.float32: 4,
+        torch.float64: 8,
+        torch.int8: 1,
+        torch.uint8: 1,
+        torch.int16: 2,
+        torch.uint16: 2,
+        torch.int32: 4,
+        torch.uint32: 4,
+        torch.int64: 8,
+        torch.uint64: 8,
+        torch.bool: 1,
+    }
+    if dtype not in dtype_size_map:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return dtype_size_map[dtype]
+
+
 def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
     if strategy_str == "KLru":
         return EvictStrategy.KLru
