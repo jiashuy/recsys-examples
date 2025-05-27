@@ -277,10 +277,23 @@ template <typename ElementType, typename SizeType>
 struct OptStateInitializer {
   SizeType dim;
   ElementType initial_optstate;
-  DEVICE_INLINE void init (ElementType* vec_ptr) {
+  DEVICE_INLINE void init(ElementType* vec_ptr) {
     if (vec_ptr == nullptr) return;
     for (SizeType i = threadIdx.x; i < dim; i ++) {
       vec_ptr[i] = initial_optstate;
+    }
+  }
+  DEVICE_INLINE void init4(ElementType* vec_ptr) {
+    if (vec_ptr == nullptr) return;
+    Vec4T<ElementType> state;
+    state.set(initial_optstate);
+
+    constexpr int VecSize = 4;
+    constexpr int kWarpSize = 32;
+    const int lane_id = threadIdx.x % kWarpSize;
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      state.store(vec_ptr + idx4);
     }
   }
 };
@@ -338,15 +351,13 @@ private:
 template <
   typename T, 
   typename EmbeddingGenerator,
-  typename OptStateInitializer,
   typename TableVector>
-__global__ void fill_output_with_table_vectors(
+__global__ void fill_output_with_table_vectors_kernel(
     uint64_t n,
     int emb_dim,
     T* outputs, 
     typename TableVector::Args vector_args,
-    typename EmbeddingGenerator::Args generator_args,
-    OptStateInitializer optstate_initailizer) {
+    typename EmbeddingGenerator::Args generator_args) {
   
   TableVector vectors(vector_args);
   EmbeddingGenerator emb_gen(generator_args);
@@ -356,13 +367,12 @@ __global__ void fill_output_with_table_vectors(
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         outputs[emb_id * emb_dim + i] = *vectors.data_ptr(emb_id, i);
       }
-    } else if (vectors.isValid(emb_id)) { // initialize the embedding and optimizer state, as well as outputs.
+    } else if (vectors.isValid(emb_id)) { // initialize the embedding as well as outputs.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         auto tmp = emb_gen.generate(emb_id);
         outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
         *vectors.data_ptr(emb_id, i) = TypeConvertFunc<T, float>::convert(tmp);
       }
-      optstate_initailizer.init(vectors.data_ptr(emb_id, emb_dim));
     } else { // vector not exists in table, set the output to 0.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(0.0f);
@@ -371,6 +381,49 @@ __global__ void fill_output_with_table_vectors(
   }
 
   emb_gen.destroy();
+}
+
+template <
+  typename T,
+  typename OptStateInitializer,
+  typename TableVector>
+__global__ void initialize_optimizer_state_kernel_vec4(
+    uint64_t n,
+    int emb_dim,
+    typename TableVector::Args vector_args,
+    OptStateInitializer optstate_initailizer) {
+  
+  TableVector vectors(vector_args);
+
+  constexpr int kWarpSize = 32;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+
+  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+      emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
+    if ((!vectors.isInitialized(emb_id)) and vectors.isValid(emb_id)) {
+      optstate_initailizer.init4(vectors.data_ptr(emb_id, emb_dim));
+    }
+  }
+}
+
+template <
+  typename T,
+  typename OptStateInitializer,
+  typename TableVector>
+__global__ void initialize_optimizer_state_kernel(
+    uint64_t n,
+    int emb_dim,
+    typename TableVector::Args vector_args,
+    OptStateInitializer optstate_initailizer) {
+  
+  TableVector vectors(vector_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    if ((!vectors.isInitialized(emb_id)) and vectors.isValid(emb_id)) {
+      optstate_initailizer.init(vectors.data_ptr(emb_id, emb_dim));
+    }
+  }
 }
 
 static void set_curand_states(curandState **states,
@@ -546,47 +599,81 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
                        ? dim
                        : device_prop.max_thread_per_block;
   int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
-  auto &initializer_ = initializer_args.mode;
-
-  int optstate_dim = get_optimizer_state_dim<ValueType>(optimizer_type_, dim);
-  using OptStateInitializer = OptStateInitializer<ValueType, int>;
-  OptStateInitializer optstate_initializer {optstate_dim, initial_optstate_};
   using TableVector = TableVector<ValueType>;
   auto table_vec_args = typename TableVector::Args {reinterpret_cast<ValueType **>(value_ptrs), d_found};
+
+  auto &initializer_ = initializer_args.mode;
   if (initializer_ == "normal") {
     using Generator = NormalEmbeddingGenerator;
     auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
-    fill_output_with_table_vectors<ValueType, Generator, OptStateInitializer, TableVector>
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args, optstate_initializer);
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "truncated_normal") {
     using Generator = TruncatedNormalEmbeddingGenerator;
-    using Args = typename Generator::Args;
     auto generator_args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
-    fill_output_with_table_vectors<ValueType, Generator, OptStateInitializer, TableVector>
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args, optstate_initializer);
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "uniform") {
     using Generator = UniformEmbeddingGenerator;
     auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
-    fill_output_with_table_vectors<ValueType, Generator, OptStateInitializer, TableVector>
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args, optstate_initializer);
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "debug") {
     using Generator = MappingEmbeddingGenerator<KeyType>;
     auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
-    fill_output_with_table_vectors<ValueType, Generator, OptStateInitializer, TableVector>
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args, optstate_initializer);
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "constant") {
     using Generator = ConstEmbeddingGenerator;
     auto generator_args = typename Generator::Args {initializer_args.value};
-    fill_output_with_table_vectors<ValueType, Generator, OptStateInitializer, TableVector>
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args, optstate_initializer);
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else {
     throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
   }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+  int optstate_dim = get_optimizer_state_dim<ValueType>(optimizer_type_, dim);
+  if (optstate_dim == 0) return;
+  using OptStateInitializer = OptStateInitializer<ValueType, int>;
+  OptStateInitializer optstate_initializer {optstate_dim, initial_optstate_};
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size_opt = 0;
+  if (n / WARP_PER_BLOCK < max_grid_size) {
+    grid_size_opt = (n - 1) / WARP_PER_BLOCK + 1;
+  } else if (n / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size_opt = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size_opt = max_grid_size;
+  }
+
+  if (dim % 4 == 0 and optstate_dim % 4 == 0) {
+    initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer, TableVector>
+      <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(
+      n, dim, table_vec_args, optstate_initializer);
+  } else {
+    int block_size = optstate_dim < device_prop.max_thread_per_block
+                        ? optstate_dim
+                        : device_prop.max_thread_per_block;
+    int grid_size = n;
+    initialize_optimizer_state_kernel<ValueType, OptStateInitializer, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, table_vec_args, optstate_initializer);
+  }
+
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
