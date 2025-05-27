@@ -182,6 +182,7 @@ public:
   virtual curandState* get_curand_states() const = 0;
   virtual const InitializerArgs& get_initializer_args() const = 0;
   virtual const int optstate_dim() const = 0;
+  virtual void set_initial_optstate(const float value) = 0;
 };
 
 class VariableFactory {

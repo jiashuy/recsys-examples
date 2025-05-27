@@ -54,13 +54,6 @@ template <> struct Vec4T<__half> {
     value.h[1].y = 0.f;
   }
 
-  DEVICE_INLINE void set(const __half input) {
-    value.h[0].x = input;
-    value.h[0].y = input;
-    value.h[1].x = input;
-    value.h[1].y = input;
-  }
-
   DEVICE_INLINE void reset() {
     value.h[0].x = 0.f;
     value.h[0].y = 0.f;
@@ -293,13 +286,6 @@ template <> struct Vec4T<__nv_bfloat16> {
     value.h[1].y = 0.f;
   }
 
-  DEVICE_INLINE void set(const __nv_bfloat16 input) {
-    value.h[0].x = input;
-    value.h[0].y = input;
-    value.h[1].x = input;
-    value.h[1].y = input;
-  }
-
   DEVICE_INLINE void reset() {
     value.h[0].x = 0.f;
     value.h[0].y = 0.f;
@@ -516,13 +502,6 @@ template <> struct Vec4T<float> {
     val.y = 0.f;
     val.z = 0.f;
     val.w = 0.f;
-  }
-
-  DEVICE_INLINE void set(const float input) {
-    val.x = input;
-    val.y = input;
-    val.z = input;
-    val.w = input;
   }
 
   DEVICE_INLINE void reset() {

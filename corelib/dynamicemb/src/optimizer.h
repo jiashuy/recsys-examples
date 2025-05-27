@@ -54,7 +54,6 @@ void dynamic_emb_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score = std::nullopt);
 
 void dynamic_emb_rowwise_adagrad_with_table(
@@ -63,7 +62,6 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score = std::nullopt);
 
 } // namespace dyn_emb

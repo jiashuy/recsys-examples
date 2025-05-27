@@ -300,7 +300,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ) -> None:
         super().__init__(opt_args, table_options, hashtables)
 
-        self._state_dict["Gt"] = []
+        self._state_dict["Gt"] = hashtables
 
     def update(
         self,
@@ -316,7 +316,6 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 )
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
-        initial_accumulator_value = self._opt_args.initial_accumulator_value
 
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
@@ -344,7 +343,10 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-        self._opt_args.initial_accumulator_value = get_required_arg(args, "initial_accumulator_value")
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        for table in self._state_dict["Gt"]:
+            table.set_initial_optstate(initial_value)
         return
 
 
@@ -357,7 +359,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ) -> None:
         super().__init__(opt_args, table_options, hashtables)
 
-        self._state_dict["Gt"] = []
+        self._state_dict["Gt"] = hashtables
 
     def update(
         self,
@@ -373,7 +375,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 )
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
-        initial_accumulator_value = self._opt_args.initial_accumulator_value
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
@@ -400,5 +401,8 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-        self._opt_args.initial_accumulator_value = get_required_arg(args, "initial_accumulator_value")
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        for table in self._state_dict["Gt"]:
+            table.set_initial_optstate(initial_value)
         return

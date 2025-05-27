@@ -102,7 +102,12 @@ class DynamicEmbInitializerArgs:
         if self.mode == DynamicEmbInitializerMode.NORMAL:
             return self.mean == other.mean and self.std_dev == other.std_dev
         elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-            return self.mean == other.mean and self.std_dev == other.std_dev and self.lower == other.lower and self.upper == other.upper
+            return (
+                self.mean == other.mean
+                and self.std_dev == other.std_dev
+                and self.lower == other.lower
+                and self.upper == other.upper
+            )
         elif self.mode == DynamicEmbInitializerMode.UNIFORM:
             return self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.CONSTANT:

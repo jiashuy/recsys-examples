@@ -176,7 +176,6 @@ void dynamic_emb_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score){
   if (n == 0) return;
 
@@ -245,7 +244,6 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score) {
   if (n == 0) return;
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");

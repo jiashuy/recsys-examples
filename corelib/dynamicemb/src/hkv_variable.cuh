@@ -214,7 +214,7 @@ struct TruncatedNormalEmbeddingGenerator {
     tmp += mean;
     tmp = max(tmp, lower);
     tmp = min(tmp, upper);
-    return return tmp;
+    return tmp;
   }
 
   DEVICE_INLINE void destroy() {
@@ -286,7 +286,7 @@ struct OptStateInitializer {
   DEVICE_INLINE void init4(ElementType* vec_ptr) {
     if (vec_ptr == nullptr) return;
     Vec4T<ElementType> state;
-    state.set(initial_optstate);
+    state.reset(initial_optstate);
 
     constexpr int VecSize = 4;
     constexpr int kWarpSize = 32;
@@ -611,7 +611,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
       n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "truncated_normal") {
     using Generator = TruncatedNormalEmbeddingGenerator;
-    auto generator_args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
       <<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
@@ -806,5 +806,11 @@ template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 const int  HKVVariable<KeyType, ValueType, Strategy>::optstate_dim() const {
   return hkv_table_option_.dim - dim_;
 }
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::set_initial_optstate(const float value) {
+  this->initial_optstate_ = value;
+}
+
 
 } // namespace dyn_emb

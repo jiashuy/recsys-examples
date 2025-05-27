@@ -144,6 +144,7 @@ public:
   curandState* get_curand_states() const override;
   const InitializerArgs& get_initializer_args() const override;
   const int optstate_dim() const override;
+  void set_initial_optstate(const float value) override;
 
 
 private:
