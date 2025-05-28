@@ -183,6 +183,7 @@ public:
   virtual const InitializerArgs& get_initializer_args() const = 0;
   virtual const int optstate_dim() const = 0;
   virtual void set_initial_optstate(const float value) = 0;
+  virtual const float get_initial_optstate() const = 0;
 };
 
 class VariableFactory {

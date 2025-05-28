@@ -302,6 +302,9 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
         self._state_dict["Gt"] = hashtables
 
+        for table in hashtables:
+            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
+
     def update(
         self,
         hashtables: List[DynamicEmbTable],
@@ -360,6 +363,9 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         super().__init__(opt_args, table_options, hashtables)
 
         self._state_dict["Gt"] = hashtables
+
+        for table in hashtables:
+            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
 
     def update(
         self,

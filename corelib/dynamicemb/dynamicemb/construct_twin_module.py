@@ -528,11 +528,15 @@ class ConstructTwinModule:
             tmp_table_name = feature.replace("f_", "t_")
             cur_hkv_table = table_name_map_hkv_table[tmp_table_name]
             optstate_dim = cur_hkv_table.optstate_dim()
-            optstate = torch.zeros(
-                unique_values.size(0),
-                optstate_dim,
-                dtype=unique_values.dtype,
-                device=unique_values.device,
+            initial_accumulator = cur_hkv_table.get_initial_optstate()
+            optstate = (
+                torch.ones(
+                    unique_values.size(0),
+                    optstate_dim,
+                    dtype=unique_values.dtype,
+                    device=unique_values.device,
+                )
+                * initial_accumulator
             )
             unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
             unique_values = unique_values.reshape(-1)

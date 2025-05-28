@@ -883,11 +883,14 @@ def load_table(
                     masked_values, dtype=value_dtype, device=device
                 )
                 if not optim:
-                    optstate = torch.zeros(
-                        values_tensor.size(0),
-                        optstate_dim,
-                        dtype=value_dtype,
-                        device=device,
+                    optstate = (
+                        torch.ones(
+                            values_tensor.size(0),
+                            optstate_dim,
+                            dtype=value_dtype,
+                            device=device,
+                        )
+                        * dynamic_table.get_initial_optstate()
                     )
                     values_tensor = torch.cat(
                         (values_tensor[:, :dim], optstate), dim=1

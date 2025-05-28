@@ -812,5 +812,9 @@ void HKVVariable<KeyType, ValueType, Strategy>::set_initial_optstate(const float
   this->initial_optstate_ = value;
 }
 
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const float HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() const {
+  return this->initial_optstate_;
+}
 
 } // namespace dyn_emb

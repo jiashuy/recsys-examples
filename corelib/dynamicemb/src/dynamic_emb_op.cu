@@ -827,7 +827,9 @@ void bind_dyn_emb_op(py::module &m) {
           .def("optstate_dim", &dyn_emb::DynamicVariableBase::optstate_dim,
             "Get dim of all optimizer states.")
           .def("set_initial_optstate", &dyn_emb::DynamicVariableBase::set_initial_optstate,
-            "Set initial value of optimizer state.");
+            "Set initial value of optimizer state.")
+          .def("get_initial_optstate", &dyn_emb::DynamicVariableBase::get_initial_optstate,
+            "Get initial value of optimizer state.");
 
   m.def("dyn_emb_rows", &dyn_emb_rows, "Get the number of rows in the table",
         py::arg("table"));

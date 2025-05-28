@@ -145,6 +145,7 @@ public:
   const InitializerArgs& get_initializer_args() const override;
   const int optstate_dim() const override;
   void set_initial_optstate(const float value) override;
+  const float get_initial_optstate() const override;
 
 
 private:
