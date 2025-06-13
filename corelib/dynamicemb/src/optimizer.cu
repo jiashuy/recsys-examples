@@ -86,15 +86,14 @@ void update_heirarchical_tables(
   const std::optional<uint64_t> score
 ) {
 
-  at::Tensor evicted_keys = at::empty({static_cast<int64_t>(total_key_num)}, keys.options());
-  at::Tensor evicted_values = at::empty({static_cast<int64_t>(total_key_num), values.size(1)}, keys.options());
-  at::Tensor evicted_score = at::empty({static_cast<int64_t>(total_key_num)}, keys.options().dtype(at::kUInt64));
+  ///TODO: to check why using missed_key_num here will cause errors.
+  at::Tensor evicted_keys = at::empty({static_cast<int64_t>(missed_key_num)}, keys.options());
+  at::Tensor evicted_values = at::empty({static_cast<int64_t>(missed_key_num), values.size(1)}, keys.options());
+  at::Tensor evicted_score = at::empty({static_cast<int64_t>(missed_key_num)}, keys.options().dtype(at::kUInt64));
   at::Tensor d_evicted_counter =  at::zeros({static_cast<int64_t>(1)}, at::TensorOptions().dtype(at::kUInt64).device(keys.device()));
-  std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
-  insert_and_evict(t1, total_key_num, keys, values, score, evicted_keys, evicted_values, evicted_score, d_evicted_counter);
-  std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  insert_and_evict(t1, total_key_num, keys, values, score, evicted_keys, evicted_values, evicted_score, d_evicted_counter);  
   uint64_t evict_counter = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&evict_counter, d_evicted_counter.data_ptr(),
       sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
@@ -104,9 +103,7 @@ void update_heirarchical_tables(
     throw std::runtime_error("Evict too much keys than new inserted.");
   }
   auto evict_score_opt = c10::make_optional(evicted_score);
-  std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
   insert_or_assign(t2, evict_counter, evicted_keys, evicted_values, evict_score_opt);
-  std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
 }
 
 void dynamic_emb_sgd_with_table(

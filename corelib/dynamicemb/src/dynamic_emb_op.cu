@@ -114,11 +114,15 @@ void insert_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                       bool ignore_evict_strategy = false) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if (score.has_value()) {
-    at::Tensor score_ = score.value();
-    table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(),
-                            score_.data_ptr(), stream, unique_key,
-                            ignore_evict_strategy);
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+    if (score.has_value()) {
+      at::Tensor score_ = score.value();
+      table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(),
+                              score_.data_ptr(), stream, unique_key,
+                              ignore_evict_strategy);
+    } else {
+      throw std::runtime_error("Not provide score in Customized or LFU mode.");
+    }
   } else {
     table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(), nullptr,
                             stream, unique_key, ignore_evict_strategy);
@@ -208,9 +212,17 @@ __global__ void get_missed_keys_kernel(
     int64_t n, const bool* founds, const key_t* keys, key_t* missed_keys, idx_t* missed_ids, int64_t* missed_counter) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   cg::thread_block_tile<32> g = cg::tiled_partition<32>(cg::this_thread_block());
-  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
-    bool missed = not founds[i];
-    key_t key = keys[i];
+  int64_t group_begin = (tid >> 5) * 32;
+  int lane = tid % 32;
+  for (int64_t i = group_begin; i < n; i += gridDim.x * blockDim.x) {
+    bool missed;
+    key_t key;
+    if (i + lane < n) {
+      missed = not founds[i + lane];
+      key = keys[i + lane];
+    } else {
+      missed = false;
+    }
     uint32_t vote = g.ballot(missed);
     int group_cnt = __popc(vote);
     int64_t group_offset = 0;
@@ -222,7 +234,7 @@ __global__ void get_missed_keys_kernel(
     int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
     if (missed) {
       missed_keys[group_offset + previous_cnt] = key;
-      missed_ids[i] = static_cast<idx_t>(group_offset + previous_cnt);
+      missed_ids[i + lane] = static_cast<idx_t>(group_offset + previous_cnt);
     }
   }
 }
@@ -301,14 +313,15 @@ void find_and_initialize_from_hierarchical_table(
       missed_counter.data_ptr<int64_t>()
     );
   });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   int64_t missed_host_counter = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&missed_host_counter, missed_counter.data_ptr(),
       sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  auto vals_host_ptr_tensor = at::empty({missed_host_counter}, vals_dev_ptr_tensor.options());
+  auto vals_host_ptr_tensor = at::empty({static_cast<int64_t>(missed_host_counter)}, vals_dev_ptr_tensor.options());
   auto vals_host_ptr = reinterpret_cast<void**>(vals_host_ptr_tensor.data_ptr<int64_t>());
-  auto founds_host = at::empty({missed_host_counter}, founds_dev_tensor.options()).data_ptr<bool>();
+  auto founds_host = at::empty({static_cast<int64_t>(missed_host_counter)}, founds_dev_tensor.options()).data_ptr<bool>();
 
   host_table->find_pointers(missed_host_counter, missed_dev_keys.data_ptr(), vals_host_ptr, founds_host, nullptr, stream);
 
@@ -464,7 +477,7 @@ int64_t find_and_get_missed(
 ) {
 
   find_pointers(ht, n, keys, vals_ptr, founds);
-  static auto missed_counter = at::zeros({static_cast<int64_t>(1)},
+  auto missed_counter = at::zeros({static_cast<int64_t>(1)},
     at::TensorOptions().dtype(at::kLong).device(keys.device()));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -475,6 +488,7 @@ int64_t find_and_get_missed(
       missed_counter.data_ptr<int64_t>()
     );
   });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   int64_t missed_host_counter = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&missed_host_counter, missed_counter.data_ptr(),
       sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
@@ -683,7 +697,11 @@ void lookup_forward_dense(
       if (use_index_dedup) {
         if (host_tables.has_value()) {
           auto& host_table = host_tables.value()[i];
-          find_and_initialize_from_hierarchical_table(tables[i], host_table, tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+          if (host_table != nullptr) {
+            find_and_initialize_from_hierarchical_table(tables[i], host_table, tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+          } else {
+            find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+          }
         } else {
           find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
         }
