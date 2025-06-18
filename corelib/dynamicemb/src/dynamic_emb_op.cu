@@ -209,7 +209,7 @@ template<
   typename key_t,
   typename idx_t>
 __global__ void get_missed_keys_kernel(
-    int64_t n, const bool* founds, const key_t* keys, key_t* missed_keys, idx_t* missed_ids, int64_t* missed_counter) {
+    int64_t n, const bool* founds, const key_t* keys, key_t* missed_keys, idx_t* missed_ids, int64_t* missed_counter, idx_t* reverse_ids=nullptr) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   cg::thread_block_tile<32> g = cg::tiled_partition<32>(cg::this_thread_block());
   int64_t group_begin = (tid >> 5) * 32;
@@ -235,6 +235,9 @@ __global__ void get_missed_keys_kernel(
     if (missed) {
       missed_keys[group_offset + previous_cnt] = key;
       missed_ids[i + lane] = static_cast<idx_t>(group_offset + previous_cnt);
+      if (reverse_ids) {
+        reverse_ids[group_offset + previous_cnt] = i + lane;
+      }
     }
   }
 }
@@ -473,7 +476,8 @@ int64_t find_and_get_missed(
   at::Tensor founds,
   at::Tensor vals_ptr,
   at::Tensor missed_keys,
-  at::Tensor missed_ids
+  at::Tensor missed_ids,
+  at::Tensor reverse_ids
 ) {
 
   find_pointers(ht, n, keys, vals_ptr, founds);
@@ -485,7 +489,7 @@ int64_t find_and_get_missed(
     get_missed_keys_kernel<key_t, int><<<(n + 127) / 128, 128, 0, stream>>>(
       n, founds.data_ptr<bool>(), reinterpret_cast<key_t*>(keys.data_ptr()), 
       reinterpret_cast<key_t*>(missed_keys.data_ptr()), missed_ids.data_ptr<int>(),
-      missed_counter.data_ptr<int64_t>()
+      missed_counter.data_ptr<int64_t>(), reverse_ids.data_ptr<int>()
     );
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();

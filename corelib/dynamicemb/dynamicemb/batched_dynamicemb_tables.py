@@ -484,7 +484,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     raise ValueError(
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
-            if option.caching:
+            if option.caching and option.training:
                 gpu_option = deepcopy(option)
                 capacity = get_constraint_capacity(
                     option.local_hbm_for_values,

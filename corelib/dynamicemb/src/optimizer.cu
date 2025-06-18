@@ -59,7 +59,8 @@ int64_t find_and_get_missed(
   at::Tensor foundss,
   at::Tensor vals_ptr,
   at::Tensor missed_keys,
-  at::Tensor missed_ids
+  at::Tensor missed_ids,
+  at::Tensor reverse_ids
 );
 
 void insert_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
@@ -69,12 +70,35 @@ void insert_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                       bool unique_key = true,
                       bool ignore_evict_strategy = false);
 
+void assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
+            const at::Tensor keys, const at::Tensor values,
+            const c10::optional<at::Tensor> &score = c10::nullopt,
+            bool unique_key = true);
+
 namespace dyn_emb {
 
 constexpr int MULTIPLIER = 4;
 constexpr int WARPSIZE = 32;
 constexpr int OPTIMIZER_BLOCKSIZE_VEC = 64;
 constexpr int OPTIMIZER_BLOCKSIZE = 1024;
+
+template<typename IdxType, typename V, int GROUP_SIZE=32>
+__global__ void get_missing_values(
+    int n, int dim,
+    IdxType const * __restrict__ original_ids,
+    V const* __restrict__ src, 
+    V* __restrict__ dst) {
+  
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int group_id = tid / GROUP_SIZE;
+  int lane_id = tid % GROUP_SIZE;
+  if (group_id < n) {
+    auto src_id = original_ids[group_id];
+    for (int i = lane_id; i < dim; i += GROUP_SIZE) {
+      dst[group_id * dim + i] = src[src_id * dim + i];
+    }
+  }
+}
 
 void update_heirarchical_tables(
   std::shared_ptr<dyn_emb::DynamicVariableBase> t1,
@@ -83,17 +107,53 @@ void update_heirarchical_tables(
   uint64_t missed_key_num,
   at::Tensor keys,
   at::Tensor values,
-  const std::optional<uint64_t> score
+  const std::optional<uint64_t> score,
+  at::Tensor missed_keys,
+  at::Tensor reverse_ids
 ) {
 
-  ///TODO: to check why using missed_key_num here will cause errors.
+  //1.update
+  if (t1->need_score()) {
+    if (not score) {
+      throw std::invalid_argument("Must specify the score.");
+    }
+    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+    // broadcast scores
+    at::Tensor bc_scores = at::empty({static_cast<int64_t>(total_key_num)}, option);
+    bc_scores.fill_(score.value());
+    c10::optional<at::Tensor> opt_scores(bc_scores);
+    assign(t1, total_key_num, keys, values, opt_scores);
+  } else {
+    assign(t1, total_key_num, keys, values);
+  }
+
+  if (missed_key_num == 0) return;
+
+  //2.lock
+  at::Tensor locked_keys_ptr = at::empty({static_cast<int64_t>(total_key_num)}, keys.options().dtype(at::kUInt64));
+  at::Tensor flags = at::zeros({static_cast<int64_t>(total_key_num)}, keys.options().dtype(at::kBool));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  ///TODO: check flags consistent with founds.
+  t1->lock(total_key_num, keys.data_ptr(), (void**)(locked_keys_ptr.data_ptr()), flags.data_ptr<bool>(), stream);
+
+  //3.insert_and_evict missing
+  at::Tensor missed_values = at::empty({static_cast<int64_t>(missed_key_num), values.size(1)}, values.options());
+  constexpr int BLOCK_SIZE_ = 128;
+  constexpr int WARP_PER_BLOCK_ = BLOCK_SIZE_ / 32;
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(t1->value_type(), ValueType, [&] {
+    get_missing_values<int, ValueType, 32>
+      <<<(missed_key_num + WARP_PER_BLOCK_ - 1) / WARP_PER_BLOCK_, BLOCK_SIZE_, 0, stream>>>(
+        missed_key_num, values.size(1), reverse_ids.data_ptr<int>(), 
+        reinterpret_cast<ValueType*>(values.data_ptr()), reinterpret_cast<ValueType*>(missed_values.data_ptr())
+      );
+  });
+  
   at::Tensor evicted_keys = at::empty({static_cast<int64_t>(missed_key_num)}, keys.options());
-  at::Tensor evicted_values = at::empty({static_cast<int64_t>(missed_key_num), values.size(1)}, keys.options());
+  at::Tensor evicted_values = at::empty({static_cast<int64_t>(missed_key_num), values.size(1)}, values.options());
   at::Tensor evicted_score = at::empty({static_cast<int64_t>(missed_key_num)}, keys.options().dtype(at::kUInt64));
   at::Tensor d_evicted_counter =  at::zeros({static_cast<int64_t>(1)}, at::TensorOptions().dtype(at::kUInt64).device(keys.device()));
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  insert_and_evict(t1, total_key_num, keys, values, score, evicted_keys, evicted_values, evicted_score, d_evicted_counter);  
+  insert_and_evict(t1, missed_key_num, missed_keys, missed_values, score, evicted_keys, evicted_values, evicted_score, d_evicted_counter);
+  t1->unlock(total_key_num, (void**)(locked_keys_ptr.data_ptr()), keys.data_ptr(), flags.data_ptr<bool>(), stream);
   uint64_t evict_counter = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&evict_counter, d_evicted_counter.data_ptr(),
       sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
@@ -136,7 +196,8 @@ void dynamic_emb_sgd_with_table(
     }
     auto missed_keys = at::empty_like(indices);
     auto missed_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
-    auto miss_counter = find_and_get_missed(table, n, indices, founds, weight_ptrs, missed_keys, missed_ids);
+    auto reverse_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
+    auto miss_counter = find_and_get_missed(table, n, indices, founds, weight_ptrs, missed_keys, missed_ids, reverse_ids);
     auto vals_host_ptr = at::empty({miss_counter}, weight_ptrs.options());
     auto founds_host = at::empty({miss_counter}, founds.options());
     find_pointers(host_table.value(), miss_counter, missed_keys, vals_host_ptr, founds_host);
@@ -189,7 +250,7 @@ void dynamic_emb_sgd_with_table(
       });
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(table, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score);
+    update_heirarchical_tables(table, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score, missed_keys, reverse_ids);
     return;
   }
   if (embs.has_value()) {
@@ -313,9 +374,8 @@ void dynamic_emb_adam_with_table(
     }
     auto missed_keys = at::empty_like(indices);
     auto missed_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
-    std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
-    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids);
-    std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
+    auto reverse_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
+    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids, reverse_ids);
     auto vals_host_ptr = at::empty({miss_counter}, vector_ptrs.options());
     auto founds_host = at::empty({miss_counter}, founds.options());
     find_pointers(host_table.value(), miss_counter, missed_keys, vals_host_ptr, founds_host);
@@ -373,9 +433,7 @@ void dynamic_emb_adam_with_table(
       });
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
-    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score);
-    std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
+    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score, missed_keys, reverse_ids);
     return;
   }
 
@@ -507,7 +565,8 @@ void dynamic_emb_adagrad_with_table(
     }
     auto missed_keys = at::empty_like(indices);
     auto missed_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
-    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids);
+    auto reverse_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
+    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids, reverse_ids);
     auto vals_host_ptr = at::empty({miss_counter}, vector_ptrs.options());
     auto founds_host = at::empty({miss_counter}, founds.options());
     find_pointers(host_table.value(), miss_counter, missed_keys, vals_host_ptr, founds_host);
@@ -561,7 +620,7 @@ void dynamic_emb_adagrad_with_table(
       });
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score);
+    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score, missed_keys, reverse_ids);
     return;
   }
 
@@ -690,7 +749,8 @@ void dynamic_emb_rowwise_adagrad_with_table(
     }
     auto missed_keys = at::empty_like(indices);
     auto missed_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
-    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids);
+    auto reverse_ids = at::empty({static_cast<int64_t>(n)}, at::TensorOptions().dtype(at::kInt).device(indices.device()));
+    auto miss_counter = find_and_get_missed(ht, n, indices, founds, vector_ptrs, missed_keys, missed_ids, reverse_ids);
     auto vals_host_ptr = at::empty({miss_counter}, vector_ptrs.options());
     auto founds_host = at::empty({miss_counter}, founds.options());
     find_pointers(host_table.value(), miss_counter, missed_keys, vals_host_ptr, founds_host);
@@ -744,7 +804,7 @@ void dynamic_emb_rowwise_adagrad_with_table(
       });
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score);
+    update_heirarchical_tables(ht, host_table.value(), n, miss_counter, indices, emb_optstate_buffer, score, missed_keys, reverse_ids);
     return;
   }
 
