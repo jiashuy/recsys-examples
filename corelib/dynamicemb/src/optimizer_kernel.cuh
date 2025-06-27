@@ -1284,5 +1284,59 @@ __global__ void update_kernel_v3(
   }
 }
 
+template <typename grad_t, typename emb_t, typename OptimizerFunc>
+__global__ void update4_kernel_v4(
+    const uint32_t num_keys,
+    const uint32_t dim, 
+    const uint32_t optstate_dim,
+    const grad_t *grad_evs,
+    const emb_t* emb_evs,
+    emb_t* outputs_buffer,
+    OptimizerFunc optimizer,
+    emb_t **weight_evs, 
+    const bool* masks
+    ) {
+  constexpr int kWarpSize = 32;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+
+  for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
+    const grad_t *grad_ptr = grad_evs + ev_id * dim;
+    const emb_t* emb_ptr = emb_evs + ev_id * dim;
+    emb_t* output_buffer = outputs_buffer + ev_id * (dim + optstate_dim);
+    bool found = masks[ev_id];
+    auto val_ptr = weight_evs[ev_id];
+    OptimizierInputV3<grad_t, emb_t> input {grad_ptr, emb_ptr, val_ptr, dim, found, output_buffer};
+    optimizer.template update4<OptimizierInputV3<grad_t, emb_t>>(input);
+  }
+}
+
+template <typename grad_t, typename emb_t, typename OptimizerFunc>
+__global__ void update_kernel_v4(
+    const uint32_t num_keys, 
+    const uint32_t dim,
+    const uint32_t optstate_dim,
+    const grad_t *grad_evs,
+    const emb_t* emb_evs,
+    emb_t* outputs_buffer,
+    OptimizerFunc optimizer,
+    emb_t **weight_evs, 
+    const bool* masks
+) {
+  constexpr int kWarpSize = 32;
+
+  for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
+
+    const grad_t *grad_ptr = grad_evs + ev_id * dim;
+    const emb_t* emb_ptr = emb_evs + ev_id * dim;
+    emb_t* output_buffer = outputs_buffer + ev_id * (dim + optstate_dim);
+    bool found = masks[ev_id];
+    auto val_ptr = weight_evs[ev_id];
+    OptimizierInputV3<grad_t, emb_t> input {grad_ptr, emb_ptr, val_ptr, dim, found, output_buffer};
+    optimizer.template update<OptimizierInputV3<grad_t, emb_t>>(input);
+  }
+}
+
 } // namespace dyn_emb
 #endif // OPTIMIZER_KERNEL_H
