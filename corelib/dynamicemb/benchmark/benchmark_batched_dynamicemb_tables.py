@@ -358,6 +358,7 @@ def create_split_table_batched_embeddings(args, device):
             weight_decay=args.weight_decay,
             beta1=args.beta1,
             beta2=args.beta2,
+            bounds_check_mode=BoundsCheckMode.NONE,
         ).cuda()
     else:
         emb = SplitTableBatchedEmbeddingBagsCodegen(
@@ -381,6 +382,7 @@ def create_split_table_batched_embeddings(args, device):
             weight_decay=args.weight_decay,
             beta1=args.beta1,
             beta2=args.beta2,
+            bounds_check_mode=BoundsCheckMode.NONE,
         ).cuda()
     return emb
 
@@ -496,19 +498,6 @@ def main():
             f"total: {iteration_latency:.3f} ms,  load factors: {load_factors}  cache info: {cache_info}"
         )
 
-            
-    torch.cuda.profiler.start()
-    timer.start()
-    for i in range(repeat):
-        sparse_feature = sparse_features[args.num_iterations]
-        output = var(sparse_feature.values(), sparse_feature.offsets())
-        grad = torch.empty_like(output)
-        output.backward(grad)
-    timer.stop()
-    latency = timer.elapsed_time() / repeat
-    torch.cuda.profiler.stop()
-    print(f"Latency(dynamicemb): {latency:.4f}")
-
     # benchmark TorchRec
     torchrec_emb = create_split_table_batched_embeddings(args, device)
     for i in range(args.num_iterations):
@@ -520,9 +509,19 @@ def main():
             f"Iteration {i}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
             f"total: {iteration_latency:.3f} ms"
         )
-
             
     torch.cuda.profiler.start()
+
+    timer.start()
+    for i in range(repeat):
+        sparse_feature = sparse_features[args.num_iterations]
+        output = var(sparse_feature.values(), sparse_feature.offsets())
+        grad = torch.empty_like(output)
+        output.backward(grad)
+    timer.stop()
+    latency = timer.elapsed_time() / repeat
+    print(f"Latency(dynamicemb): {latency:.4f}")
+
     timer.start()
     for i in range(repeat):
         sparse_feature = sparse_features[args.num_iterations]
@@ -531,8 +530,10 @@ def main():
         output.backward(grad)
     timer.stop()
     latency = timer.elapsed_time() / repeat
-    torch.cuda.profiler.stop()
     print(f"Latency(torchrec): {latency:.4f}")
+
+    torch.cuda.profiler.stop()
+    
 
     # test_result = {
     #     "use_index_dedup": args.use_index_dedup,

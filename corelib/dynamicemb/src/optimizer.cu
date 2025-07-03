@@ -161,6 +161,9 @@ __global__ void get_found_counter(bool const * __restrict__ found, int64_t* coun
     if (cur_found != pre_found) {
       *counter = static_cast<int64_t>(tid);
     }
+    if ((tid == (batch_size - 1)) && cur_found) {
+      *counter = batch_size;
+    }
   }
 }
 
@@ -190,7 +193,7 @@ int64_t find_ptr_from_hierarchical_table_for_classified_keys(
 ) {
 
   find_pointers(ht1, n, keys, vals_ptr, founds);
-  auto found_counter = at::zeros({static_cast<int64_t>(1)},
+  auto found_counter = at::empty({static_cast<int64_t>(1)},
     at::TensorOptions().dtype(at::kLong).device(keys.device()));
   
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -209,7 +212,9 @@ int64_t find_ptr_from_hierarchical_table_for_classified_keys(
   // );
   // DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
+  if (found_counter_host == n) {
+    return found_counter_host;
+  }
   auto missed_keys = create_sub_tensor(keys, found_counter_host);
   auto vals_host_ptr = create_sub_tensor(vals_ptr, found_counter_host);
   auto founds_host = create_sub_tensor(founds, found_counter_host);
