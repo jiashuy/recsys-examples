@@ -465,6 +465,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
             1, dtype=torch.uint64, device=torch.device(self.device_id)
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
+        
+        self._cache_metrics = torch.zeros(3, dtype=torch.int32, device="cpu")
 
     def _create_tables(self) -> None:
         for option in self._dynamicemb_options:
@@ -500,6 +502,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 if gpu_option.max_capacity > capacity:
                     gpu_option.init_capacity = capacity
                     gpu_option.max_capacity = capacity
+                print(f"GPU capacity: {gpu_option.max_capacity}")
                 self._tables.append(create_dynamicemb_table(gpu_option))
                 rest_capacity = option.max_capacity - gpu_option.max_capacity
                 host_capacity = (
@@ -511,10 +514,12 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     host_option.init_capacity = host_capacity
                     host_option.max_capacity = host_capacity
                     host_option.local_hbm_for_values = 0
+                    print(f"CPU capacity: {host_option.max_capacity}")
                     self._host_tables.append(create_dynamicemb_table(host_option))
                 else:
                     self._host_tables.append(None)
             else:
+                print(f"Total capacity: {option.max_capacity}")
                 self._tables.append(create_dynamicemb_table(option))
                 self._host_tables.append(None)
 
@@ -594,6 +599,14 @@ class BatchedDynamicEmbeddingTables(nn.Module):
     def tables(self) -> List[DynamicEmbTable]:
         return self._tables
 
+    @property
+    def host_tables(self) -> List[DynamicEmbTable]:
+        return self._host_tables
+    
+    @property
+    def cache_metrics(self) -> torch.Tensor:
+        return self._cache_metrics
+
     def set_learning_rate(self, lr: float) -> None:
         self._optimizer.set_learning_rate(lr)
         return
@@ -644,6 +657,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 torch.device(self.device_id),
                 self._optimizer,
                 self._host_tables if self._caching else None,
+                self._cache_metrics,
                 self._empty_tensor,
             )
         else:

@@ -425,7 +425,9 @@ void find_and_initialize_from_hierarchical_table(
     const at::Tensor keys,
     at::Tensor classified_keys,
     at::Tensor classified_ids,
-    const at::Tensor values) {
+    const at::Tensor values,
+    const c10::optional<at::Tensor>& cache_metrics=c10::nullopt
+  ) {
 
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -456,6 +458,10 @@ void find_and_initialize_from_hierarchical_table(
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
   int missed_counter = n - found_counter;
+  if (cache_metrics.has_value()) {
+    cache_metrics.value()[0] = static_cast<int>(n);
+    cache_metrics.value()[1] = static_cast<int>(found_counter);
+  }
 
   auto vals_host_ptr_tensor = at::empty({static_cast<int64_t>(missed_counter)}, vals_dev_ptr_tensor.options());
   auto vals_host_ptr = reinterpret_cast<void**>(vals_host_ptr_tensor.data_ptr<int64_t>());
@@ -737,6 +743,7 @@ void lookup_forward_dense(
     const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
     const at::Tensor unique_embs, const at::Tensor output_embs,
     int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
+    const c10::optional<at::Tensor>& cache_metrics=c10::nullopt,
     std::optional<std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>> host_tables = std::nullopt) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
@@ -851,7 +858,7 @@ void lookup_forward_dense(
           auto& host_table = host_tables.value()[i];
           if (host_table != nullptr) {
             classified = true;
-            find_and_initialize_from_hierarchical_table(tables[i], host_table, tmp_unique_num, tmp_unique_indices[i], classified_unique_indices, classified_ids, tmp_unique_embs);
+            find_and_initialize_from_hierarchical_table(tables[i], host_table, tmp_unique_num, tmp_unique_indices[i], classified_unique_indices, classified_ids, tmp_unique_embs, cache_metrics);
           } else {
             find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
           }
@@ -1246,7 +1253,8 @@ void bind_dyn_emb_op(py::module &m) {
           .def("set_initial_optstate", &dyn_emb::DynamicVariableBase::set_initial_optstate,
             "Set initial value of optimizer state.")
           .def("get_initial_optstate", &dyn_emb::DynamicVariableBase::get_initial_optstate,
-            "Get initial value of optimizer state.");
+            "Get initial value of optimizer state.")
+          .def("load_factor", &dyn_emb::DynamicVariableBase::load_factor, "Get the load factor of the table");
 
   m.def("dyn_emb_rows", &dyn_emb_rows, "Get the number of rows in the table",
         py::arg("table"));
@@ -1386,6 +1394,7 @@ void bind_dyn_emb_op(py::module &m) {
                   const at::Tensor, const at::Tensor, const at::Tensor,
                   const at::Tensor, int,
                   std::shared_ptr<dyn_emb::UniqueOpBase>,
+                  const c10::optional<at::Tensor>& cache_metrics,
                   std::optional<std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>> host_tables)) &
             lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
@@ -1397,7 +1406,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("d_unique_nums"), py::arg("h_unique_offsets"),
         py::arg("d_unique_offsets"), py::arg("unique_embs"),
         py::arg("output_embs"), py::arg("device_num_sms"),
-        py::arg("unique_op"), py::arg("host_tables") = py::none());
+        py::arg("unique_op"), py::arg("cache_metrics") = c10::nullopt,  py::arg("host_tables") = py::none());
 
   m.def("lookup_forward_dense",
         (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,

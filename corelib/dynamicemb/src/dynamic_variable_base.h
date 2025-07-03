@@ -201,6 +201,7 @@ public:
   virtual void set_initial_optstate(const float value) = 0;
   virtual const float get_initial_optstate() const = 0;
   virtual const bool need_score() const = 0;
+  virtual const float load_factor() const = 0;
 };
 
 class VariableFactory {

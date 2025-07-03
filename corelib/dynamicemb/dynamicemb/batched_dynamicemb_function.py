@@ -281,6 +281,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
         host_tables: List[DynamicEmbTable],
+        cache_metrics: torch.Tensor,
         *args
     ):
         # TODO:need check dimension is right
@@ -344,6 +345,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 output_embs,
                 device_num_sms,
                 unique_op,
+                cache_metrics,
                 host_tables,
             )
         else:
@@ -473,4 +475,4 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         optimizer.update(
             tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
         )
-        return (None,) * 18
+        return (None,) * 19

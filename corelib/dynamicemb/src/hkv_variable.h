@@ -165,6 +165,7 @@ public:
   void set_initial_optstate(const float value) override;
   const float get_initial_optstate() const override;
   const bool need_score() const override;
+  const float load_factor() const override;
 
 
 private:

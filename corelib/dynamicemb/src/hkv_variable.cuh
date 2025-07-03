@@ -937,4 +937,9 @@ template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 const bool HKVVariable<KeyType, ValueType, Strategy>::need_score() const {
   return Strategy == EvictStrategy::kCustomized || Strategy == EvictStrategy::kLfu;
 }
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const float  HKVVariable<KeyType, ValueType, Strategy>::load_factor() const {
+  return hkv_table_->load_factor();
+}
 } // namespace dyn_emb
