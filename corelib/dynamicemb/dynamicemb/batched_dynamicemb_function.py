@@ -443,9 +443,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_grads_list.append(
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
-                unique_embs_list.append(
-                    unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
-                )
+                # unique_embs_list.append(
+                #     unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
+                # )
         else:
             # backward: reduce the grad.
             unique_indices = torch.empty(

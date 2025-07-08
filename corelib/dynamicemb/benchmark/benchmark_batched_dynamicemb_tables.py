@@ -50,6 +50,26 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
+from fbgemm_gpu.runtime_monitor import (
+    AsyncSeriesTimer,
+    TBEStatsReporter,
+    TBEStatsReporterConfig,
+    StdLogStatsReporterConfig,
+)
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+    BoundsCheckMode,
+    CacheAlgorithm,
+    CacheState,
+    construct_cache_state,
+    EmbeddingLocation,
+    MAX_PREFETCH_DEPTH,
+    PoolingMode,
+    RecordCacheMetrics,
+    SplitState,
+)
+
+report_interval = 10
+warmup_repeat=100
 
 
 def str2bool(v):
@@ -102,7 +122,7 @@ def parse_args():
     parser.add_argument(
         "--num_iterations",
         type=int,
-        default=120,
+        default=1200,
         help="number of iterations",
     )
     parser.add_argument(
@@ -137,6 +157,7 @@ def parse_args():
         help="Use index deduplication, using to select the codepath.",
     )
     parser.add_argument("--caching", action="store_true")
+    parser.add_argument("--cache_metrics", action="store_true")
     parser.add_argument(
         "--embedding_dim", type=int, default=128, help="Size of each embedding."
     )
@@ -306,7 +327,7 @@ def create_dynamic_embedding_tables(args, device):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL,
                 ),
-                # score_strategy=DynamicEmbScoreStrategy.STEP,
+                score_strategy=DynamicEmbScoreStrategy.LFU if args.cache_algorithm == "lfu" else DynamicEmbScoreStrategy.TIMESTAMP,
                 caching=args.caching,
             )
         )
@@ -325,6 +346,7 @@ def create_dynamic_embedding_tables(args, device):
         beta1=args.beta1,
         beta2=args.beta2,
     )
+    var.set_record_cache_metrics(args.cache_metrics)
 
     return var
 
@@ -359,6 +381,8 @@ def create_split_table_batched_embeddings(args, device):
             beta1=args.beta1,
             beta2=args.beta2,
             bounds_check_mode=BoundsCheckMode.NONE,
+            stats_reporter_config=StdLogStatsReporterConfig(report_interval),
+            record_cache_metrics=RecordCacheMetrics(args.cache_metrics, False),
         ).cuda()
     else:
         emb = SplitTableBatchedEmbeddingBagsCodegen(
@@ -440,6 +464,24 @@ def append_to_json(file_path, data):
     with open(file_path, "w") as f:
         json.dump(exist_data, f, indent=4)
 
+def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb):
+    counts = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
+    for tensor in tensor_list:
+        indices = tensor.values()
+        unique_vals, cnts = torch.unique(indices, return_counts=True)
+        counts[unique_vals] += cnts
+    top_counts, top_indices = torch.topk(counts, n)
+    length = torch.ones(batch_size, dtype=torch.int64, device=top_indices.device)
+    batches = torch.split(top_indices, batch_size, dim=0)
+    for i, batch in enumerate(reversed(batches)):
+        features = torchrec.KeyedJaggedTensor(
+            keys=["t0"],
+            values=batch,
+            lengths=length,
+        )
+        for j in range(warmup_repeat):
+            dynamic_emb(features.values(), features.offsets())
+            torchrec_emb(features.values(), features.offsets())
 
 @record
 def main():
@@ -476,45 +518,77 @@ def main():
         torch.save(sparse_features, features_file)
     timer.stop()
     print(f"Generate sparse features done in {timer.elapsed_time() / 1000:.3f} s.")
+    
 
     warmup_gpu(device)
-    for i in range(args.num_iterations):
-            
-        forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
-            var, sparse_features[i]
-        )
-        load_factors = [t.load_factor() for t in var.tables]
-        load_factors.extend([t.load_factor() for t in var.host_tables if t is not None])
-        load_factors = [f"{lf}" for lf in load_factors]
-        cache_info = ""
-        if var.host_tables[0] is not None:
-            cache_metrics = var.cache_metrics
-            unique_num = cache_metrics[0].item()
-            cache_hit = cache_metrics[1].item()
-            hit_rate = 1.0 * cache_hit / unique_num
-            cache_info = f"unique: {unique_num}, hit: {cache_hit}, rate: {hit_rate}"
-        print(
-            f"Iteration {i}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-            f"total: {iteration_latency:.3f} ms,  load factors: {load_factors}  cache info: {cache_info}"
-        )
+    torchrec_emb = create_split_table_batched_embeddings(args, device)
+    cache_miss_counter_torchrec = None
+
+    # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
+    #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+
+    for i in range(0, args.num_iterations, report_interval):
+        for j in range(report_interval):   
+            forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
+                var, sparse_features[i + j]
+            )
+            load_factors = [t.load_factor() for t in var.tables]
+            load_factors.extend([t.load_factor() for t in var.host_tables if t is not None])
+            load_factors = [f"{lf}" for lf in load_factors]
+            cache_info = ""
+            if args.cache_metrics and var.host_tables[0] is not None:
+                cache_metrics = var.cache_metrics
+                unique_num = cache_metrics[0].item()
+                cache_hit = cache_metrics[1].item()
+                storage_hit = cache_metrics[2].item()
+                storage_evict = cache_metrics[3].item()
+                hit_rate = 1.0 * cache_hit / unique_num
+                cache_info = f"miss: {unique_num - cache_hit} unique: {unique_num}, hit_rate: {hit_rate}, need_init: {unique_num-cache_hit-storage_hit}, storage_evict: {storage_evict}"
+            print(
+                f"Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
+                f"total: {iteration_latency:.3f} ms,  load factors: {load_factors}  cache info: {cache_info}"
+            )
+
+        # table_wise_cache_miss = None
+        for j in range(report_interval):   
+            forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
+                torchrec_emb, sparse_features[i + j]
+            )
+            cache_miss_counter_ = torchrec_emb.get_cache_miss_counter().clone()
+            # table_wise_cache_miss_ = torchrec_emb.get_table_wise_cache_miss().clone()
+            if cache_miss_counter_torchrec is not None:
+                cache_miss_counter_incerment = cache_miss_counter_ - cache_miss_counter_torchrec
+            else:
+                cache_miss_counter_incerment = torch.tensor([0,0])
+            # if table_wise_cache_miss is not None:
+            #     table_wise_cache_miss_increment = table_wise_cache_miss_ - table_wise_cache_miss
+            # else:
+            #     table_wise_cache_miss_increment = torch.tensor([0])
+            cache_info = f"miss: {cache_miss_counter_incerment[1].item()}"
+            print(
+                f"Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
+                f"total: {iteration_latency:.3f} ms, cache info {cache_info}"
+            )
+            cache_miss_counter_torchrec = cache_miss_counter_
+            # table_wise_cache_miss = table_wise_cache_miss_
 
     # benchmark TorchRec
-    torchrec_emb = create_split_table_batched_embeddings(args, device)
-    for i in range(args.num_iterations):
+    # torchrec_emb = create_split_table_batched_embeddings(args, device)
+    # for i in range(args.num_iterations):
             
-        forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
-            torchrec_emb, sparse_features[i]
-        )
-        print(
-            f"Iteration {i}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-            f"total: {iteration_latency:.3f} ms"
-        )
+    #     forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
+    #         torchrec_emb, sparse_features[i]
+    #     )
+    #     print(
+    #         f"Iteration {i}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
+    #         f"total: {iteration_latency:.3f} ms"
+    #     )
             
     torch.cuda.profiler.start()
 
     timer.start()
     for i in range(repeat):
-        sparse_feature = sparse_features[args.num_iterations]
+        sparse_feature = sparse_features[args.num_iterations + i]
         output = var(sparse_feature.values(), sparse_feature.offsets())
         grad = torch.empty_like(output)
         output.backward(grad)
@@ -524,7 +598,7 @@ def main():
 
     timer.start()
     for i in range(repeat):
-        sparse_feature = sparse_features[args.num_iterations]
+        sparse_feature = sparse_features[args.num_iterations + i]
         output = torchrec_emb(sparse_feature.values(), sparse_feature.offsets())
         grad = torch.empty_like(output)
         output.backward(grad)

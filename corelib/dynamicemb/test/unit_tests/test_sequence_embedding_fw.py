@@ -120,7 +120,7 @@ def get_planner(args, device, eb_configs):
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
                     safe_check_mode=DynamicEmbCheckMode.WARNING,
-                    caching=True if args.use_index_dedup else False,
+                    caching=args.caching,
                 ),
             )
 
@@ -533,6 +533,7 @@ def main(argv: List[str]) -> None:
         default=True,
         help="Use index deduplication (default: True).",
     )
+    parser.add_argument("--caching", action="store_true")
     args = parser.parse_args()
 
     args.num_embeddings_per_feature = [

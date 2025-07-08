@@ -187,6 +187,7 @@ public:
                     const void* keys,            // (n)
                     void** locked_keys_ptr,      // (n)
                     bool* flags = nullptr,       // (n)
+                    void* scores = nullptr, // (n)
                     cudaStream_t stream = 0) = 0;
 
   virtual void unlock(const size_t n,

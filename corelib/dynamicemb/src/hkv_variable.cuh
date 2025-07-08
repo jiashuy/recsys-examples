@@ -882,13 +882,14 @@ void HKVVariable<KeyType, ValueType, Strategy>::lock(
     const void* keys,            // (n)
     void** locked_keys_ptr,      // (n)
     bool* flags,                 // (n)
+    void* scores,
     cudaStream_t stream
 )  {
   hkv_table_->lock_keys(
     n,
     reinterpret_cast<const KeyType*>(keys),
     reinterpret_cast<KeyType**>(locked_keys_ptr),
-    flags, stream);
+    flags, stream, (uint64_t*)scores);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

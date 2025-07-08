@@ -466,7 +466,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
         
-        self._cache_metrics = torch.zeros(3, dtype=torch.int32, device="cpu")
+        self._cache_metrics = torch.zeros(5, dtype=torch.int32, device="cpu")
+        self._record_cache_metrics = False
 
     def _create_tables(self) -> None:
         for option in self._dynamicemb_options:
@@ -602,10 +603,14 @@ class BatchedDynamicEmbeddingTables(nn.Module):
     @property
     def host_tables(self) -> List[DynamicEmbTable]:
         return self._host_tables
-    
+
     @property
     def cache_metrics(self) -> torch.Tensor:
         return self._cache_metrics
+
+    def set_record_cache_metrics(self, record: bool) -> None:
+        self._record_cache_metrics = record
+        return
 
     def set_learning_rate(self, lr: float) -> None:
         self._optimizer.set_learning_rate(lr)
@@ -657,7 +662,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 torch.device(self.device_id),
                 self._optimizer,
                 self._host_tables if self._caching else None,
-                self._cache_metrics,
+                self._cache_metrics if self._record_cache_metrics else None,
                 self._empty_tensor,
             )
         else:

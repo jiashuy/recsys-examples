@@ -20,6 +20,7 @@
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
+#include "index_calculation.h"
 #include <iostream>
 
 void find_pointers(
@@ -183,6 +184,26 @@ __global__ void verify_found_counter(bool const * __restrict__ found, int64_t co
   }
 }
 
+template <typename T>
+__global__ void set_uncached_pointer_kernel(
+  int num_uncached,
+  T* const * __restrict__ in_values_ptr,
+  int const * __restrict__ outs_idx,
+  bool* __restrict__ out_founds,
+  T* * __restrict__ out_values_ptr
+) {
+
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_uncached) {
+    T* const in_value_ptr = in_values_ptr[tid];
+    int const out_idx = outs_idx[tid];
+    if (in_value_ptr != nullptr) {
+      out_founds[out_idx] = true;
+      out_values_ptr[out_idx] = in_value_ptr;
+    }
+  }
+}
+
 int64_t find_ptr_from_hierarchical_table_for_classified_keys(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht1,
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht2,
@@ -222,6 +243,46 @@ int64_t find_ptr_from_hierarchical_table_for_classified_keys(
   find_pointers(ht2, missed_counter, missed_keys, vals_host_ptr, founds_host);
   return found_counter_host;
 }
+
+void storage_find_pointers(
+  std::shared_ptr<dyn_emb::DynamicVariableBase> storage,
+  int64_t n,
+  at::Tensor const& indices,
+  at::Tensor& founds, // cache
+  at::Tensor& weight_ptrs
+) {
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto key_type = storage->key_type();
+  at::Tensor inv_founds = at::logical_not(founds);
+  at::Tensor num_missing = at::empty({static_cast<int64_t>(2)}, indices.options().dtype(at::kInt));
+  at::Tensor missing_keys = at::empty_like(indices);
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
+    select_async<KeyType>(n, inv_founds.data_ptr<bool>(), reinterpret_cast<KeyType*>(indices.data_ptr()),
+      reinterpret_cast<KeyType*>(missing_keys.data_ptr()), num_missing.data_ptr<int>(), indices.device(), stream);
+  });
+  at::Tensor missing_keys_idx = at::empty({static_cast<int64_t>(n)}, indices.options().dtype(at::kInt));
+  select_index_async(n, inv_founds.data_ptr<bool>(), missing_keys_idx.data_ptr<int>(), 
+                    num_missing.data_ptr<int>()+1, indices.device(), stream);
+  
+  int h_num_missing = 0;
+  AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_missing, num_missing.data_ptr<int>(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (h_num_missing != 0) {
+    auto vals_host_ptr = at::empty({static_cast<int64_t>(h_num_missing)}, missing_keys.options().dtype(at::kLong));
+    auto founds_host = at::empty({static_cast<int64_t>(h_num_missing)}, missing_keys.options().dtype(at::kBool));
+    find_pointers(storage, h_num_missing, missing_keys, vals_host_ptr, founds_host);
+    auto value_type = storage->value_type();
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+      set_uncached_pointer_kernel<ValueType><<<(h_num_missing + 63) / 64, 64, 0, stream>>>(
+        h_num_missing, reinterpret_cast<ValueType**>(vals_host_ptr.data_ptr()), 
+        missing_keys_idx.data_ptr<int>(), founds.data_ptr<bool>(),
+        reinterpret_cast<ValueType**>(weight_ptrs.data_ptr())
+      );
+    });
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 void dynamic_emb_sgd_with_table(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table, const uint64_t n, 
     const at::Tensor indices, const at::Tensor grads, const float lr, DataType weight_type, 
@@ -246,107 +307,10 @@ void dynamic_emb_sgd_with_table(
       scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  find_pointers(table, n, indices, weight_ptrs, founds);
+
   if (host_table.has_value()) {
-    if (not embs.has_value()) {
-      throw std::runtime_error("Not provide unique embeddings on caching mode.");
-    }
-
-    int64_t found_counter = find_ptr_from_hierarchical_table_for_classified_keys(
-      table, host_table.value(), n, indices, founds, weight_ptrs
-    );
-
-    int optstate_dim = table->optstate_dim();
-    auto emb_optstate_buffer = at::empty({static_cast<int64_t>(n), dim + optstate_dim}, embs.value().options());
-
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-    
-        SgdVecOptimizerV3<g_t, w_t> opt{lr};
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(table, host_table.value(), n, found_counter, indices, emb_optstate_buffer, score);
-    return;
-  }
-  if (embs.has_value()) {
-    find_or_insert_pointers(table, n, indices, weight_ptrs, founds, score);
-  } else {
-    find_pointers(table, n, indices, weight_ptrs, founds);
-  }
-
-  if (embs.has_value()) {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-        
-        SgdVecOptimizerV2<g_t, w_t> opt{lr};
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, block_size, 0, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
+    storage_find_pointers(host_table.value(), n, indices, founds, weight_ptrs);
   }
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
@@ -417,116 +381,10 @@ void dynamic_emb_adam_with_table(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  find_pointers(ht, n, indices, vector_ptrs, founds);
+
   if (host_table.has_value()) {
-    if (not embs.has_value()) {
-      throw std::runtime_error("Not provide unique embeddings on caching mode.");
-    }
-
-    int64_t found_counter = find_ptr_from_hierarchical_table_for_classified_keys(
-      ht, host_table.value(), n, indices, founds, vector_ptrs
-    );
-    int optstate_dim = ht->optstate_dim();
-    auto emb_optstate_buffer = at::empty({static_cast<int64_t>(n), dim + optstate_dim}, embs.value().options());
-
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
- 
-        AdamVecOptimizerV3<g_t, w_t> opt{lr,
-                                      beta1,
-                                      beta2,
-                                      eps,
-                                      weight_decay,
-                                      iter_num};
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(ht, host_table.value(), n, found_counter, indices, emb_optstate_buffer, score);
-    return;
-  }
-
-  if (embs.has_value()) {
-    find_or_insert_pointers(ht, n, indices, vector_ptrs, founds, score);
-  } else {
-    find_pointers(ht, n, indices, vector_ptrs, founds);
-  }
-  
-  if (embs.has_value()) {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-        AdamVecOptimizerV2<g_t, w_t> opt{lr,
-                                      beta1,
-                                      beta2,
-                                      eps,
-                                      weight_decay,
-                                      iter_num};
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, block_size, 0, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
+    storage_find_pointers(host_table.value(), n, indices, founds, vector_ptrs);
   }
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
@@ -600,113 +458,10 @@ void dynamic_emb_adagrad_with_table(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  find_pointers(ht, n, indices, vector_ptrs, founds);
+
   if (host_table.has_value()) {
-    if (not embs.has_value()) {
-      throw std::runtime_error("Not provide unique embeddings on caching mode.");
-    }
-
-    int64_t found_counter = find_ptr_from_hierarchical_table_for_classified_keys(
-      ht, host_table.value(), n, indices, founds, vector_ptrs
-    );
-
-    int optstate_dim = ht->optstate_dim();
-    auto emb_optstate_buffer = at::empty({static_cast<int64_t>(n), dim + optstate_dim}, embs.value().options());
-
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-        
-        AdaGradVecOptimizerV3<g_t,w_t> opt{lr, eps, ht->get_initial_optstate()};
-
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(ht, host_table.value(), n, found_counter, indices, emb_optstate_buffer, score);
-    return;
-  }
-
-  if (embs.has_value()) {
-    find_or_insert_pointers(ht, n, indices, vector_ptrs, founds, score);
-  } else {
-    find_pointers(ht, n, indices, vector_ptrs, founds);
-  }
-
-  if (embs.has_value()) {
-
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-
-      AdaGradVecOptimizerV2<g_t,w_t> opt{lr, eps, ht->get_initial_optstate()};
-
-      if (dim % 4 == 0) {
-        const int max_grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-        const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC/WARPSIZE;
-
-        int grid_size = 0;
-        if (ev_nums/warp_per_block < max_grid_size){
-            grid_size = (ev_nums-1)/warp_per_block+1;
-        }
-        else if (ev_nums/warp_per_block > max_grid_size*MULTIPLIER){
-            grid_size = max_grid_size*MULTIPLIER;
-        }
-        else{
-            grid_size = max_grid_size;
-        }
-
-        auto kernel = update4_kernel_v2<g_t, w_t, decltype(opt)>;
-        kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-          ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-          reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-        DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-      } else {
-
-        int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-        int grid_size = ev_nums;
-
-        auto kernel = update_kernel_v2<g_t, w_t, decltype(opt)>;
-        kernel<<<grid_size, block_size, 0, stream>>>(
-          ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-          reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-        DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-      }
-    });
-  });
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return;
+    storage_find_pointers(host_table.value(), n, indices, founds, vector_ptrs);
   }
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
@@ -777,113 +532,10 @@ void dynamic_emb_rowwise_adagrad_with_table(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  find_pointers(ht, n, indices, vector_ptrs, founds);
+
   if (host_table.has_value()) {
-    if (not embs.has_value()) {
-      throw std::runtime_error("Not provide unique embeddings on caching mode.");
-    }
-
-    int64_t found_counter = find_ptr_from_hierarchical_table_for_classified_keys(
-      ht, host_table.value(), n, indices, founds, vector_ptrs
-    );
-
-    int optstate_dim = ht->optstate_dim();
-    auto emb_optstate_buffer = at::empty({static_cast<int64_t>(n), dim + optstate_dim}, embs.value().options());
-
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-        
-        RowWiseAdaGradVecOptimizerV3<g_t, w_t> opt {lr, eps, ht->get_initial_optstate()};
-
-        if (dim % 4 == 0) {
-          const int max_grid_size =
-              device_prop.num_sms *
-              (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums - 1) / warp_per_block + 1;
-          } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        } else {
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-
-          auto kernel = update_kernel_v4<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, optstate_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t *>(embs.value().data_ptr()), 
-            reinterpret_cast<w_t *>(emb_optstate_buffer.data_ptr()), opt,
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), founds.data_ptr<bool>()
-          );
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    update_heirarchical_tables(ht, host_table.value(), n, found_counter, indices, emb_optstate_buffer, score);
-    return;
-  }
-
-  if (embs.has_value()) {
-    find_or_insert_pointers(ht, n, indices, vector_ptrs, founds, score);
-  } else {
-    find_pointers(ht, n, indices, vector_ptrs, founds);
-  }
-
-  if (embs.has_value()) {
-
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
-
-        RowWiseAdaGradVecOptimizerV2<g_t, w_t> opt {lr, eps, ht->get_initial_optstate()};
-        if (dim % 4 == 0) {
-          const int max_grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
-          const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
-
-          int grid_size = 0;
-          if (ev_nums / warp_per_block < max_grid_size) {
-            grid_size = (ev_nums-1) / warp_per_block + 1;
-          }
-          else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
-            grid_size = max_grid_size * MULTIPLIER;
-          } else {
-            grid_size = max_grid_size;
-          }
-
-          auto kernel = update4_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-        } else {
-
-          int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
-          int grid_size = ev_nums;
-          int shared_memory_bytes = block_size * sizeof(float);
-
-          auto kernel = update_kernel_v2<g_t, w_t, decltype(opt)>;
-          kernel<<<grid_size, block_size, shared_memory_bytes, stream>>>(
-            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
-            reinterpret_cast<w_t **>(vector_ptrs.data_ptr()), reinterpret_cast<w_t *>(embs.value().data_ptr()), founds.data_ptr<bool>(), opt);
-          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-      });
-    });
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return;
+    storage_find_pointers(host_table.value(), n, indices, founds, vector_ptrs);
   }
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
