@@ -166,6 +166,37 @@ void insert_and_evict(
   }
 }
 
+// If don't need input scores, `scores` can be set to std::nullopt.
+void insert_and_evict_(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+    const size_t n,
+    const at::Tensor keys,
+    const at::Tensor values,
+    c10::optional<at::Tensor> const &scores,
+    at::Tensor evicted_keys,
+    at::Tensor evicted_values,
+    at::Tensor evicted_score,
+    at::Tensor d_evicted_counter,
+    bool unique_key = true,
+    bool ignore_evict_strategy = false) {
+
+  if (not scores and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
+  }
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+    table->insert_and_evict(
+      n, keys.data_ptr(), values.data_ptr(), scores.value().data_ptr(),
+      evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
+      reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+  } else {
+    table->insert_and_evict(
+      n, keys.data_ptr(), values.data_ptr(), nullptr, 
+      evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
+      reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+  }
+}
+
 void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                      const size_t n, const at::Tensor keys,
                      const at::Tensor value_or_deltas,
@@ -974,12 +1005,28 @@ __global__ void load_or_initialize_optimizer_state_kernel(
   }
 }
 
+__global__ void update_cache_missed_score_for_lfu(
+  int n, uint64_t* __restrict__ scores, bool const * __restrict__ founds
+) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    bool found = founds[tid];
+    uint64_t old_score = scores[tid];
+    if (found) {
+      scores[tid] = old_score + 1;
+    } else {
+      scores[tid] = 1;
+    }
+  }
+}
+
 
 void storage_find_and_initialize(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table,
     int const num_total,
     at::Tensor const& keys,
     at::Tensor& values,
+    at::Tensor& scores,
     at::Tensor& embs,
     at::Tensor const& emb_idx,
     const c10::optional<at::Tensor>& cache_metrics
@@ -990,8 +1037,16 @@ void storage_find_and_initialize(
   auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
   auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
   auto founds_ptr = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool)).data_ptr<bool>();
-
-  table->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, nullptr, stream);
+  void* score_ptr = nullptr;
+  bool is_lfu = table->evict_strategy() == EvictStrategy::kLfu;
+  if (is_lfu) {
+    score_ptr = scores.data_ptr();
+  }
+  // for customized strategy, just use the new score.
+  table->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, score_ptr, stream);
+  if (is_lfu) {
+    update_cache_missed_score_for_lfu<<<(num_total + 63)/64, 64, 0, stream>>>(num_total, reinterpret_cast<uint64_t*>(score_ptr), founds_ptr);
+  }
   if (cache_metrics.has_value()) {
     auto num_found = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kInt));
     at::Tensor found_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
@@ -1152,13 +1207,21 @@ void cache_insert_and_evict(
     at::Tensor const& keys,
     at::Tensor const& values,
     std::optional<uint64_t> const score,
+    c10::optional<at::Tensor> const &scores,
     at::Tensor& evicted_keys,
     at::Tensor& evicted_values,
     at::Tensor& evicted_scores,
     at::Tensor& num_evicted
 ) {
   if (num_total == 0) return;
-  insert_and_evict(table, num_total, keys, values, score, evicted_keys, evicted_values, evicted_scores, num_evicted);
+  if (not (score.has_value() ^ scores.has_value())) {
+    throw std::runtime_error("To provide only one score in uint64_t or at::Tensor");
+  }
+  if (score.has_value()) {
+    insert_and_evict(table, num_total, keys, values, score, evicted_keys, evicted_values, evicted_scores, num_evicted);
+  } else {
+    insert_and_evict_(table, num_total, keys, values, scores, evicted_keys, evicted_values, evicted_scores, num_evicted);
+  }
 }
 
 void storage_insert(
@@ -1179,16 +1242,18 @@ void storage_insert(
     // CUDA_CHECK(cudaDeviceSynchronize());
     // std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
     ///make score to 0 to avoid score unexpected grow.
-    insert_and_evict(table, num_total, keys, values, std::optional<uint64_t>(0), evicted_keys, evicted_values, evicted_scores, num_evicted);
+    ///:it works for LRU and LFU, but not for customized.
+    insert_and_evict_(table, num_total, keys, values, c10::make_optional<at::Tensor>(scores), evicted_keys, evicted_values, evicted_scores, num_evicted);
     // CUDA_CHECK(cudaDeviceSynchronize());
     // std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
     uint64_t h_num_evicted = 0;
     AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_evicted, num_evicted.data_ptr(), sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
     cache_metrics.value()[3] = h_num_evicted;
-  } 
-  //update score only.
-  insert_or_assign(table, num_total, keys, values, scores);
+  }  else {
+    //update score only.
+    insert_or_assign(table, num_total, keys, values, scores);
+  }
 }
 
 void storage_find_or_insert_with_initialize(
@@ -1230,15 +1295,21 @@ void cache_storage_find_or_insert_with_initialize(
   int64_t h_num_missing = total_num - h_num_found;
   int64_t value_dim = storage->cols() + storage->optstate_dim();
   at::Tensor missing_values = at::empty({h_num_missing, value_dim}, embs.options());
-  storage_find_and_initialize(storage, h_num_missing, missing_keys, missing_values, embs, missing_keys_idx, cache_metrics);
+  at::Tensor missing_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
+  storage_find_and_initialize(storage, h_num_missing, missing_keys, missing_values, missing_scores, embs, missing_keys_idx, cache_metrics);
   at::Tensor locked_ptr = at::empty({h_num_found}, found_keys.options().dtype(at::kLong));
   cache_lock(cache, h_num_found, found_keys, locked_ptr, score);
   at::Tensor evicted_keys = at::empty({h_num_missing}, keys.options());
   at::Tensor evicted_values = at::empty({h_num_missing, value_dim}, keys.options());
   at::Tensor evicted_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
   at::Tensor num_evicted = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kUInt64));
-  cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, score, 
-                          evicted_keys, evicted_values, evicted_scores, num_evicted);
+  if (cache->evict_strategy() == EvictStrategy::kLfu) {
+    cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, std::nullopt, c10::make_optional<at::Tensor>(missing_scores), 
+                            evicted_keys, evicted_values, evicted_scores, num_evicted);
+  } else {
+    cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, score, c10::nullopt,
+                            evicted_keys, evicted_values, evicted_scores, num_evicted);
+  }
   cache_unlock(cache, h_num_found, found_keys, locked_ptr);
   uint64_t h_num_evicted = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_evicted, num_evicted.data_ptr(), sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
