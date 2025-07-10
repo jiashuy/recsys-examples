@@ -1037,16 +1037,19 @@ void storage_find_and_initialize(
   auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
   auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
   auto founds_ptr = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool)).data_ptr<bool>();
+  ///////////////////////
   void* score_ptr = nullptr;
-  bool is_lfu = table->evict_strategy() == EvictStrategy::kLfu;
-  if (is_lfu) {
-    score_ptr = scores.data_ptr();
-  }
+  // bool is_lfu = table->evict_strategy() == EvictStrategy::kLfu;
+  // if (is_lfu) {
+  //   score_ptr = scores.data_ptr();
+  // }
   // for customized strategy, just use the new score.
   table->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, score_ptr, stream);
-  if (is_lfu) {
-    update_cache_missed_score_for_lfu<<<(num_total + 63)/64, 64, 0, stream>>>(num_total, reinterpret_cast<uint64_t*>(score_ptr), founds_ptr);
-  }
+  // if (is_lfu) {
+  //   update_cache_missed_score_for_lfu<<<(num_total + 63)/64, 64, 0, stream>>>(num_total, reinterpret_cast<uint64_t*>(score_ptr), founds_ptr);
+  // }
+  ///////////////////////
+
   if (cache_metrics.has_value()) {
     auto num_found = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kInt));
     at::Tensor found_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
@@ -1303,13 +1306,15 @@ void cache_storage_find_or_insert_with_initialize(
   at::Tensor evicted_values = at::empty({h_num_missing, value_dim}, keys.options());
   at::Tensor evicted_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
   at::Tensor num_evicted = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kUInt64));
-  if (cache->evict_strategy() == EvictStrategy::kLfu) {
-    cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, std::nullopt, c10::make_optional<at::Tensor>(missing_scores), 
-                            evicted_keys, evicted_values, evicted_scores, num_evicted);
-  } else {
-    cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, score, c10::nullopt,
-                            evicted_keys, evicted_values, evicted_scores, num_evicted);
-  }
+  ///////////////////////
+  // if (cache->evict_strategy() == EvictStrategy::kLfu) {
+  //   cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, std::nullopt, c10::make_optional<at::Tensor>(missing_scores), 
+  //                           evicted_keys, evicted_values, evicted_scores, num_evicted);
+  // } else {
+  cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, score, c10::nullopt,
+                          evicted_keys, evicted_values, evicted_scores, num_evicted);
+  // }
+  ///////////////////////
   cache_unlock(cache, h_num_found, found_keys, locked_ptr);
   uint64_t h_num_evicted = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_evicted, num_evicted.data_ptr(), sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));

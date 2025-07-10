@@ -505,20 +505,10 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     gpu_option.max_capacity = capacity
                 print(f"GPU capacity: {gpu_option.max_capacity}")
                 self._tables.append(create_dynamicemb_table(gpu_option))
-                rest_capacity = option.max_capacity - gpu_option.max_capacity
-                host_capacity = (
-                    (rest_capacity + option.bucket_capacity - 1)
-                    // option.bucket_capacity
-                ) * option.bucket_capacity
-                if host_capacity != 0:
-                    host_option = deepcopy(option)
-                    host_option.init_capacity = host_capacity
-                    host_option.max_capacity = host_capacity
-                    host_option.local_hbm_for_values = 0
-                    print(f"CPU capacity: {host_option.max_capacity}")
-                    self._host_tables.append(create_dynamicemb_table(host_option))
-                else:
-                    self._host_tables.append(None)
+                host_option = deepcopy(option)
+                host_option.local_hbm_for_values = 0
+                print(f"CPU capacity: {host_option.max_capacity}")
+                self._host_tables.append(create_dynamicemb_table(host_option))
             else:
                 print(f"Total capacity: {option.max_capacity}")
                 self._tables.append(create_dynamicemb_table(option))
