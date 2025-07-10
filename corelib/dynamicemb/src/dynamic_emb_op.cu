@@ -921,14 +921,17 @@ __global__ void load_or_initialize_embeddings_twice_kernel(
     T* __restrict__ out_embs,
     int const * __restrict__ out_embs_idx,
     T* const * __restrict__ in_values_ptr,
-    typename EmbeddingGenerator::Args generator_args) {
+    typename EmbeddingGenerator::Args generator_args,
+    int const * __restrict__ reverse_indices
+  ) {
 
   EmbeddingGenerator emb_gen(generator_args);
 
   for (int emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
-    int out_emb_idx = out_embs_idx[emb_id];
     T* const in_value_ptr = in_values_ptr[emb_id];
-    T* out_value_ptr = out_values + emb_id * value_dim;  
+    int reverse_idx = reverse_indices[emb_id];
+    int out_emb_idx = out_embs_idx[reverse_idx];
+    T* out_value_ptr = out_values + reverse_idx * value_dim;  
     T* out_emb_ptr = out_embs + out_emb_idx * emb_dim;
 
     if (in_value_ptr) { // copy embedding from inputs.
@@ -949,6 +952,33 @@ __global__ void load_or_initialize_embeddings_twice_kernel(
   emb_gen.destroy();
 }
 
+template <typename T>
+__global__ void load_storage_emb_kernel(
+    int n,
+    int value_dim,
+    int emb_dim,
+    T* const * __restrict__ in_values_ptr,
+    T* __restrict__ out_values,
+    T* __restrict__ out_embs,
+    int const * __restrict__ out_vals_idx,
+    int const * __restrict__ out_embs_idx) {
+
+  for (int emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    T* const in_value_ptr = in_values_ptr[emb_id];
+    int out_val_idx = out_vals_idx[emb_id];
+    int out_emb_idx = out_embs_idx[out_val_idx];
+    T* out_value_ptr = out_values + out_val_idx * value_dim;  
+    T* out_emb_ptr = out_embs + out_emb_idx * emb_dim;
+
+    // copy embedding from storage
+    for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+      T tmp = in_value_ptr[i];
+      out_value_ptr[i] = tmp;
+      out_emb_ptr[i] = tmp;
+    }
+  }
+}
+
 template <
   typename T,
   typename OptStateInitializer>
@@ -957,7 +987,9 @@ __global__ void load_or_initialize_optimizer_state_kernel_vec4(
     int emb_dim,
     T* __restrict__ out_values,
     T* const * __restrict__ in_values_ptr,
-    OptStateInitializer optstate_initailizer) {
+    OptStateInitializer optstate_initailizer,
+    int const * __restrict__ reverse_indices
+  ) {
   
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -969,7 +1001,8 @@ __global__ void load_or_initialize_optimizer_state_kernel_vec4(
   for (int emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
       emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
     T* const in_value_ptr = in_values_ptr[emb_id];
-    T* out_value_ptr = out_values + (emb_dim + optstate_initailizer.dim) * emb_id;
+    int reverse_idx = reverse_indices[emb_id];
+    T* out_value_ptr = out_values + (emb_dim + optstate_initailizer.dim) * reverse_idx;
     if (in_value_ptr) {
       for (int i = 0; VecSize * (kWarpSize * i + lane_id) < optstate_initailizer.dim; ++i) {
         int idx4 = VecSize * (kWarpSize * i + lane_id);
@@ -990,11 +1023,14 @@ __global__ void load_or_initialize_optimizer_state_kernel(
     int emb_dim,
     T* __restrict__ out_values,
     T* const * __restrict__ in_values_ptr,
-    OptStateInitializer optstate_initailizer) {
+    OptStateInitializer optstate_initailizer,
+    int const * __restrict__ reverse_indices
+) {
   
   for (int emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
     T* const in_value_ptr = in_values_ptr[emb_id];
-    T* out_value_ptr = out_values + (emb_dim + optstate_initailizer.dim) * emb_id;
+    int reverse_idx = reverse_indices[emb_id];
+    T* out_value_ptr = out_values + (emb_dim + optstate_initailizer.dim) * reverse_idx;
     if (in_value_ptr) {
       for (int i = threadIdx.x; i < optstate_initailizer.dim; i += blockDim.x) {
         out_value_ptr[emb_dim + i] = in_value_ptr[emb_dim + i];
@@ -1036,7 +1072,8 @@ void storage_find_and_initialize(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
   auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
-  auto founds_ptr = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool)).data_ptr<bool>();
+  auto founds_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool));
+  auto founds_ptr = founds_tensor.data_ptr<bool>();
   ///////////////////////
   void* score_ptr = nullptr;
   // bool is_lfu = table->evict_strategy() == EvictStrategy::kLfu;
@@ -1050,6 +1087,38 @@ void storage_find_and_initialize(
   // }
   ///////////////////////
 
+  /// select results using cub.
+  // auto value_type = table->value_type();
+  // at::Tensor inv_founds = at::logical_not(founds_tensor);
+  // auto found_val_ptrs = at::empty_like(vals_ptr_tensor);
+  // auto missing_val_ptrs = at::empty_like(vals_ptr_tensor);
+  // at::Tensor select_res = at::empty({3}, keys.options().dtype(at::kInt));
+  // int* d_num_select = select_res.data_ptr<int>();
+  // auto num_found = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kInt));
+  // DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+  //   select_async<ValueType*>(num_total, founds_ptr, reinterpret_cast<ValueType**>(vals_ptr_tensor.data_ptr()),
+  //     reinterpret_cast<ValueType**>(found_val_ptrs.data_ptr()), num_found.data_ptr<int>(), keys.device(), stream);
+  //   select_async<ValueType*>(num_total, inv_founds.data_ptr<bool>(), reinterpret_cast<ValueType**>(vals_ptr_tensor.data_ptr()),
+  //     reinterpret_cast<ValueType**>(missing_val_ptrs.data_ptr()), d_num_select, keys.device(), stream);
+  // });
+  // at::Tensor found_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
+  // at::Tensor missing_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
+  // select_index_async(num_total, founds_ptr, found_keys_idx.data_ptr<int>(), 
+  //                   d_num_select + 1, keys.device(), stream);
+  // select_index_async(num_total, inv_founds.data_ptr<bool>(), missing_keys_idx.data_ptr<int>(), 
+  //                   d_num_select + 2, keys.device(), stream);
+  // int h_num_found = 0;
+  // AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_found, num_found.data_ptr(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+  // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  auto value_type = table->value_type();
+  auto sorted_val_ptrs = at::empty_like(vals_ptr_tensor);
+  at::Tensor reverse_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    sort_async<uint64_t>(num_total, (uint64_t*)vals_ptr_tensor.data_ptr(), //reinterpret_cast<ValueType**>(vals_ptr_tensor.data_ptr()),
+                           (uint64_t*)sorted_val_ptrs.data_ptr(),/*reinterpret_cast<ValueType**>(sorted_val_ptrs.data_ptr())*/ reverse_keys_idx.data_ptr<int>(),
+                           keys.device(), stream);
+  });
   if (cache_metrics.has_value()) {
     auto num_found = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kInt));
     at::Tensor found_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
@@ -1070,10 +1139,16 @@ void storage_find_and_initialize(
   int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
 
   // initialize value'emb, unique emb
+  // DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+  //   load_storage_emb_kernel<ValueType><<<grid_size, block_size, 0, stream>>>(
+  //     h_num_found, value_dim, emb_dim, reinterpret_cast<ValueType **>(found_val_ptrs.data_ptr()),
+  //     reinterpret_cast<ValueType *>(values.data_ptr()), reinterpret_cast<ValueType *>(embs.data_ptr()), 
+  //     found_keys_idx.data_ptr<int>(), emb_idx.data_ptr<int>()
+  //   );
+  // });
   auto &initializer_args = table->get_initializer_args();
   auto* curand_states_ = table->get_curand_states();
   auto key_type = table->key_type();
-  auto value_type = table->value_type();
   DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
       if (initializer_args.mode == "normal") {
@@ -1083,7 +1158,7 @@ void storage_find_and_initialize(
           <<<grid_size, block_size, 0, stream>>>(
           num_total, value_dim, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()), 
           reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(),
-          reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), generator_args);
+          reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), generator_args, reverse_keys_idx.data_ptr<int>());
       } else if (initializer_args.mode == "truncated_normal") {
         using Generator = TruncatedNormalEmbeddingGenerator;
         auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
@@ -1091,7 +1166,7 @@ void storage_find_and_initialize(
           <<<grid_size, block_size, 0, stream>>>(
           num_total, value_dim, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()), 
           reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(),
-          reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), generator_args);
+          reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), generator_args, reverse_keys_idx.data_ptr<int>());
       } else if (initializer_args.mode == "uniform") {
         using Generator = UniformEmbeddingGenerator;
         auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
@@ -1099,7 +1174,7 @@ void storage_find_and_initialize(
           <<<grid_size, block_size, 0, stream>>>(
           num_total, value_dim, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()), 
           reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(),
-          reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), generator_args);
+          reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), generator_args, reverse_keys_idx.data_ptr<int>());
       } else if (initializer_args.mode == "debug") {
         using Generator = MappingEmbeddingGenerator<KeyType>;
         auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys.data_ptr()), 100000};
@@ -1107,7 +1182,7 @@ void storage_find_and_initialize(
           <<<grid_size, block_size, 0, stream>>>(
           num_total, value_dim, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()), 
           reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(),
-          reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), generator_args);
+          reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), generator_args, reverse_keys_idx.data_ptr<int>());
       } else if (initializer_args.mode == "constant") {
         using Generator = ConstEmbeddingGenerator;
         auto generator_args = typename Generator::Args {initializer_args.value};
@@ -1115,7 +1190,7 @@ void storage_find_and_initialize(
           <<<grid_size, block_size, 0, stream>>>(
           num_total, value_dim, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()), 
           reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(),
-          reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), generator_args);
+          reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), generator_args, reverse_keys_idx.data_ptr<int>());
       } else {
         throw std::runtime_error("Unrecognized initializer {" + initializer_args.mode + "}");
       }
@@ -1152,7 +1227,7 @@ void storage_find_and_initialize(
       load_or_initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer>
         <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(
         num_total, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()),
-        reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), optim_state_initializer);
+        reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), optim_state_initializer, reverse_keys_idx.data_ptr<int>());
     } else {
       int block_size = optim_state_dim < device_prop.max_thread_per_block
                           ? optim_state_dim
@@ -1161,7 +1236,7 @@ void storage_find_and_initialize(
       load_or_initialize_optimizer_state_kernel<ValueType, OptStateInitializer>
         <<<grid_size, block_size, 0, stream>>>(
         num_total, emb_dim, reinterpret_cast<ValueType *>(values.data_ptr()),
-        reinterpret_cast<ValueType **>(vals_ptr_tensor.data_ptr()), optim_state_initializer);
+        reinterpret_cast<ValueType **>(sorted_val_ptrs.data_ptr()), optim_state_initializer, reverse_keys_idx.data_ptr<int>());
     }
   });
 
