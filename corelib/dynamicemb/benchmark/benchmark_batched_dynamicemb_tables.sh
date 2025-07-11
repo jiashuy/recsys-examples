@@ -19,9 +19,8 @@ for batch_size in "${batch_sizes[@]}"; do
       for embedding_dim in "${embedding_dims[@]}"; do
         # for cache_algorithm in "${cache_algorithms[@]}"; do
 
-
-          # ncu -f --target-processes all --export dynamicemb-rep.report --section SchedulerStats --section WarpStateStats --import-source=yes --page raw --set full --profile-from-start no -k regex:"gpu_select_kvm_kernel" \
           # nsys profile  -s none -t cuda,nvtx,osrt,mpi,ucx -f true -o de_and_tr$batch_size-$optimizer_type-cache-lfu-0.25_freeze_hot.qdrep -c cudaProfilerApi  --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node \
+          # ncu -f --target-processes all --export $optimizer_type-sort_ptr-rep.report --section SchedulerStats --section WarpStateStats --import-source=yes --page raw --set full --profile-from-start no -k regex:"load_or_initialize_" \
           torchrun --nnodes 1 --nproc_per_node 1 \
             ./benchmark/benchmark_batched_dynamicemb_tables.py  \
               --caching \
@@ -33,8 +32,8 @@ for batch_size in "${batch_sizes[@]}"; do
               --embedding_dim $embedding_dim \
               --gpu_ratio $gpu_ratio \
               --num_iterations 1200 \
-              --cache_algorithm "lru" \
-              --cache_metrics
+              --cache_algorithm "lfu" 
+              # --cache_metrics
               # --cache_algorithm $cache_algorithm
           # done
       done

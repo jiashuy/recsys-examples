@@ -146,7 +146,7 @@ def parse_args():
         help="Distribution of sparse features.",
     )
     parser.add_argument(
-        "--alpha", type=float, default=1.2, help="Exponent of power-law distribution."
+        "--alpha", type=float, default=1.05, help="Exponent of power-law distribution."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed used for initialization"
@@ -240,6 +240,9 @@ def get_fbgemm_optimizer(optimizer_type):
     else:
         raise ValueError("unknown optimizer type")
 
+#TODO: collect input distribution theory hit_rate
+# if existed gap, then improve hit rate.
+# if low theory hit_rate is low, then change alpha.
 def zipf(min_val, max_val, exponent, size, device):
     """
     Generates Zipf-like random variables in the inclusive range [min_val, max_val).
@@ -464,6 +467,24 @@ def append_to_json(file_path, data):
     with open(file_path, "w") as f:
         json.dump(exist_data, f, indent=4)
 
+def input_distribution(tensor_list, n, max_val, batch_size):
+    counts = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
+    counts_res = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
+    for i in range(n):
+        tensor_ = tensor_list[i]
+        indices = tensor_.values()
+        unique_vals_, cnts = torch.unique(indices, return_counts=True)
+        counts[unique_vals_] = 1
+    tensor = tensor_list[n]
+    indices = tensor.values()
+    print(indices.size(0))
+    unique_vals, cnts = torch.unique(indices, return_counts=True)
+    counts_res[unique_vals] = 1
+    print(unique_vals.size(0))
+    equal_mask = (counts == 1) & (counts_res == 1) 
+    num_equal = equal_mask.sum().item()
+    return num_equal, (num_equal / unique_vals.size(0)) * 100
+
 def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb):
     counts = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
     for tensor in tensor_list:
@@ -523,9 +544,15 @@ def main():
     warmup_gpu(device)
     torchrec_emb = create_split_table_batched_embeddings(args, device)
     cache_miss_counter_torchrec = None
+    
+    for i in range(5):
+        hit_cnt, hit_rate = input_distribution(sparse_features, 200 * i, args.num_embeddings_per_feature[0], args.batch_size)
+        print(f"Iteration{i}, hit_cnt {hit_cnt}, hit_rate {hit_rate:.5f}")
+    
+    return
 
-    # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
-    #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+    warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
+                  args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
 
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):   
