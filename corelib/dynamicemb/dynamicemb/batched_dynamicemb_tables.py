@@ -488,7 +488,6 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
             if option.caching and option.training:
-                gpu_option = deepcopy(option)
                 capacity = get_constraint_capacity(
                     option.local_hbm_for_values,
                     option.embedding_dtype,
@@ -496,14 +495,17 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     option.optimizer_type,
                     option.bucket_capacity,
                 )
+
                 if capacity == 0:
                     raise ValueError(
                         "Can't use caching mode as the reserved HBM size is too small."
                     )
-                if gpu_option.max_capacity > capacity:
-                    gpu_option.init_capacity = capacity
-                    gpu_option.max_capacity = capacity
+                gpu_option = deepcopy(option)
+                gpu_option.max_capacity = capacity
+                gpu_option.init_capacity = capacity
+                gpu_option.bucket_capacity = 1024
                 print(f"GPU capacity: {gpu_option.max_capacity}")
+
                 self._tables.append(create_dynamicemb_table(gpu_option))
                 host_option = deepcopy(option)
                 host_option.local_hbm_for_values = 0

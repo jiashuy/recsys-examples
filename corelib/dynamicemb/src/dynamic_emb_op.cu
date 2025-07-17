@@ -1375,6 +1375,11 @@ void cache_storage_find_or_insert_with_initialize(
   at::Tensor missing_values = at::empty({h_num_missing, value_dim}, embs.options());
   at::Tensor missing_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
   storage_find_and_initialize(storage, h_num_missing, missing_keys, missing_values, missing_scores, embs, missing_keys_idx, cache_metrics);
+  
+  if (std::getenv("DISABLE_UPDATE_CACHE") != nullptr) {
+    return;
+  }
+  
   at::Tensor locked_ptr = at::empty({h_num_found}, found_keys.options().dtype(at::kLong));
   cache_lock(cache, h_num_found, found_keys, locked_ptr, score);
   at::Tensor evicted_keys = at::empty({h_num_missing}, keys.options());

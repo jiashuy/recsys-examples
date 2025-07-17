@@ -67,6 +67,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     RecordCacheMetrics,
     SplitState,
 )
+from dynamicemb_extensions import insert_or_assign, clear
 
 report_interval = 10
 warmup_repeat=100
@@ -122,7 +123,7 @@ def parse_args():
     parser.add_argument(
         "--num_iterations",
         type=int,
-        default=1200,
+        default=100,
         help="number of iterations",
     )
     parser.add_argument(
@@ -349,8 +350,40 @@ def create_dynamic_embedding_tables(args, device):
         beta1=args.beta1,
         beta2=args.beta2,
     )
-    var.set_record_cache_metrics(args.cache_metrics)
 
+    for table_id in range(table_num):
+        if args.caching:
+            cur_hkv_table = var.host_tables[table_id]
+        else:
+            cur_hkv_table = var.tables[table_id]
+
+        num_embeddings = args.num_embeddings_per_feature[table_id]
+        fill_batch = 1024*1024
+        i = 0
+        while i < num_embeddings:
+            start = i
+            end = min(i + fill_batch, num_embeddings)
+            i += fill_batch
+            unique_indices = torch.arange(start, end, device=device, dtype=torch.int64)
+            unique_values = torch.rand(unique_indices.numel(), args.embedding_dim, device=device, dtype=torch.float32)
+
+            optstate_dim = cur_hkv_table.optstate_dim()
+            initial_accumulator = cur_hkv_table.get_initial_optstate()
+            optstate = (
+                torch.rand(
+                    unique_values.size(0),
+                    optstate_dim,
+                    dtype=unique_values.dtype,
+                    device=unique_values.device,
+                )
+                * initial_accumulator
+            )
+            unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
+            unique_values = unique_values.reshape(-1)
+
+            n = unique_indices.shape[0]
+
+            insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
     return var
 
 def create_split_table_batched_embeddings(args, device):    
@@ -504,6 +537,13 @@ def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb
             dynamic_emb(features.values(), features.offsets())
             torchrec_emb(features.values(), features.offsets())
 
+def clear_cache(args, dynamic_emb, torchrec_emb):
+    table_num = args.num_embedding_table
+    if args.caching:
+        for table_id in range(table_num):
+            clear(dynamic_emb.tables[table_id])
+    torchrec_emb.reset_cache_states()
+    
 @record
 def main():
     args = parse_args()
@@ -525,21 +565,19 @@ def main():
     timer.stop()
     print(f"Create dynamic embedding done in {timer.elapsed_time() / 1000:.3f} s.")
 
-    repeat = 5
     timer.start()
     num_embs = [f"{num}" for num in args.num_embeddings_per_feature]
-    features_file = f"{args.num_iterations + repeat}-{args.feature_distribution}-{num_embs}-{args.batch_size}-{args.alpha}.pt"
+    features_file = f"{args.num_iterations}-{args.feature_distribution}-{num_embs}-{args.batch_size}-{args.alpha}.pt"
     try:
         with open(features_file, 'rb') as f:
             sparse_features = torch.load(f, map_location=f"cuda:{local_rank}")
     except FileNotFoundError:
         sparse_features = []
-        for i in range(args.num_iterations + repeat):
+        for i in range(args.num_iterations):
             sparse_features.append(generate_sequence_sparse_feature(args, device))
         torch.save(sparse_features, features_file)
     timer.stop()
     print(f"Generate sparse features done in {timer.elapsed_time() / 1000:.3f} s.")
-    
 
     warmup_gpu(device)
     torchrec_emb = create_split_table_batched_embeddings(args, device)
@@ -549,10 +587,12 @@ def main():
         hit_cnt, hit_rate = input_distribution(sparse_features, 200 * i, args.num_embeddings_per_feature[0], args.batch_size)
         print(f"Iteration{i}, hit_cnt {hit_cnt}, hit_rate {hit_rate:.5f}")
     
-    return
 
+    var.set_record_cache_metrics(True)
+    clear_cache(args, var, torchrec_emb)
     warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
                   args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+    os.environ["DISABLE_UPDATE_CACHE"] = "1"
 
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):   
@@ -563,7 +603,7 @@ def main():
             load_factors.extend([t.load_factor() for t in var.host_tables if t is not None])
             load_factors = [f"{lf}" for lf in load_factors]
             cache_info = ""
-            if args.cache_metrics and var.host_tables[0] is not None:
+            if var.host_tables[0] is not None:
                 cache_metrics = var.cache_metrics
                 unique_num = cache_metrics[0].item()
                 cache_hit = cache_metrics[1].item()
@@ -610,27 +650,32 @@ def main():
     #         f"Iteration {i}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
     #         f"total: {iteration_latency:.3f} ms"
     #     )
-            
+    
+    var.set_record_cache_metrics(False)
+    clear_cache(args, var, torchrec_emb)
+    warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
+                  args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+
     torch.cuda.profiler.start()
 
     timer.start()
-    for i in range(repeat):
-        sparse_feature = sparse_features[args.num_iterations + i]
+    for i in range(args.num_iterations):
+        sparse_feature = sparse_features[i]
         output = var(sparse_feature.values(), sparse_feature.offsets())
         grad = torch.empty_like(output)
         output.backward(grad)
     timer.stop()
-    latency = timer.elapsed_time() / repeat
+    latency = timer.elapsed_time() / args.num_iterations
     print(f"Latency(dynamicemb): {latency:.4f}")
 
     timer.start()
-    for i in range(repeat):
-        sparse_feature = sparse_features[args.num_iterations + i]
+    for i in range(args.num_iterations):
+        sparse_feature = sparse_features[i]
         output = torchrec_emb(sparse_feature.values(), sparse_feature.offsets())
         grad = torch.empty_like(output)
         output.backward(grad)
     timer.stop()
-    latency = timer.elapsed_time() / repeat
+    latency = timer.elapsed_time() / args.num_iterations
     print(f"Latency(torchrec): {latency:.4f}")
 
     torch.cuda.profiler.stop()
