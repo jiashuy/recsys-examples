@@ -583,11 +583,10 @@ def main():
     torchrec_emb = create_split_table_batched_embeddings(args, device)
     cache_miss_counter_torchrec = None
     
-    for i in range(5):
-        hit_cnt, hit_rate = input_distribution(sparse_features, 200 * i, args.num_embeddings_per_feature[0], args.batch_size)
-        print(f"Iteration{i}, hit_cnt {hit_cnt}, hit_rate {hit_rate:.5f}")
+    # for i in range(5):
+    #     hit_cnt, hit_rate = input_distribution(sparse_features, 200 * i, args.num_embeddings_per_feature[0], args.batch_size)
+    #     print(f"Iteration{i}, hit_cnt {hit_cnt}, hit_rate {hit_rate:.5f}")
     
-
     var.set_record_cache_metrics(True)
     clear_cache(args, var, torchrec_emb)
     warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
@@ -652,9 +651,9 @@ def main():
     #     )
     
     var.set_record_cache_metrics(False)
-    clear_cache(args, var, torchrec_emb)
-    warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
-                  args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+    # clear_cache(args, var, torchrec_emb)
+    # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
+    #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
 
     torch.cuda.profiler.start()
 
