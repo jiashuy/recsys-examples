@@ -1,6 +1,38 @@
 
 import torch
 import numpy as np
+
+def translateToPowerLaw(min, max, alpha, x):
+    gamma = torch.tensor([1 - alpha], device=x.device)
+    y = torch.pow(x * (torch.pow(max, gamma) - torch.pow(min, gamma)) + torch.pow(min, gamma),
+          1.0 / gamma)
+    b = (y >= max)
+    y[b] = max-1
+    return y
+
+def PowerLaw(min, max, alpha, N, device=torch.device('cuda'), permute=None):
+    x = torch.rand(N, device=device, dtype=torch.float64)
+    y = translateToPowerLaw(min, max, alpha, x).to(torch.int64)
+
+    if permute != None:
+        y = permute[y]
+
+    return y
+
+def gen_key(batch, hotness, alpha, N, device, permute=None):
+    ret = PowerLaw(1, N, alpha, hotness*batch, device, permute)
+    return ret
+
+def gen_jagged_key(batch, hotness, alpha, num_table_rows, device, feature_name, permute=None):
+    import torchrec
+    key = gen_key(batch, hotness, alpha, num_table_rows, device, permute)
+    lengths = torch.tensor([hotness]*batch, dtype=torch.int64, device=device)
+    return torchrec.KeyedJaggedTensor(
+        keys=[feature_name],
+        values=key,
+        lengths=lengths,
+    )
+
 def zipf(min_val, max_val, exponent, size, device):
     """
     Generates Zipf-like random variables in the inclusive range [min_val, max_val).

@@ -306,6 +306,18 @@ def generate_sequence_sparse_feature(args, device):
         return res
     elif args.feature_distribution == "pow-law":
         assert args.num_embedding_table == 1
+        from dataset_generator import gen_jagged_key
+        res = [
+            gen_jagged_key(
+                args.batch_size,
+                1, 
+                args.alpha,
+                args.num_embeddings_per_feature[0],
+                device,
+                feature_names) for i in range(args.num_iterations)]
+        return res
+    elif args.feature_distribution == "zipf":
+        assert args.num_embedding_table == 1
         total_indices = zipf(
             min_val=0,
             max_val=args.num_embeddings_per_feature[0],
@@ -547,6 +559,8 @@ def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb
         unique_vals, cnts = torch.unique(indices, return_counts=True)
         counts[unique_vals] += cnts
     top_counts, top_indices = torch.topk(counts, n)
+    total_unique_num = (counts != 0).sum().item()
+    print("Totol unique input number:", total_unique_num)
     length = torch.ones(batch_size, dtype=torch.int64, device=top_indices.device)
     batches = torch.split(top_indices, batch_size, dim=0)
     for i, batch in enumerate(reversed(batches)):
