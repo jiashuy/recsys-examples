@@ -278,43 +278,65 @@ def zipf(min_val, max_val, exponent, size, device):
 
 
 def generate_sequence_sparse_feature(args, device):
-    indices_list = []
-    lengths_list = []
-    for i in range(args.num_embedding_table):
-        if args.feature_distribution == "random":
-            indices_list.append(
-                torch.randint(low=0, high=(2**63)-1, size=(args.batch_size,))
-            )
-        elif args.feature_distribution == "pow-law":
-            indices_list.append(
-                zipf(
-                    min_val=0,
-                    max_val=args.num_embeddings_per_feature[i],
-                    exponent=args.alpha,
-                    size=args.batch_size,
-                    device=device,
-                )
-            )
-        else:
-            raise ValueError(
-                f"Not support distribution {args.feature_distribution} of sparse features."
-            )
-
-    indices = torch.cat(indices_list, dim=0)
-    indices = indices.to(dtype=torch.int64, device="cuda")
-    lengths_list.extend([1] * args.batch_size * args.num_embedding_table)
-    lengths = torch.tensor(lengths_list, dtype=torch.int64).cuda()
     feature_names = [
         feature_idx_to_name(feature_idx)
         for feature_idx in range(args.num_embedding_table)
     ]
+    if args.feature_distribution == "random":
+        res = []
+        for x in range(args.num_iterations):
+            indices_list = []
+            lengths_list = []
+            for i in range(args.num_embedding_table):
+                indices_list.append(
+                    torch.randint(low=0, high=(2**63)-1, size=(args.batch_size,))
+                )
+            indices = torch.cat(indices_list, dim=0)
+            indices = indices.to(dtype=torch.int64, device="cuda")
+            lengths_list.extend([1] * args.batch_size * args.num_embedding_table)
+            lengths = torch.tensor(lengths_list, dtype=torch.int64).cuda()
 
-    return torchrec.KeyedJaggedTensor(
-        keys=feature_names,
-        values=indices,
-        lengths=lengths,
-    )
+            res.append(
+                torchrec.KeyedJaggedTensor(
+                    keys=feature_names,
+                    values=indices,
+                    lengths=lengths,
+                )
+            )
+        return res
+    elif args.feature_distribution == "pow-law":
+        assert args.num_embedding_table == 1
+        total_indices = zipf(
+            min_val=0,
+            max_val=args.num_embeddings_per_feature[0],
+            exponent=args.alpha,
+            size=args.batch_size * args.num_iterations,
+            device=device,
+        )
+        total_indices = total_indices.to(dtype=torch.int64, device="cuda")
+        res = []
+        for x in range(args.num_iterations):  
+            indices = total_indices[x * args.batch_size: (x + 1) * args.batch_size]
+            lengths_list = []
+            lengths_list.extend([1] * args.batch_size * args.num_embedding_table)
+            lengths = torch.tensor(lengths_list, dtype=torch.int64).cuda()
+            feature_names = [
+                feature_idx_to_name(feature_idx)
+                for feature_idx in range(args.num_embedding_table)
+            ]
 
+            res.append(
+                torchrec.KeyedJaggedTensor(
+                    keys=feature_names,
+                    values=indices,
+                    lengths=lengths,
+                )
+            )
+        return res
+    else:
+        raise ValueError(
+            f"Not support distribution {args.feature_distribution} of sparse features."
+        )
 
 def create_dynamic_embedding_tables(args, device):
     table_options = []
@@ -574,7 +596,7 @@ def main():
     except FileNotFoundError:
         sparse_features = []
         for i in range(args.num_iterations):
-            sparse_features.append(generate_sequence_sparse_feature(args, device))
+            sparse_features= generate_sequence_sparse_feature(args, device)
         torch.save(sparse_features, features_file)
     timer.stop()
     print(f"Generate sparse features done in {timer.elapsed_time() / 1000:.3f} s.")
@@ -609,7 +631,7 @@ def main():
                 storage_hit = cache_metrics[2].item()
                 storage_evict = cache_metrics[3].item()
                 hit_rate = 1.0 * cache_hit / unique_num
-                cache_info = f"miss: {unique_num - cache_hit} unique: {unique_num}, hit_rate: {hit_rate}, need_init: {unique_num-cache_hit-storage_hit}, storage_evict: {storage_evict}"
+                cache_info = f"miss: {unique_num - cache_hit} unique: {unique_num}, hit_rate: {hit_rate:.8f}, need_init: {unique_num-cache_hit-storage_hit}, storage_evict: {storage_evict}"
             print(
                 f"Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
                 f"total: {iteration_latency:.3f} ms,  load factors: {load_factors}  cache info: {cache_info}"
