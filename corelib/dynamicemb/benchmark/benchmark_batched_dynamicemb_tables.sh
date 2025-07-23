@@ -3,7 +3,7 @@
 export CUDA_VISIBLE_DEVICES=0
 
 # declare -A hbm=(["sgd"]=16 ["adam"]=48)
-declare -A hbm=(["sgd"]=8 ["adam"]=24)
+declare -A hbm=(["sgd"]=4 ["adam"]=12)
 
 use_index_dedups=("False")
 batch_sizes=(1048576) #(65536 131072 262144) # batch_size = 32, sequence_len=(2k, 4k, 8k)
@@ -11,7 +11,7 @@ capacities=( "64") # 64 * 1024 * 1024
 optimizer_types=("sgd" "adam")
 embedding_dims=(128)
 alphas=(1.05 1.2)
-gpu_ratio=0.25
+gpu_ratio=0.125
 # cache_algorithms=("lru" "lfu")
 
 for batch_size in "${batch_sizes[@]}"; do

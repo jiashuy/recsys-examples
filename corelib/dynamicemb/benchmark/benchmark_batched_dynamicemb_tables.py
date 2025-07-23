@@ -416,8 +416,11 @@ def create_dynamic_embedding_tables(args, device):
             unique_values = unique_values.reshape(-1)
 
             n = unique_indices.shape[0]
-
-            insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
+            if args.cache_algorithm == "lfu":
+                scores = torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
+                insert_or_assign(cur_hkv_table, n, unique_indices, unique_values, scores)
+            else:
+                insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
     return var
 
 def create_split_table_batched_embeddings(args, device):    
@@ -625,9 +628,9 @@ def main():
     
     var.set_record_cache_metrics(True)
     clear_cache(args, var, torchrec_emb)
-    warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
-                  args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
-    os.environ["DISABLE_UPDATE_CACHE"] = "1"
+    # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
+    #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
+    # os.environ["DISABLE_UPDATE_CACHE"] = "1"
 
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):   
@@ -687,7 +690,7 @@ def main():
     #     )
     
     var.set_record_cache_metrics(False)
-    # clear_cache(args, var, torchrec_emb)
+    clear_cache(args, var, torchrec_emb)
     # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
     #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
 
