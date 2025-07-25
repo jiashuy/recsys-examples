@@ -455,7 +455,7 @@ def create_split_table_batched_embeddings(args, device):
             beta2=args.beta2,
             bounds_check_mode=BoundsCheckMode.NONE,
             stats_reporter_config=StdLogStatsReporterConfig(report_interval),
-            record_cache_metrics=RecordCacheMetrics(args.cache_metrics, False),
+            record_cache_metrics=RecordCacheMetrics(True, False),
         ).cuda()
     else:
         emb = SplitTableBatchedEmbeddingBagsCodegen(
@@ -690,6 +690,7 @@ def main():
     #     )
     
     var.set_record_cache_metrics(False)
+    torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
     clear_cache(args, var, torchrec_emb)
     # warmup_tables(sparse_features, int(args.gpu_ratio * args.num_embeddings_per_feature[0]), 
     #               args.num_embeddings_per_feature[0], args.batch_size, var, torchrec_emb)
