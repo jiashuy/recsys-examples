@@ -167,6 +167,17 @@ public:
   const float get_initial_optstate() const override;
   const bool need_score() const override;
   const float load_factor() const override;
+  void find_or_insert_ptr_with_evict(
+      const size_t n, 
+      const void *keys, // (n)
+      void **value_ptrs,  // (n * ptrs)
+      void *scores, // (n)
+      bool *d_found,          // (n * 1)
+      void* evicted_keys,        // (n)
+      void** evicted_values,    // (n, DIM)
+      void* evicted_scores,    // (n)
+      int* evicted_counter,  // (1)
+      cudaStream_t stream = 0) override;
 
 
 private:

@@ -645,10 +645,13 @@ def main():
                 cache_metrics = var.cache_metrics
                 unique_num = cache_metrics[0].item()
                 cache_hit = cache_metrics[1].item()
-                storage_hit = cache_metrics[2].item()
-                storage_evict = cache_metrics[3].item()
+                cache_miss = cache_metrics[2].item()
+                storage_hit = cache_metrics[3].item()
+                storage_miss = cache_metrics[4].item()
+                cache_inserted = cache_metrics[5].item()
+                cache_evicted = cache_metrics[6].item()
                 hit_rate = 1.0 * cache_hit / unique_num
-                cache_info = f"miss: {unique_num - cache_hit} unique: {unique_num}, hit_rate: {hit_rate:.8f}, need_init: {unique_num-cache_hit-storage_hit}, storage_evict: {storage_evict}"
+                cache_info = f"miss: {cache_miss} unique: {unique_num}, hit_rate: {hit_rate:.8f}, need_init: {storage_miss}, cache_inserted: {cache_inserted}, cache_evicted: {cache_evicted}"
             print(
                 f"Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
                 f"total: {iteration_latency:.3f} ms,  load factors: {load_factors}  cache info: {cache_info}"

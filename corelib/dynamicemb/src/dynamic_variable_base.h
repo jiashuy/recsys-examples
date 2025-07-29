@@ -131,6 +131,18 @@ public:
                                        bool unique_key = true,
                                        bool ignore_evict_strategy = false) = 0;
 
+  virtual void find_or_insert_ptr_with_evict(
+      const size_t n, 
+      const void *keys, // (n)
+      void **value_ptrs,  // (n * ptrs)
+      void *scores, // (n)
+      bool *d_found,          // (n * 1)
+      void* evicted_keys,        // (n)
+      void** evicted_values,    // (n, DIM)
+      void* evicted_scores,    // (n)
+      int* evicted_counter,  // (1)
+      cudaStream_t stream = 0) = 0;
+
   virtual void find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
     bool *founds, const cudaStream_t& stream) = 0;

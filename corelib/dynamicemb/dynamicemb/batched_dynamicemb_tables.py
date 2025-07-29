@@ -466,7 +466,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
         
-        self._cache_metrics = torch.zeros(5, dtype=torch.int32, device="cpu")
+        self._cache_metrics = torch.zeros(10, dtype=torch.int32, device="cpu")
         self._record_cache_metrics = False
 
     def _create_tables(self) -> None:

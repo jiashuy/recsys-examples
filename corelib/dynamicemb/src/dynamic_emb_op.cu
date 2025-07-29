@@ -1244,28 +1244,221 @@ void storage_find_and_initialize(
 
 }
 
+void storage_find(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> storage, 
+    int64_t num_total,
+    at::Tensor const& keys,
+    at::Tensor& values,
+    c10::optional<at::Tensor> const & scores
+) {
+  if (num_total == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto founds_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool));
+  auto founds_ptr = founds_tensor.data_ptr<bool>();
+  if (scores.has_value()) {
+    storage->find(num_total, keys.data_ptr(), values.data_ptr(), 
+                  founds_ptr, scores.value().data_ptr(), stream);
+  } else {
+    storage->find(num_total, keys.data_ptr(), values.data_ptr(), 
+                  founds_ptr, nullptr, stream);
+  }
+}
+
+template <
+  typename T, 
+  typename EmbeddingGenerator,
+  typename TableVector>
+__global__ void fill_output_with_table_vectors_kernel_v2(
+    uint64_t n,
+    int emb_dim,
+    T* outputs, 
+    int const * __restrict__ out_embs_idx,
+    typename TableVector::Args vector_args,
+    typename EmbeddingGenerator::Args generator_args) {
+  
+  TableVector vectors(vector_args);
+  EmbeddingGenerator emb_gen(generator_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    int out_emb_idx = out_embs_idx[emb_id];
+    if (vectors.isInitialized(emb_id)) { // copy embedding from table to outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[out_emb_idx * emb_dim + i] = *vectors.data_ptr(emb_id, i);
+      }
+    } else if (vectors.isValid(emb_id)) { // initialize the embedding as well as outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        auto tmp = emb_gen.generate(emb_id);
+        outputs[out_emb_idx * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
+        *vectors.data_ptr(emb_id, i) = TypeConvertFunc<T, float>::convert(tmp);
+      }
+    } else { // vector not exists in table, set the output to 0.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[out_emb_idx * emb_dim + i] = TypeConvertFunc<T, float>::convert(0.0f);
+      }
+    }
+  }
+
+  emb_gen.destroy();
+}
+
+void storage_embedding_lookup(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> storage,
+    int const num_total,
+    at::Tensor const& keys,
+    at::Tensor& embs,
+    at::Tensor const& emb_idx,
+    c10::optional<at::Tensor>& in_scores,
+    c10::optional<at::Tensor>& out_scores,
+    c10::optional<at::Tensor> const & cache_metrics
+) {
+
+  /// step 1: find_or_insert missing keys in storage.
+  if (num_total == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
+  auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
+  auto founds_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool));
+  auto founds_ptr = founds_tensor.data_ptr<bool>();
+
+  if (in_scores.has_value()) {
+    storage->find_or_insert_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, in_scores.value().data_ptr(), stream);
+  } else {
+    storage->find_or_insert_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, nullptr, stream);
+  }
+
+  /// step 1.2: collect hit info of storage.
+  if (cache_metrics.has_value()) {
+    auto num_found = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kInt));
+    at::Tensor found_keys_idx = at::empty({num_total}, keys.options().dtype(at::kInt));
+    select_index_async(num_total, founds_ptr, found_keys_idx.data_ptr<int>(), 
+                      num_found.data_ptr<int>(), keys.device(), stream);
+    int h_num_found = 0;
+    AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_found, num_found.data_ptr(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+    AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+    cache_metrics.value()[3] = h_num_found;
+    cache_metrics.value()[4] = num_total - h_num_found;
+  }
+
+  /// step 2: load or initialize embedding from pointer.
+  auto &device_prop = DeviceProp::getDeviceProp();
+  int64_t emb_dim = storage->cols();
+  int block_size = emb_dim < device_prop.max_thread_per_block
+                       ? emb_dim
+                       : device_prop.max_thread_per_block;
+  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+
+  auto value_type = storage->value_type();
+  auto &initializer_args = storage->get_initializer_args();
+  auto* curand_states_ = storage->get_curand_states();
+  auto key_type = storage->key_type();
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
+      using TableVector = TableVector<ValueType>;
+      auto table_vec_args = typename TableVector::Args {reinterpret_cast<ValueType **>(vals_ptr), founds_ptr};
+      auto &initializer_ = initializer_args.mode;
+      if (initializer_ == "normal") {
+        using Generator = NormalEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+        fill_output_with_table_vectors_kernel_v2<ValueType, Generator, TableVector>
+          <<<grid_size, block_size, 0, stream>>>(
+          num_total, emb_dim, reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(), table_vec_args, generator_args);
+      } else if (initializer_ == "truncated_normal") {
+        using Generator = TruncatedNormalEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+        fill_output_with_table_vectors_kernel_v2<ValueType, Generator, TableVector>
+          <<<grid_size, block_size, 0, stream>>>(
+          num_total, emb_dim, reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(), table_vec_args, generator_args);
+      } else if (initializer_ == "uniform") {
+        using Generator = UniformEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+        fill_output_with_table_vectors_kernel_v2<ValueType, Generator, TableVector>
+          <<<grid_size, block_size, 0, stream>>>(
+          num_total, emb_dim, reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(), table_vec_args, generator_args);
+      } else if (initializer_ == "debug") {
+        using Generator = MappingEmbeddingGenerator<KeyType>;
+        auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys.data_ptr()), 100000};
+        fill_output_with_table_vectors_kernel_v2<ValueType, Generator, TableVector>
+          <<<grid_size, block_size, 0, stream>>>(
+          num_total, emb_dim, reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(), table_vec_args, generator_args);
+      } else if (initializer_ == "constant") {
+        using Generator = ConstEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {initializer_args.value};
+        fill_output_with_table_vectors_kernel_v2<ValueType, Generator, TableVector>
+          <<<grid_size, block_size, 0, stream>>>(
+          num_total, emb_dim, reinterpret_cast<ValueType *>(embs.data_ptr()), emb_idx.data_ptr<int>(), table_vec_args, generator_args);
+      } else {
+        throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
+      }
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+  /// step 3: initialize optimizer states from pointer if needed.
+  int optim_state_dim = storage->optstate_dim();
+  if (optim_state_dim == 0) return;
+  
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size_opt = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size_opt = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size_opt = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size_opt = max_grid_size;
+  }
+
+  float initial_optim_state = storage->get_initial_optstate();
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    using OptStateInitializer = OptStateInitializer<ValueType, int>;
+    OptStateInitializer optim_state_initializer {optim_state_dim, initial_optim_state};
+    using TableVector = TableVector<ValueType>;
+    auto table_vec_args = typename TableVector::Args {reinterpret_cast<ValueType **>(vals_ptr), founds_ptr};
+    if (emb_dim % 4 == 0 and optim_state_dim % 4 == 0) {
+      initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer, TableVector>
+        <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(
+        num_total, emb_dim, table_vec_args, optim_state_initializer);
+    } else {
+      int block_size = optim_state_dim < device_prop.max_thread_per_block
+                          ? optim_state_dim
+                          : device_prop.max_thread_per_block;
+      int grid_size = num_total;
+      initialize_optimizer_state_kernel<ValueType, OptStateInitializer, TableVector>
+        <<<grid_size, block_size, 0, stream>>>(
+        num_total, emb_dim, table_vec_args, optim_state_initializer);
+    }
+  });
+
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+  /// step 4: load scores if needed.
+  if (out_scores.has_value()) {
+    storage->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, out_scores.value().data_ptr(), stream);
+  }
+}
+
 void cache_lock(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table,
     int64_t num_total,
     at::Tensor const& keys,
     at::Tensor& locked_ptr,
-    std::optional<uint64_t> const score
+    c10::optional<at::Tensor> const & scores
 ) {
   at::Tensor success = at::empty({num_total}, keys.options().dtype(at::kBool));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if ((table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
-    if (not score.has_value()) {
-      throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
-    }
-    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
-    at::Tensor bc_scores = at::empty({static_cast<int64_t>(num_total)}, option);
-    bc_scores.fill_(score.value());
-    table->lock(num_total, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                success.data_ptr<bool>(), bc_scores.data_ptr(), stream);
-  } else {
-    table->lock(num_total, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                success.data_ptr<bool>(), nullptr, stream);
+  void * scores_ptr = nullptr;
+  if (scores.has_value()) {
+    scores_ptr = scores.value().data_ptr();
   }
+  table->lock(num_total, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
+              success.data_ptr<bool>(), scores_ptr, stream);
 }
 
 void cache_unlock(
@@ -1302,36 +1495,167 @@ void cache_insert_and_evict(
   }
 }
 
+void cache_insert_ptr_and_evict(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> cache,
+    int64_t num_total,
+    at::Tensor const& keys,
+    c10::optional<at::Tensor> const & scores,
+    at::Tensor & inserted_keys,
+    at::Tensor& num_inserted,
+    at::Tensor& evicted_keys,
+    at::Tensor& evicted_values,
+    c10::optional<at::Tensor>& evicted_scores,
+    at::Tensor& num_evicted
+) {
+
+  if (num_total == 0) return;
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
+  auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
+  auto founds_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool));
+  auto founds_ptr = founds_tensor.data_ptr<bool>();
+
+  auto evicted_vals_ptr = reinterpret_cast<void**>(evicted_values.data_ptr<int64_t>());
+  if (scores.has_value() and evicted_scores.has_value()) {
+    cache->find_or_insert_ptr_with_evict(
+      num_total, keys.data_ptr(), vals_ptr, scores.value().data_ptr(), founds_ptr,
+      evicted_keys.data_ptr(), evicted_vals_ptr, evicted_scores.value().data_ptr(), 
+      num_evicted.data_ptr<int>(), stream);
+  } else {
+    cache->find_or_insert_ptr_with_evict(
+      num_total, keys.data_ptr(), vals_ptr, nullptr, founds_ptr,
+      evicted_keys.data_ptr(), evicted_vals_ptr, nullptr, 
+      num_evicted.data_ptr<int>(), stream);
+  }
+
+  cache->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, nullptr, stream);
+  auto key_type = cache->key_type();
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
+    select_async<KeyType>(num_total, founds_ptr, reinterpret_cast<KeyType*>(keys.data_ptr()),
+      reinterpret_cast<KeyType*>(inserted_keys.data_ptr()), num_inserted.data_ptr<int>(), keys.device(), stream);
+  });
+}
+
+template <typename T>
+__global__ void load_value_kernel_vec4(
+    int n,
+    int val_dim,
+    T const * __restrict__ in_values,
+    T* * __restrict__ out_values_ptr
+  ) {
+  
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  for (int val_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+      val_id < n; val_id += gridDim.x * warp_num_per_block) {
+    T const * in_value_ptr = in_values + val_dim * val_id;
+    T* out_value_ptr = out_values_ptr[val_id];
+    if (out_value_ptr) {
+      #pragma unroll
+      for (int i = 0; VecSize * (kWarpSize * i + lane_id) < val_dim; ++i) {
+        Vec4T<T> val;
+        int idx4 = VecSize * (kWarpSize * i + lane_id);
+        val.load(in_value_ptr + idx4);
+        val.store(out_value_ptr + idx4);
+      }
+    }
+  }
+}
+
+template <typename T>
+__global__ void load_value_kernel(
+    int n,
+    int val_dim,
+    T const * __restrict__ in_values,
+    T* * __restrict__ out_values_ptr
+) {
+  
+  for (int val_id = blockIdx.x; val_id < n; val_id += gridDim.x) {
+    T const * in_value_ptr = in_values + val_dim * val_id;
+    T* out_value_ptr = out_values_ptr[val_id];
+    if (out_values_ptr) {
+      #pragma unroll
+      for (int i = threadIdx.x; i < val_dim; i += blockDim.x) {
+        out_value_ptr[i] = in_value_ptr[i];
+      }
+    }
+  }
+}
+
+void cache_assign_value(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> cache,
+    int64_t num_total,
+    at::Tensor const & keys,
+    at::Tensor & values
+) {
+
+  if (num_total == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto vals_ptr_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kLong));
+  auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
+  auto founds_tensor = at::empty({static_cast<int64_t>(num_total)}, keys.options().dtype(at::kBool));
+  auto founds_ptr = founds_tensor.data_ptr<bool>();
+  cache->find_pointers(num_total, keys.data_ptr(), vals_ptr, founds_ptr, nullptr, stream);
+
+  auto &device_prop = DeviceProp::getDeviceProp();
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  int val_dim = cache->cols() + cache->optstate_dim();
+  auto value_type = cache->value_type();
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    if (val_dim % 4 == 0) {
+      load_value_kernel_vec4<ValueType>
+        <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+        num_total, val_dim, reinterpret_cast<ValueType *>(values.data_ptr()),
+        reinterpret_cast<ValueType **>(vals_ptr));
+    } else {
+      int block_size = val_dim < device_prop.max_thread_per_block
+                          ? val_dim
+                          : device_prop.max_thread_per_block;
+      int grid_size = num_total;
+      load_value_kernel<ValueType>
+        <<<grid_size, block_size, 0, stream>>>(
+        num_total, val_dim, reinterpret_cast<ValueType *>(values.data_ptr()),
+        reinterpret_cast<ValueType **>(vals_ptr));
+    }
+  });
+
+}
+
 void storage_insert(
-    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-    int64_t num_total, 
+    std::shared_ptr<dyn_emb::DynamicVariableBase> storage,
+    int64_t num_total,
     at::Tensor const& keys, 
     at::Tensor const& values,
-    at::Tensor const& scores,
-    const c10::optional<at::Tensor>& cache_metrics,
-    std::optional<uint64_t> const score
+    c10::optional<at::Tensor> const & scores
 ) {
-  if (cache_metrics.has_value()) {
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    at::Tensor evicted_keys = at::empty({num_total}, keys.options());
-    at::Tensor evicted_values = at::empty_like(values);
-    at::Tensor evicted_scores = at::empty({num_total}, keys.options().dtype(at::kUInt64));
-    at::Tensor num_evicted = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kUInt64));
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
-    ///make score to 0 to avoid score unexpected grow.
-    ///:it works for LRU and LFU, but not for customized.
-    insert_and_evict_(table, num_total, keys, values, c10::make_optional<at::Tensor>(scores), evicted_keys, evicted_values, evicted_scores, num_evicted);
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // std::cout << "Jiashu " << __FILE__ << " " << __LINE__ << "\n";
-    uint64_t h_num_evicted = 0;
-    AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_evicted, num_evicted.data_ptr(), sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
-    AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-    cache_metrics.value()[3] = h_num_evicted;
-  }  else {
-    //update score only.
-    insert_or_assign(table, num_total, keys, values, scores);
+  if (num_total == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (storage->evict_strategy() == EvictStrategy::kLfu) {
+    // to avoid score accumulation for LFU.
+    storage->erase(num_total, keys.data_ptr(), stream);
   }
+  insert_or_assign(storage, num_total, keys, values, scores);
 }
 
 void storage_find_or_insert_with_initialize(
@@ -1344,6 +1668,106 @@ void storage_find_or_insert_with_initialize(
   find_or_insert(table, num_total, keys, embs, score);
 }
 
+template <typename T>
+__global__ void store_value_kernel_vec4(
+    int n,
+    int val_dim,
+    T* const * __restrict__ in_values_ptr,
+    T * __restrict__ out_values
+  ) {
+  
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  for (int val_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+      val_id < n; val_id += gridDim.x * warp_num_per_block) {
+    T* in_value_ptr = in_values_ptr[val_id];
+    T* out_value_ptr = out_values + val_dim * val_id;
+    if (in_value_ptr) {
+      #pragma unroll
+      for (int i = 0; VecSize * (kWarpSize * i + lane_id) < val_dim; ++i) {
+        Vec4T<T> val;
+        int idx4 = VecSize * (kWarpSize * i + lane_id);
+        val.load(in_value_ptr + idx4);
+        val.store(out_value_ptr + idx4);
+      }
+    }
+  }
+}
+
+template <typename T>
+__global__ void store_value_kernel(
+    int n,
+    int val_dim,
+    T* const * __restrict__ in_values_ptr,
+    T * __restrict__ out_values
+) {
+  
+  for (int val_id = blockIdx.x; val_id < n; val_id += gridDim.x) {
+    T* in_value_ptr = in_values_ptr[val_id];
+    T* out_value_ptr = out_values + val_dim * val_id;
+    if (in_value_ptr) {
+      #pragma unroll
+      for (int i = threadIdx.x; i < val_dim; i += blockDim.x) {
+        out_value_ptr[i] = in_value_ptr[i];
+      }
+    }
+  }
+}
+
+void extract_evicted_values(
+  int64_t num_total,
+  int val_dim,
+  DataType value_type,
+  at::Tensor const & values_ptr,
+  at::Tensor & values
+) {
+
+  if (num_total == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto &device_prop = DeviceProp::getDeviceProp();
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    if (val_dim % 4 == 0) {
+      store_value_kernel_vec4<ValueType>
+        <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+        num_total, val_dim, 
+        reinterpret_cast<ValueType **>(values_ptr.data_ptr()),
+        reinterpret_cast<ValueType *>(values.data_ptr()));
+    } else {
+      int block_size = val_dim < device_prop.max_thread_per_block
+                          ? val_dim
+                          : device_prop.max_thread_per_block;
+      int grid_size = num_total;
+      store_value_kernel<ValueType>
+        <<<grid_size, block_size, 0, stream>>>(
+        num_total, val_dim, 
+        reinterpret_cast<ValueType **>(values_ptr.data_ptr()),
+        reinterpret_cast<ValueType *>(values.data_ptr()));
+    }
+  });
+
+}
+
 void cache_storage_find_or_insert_with_initialize(
     std::shared_ptr<dyn_emb::DynamicVariableBase> cache,
     std::shared_ptr<dyn_emb::DynamicVariableBase> storage,
@@ -1354,13 +1778,15 @@ void cache_storage_find_or_insert_with_initialize(
     const c10::optional<at::Tensor>& cache_metrics
 ) {
   if (total_num == 0) return;
+
+  /// step 1: find in the cache
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   at::Tensor found_keys = at::empty({total_num}, keys.options());
   at::Tensor num_found = at::empty({1}, keys.options().dtype(at::kInt));
   at::Tensor missing_keys = at::empty({total_num}, keys.options());
   at::Tensor missing_keys_idx = at::empty({total_num}, keys.options().dtype(at::kInt));
   cache_embedding_lookup(cache, total_num, keys, embs, 
-                          found_keys, num_found, missing_keys, missing_keys_idx);
+                         found_keys, num_found, missing_keys, missing_keys_idx);
   
   int h_num_found = 0;
   AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_found, num_found.data_ptr<int>(), sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -1368,38 +1794,81 @@ void cache_storage_find_or_insert_with_initialize(
   if (cache_metrics.has_value()) {
     cache_metrics.value()[0] = static_cast<int>(total_num);
     cache_metrics.value()[1] = static_cast<int>(h_num_found);
+    cache_metrics.value()[2] = static_cast<int>(total_num - h_num_found);
   }
+
   if (h_num_found == total_num) return;
   int64_t h_num_missing = total_num - h_num_found;
-  int64_t value_dim = storage->cols() + storage->optstate_dim();
-  at::Tensor missing_values = at::empty({h_num_missing, value_dim}, embs.options());
-  at::Tensor missing_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
-  storage_find_and_initialize(storage, h_num_missing, missing_keys, missing_values, missing_scores, embs, missing_keys_idx, cache_metrics);
-  
-  if (std::getenv("DISABLE_UPDATE_CACHE") != nullptr) {
-    return;
+ 
+  /// step 2: found in the storage
+  bool update_cache = std::getenv("DISABLE_UPDATE_CACHE") == nullptr;
+  c10::optional<at::Tensor> common_in_scores = c10::nullopt;
+  c10::optional<at::Tensor> storage_scores = c10::nullopt;
+  if (storage->evict_strategy() == EvictStrategy::kCustomized || 
+      storage->evict_strategy() == EvictStrategy::kLfu) {
+    if (not score.has_value()) {
+      throw std::runtime_error("Must provide score in customized or lfu mode.");
+    }
+    // broadcast scores
+    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+    at::Tensor in_scores_tens = at::empty({static_cast<int64_t>(total_num)}, option);
+    in_scores_tens.fill_(score.value());
+    common_in_scores = c10::make_optional<at::Tensor>(in_scores_tens);
+    if (update_cache) {
+      at::Tensor storage_scores_tens = at::zeros({static_cast<int64_t>(h_num_missing)}, option);
+      storage_scores = c10::make_optional<at::Tensor>(storage_scores_tens);
+    }
   }
-  
+  storage_embedding_lookup(storage, h_num_missing, missing_keys, embs, 
+                           missing_keys_idx, common_in_scores, storage_scores, cache_metrics);
+
+  if (not update_cache) {
+    return; // will not update the score in cache.
+  }
+
+  /// step 3: try to update cache.
+  /// step 3.1: lock cache and update scores.
   at::Tensor locked_ptr = at::empty({h_num_found}, found_keys.options().dtype(at::kLong));
-  cache_lock(cache, h_num_found, found_keys, locked_ptr, score);
+  if (common_in_scores.has_value()) {
+    common_in_scores = c10::make_optional<at::Tensor>(
+                        common_in_scores.value().slice(0, h_num_missing, total_num));
+  }
+  cache_lock(cache, h_num_found, found_keys, locked_ptr, common_in_scores);
+  
+  int64_t value_dim = storage->cols() + storage->optstate_dim();
   at::Tensor evicted_keys = at::empty({h_num_missing}, keys.options());
-  at::Tensor evicted_values = at::empty({h_num_missing, value_dim}, keys.options());
-  at::Tensor evicted_scores = at::empty({h_num_missing}, keys.options().dtype(at::kUInt64));
-  at::Tensor num_evicted = at::zeros({static_cast<int64_t>(1)}, keys.options().dtype(at::kUInt64));
-  ///////////////////////
-  // if (cache->evict_strategy() == EvictStrategy::kLfu) {
-  //   cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, std::nullopt, c10::make_optional<at::Tensor>(missing_scores), 
-  //                           evicted_keys, evicted_values, evicted_scores, num_evicted);
-  // } else {
-  cache_insert_and_evict(cache, h_num_missing, missing_keys, missing_values, score, c10::nullopt,
-                          evicted_keys, evicted_values, evicted_scores, num_evicted);
-  // }
-  ///////////////////////
-  cache_unlock(cache, h_num_found, found_keys, locked_ptr);
-  uint64_t h_num_evicted = 0;
-  AT_CUDA_CHECK(cudaMemcpyAsync(&h_num_evicted, num_evicted.data_ptr(), sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+  at::Tensor evicted_values_ptr = at::empty({h_num_missing}, keys.options().dtype(at::kLong));
+  at::Tensor evicted_values = at::empty({h_num_missing, value_dim}, embs.options());
+  c10::optional<at::Tensor> evicted_scores = c10::nullopt;
+  if (storage_scores.has_value()) {
+    evicted_scores = c10::make_optional<at::Tensor>(
+                      at::empty({h_num_missing}, keys.options().dtype(at::kUInt64)));
+  }
+  at::Tensor num_evicted = at::zeros({static_cast<int64_t>(2)}, keys.options().dtype(at::kInt));
+  at::Tensor num_inserted = num_evicted.slice(0, 1, 2);
+
+  at::Tensor inserted_keys = at::empty({h_num_missing}, keys.options());
+  cache_insert_ptr_and_evict(cache, h_num_missing, missing_keys, storage_scores, inserted_keys, num_inserted, 
+                             evicted_keys, evicted_values_ptr, evicted_scores, num_evicted);
+
+  int h_num[2];
+  AT_CUDA_CHECK(cudaMemcpyAsync(h_num, num_evicted.data_ptr(), 2 * sizeof(int), cudaMemcpyDeviceToHost, stream));
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-  storage_insert(storage, h_num_evicted, evicted_keys, evicted_values, evicted_scores, cache_metrics, score);
+  int h_num_evicted = h_num[0];
+  int h_num_inserted = h_num[1];
+
+  extract_evicted_values(h_num_evicted, value_dim, cache->value_type(), evicted_values_ptr, evicted_values);
+
+  if (cache_metrics.has_value()) {
+    cache_metrics.value()[5] = static_cast<int>(h_num_inserted);
+    cache_metrics.value()[6] = static_cast<int>(h_num_evicted);
+  }
+
+  at::Tensor inserted_embs = at::empty({h_num_inserted, value_dim}, embs.options());
+  storage_find(storage, h_num_inserted, inserted_keys, inserted_embs, c10::nullopt);
+  cache_assign_value(cache, h_num_inserted, inserted_keys, inserted_embs);
+  cache_unlock(cache, h_num_found, found_keys, locked_ptr);
+  storage_insert(storage, h_num_evicted, evicted_keys, evicted_values, evicted_scores);
 }
 
 void lookup_forward_dense(

@@ -40,7 +40,7 @@ for batch_size in "${batch_sizes[@]}"; do
                 --embedding_dim $embedding_dim \
                 --gpu_ratio $gpu_ratio \
                 --num_iterations 100 \
-                --cache_algorithm "lru" \
+                --cache_algorithm "lfu" \
                 --alpha $alpha
           
           # nsys profile  -s none -t cuda,nvtx,osrt,mpi,ucx -f true -o de_and_tr$batch_size-$optimizer_type-no_cache-lfu-0.25_freeze_hot.qdrep -c cudaProfilerApi  --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node \
