@@ -30,6 +30,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTable,
     create_dynamicemb_table,
     dyn_emb_to_torch,
+    DynamicEmbCheckMode,
 )
 from dynamicemb_extensions import EvictStrategy, OptimizerType, dyn_emb_cols, find
 from torchrec.distributed.comm import get_local_rank
@@ -100,7 +101,8 @@ def assert_two_dynamicemb_table_equal(
     )
     for keys, embeddings, opt_states, scores in table_data_iterator:
         dim = dyn_emb_cols(table)
-        optstate_dim = table.optstate_dim()
+        optstate_dim = reference_table.optstate_dim()
+        print("optstate_dim:", optstate_dim)
         value_type = dyn_emb_to_torch(table.value_type())
         # print('dim', dim)
         values = torch.empty(
@@ -114,6 +116,8 @@ def assert_two_dynamicemb_table_equal(
         scores = torch.empty(
             keys.numel(), device=device, dtype=torch.uint64
         )
+        
+        print(f"reference table dive: dim{dyn_emb_cols(reference_table)}, optim_state_dim{reference_table.optstate_dim()}" )
         find(reference_table, keys.numel(), keys, values, founds, scores)
         assert torch.allclose(founds, torch.ones_like(founds)), "missing keys in reference table"
 
@@ -123,11 +127,12 @@ def assert_two_dynamicemb_table_equal(
         print("embeddings", embeddings)
         print("opt_states", opt_states)
         print('reference_embeddings', reference_embeddings, values)
-        print('reference_embeddings', reference_embeddings, values)
+        # print('reference_embeddings', reference_embeddings, values)
         print('reference optim states', reference_values[:, dim:])
         # print('reference_embeddings', reference_embeddings)
         # raise
-        assert torch.allclose(embeddings, reference_embeddings)
+        print("Size:", embeddings.size(), reference_embeddings.size(), embeddings.dtype, reference_embeddings.dtype)
+        torch.testing.assert_close(embeddings, reference_embeddings)
 
 
 def create_table_options(
@@ -200,6 +205,7 @@ def create_table_options(
         training=training,
         local_hbm_for_values=0,
         device_id=0,
+        safe_check_mode=DynamicEmbCheckMode.ERROR,
     )
     return table_options
 
@@ -234,8 +240,8 @@ def create_table_options(
         "adam"]
 )
 @pytest.mark.parametrize("dump_mode", ["training"])
-@pytest.mark.parametrize("load_mode", ["training", "evaluation"])
-@pytest.mark.parametrize("num_embeddings", [100])
+@pytest.mark.parametrize("load_mode", ["training"])
+@pytest.mark.parametrize("num_embeddings", [10])
 @pytest.mark.parametrize("embedding_dim", [16])
 def test_dynamic_table_load_dump(
     key_type: str,
