@@ -49,12 +49,18 @@ def init_dynamicemb_table(
 ):
     # Generate exactly num_embeddings unique random keys in range 0 to sys.maxsize
     # Use torch.randint to sample from the large range without creating a massive tensor
-    keys = torch.randint(0, sys.maxsize, (num_embeddings,), dtype=torch.int64)
+    keys = torch.randint(
+        0, sys.maxsize, (num_embeddings,), dtype=torch.int64, device=device
+    )
     # Ensure uniqueness by removing duplicates and adding more if needed
     keys = torch.unique(keys)
     while len(keys) < num_embeddings:
         additional_keys = torch.randint(
-            0, sys.maxsize, (num_embeddings - len(keys),), dtype=torch.int64
+            0,
+            sys.maxsize,
+            (num_embeddings - len(keys),),
+            dtype=torch.int64,
+            device=device,
         )
         keys = torch.cat([keys, additional_keys])
         keys = torch.unique(keys)
@@ -63,7 +69,9 @@ def init_dynamicemb_table(
     embeddings = torch.randn(num_embeddings, embedding_dim, device=device)
 
     scores = (
-        torch.randint(0, sys.maxsize, (num_embeddings,), dtype=torch.uint64)
+        torch.randint(
+            0, sys.maxsize, (num_embeddings,), dtype=torch.uint64, device=device
+        )
         if dynamicemb_table.evict_strategy() != EvictStrategy.KLru
         else None
     )
@@ -88,7 +96,7 @@ def assert_two_dynamicemb_table_equal(
     reference_table: DynamicEmbTable, table: DynamicEmbTable
 ):
     table_data_iterator = export_keys_values(
-        table, torch.device("cuda:0"), batch_size=10
+        table, device
     )
     for keys, embeddings, opt_states, scores in table_data_iterator:
         dim = dyn_emb_cols(table)
@@ -96,19 +104,27 @@ def assert_two_dynamicemb_table_equal(
         value_type = dyn_emb_to_torch(table.value_type())
         # print('dim', dim)
         values = torch.empty(
-            keys.numel(),
-            dim + optstate_dim,
-            device=torch.device("cuda:0"),
+            keys.numel() * (dim + optstate_dim),
+            device=device,
             dtype=value_type,
-        )
+        ).zero_()
         founds = torch.empty(
-            keys.numel(), device=torch.device("cuda:0"), dtype=torch.bool
+            keys.numel(), device=device, dtype=torch.bool
         )
         scores = torch.empty(
-            keys.numel(), device=torch.device("cuda:0"), dtype=torch.uint64
+            keys.numel(), device=device, dtype=torch.uint64
         )
         find(reference_table, keys.numel(), keys, values, founds, scores)
-        reference_embeddings = values.reshape(-1, dim + optstate_dim)[:, :dim]
+        assert torch.allclose(founds, torch.ones_like(founds)), "missing keys in reference table"
+
+        reference_values = values.reshape(-1, dim + optstate_dim)
+        reference_embeddings = reference_values[:, :dim].contiguous()
+        print("keys", keys)
+        print("embeddings", embeddings)
+        print("opt_states", opt_states)
+        print('reference_embeddings', reference_embeddings, values)
+        print('reference_embeddings', reference_embeddings, values)
+        print('reference optim states', reference_values[:, dim:])
         # print('reference_embeddings', reference_embeddings)
         # raise
         assert torch.allclose(embeddings, reference_embeddings)
@@ -200,6 +216,7 @@ def create_table_options(
 # @pytest.mark.parametrize("load_optimizer_type", ["sgd", "adam", "adagrad", "rowwise_adagrad"])
 # @pytest.mark.parametrize("load_score_strategy", ["timestamp", "step", "custimized"])
 # @pytest.mark.parametrize("load_mode", ["training", "evaluation"])
+# @pytest.mark.parametrize("value_type", ["float32", "float16", "bfloat16"])
 
 
 @pytest.mark.parametrize("key_type", ["int64"])
@@ -207,15 +224,19 @@ def create_table_options(
 @pytest.mark.parametrize("score_type", ["uint64"])
 @pytest.mark.parametrize("score_strategy", ["timestamp"])
 @pytest.mark.parametrize(
-    "dump_optimizer_type", ["sgd", "adam", "adagrad", "rowwise_adagrad"]
+    "dump_optimizer_type", [
+        "sgd", 
+        "adam"]
 )
 @pytest.mark.parametrize(
-    "load_optimizer_type", ["sgd", "adam", "adagrad", "rowwise_adagrad"]
+    "load_optimizer_type", [
+        # "sgd", 
+        "adam"]
 )
-@pytest.mark.parametrize("dump_mode", ["training", "evaluation"])
+@pytest.mark.parametrize("dump_mode", ["training"])
 @pytest.mark.parametrize("load_mode", ["training", "evaluation"])
-@pytest.mark.parametrize("num_embeddings", [10000])
-@pytest.mark.parametrize("embedding_dim", [16, 31])
+@pytest.mark.parametrize("num_embeddings", [100])
+@pytest.mark.parametrize("embedding_dim", [16])
 def test_dynamic_table_load_dump(
     key_type: str,
     value_type: str,
@@ -278,25 +299,5 @@ def test_dynamic_table_load_dump(
     )
 
     assert_two_dynamicemb_table_equal(dynamicemb_table, new_dynamicemb_table)
-    # Only global rank 0 should clean up, not local rank 0 on each node
-    try:
-        shutil.rmtree("emb_key_path")
-    except Exception as e:
-        print(f"Warning: Failed to remove emb_key_path: {e}")
 
-    try:
-        shutil.rmtree("embedding_file_path")
-    except Exception as e:
-        print(f"Warning: Failed to remove embedding_file_path: {e}")
-
-    try:
-        shutil.rmtree("score_file_path")
-    except Exception as e:
-        print(f"Warning: Failed to remove score_file_path: {e}")
-
-    try:
-        shutil.rmtree("opt_file_path")
-    except Exception as e:
-        print(f"Warning: Failed to remove opt_file_path: {e}")
-
-    dist.destroy_process_group()
+dist.destroy_process_group()

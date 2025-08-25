@@ -313,6 +313,9 @@ void find(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
   } else {
     table->find(n, keys.data_ptr(), values.data_ptr(), founds.data_ptr<bool>(),
                 nullptr, stream);
+    std::cout << "keys" << keys << std::endl;
+    std::cout << "values" << values << std::endl;
+    std::cout << "founds" << founds << std::endl;
   }
 }
 

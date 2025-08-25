@@ -168,12 +168,18 @@ def export_keys_values(
         export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
 
         values = values.reshape(batch_size, total_dim)
+        
         embeddings = values[:, :dim].contiguous()
         opt_states = values[:, dim:].contiguous()
 
         d_counter = d_counter.to(dtype=torch.int64)
         actual_length = d_counter.item()
         if actual_length > 0:
+            for i in range(actual_length):
+                print('export_keys_values keys', keys[i])
+                print('export_keys_values values', values[i, :])
+                print('export_keys_values embeddings', embeddings[i, :])
+                print('export_keys_values opt_states', opt_states[i, :])
             yield (
                 keys[:actual_length].to(KEY_TYPE),
                 embeddings[:actual_length, :].to(EMBEDDING_TYPE),
@@ -406,6 +412,14 @@ def load_key_values(
 ):
     dim = dyn_emb_cols(dynamic_table)
     optstate_dim = dynamic_table.optstate_dim()
+    if not keys.is_cuda:
+        raise RuntimeError("Keys must be on GPU")
+    if not embeddings.is_cuda:
+        raise RuntimeError("Embeddings must be on GPU")
+    if scores is not None and not scores.is_cuda:
+        raise RuntimeError("Scores must be on GPU")
+    if opt_states is not None and not opt_states.is_cuda:
+        raise RuntimeError("Opt states must be on GPU")
 
     if opt_states is None and optstate_dim > 0:
         opt_states = (
@@ -506,12 +520,14 @@ def local_load(
         keys = torch.tensor(
             np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
             dtype=KEY_TYPE,
+            device=device,
         )
         embeddings = torch.tensor(
             np.frombuffer(
                 embedding_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
             ),
             dtype=EMBEDDING_TYPE,
+            device=device,
         )
 
         scores = None
@@ -520,6 +536,7 @@ def local_load(
             scores = torch.tensor(
                 np.frombuffer(score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]),
                 dtype=SCORE_TYPE,
+                device=device,
             )
 
         opt_states = None
@@ -532,6 +549,7 @@ def local_load(
                     opt_state_bytes, dtype=torch_dtype_to_np_dtype[OPT_STATE_TYPE]
                 ),
                 dtype=OPT_STATE_TYPE,
+                device=device,
             )
 
         if world_size > 1:
