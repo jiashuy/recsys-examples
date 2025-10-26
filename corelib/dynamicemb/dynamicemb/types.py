@@ -1,10 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import abc
 from typing import Generic, Optional, Tuple, TypeVar
+import enum
 
 import torch
 
+@enum.unique
+class MemoryType(enum.Enum):
+    DEVICE = "device" # memory allocated using cudaMalloc/cudaMallocAsync
+    MANAGED = "managed" # memory allocated using cudaMallocManaged
+    PINNED_HOST = "pinned_host" # memory allocated using cudaHostAlloc/cudaMallocHost
+    HOST = "host" # system memory allocated using e.g. malloc.
+
 TableOptionType = TypeVar("TableOptionType")
 OptimizerInterface = TypeVar("OptimizerInterface")
+
+@enum.unique
+class BucketType(enum.Enum):
+    SLOTS = "slots" # Inside the bucket, use open-addressing to solve hash-collision.
+    CHAIN = "chain" # Unidirectional linked list
 
 
 # make it standalone to avoid recursive references.
@@ -195,4 +223,46 @@ class Cache(abc.ABC):
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:
+        pass
+
+class Counter(abc.ABC):
+    """
+    `Counter` is an interface of a counter table which maps a key to a counter.
+    """
+
+    @abc.abstractmethod
+    def add(self, keys: torch.Tensor, counters: torch.Tensor) -> torch.Tensor:
+        """
+        Add keys with counters to the `Counter` and get accumulated counter of each key.
+        For not existed keys, the counters will be assigned directly.
+        For existing keys, the counters will be accumulated.
+
+        Args:
+            keys (torch.Tensor): The input keys, should be unique keys.
+            counters (torch.Tensor): The input counters, serve as initial or incremental values of counters' states.
+
+        Returns:
+            accumulated_counters (torch.Tensor): the counters' state in the `Counter` for the input keys.
+        """
+        accumulated_counters: torch.Tensor
+        return accumulated_counters
+
+    @abc.abstractmethod
+    def erase(self, keys) -> None:
+        """
+        Erase keys form the `Counter`.
+
+        Args:
+            keys (torch.Tensor): The input keys to be erased.
+        """
+        pass
+    
+    @abc.abstractmethod
+    def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
+        """
+        Get the consumption of a specific memory type.
+
+        Args:
+            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
+        """
         pass
