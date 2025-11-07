@@ -1308,3 +1308,305 @@ def DynamicEmbLoad(
     if debug_mode:
         debug_load(collections_list, path, table_names, optim, pg)
     return
+
+
+def load_to_tensor(
+    dynamic_table,
+    root_path,
+    name,
+    batch_size=65536,
+    pg: Optional[dist.ProcessGroup] = None,
+    debug_mode: Optional[bool] = False,
+    optim: bool = False,
+):
+    rank = dist.get_rank(group=pg)
+    world_size = dist.get_world_size(group=pg)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
+
+    key_name = name + "_keys"
+    value_name = name + "_values"
+
+    key_path = os.path.join(root_path, key_name)
+    value_path = os.path.join(root_path, value_name)
+
+    if not os.path.exists(key_path):
+        raise Exception("can't find path to load, path:", key_path)
+
+    if not os.path.exists(value_path):
+        raise Exception("can't find path to load, path:", value_path)
+
+    key_file_size = os.path.getsize(key_path)
+    value_file_size = os.path.getsize(value_path)
+
+    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
+    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
+
+    key_bytes = dtype_to_bytes(key_dtype)
+    value_bytes = dtype_to_bytes(value_dtype)
+
+    total_keys = key_file_size // key_bytes
+    total_dim = value_file_size // (total_keys * value_bytes)
+
+    dim = dyn_emb_cols(dynamic_table)
+    print(f"Dim={dim}")
+    optstate_dim = dynamic_table.optstate_dim()
+    if total_dim < dim or ((total_dim != dim + optstate_dim) and optim):
+        raise Exception(
+            "Can't load as mismatch of embedding dtype, dim or optimizer type"
+        )
+
+    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
+    values_read_bytes = (
+        batch_size * total_dim * 4
+    )  # value in file always float , so is 4
+
+    if debug_mode:
+        debug_check_dynamic_table_is_zero(dynamic_table)
+    if need_dump_score:
+        score_name = name + "_scores"
+        score_path = os.path.join(root_path, score_name)
+        if not os.path.exists(score_path):
+            raise Exception("can't find path to load, path:", score_path)
+        torch.uint64
+        scores_read_bytes = batch_size * 8  # score in file always uint64, so is 8
+        score_file_size = os.path.getsize(score_path)
+
+    ret_keys, ret_embs, ret_opts = None, None, None
+
+    with open(key_path, "rb") as fkey, open(value_path, "rb") as fvalue:
+        if need_dump_score:
+            fscore = open(score_path, "rb")
+        while True:
+            remaining_key_bytes = key_file_size - fkey.tell()
+            remaining_value_bytes = value_file_size - fvalue.tell()
+
+            if remaining_key_bytes <= 0 or remaining_value_bytes <= 0:
+                break
+
+            key_bytes_to_read = min(keys_read_bytes, remaining_key_bytes)
+            value_bytes_to_read = min(values_read_bytes, remaining_value_bytes)
+
+            key_bytes = fkey.read(key_bytes_to_read)
+            value_bytes = fvalue.read(value_bytes_to_read)
+
+            num_keys = len(key_bytes) // 8  # key in file always int64 ,so is 8
+
+            key_array = np.frombuffer(key_bytes, dtype=np.int64)
+            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(
+                -1, total_dim
+            )
+
+            if need_dump_score:
+                remaining_score_bytes = score_file_size - fscore.tell()
+                score_bytes_to_read = min(scores_read_bytes, remaining_score_bytes)
+                score_bytes = fscore.read(score_bytes_to_read)
+                score_array = np.frombuffer(score_bytes, dtype=np.uint64)
+
+            # Masking keys and values based on rank
+            mask = key_array % world_size == rank
+            masked_keys = key_array[mask]
+            masked_values = value_array[mask, :]
+            if need_dump_score:
+                score_array[mask]
+            if masked_keys.shape[0] > 0:
+                keys_tensor = torch.tensor(masked_keys, dtype=key_dtype, device=device)
+                values_tensor = torch.tensor(
+                    masked_values, dtype=value_dtype, device=device
+                )
+                if not optim:
+                    optstate = (
+                        torch.ones(
+                            values_tensor.size(0),
+                            optstate_dim,
+                            dtype=value_dtype,
+                            device=device,
+                        )
+                        * dynamic_table.get_initial_optstate()
+                    )
+                    values_tensor = torch.cat(
+                        (values_tensor[:, :dim], optstate), dim=1
+                    ).contiguous()
+                if ret_keys is None:
+                    ret_keys = keys_tensor.contiguous().cpu()
+                    ret_embs = values_tensor[:, :dim].contiguous().cpu()
+                    ret_opts = values_tensor[:, dim:].contiguous().cpu()
+                else:
+                    ret_keys = torch.cat(
+                        (ret_keys, keys_tensor.contiguous().cpu()), dim=0
+                    )
+                    ret_embs = torch.cat(
+                        (ret_embs, values_tensor[:, :dim].contiguous().cpu()), dim=0
+                    )
+                    ret_opts = torch.cat(
+                        (ret_opts, values_tensor[:, dim:].contiguous().cpu()), dim=0
+                    )
+
+        if need_dump_score:
+            fscore.close()
+    return ret_keys, ret_embs, ret_opts
+
+
+def load_to_cput_tensor(
+    path: str,
+    model: nn.Module,
+    table_names: Optional[List[str]] = None,
+    optim: bool = False,
+    pg: Optional[dist.ProcessGroup] = None,
+):
+    """
+    Load the distributed weights and corresponding optimizer states of dynamic embedding tables from the filesystem into the model.
+
+    Each dynamic embedding table will be stored as a key binary file and a value binary file, where the dtype of the key is int64_t,
+    and the dtype of the value is float. Each optimizer state is also treated as a dynamic embedding table.
+
+    Parameters
+    ----------
+    path : str
+        The main folder for weight files.
+    model : nn.Module
+        The model containing dynamic embedding tables.
+    table_names : Optional[Dict[str, List[str]]], optional
+        A dictionary specifying which embedding collection and which table to load. The key is the name of the embedding collection,
+        and the value is a list of dynamic embedding table names within that collection. Defaults to None.
+    optim : bool, optional
+        Whether to load the optimizer states. Defaults to False.
+    pg : Optional[dist.ProcessGroup], optional
+        The process group used to control the communication scope in the load. Defaults to None.
+
+    Returns
+    -------
+    None
+    """
+    # Due to the difficulty of checking the HKV dump and load operations externally,
+    # debug_mode has been added to the code. This is controlled by the environment variable
+    # DYNAMICEMB_DUMP_LOAD_DEBUG. When DYNAMICEMB_DUMP_LOAD_DEBUG=1, debug mode is enabled.
+    # In debug mode, the state of dynamic emb will be saved before dumping to the file system,
+    # and a comparison will be performed after the load operation.
+
+    result = {}
+
+    debug_env_var = os.getenv("DYNAMICEMB_DUMP_LOAD_DEBUG")
+    if debug_env_var == "1":
+        debug_mode = True
+        print("DynamicEmb's dump and load is in debug mode")
+    else:
+        debug_mode = False
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    if not os.path.exists(path):
+        raise Exception("can't find path to load, path:", path)
+
+    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
+    if len(collections_list) == 0:
+        warnings.warn(
+            "Input model don't have any TorchREC ShardedEmbeddingCollection or ShardedEmbeddingBagCollection module, can't load any embedding tables from filesystem!",
+            UserWarning,
+        )
+        return
+
+    check_dynamic_emb_modules_lists: List[List[nn.Module]] = []
+
+    for i, tmp_collection in enumerate(collections_list):
+        _, _, tmp_collection_module = tmp_collection
+        check_dynamic_emb_modules_lists.append(
+            get_dynamic_emb_module(tmp_collection_module)
+        )
+
+    has_dynamic_emb = False
+    for check_dynamic_emb_module_list in check_dynamic_emb_modules_lists:
+        if len(check_dynamic_emb_module_list) > 0:
+            has_dynamic_emb = True
+            break
+
+    if not has_dynamic_emb:
+        warnings.warn(
+            "Input model don't have any Dynamic embedding tables, can't load any embedding tables from filesystem!",
+            UserWarning,
+        )
+        return
+
+    collection_names_in_module = set()
+    filtered_collections_list = []
+
+    for tmp_shared_path, tmp_shared_name, module in collections_list:
+        collection_names_in_module.add(tmp_shared_name)
+        if table_names is None or tmp_shared_name in table_names:
+            filtered_collections_list.append((tmp_shared_path, tmp_shared_name, module))
+
+    collections_list = filtered_collections_list
+
+    if table_names is not None:
+        for tmp_input_collection_name in table_names.keys():
+            if tmp_input_collection_name not in collection_names_in_module:
+                warnings.warn(
+                    f"sharded module '{tmp_input_collection_name}' specified in table_names not found in the model",
+                    UserWarning,
+                )
+
+    rank = dist.get_rank(group=pg)
+
+    for i, tmp_collection in enumerate(collections_list):
+        # get collection mpdule
+        collection_path, tmp_collection_name, tmp_collection_module = tmp_collection
+        full_collection_path = os.path.join(path, collection_path)
+        tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
+
+        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
+            tmp_table_names = dynamic_emb_module.table_names
+            tmp_tables = dynamic_emb_module.tables
+
+            filtered_table_names: List[str] = []
+            filtered_dynamic_tables: List[DynamicEmbTable] = []
+
+            # TODO:need a warning
+            if table_names is not None:
+                tmp_input_names = table_names[tmp_collection_name]
+                for name in tmp_input_names:
+                    if name in tmp_table_names:
+                        index = tmp_table_names.index(name)
+                        filtered_table_names.append(tmp_table_names[index])
+                        filtered_dynamic_tables.append(tmp_tables[index])
+            else:
+                filtered_table_names = tmp_table_names
+                filtered_dynamic_tables = tmp_tables
+
+            if len(filtered_table_names) == 0:
+                continue
+
+            if optim:
+                optimizer = dynamic_emb_module.optimizer
+
+            tmp_tables_dict: Dict[str, DynamicEmbTable] = {
+                name: table
+                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
+            }
+
+            for k, load_name in enumerate(filtered_table_names):
+                # load optimizer args firstly then can check if has already dumped the optimizer states.
+                if optim:
+                    args_filename = load_name + "_opt_args.json"
+                    args_path = os.path.join(full_collection_path, args_filename)
+                    opt_args = load_from_json(args_path)
+                    # TODO: A single set of optimizer arguments is sufficient for a dynamic module set.
+                    optimizer.set_opt_args(opt_args)
+
+                result[load_name] = load_to_tensor(
+                    filtered_dynamic_tables[k],
+                    full_collection_path,
+                    load_name,
+                    pg=pg,
+                    debug_mode=debug_mode,
+                    optim=optim,
+                )
+
+                if rank == 0:
+                    print(
+                        f"DynamicEmb load table {load_name} from module {tmp_collection_name} success!"
+                    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    return result

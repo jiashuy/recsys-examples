@@ -726,6 +726,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
   if (optstate_dim == 0) return;
   using OptStateInitializer = OptStateInitializer<ValueType, int>;
   OptStateInitializer optstate_initializer {optstate_dim, initial_optstate_};
+  std::cout << "initial_optstate_: " << initial_optstate_ << "\n";
 
   constexpr int kWarpSize = 32;
   constexpr int MULTIPLIER = 4;

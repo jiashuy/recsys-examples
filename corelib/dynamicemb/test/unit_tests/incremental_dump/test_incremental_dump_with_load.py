@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import os
-import random
+import shutil
 from typing import Dict, List
 
 import pytest
@@ -22,13 +22,14 @@ import torch
 import torch.distributed as dist
 import torchrec
 from dynamicemb import (
-    BATCH_SIZE_PER_DUMP,
+    DynamicEmbDump,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
-from dynamicemb.incremental_dump import get_score, incremental_dump, set_score
+from dynamicemb.dump_load import load_to_cput_tensor
+from dynamicemb.incremental_dump import get_score, incremental_dump
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -46,32 +47,13 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 
 @pytest.fixture
 def current_device():
     assert torch.cuda.is_available()
     return torch.cuda.current_device()
-
-
-class CustomizedScore:
-    def __init__(self, table_names: List[int]):
-        self.table_names_ = table_names
-        self.steps_: Dict[str, int] = {table_name: 1 for table_name in table_names}
-
-    def get(self, table_name: str):
-        assert table_name in self.table_names_
-        ret = self.steps_[table_name]
-        self.steps_[table_name] += 1
-        return ret
-
-
-def random_indices(batch, min_index, max_index):
-    result = set({})
-    while len(result) < batch:
-        result.add(random.randint(min_index, max_index))
-    return result
 
 
 class Platform:
@@ -153,38 +135,21 @@ def get_planner(
     )
 
 
-def generate_sparse_feature(
-    feature_names: List[str],
-    multi_hot_sizes: List[int],
-    local_batch_size: int,
-    unique_indices_list: List[set],
-    use_dynamicembs: List[bool],
-    num_embeddings: List[int],
+def generate_sequence_sparse_feature(
+    feature_names: List[str], local_batch_size: int, device
 ):
     feature_num = len(feature_names)
     feature_batch = feature_num * local_batch_size
 
-    indices = []
-    lengths = []
-
-    for i in range(feature_batch):
-        f = i // local_batch_size
-        cur_bag_size = random.randint(0, multi_hot_sizes[f])
-        cur_bag = set({})
-        while len(cur_bag) < cur_bag_size:
-            if use_dynamicembs[f]:
-                cur_bag.add(random.randint(0, (1 << 63) - 1))
-            else:
-                cur_bag.add(random.randint(0, num_embeddings[f] - 1))
-
-        unique_indices_list[f].update(cur_bag)
-        indices.extend(list(cur_bag))
-        lengths.append(cur_bag_size)
+    indices = torch.randint(
+        0, (1 << 63) - 1, (feature_batch,), device=device, dtype=torch.int64
+    )
+    lengths = torch.ones(feature_batch, device=device, dtype=torch.int64)
 
     return torchrec.KeyedJaggedTensor(
         keys=feature_names,
-        values=torch.tensor(indices, dtype=torch.int64).cuda(),
-        lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
+        values=indices,
+        lengths=lengths,
     )
 
 
@@ -216,66 +181,96 @@ def backend_session():
     dist.destroy_process_group()
 
 
+def train_with_random_input(model, feature_names, local_batch, num_iteration, device):
+    for i in range(num_iteration):
+        sparse_feature = generate_sequence_sparse_feature(
+            feature_names,
+            local_batch,
+            device=device,
+        )
+        ret = model(sparse_feature)  # => this is awaitable
+        kt = ret.values()  # wait
+
+
+def check_emb_and_opt(input, table_names, dim):
+    for table_name in table_names:
+        key, emb, opt = input[table_name]
+        dump_keys = key % 100000
+        dump_embs = emb.to(dump_keys.dtype)
+
+        print(dump_keys.size(), dump_embs.size())
+        assert torch.all(
+            dump_keys.unsqueeze(1).expand(-1, dim).reshape(-1) == dump_embs.view(-1)
+        )
+        torch.testing.assert_close(
+            opt, torch.full_like(opt, initial_accumulator_value), atol=1e-5, rtol=1e-8
+        )
+
+
+def check_key_equal(a, b, table_names, world_size, rank):
+    for table_name in table_names:
+        key_a, _, _ = a[table_name]
+        key_b, _, _ = b[table_name]
+
+        mask_a = key_a % world_size == rank
+        mask_b = key_b % world_size == rank
+
+        masked_key_a = key_a[mask_a]
+        masked_key_b = key_b[mask_b]
+
+        assert masked_key_a.numel() == torch.unique(masked_key_a).numel()
+        assert masked_key_b.numel() == torch.unique(masked_key_b).numel()
+
+        a_unique_sorted = torch.sort(torch.unique(masked_key_a)).values
+        b_unique_sorted = torch.sort(torch.unique(masked_key_b)).values
+
+        assert torch.equal(a_unique_sorted, b_unique_sorted)
+
+
+def clean_file(file):
+    dist.barrier()
+    if dist.get_rank() == 0:
+        try:
+            shutil.rmtree(file)
+        except Exception as e:
+            print(f"Warning: Failed to remove {file}: {e}")
+    dist.barrier()
+
+
+def merge_ckpt(a, b, table_names):
+    res = {}
+    for table_name in table_names:
+        key_a, emb_a, opt_a = a[table_name]
+        key_b, emb_b, opt_b = b[table_name]
+        key = torch.cat((key_a, key_b), dim=0)
+        emb = torch.cat((emb_a.view(-1), emb_b.view(-1)), dim=0)
+        opt = torch.cat((opt_a.view(-1), opt_b.view(-1)), dim=0)
+        res[table_name] = (key, emb, opt)
+    return res
+
+
 @pytest.mark.parametrize(
     "table_num, num_embeddings, use_dynamicembs, score_strategies, multi_hot_sizes",
     [
         pytest.param(
             1,
-            [BATCH_SIZE_PER_DUMP * 8],
+            [100 * 1024 * 1024],
             [True],
             [DynamicEmbScoreStrategy.TIMESTAMP],
             [10],
         ),
-        # pytest.param(
-        #     4,
-        #     [BATCH_SIZE_PER_DUMP * 8] * 4,
-        #     [True] * 4,
-        #     [
-        #         DynamicEmbScoreStrategy.STEP,
-        #         DynamicEmbScoreStrategy.TIMESTAMP,
-        #         DynamicEmbScoreStrategy.CUSTOMIZED,
-        #         DynamicEmbScoreStrategy.STEP,
-        #     ],
-        #     [10] * 4,
-        # ),
-        # pytest.param(
-        #     4,
-        #     [BATCH_SIZE_PER_DUMP * 8] * 4,
-        #     [False, False, False, False],
-        #     [None, None, None, None],
-        #     [10] * 4,
-        # ),
-        # pytest.param(
-        #     4,
-        #     [BATCH_SIZE_PER_DUMP * 8] * 4,
-        #     [True, False, True, False],
-        #     [
-        #         DynamicEmbScoreStrategy.STEP,
-        #         None,
-        #         DynamicEmbScoreStrategy.CUSTOMIZED,
-        #         None,
-        #     ],
-        #     [10] * 4,
-        # ),
-        # pytest.param(
-        #     4,
-        #     [BATCH_SIZE_PER_DUMP * 8] * 4,
-        #     [True] * 4,
-        #     [DynamicEmbScoreStrategy.CUSTOMIZED] * 4,
-        #     [10] * 4,
-        # ),
     ],
 )
 @pytest.mark.parametrize(
     "is_pooled, pooling_mode",
     [
-        (True, PoolingType.SUM),
         (False, None),
-        # (False, None),
     ],
 )
-@pytest.mark.parametrize("local_batch", [128])
-@pytest.mark.parametrize("num_iteration", [12])
+@pytest.mark.parametrize("local_batch", [262144])
+@pytest.mark.parametrize(
+    "num_iteration", [12]
+)  # [24, 128] is too slow: move to GPU may OOM.
 @pytest.mark.parametrize("dump_interval", [3])
 @pytest.mark.parametrize("dim", [8])
 def test_incremental_dump_api(
@@ -295,6 +290,7 @@ def test_incremental_dump_api(
     backend_session,
 ):
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     device = torch.device(f"cuda:{local_rank}")
 
     table_names = [f"t_{t}" for t in range(table_num)]
@@ -359,85 +355,72 @@ def test_incremental_dump_api(
         plan=plan,
     )
 
-    customized_scores = CustomizedScore(table_names)
     ret: Dict[str, Dict[str, int]] = get_score(model)
     prefix_path = "model"
-
-    if ret is None:
-        return
-    else:
-        assert len(ret) == 1 and prefix_path in ret
     undump_score: Dict[str, int] = ret[prefix_path]
 
-    scores_to_set: Dict[str, int] = {}
-    for i in range(table_num):
-        if score_strategies[i] == DynamicEmbScoreStrategy.CUSTOMIZED:
-            scores_to_set[table_names[i]] = customized_scores.get(table_names[i])
-    all_customized = (
-        True
-        if score_strategies == [DynamicEmbScoreStrategy.CUSTOMIZED] * table_num
-        else False
+    # at present, the model is empty, so will dump nothing
+    ret_tensors, _ = incremental_dump(
+        model, {prefix_path: undump_score}, intra_and_cross_node_pg()[0]
     )
-    param_scores = (
-        scores_to_set[table_names[0]]
-        if all_customized
-        else {prefix_path: scores_to_set}
+    for table_name in table_names:
+        dump_keys = ret_tensors[prefix_path][table_name][0]
+        dump_embs = ret_tensors[prefix_path][table_name][1]
+        dump_opts = ret_tensors[prefix_path][table_name][2]
+        assert dump_keys.numel() == 0
+        assert dump_embs.numel() == 0
+        assert dump_opts.numel() == 0
+
+    clean_file("full_ckpt_1")
+    clean_file("full_ckpt_2")
+
+    train_with_random_input(model, feature_names, local_batch, num_iteration, device)
+    DynamicEmbDump("full_ckpt_1", model, optim=True)
+
+    ret = get_score(model)
+    intermediate_score: Dict[str, int] = ret[prefix_path]
+
+    train_with_random_input(model, feature_names, local_batch, num_iteration, device)
+
+    ret_tensors, _ = incremental_dump(
+        model, {prefix_path: intermediate_score}, intra_and_cross_node_pg()[0]
     )
-    set_score(model, param_scores)
-    undump_score.update(scores_to_set)
+    partial_ckpt = {}
+    for table_name in table_names:
+        dump_keys = ret_tensors[prefix_path][table_name][0]
+        dump_embs = ret_tensors[prefix_path][table_name][1]
+        dump_opts = ret_tensors[prefix_path][table_name][2]
+        partial_ckpt[table_name] = (dump_keys, dump_embs, dump_opts)
 
-    for i in range(0, num_iteration):
-        unique_indices = [set({}) for _ in table_names]
-        for j in range(dump_interval):
-            scores_to_set: Dict[str, int] = {}
-            for i in range(table_num):
-                if score_strategies[i] == DynamicEmbScoreStrategy.CUSTOMIZED:
-                    scores_to_set[table_names[i]] = customized_scores.get(
-                        table_names[i]
-                    )
-            set_score(model, {prefix_path: scores_to_set})
-            sparse_feature = generate_sparse_feature(
-                feature_names,
-                multi_hot_sizes,
-                local_batch,
-                unique_indices,
-                use_dynamicembs,
-                num_embeddings,
-            )
-            ret = model(sparse_feature)  # => this is awaitable
-            kt = ret.values()  # wait
+    zero_scores = {prefix_path: {table_name: 0 for table_name in table_names}}
+    ret_tensors, _ = incremental_dump(model, zero_scores, intra_and_cross_node_pg()[0])
+    inc_ckpt = {}
+    for table_name in table_names:
+        dump_keys = ret_tensors[prefix_path][table_name][0]
+        dump_embs = ret_tensors[prefix_path][table_name][1]
+        dump_opts = ret_tensors[prefix_path][table_name][2]
+        inc_ckpt[table_name] = (dump_keys, dump_embs, dump_opts)
 
-        print("Dump score=", undump_score)
-        param_scores = (
-            undump_score[table_names[0]]
-            if all_customized
-            else {prefix_path: undump_score}
-        )
-        ret_tensors, ret_scores = incremental_dump(
-            model, param_scores, intra_and_cross_node_pg()[0]
-        )
-        undump_score = ret_scores[prefix_path]
-        for i, (table_name, indices) in enumerate(zip(table_names, unique_indices)):
-            if use_dynamicembs[i]:
-                dump_keys = ret_tensors[prefix_path][table_name][0]
-                dump_vals = ret_tensors[prefix_path][table_name][1]
-                dump_opts = ret_tensors[prefix_path][table_name][2]
-                dumped_indices = set(dump_keys.tolist())
-                assert indices.issubset(dumped_indices)
+    DynamicEmbDump("full_ckpt_2", model, optim=True)
 
-                ############### Test the dumped embeddings ###############
-                dump_keys = dump_keys % 100000
-                dump_vals = dump_vals.to(dump_keys.dtype)
-                assert torch.all(
-                    dump_keys.unsqueeze(1).expand(-1, dim).reshape(-1) == dump_vals
-                )
+    full_ckpt_1 = load_to_cput_tensor(
+        "full_ckpt_1", model, table_names={prefix_path: table_names}, optim=True
+    )
+    full_ckpt_2 = load_to_cput_tensor(
+        "full_ckpt_2", model, table_names={prefix_path: table_names}, optim=True
+    )
 
-                ############### Test the dumped optimizer states ###############
-                for i in range(min(dump_opts.size(0), 2)):
-                    print(dump_opts[i].item())
-                torch.testing.assert_close(
-                    dump_opts,
-                    torch.full_like(dump_opts, initial_accumulator_value),
-                    atol=1e-5,
-                    rtol=1e-8,
-                )
+    check_emb_and_opt(inc_ckpt, table_names, dim)
+    check_emb_and_opt(partial_ckpt, table_names, dim)
+    check_emb_and_opt(full_ckpt_1, table_names, dim)
+    check_emb_and_opt(full_ckpt_2, table_names, dim)
+
+    ############### inc_ckpt == full_ckpt_2
+    check_key_equal(inc_ckpt, full_ckpt_2, table_names, world_size, local_rank)
+
+    ############### full_ckpt_1 + partial_ckpt == full_ckpt_2
+    merged_ckpt = merge_ckpt(full_ckpt_1, partial_ckpt, table_names)
+    check_key_equal(merged_ckpt, full_ckpt_2, table_names, world_size, local_rank)
+
+    clean_file("full_ckpt_1")
+    clean_file("full_ckpt_2")

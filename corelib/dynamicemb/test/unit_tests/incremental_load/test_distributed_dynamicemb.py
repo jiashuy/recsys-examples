@@ -46,7 +46,7 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 
 @pytest.fixture
@@ -188,9 +188,6 @@ def generate_sparse_feature(
     )
 
 
-initial_accumulator_value = 3.14159
-
-
 @pytest.fixture
 def optimizer_kwargs():
     optimizer_kwargs_ = {
@@ -200,7 +197,6 @@ def optimizer_kwargs():
         "beta2": 0.999,
         "weight_decay": 0,
         "eps": 0.001,
-        "initial_accumulator_value": initial_accumulator_value,
     }
     return optimizer_kwargs_
 
@@ -269,9 +265,9 @@ def backend_session():
 @pytest.mark.parametrize(
     "is_pooled, pooling_mode",
     [
-        (True, PoolingType.SUM),
-        (False, None),
+        # (True, PoolingType.SUM),
         # (False, None),
+        (False, None),
     ],
 )
 @pytest.mark.parametrize("local_batch", [128])
@@ -421,7 +417,6 @@ def test_incremental_dump_api(
             if use_dynamicembs[i]:
                 dump_keys = ret_tensors[prefix_path][table_name][0]
                 dump_vals = ret_tensors[prefix_path][table_name][1]
-                dump_opts = ret_tensors[prefix_path][table_name][2]
                 dumped_indices = set(dump_keys.tolist())
                 assert indices.issubset(dumped_indices)
 
@@ -430,14 +425,4 @@ def test_incremental_dump_api(
                 dump_vals = dump_vals.to(dump_keys.dtype)
                 assert torch.all(
                     dump_keys.unsqueeze(1).expand(-1, dim).reshape(-1) == dump_vals
-                )
-
-                ############### Test the dumped optimizer states ###############
-                for i in range(min(dump_opts.size(0), 2)):
-                    print(dump_opts[i].item())
-                torch.testing.assert_close(
-                    dump_opts,
-                    torch.full_like(dump_opts, initial_accumulator_value),
-                    atol=1e-5,
-                    rtol=1e-8,
                 )

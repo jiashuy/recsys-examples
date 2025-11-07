@@ -135,22 +135,29 @@ def _export_matched_and_gather(
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
     dim: int = dyn_emb_cols(dynamic_table)
+    optim_dim = dynamic_table.optstate_dim()
+    total_dim = dim + optim_dim
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
-    ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
+    ret_embs = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
+    ret_opts = torch.empty(total_matched * optim_dim, dtype=value_dtype, device="cpu")
     ret_offset = 0
 
     search_offset = 0
     search_capacity = dyn_emb_capacity(dynamic_table)
-    batch_size = batch_size if batch_size < search_capacity else search_capacity
+    # If search capacity not matched across ranks
+    # batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
+    d_embs = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_opts = torch.empty(batch_size * optim_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     # Gather keys and values for all ranks
     gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-    gathered_vals = [torch.empty_like(d_vals) for _ in range(world_size)]
+    gathered_embs = [torch.empty_like(d_embs) for _ in range(world_size)]
+    gathered_opts = [torch.empty_like(d_opts) for _ in range(world_size)]
     gathered_counts = [
         torch.empty_like(d_count, dtype=torch.int64) for _ in range(world_size)
     ]
@@ -160,24 +167,31 @@ def _export_matched_and_gather(
             dynamic_table, threshold, batch_size, search_offset, d_count, d_keys, d_vals
         )
 
+        d_embs = d_vals.view(batch_size, total_dim)[:, :dim].contiguous()
+        d_opts = d_vals.view(batch_size, total_dim)[:, dim:].contiguous()
         dist.all_gather(gathered_keys, d_keys, group=pg)
-        dist.all_gather(gathered_vals, d_vals, group=pg)
+        dist.all_gather(gathered_embs, d_embs, group=pg)
+        dist.all_gather(gathered_opts, d_opts, group=pg)
         dist.all_gather(gathered_counts, d_count.to(dtype=torch.int64), group=pg)
 
-        for d_keys_, d_vals_, d_count_ in zip(
-            gathered_keys, gathered_vals, gathered_counts
+        for d_keys_, d_embs_, d_opts_, d_count_ in zip(
+            gathered_keys, gathered_embs, gathered_opts, gathered_counts
         ):
             h_count = d_count_.cpu().item()
             ret_keys[ret_offset : ret_offset + h_count] = d_keys_[0:h_count].cpu()
-            ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = d_vals_[
+            ret_embs[ret_offset * dim : (ret_offset + h_count) * dim] = d_embs_[
                 0 : h_count * dim
             ].cpu()
+            if optim_dim > 0:
+                ret_opts[
+                    ret_offset * optim_dim : (ret_offset + h_count) * optim_dim
+                ] = d_opts_[0 : h_count * optim_dim].cpu()
             ret_offset += h_count
 
         search_offset += batch_size
         d_count.fill_(0)
 
-    return ret_keys, ret_vals
+    return ret_keys, ret_embs, ret_opts
 
 
 def _export_matched(
@@ -193,9 +207,12 @@ def _export_matched(
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
     dim: int = dyn_emb_cols(dynamic_table)
+    optim_dim = dynamic_table.optstate_dim()
+    total_dim = dim + optim_dim
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
-    ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
+    ret_embs = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
+    ret_opts = torch.empty(total_matched * optim_dim, dtype=value_dtype, device="cpu")
     ret_offset = 0
 
     search_offset = 0
@@ -203,7 +220,8 @@ def _export_matched(
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    # d_embs = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     while search_offset < search_capacity:
@@ -213,15 +231,22 @@ def _export_matched(
 
         h_count = d_count.cpu().item()
         ret_keys[ret_offset : ret_offset + h_count] = d_keys[0:h_count].cpu()
-        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = d_vals[
-            0 : h_count * dim
-        ].cpu()
+        ret_embs[ret_offset * dim : (ret_offset + h_count) * dim] = (
+            d_vals.view(batch_size, total_dim)[:h_count, :dim].reshape(-1).cpu()
+        )
+        if optim_dim != 0:
+            ret_opts[ret_offset * optim_dim : (ret_offset + h_count) * optim_dim] = (
+                d_vals.view(batch_size, total_dim)[:h_count, -optim_dim:]
+                .reshape(-1)
+                .cpu()
+            )
+
         ret_offset += h_count
 
         search_offset += batch_size
         d_count.fill_(0)
 
-    return ret_keys, ret_vals
+    return ret_keys, ret_embs, ret_opts
 
 
 class BatchedDynamicEmbeddingTables(nn.Module):
@@ -278,6 +303,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        print(f"initial_accumulator_value: {initial_accumulator_value}")
         assert len(table_options) >= 1
         table_option = table_options[0]
         for other_option in table_options:
@@ -794,11 +820,11 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         for table_name, threshold in zip(table_names, table_thresholds):
             index = self._table_names.index(table_name)
             if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
-                key, value = _export_matched(self._tables[index], threshold)
+                key, emb, opt = _export_matched(self._tables[index], threshold)
             else:
-                key, value = _export_matched_and_gather(
+                key, emb, opt = _export_matched_and_gather(
                     self._tables[index], threshold, pg
                 )
-            ret_tensors[table_name] = (key, value)
+            ret_tensors[table_name] = (key, emb, opt)
             ret_scores[table_name] = self._scores[table_name]
         return ret_tensors, ret_scores

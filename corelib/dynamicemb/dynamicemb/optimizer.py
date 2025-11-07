@@ -229,6 +229,9 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._state_dict["m"] = []
         self._state_dict["v"] = []
 
+        for table in hashtables:
+            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
+
     def update(
         self,
         hashtables: List[DynamicEmbTable],
