@@ -15,28 +15,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
-#include <pybind11/pybind11.h>
+#include "kernels.cuh"
+#include "table.cuh"
 
-namespace py = pybind11;
+namespace dyn_emb {
 
-void bind_dyn_emb_op(py::module &m);
-void bind_unique_op(py::module &m);
-void bind_bucktiz_kernel_op(py::module &m);
-void bind_optimizer_kernel_op(py::module &m);
-void bind_utils(py::module &m);
-void bind_index_calculation_op(py::module &m);
-void bind_initializer_op(py::module &m);
-void bind_table_operation(py::module &m);
+void table_insert(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
+                  int64_t bucket_capacity, at::Tensor bucket_sizes,
+                  at::Tensor keys,
+                  std::vector<std::optional<at::Tensor>> scores,
+                  std::vector<ScorePolicyType> policy_types,
+                  std::vector<bool> is_returns,
+                  std::optional<at::Tensor> values,
+                  std::optional<at::Tensor> insert_results) {}
 
-PYBIND11_MODULE(dynamicemb_extensions, m) {
-  m.doc() = "DYNAMICEMB"; // Optional
-
-  bind_dyn_emb_op(m);
-  bind_unique_op(m);
-  bind_bucktiz_kernel_op(m);
-  bind_optimizer_kernel_op(m);
-  bind_index_calculation_op(m);
-  bind_initializer_op(m);
-  bind_utils(m);
-  bind_table_operation(m);
-}
+} // namespace dyn_emb
