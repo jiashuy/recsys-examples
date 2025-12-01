@@ -35,9 +35,11 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.types import AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -165,6 +167,7 @@ def apply_dmp(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -178,6 +181,7 @@ def apply_dmp(
                 embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
                 emb_num_embeddings = (
                     eb_config.num_embeddings * cache_capacity_ratio
+                    # eb_config.num_embeddings
                     if caching
                     else eb_config.num_embeddings
                 )
@@ -219,6 +223,9 @@ def apply_dmp(
                     * emb_num_embeddings_next_power_of_2
                 )
 
+                admission_counter = KVCounter(
+                    max(1024 * 1024, emb_num_embeddings_next_power_of_2 // 4)
+                )
                 dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
                     global_hbm_for_values=total_hbm_need,
                     score_strategy=score_strategy,
@@ -230,6 +237,8 @@ def apply_dmp(
                     max_capacity=emb_num_embeddings_next_power_of_2,
                     caching=caching,
                     local_hbm_for_values=1024**3,
+                    admit_strategy=admit_strategy,
+                    admission_counter=admission_counter,
                 )
     planner = get_planner(
         eb_configs,
@@ -268,6 +277,7 @@ def create_model(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -303,6 +313,7 @@ def create_model(
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
+        admit_strategy=admit_strategy,
     )
     return model
 
