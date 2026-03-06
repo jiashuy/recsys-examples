@@ -428,8 +428,8 @@ def _prefetch_cache_path(
                 init_vals,
             )
 
-        # 9. Write back evicted to storage (maybe expand storage before insert)
-        # HybridStorage never uses CACHE mode, so only DynamicEmbStorage reaches here.
+        # 9. Write back evicted to storage (expand storage before insert if needed)
+        # Only DynamicEmbStorage uses CACHE mode; HybridStorage does not.
         if num_evicted > 0:
             if isinstance(storage, DynamicEmbStorage):
                 num_new_per_table = _per_table_new_key_counts(
@@ -545,7 +545,7 @@ def _prefetch_hbm_direct_path(
             admitted_scores = missing_scores
             admitted_unique_positions = missing_indices
 
-        # Decide whether to expand Storage before insert (prefetch-time expansion)
+        # Expand storage before insert if needed (HBM direct path)
         num_new_per_table = _per_table_new_key_counts(
             admitted_keys, admitted_tids, state.num_tables, device
         )
@@ -904,7 +904,7 @@ def _generic_forward_path(
 
         values_to_insert = unique_values[positions_in_unique]
 
-        # DEFAULT mode: expand before insert (HybridStorage and other storages use this path).
+        # DEFAULT mode: expand before insert (DynamicEmbStorage or HybridStorage._host).
         if isinstance(storage, DynamicEmbStorage):
             num_new_per_table = _per_table_new_key_counts(
                 keys_to_insert, table_ids_to_insert, storage._state.num_tables, device

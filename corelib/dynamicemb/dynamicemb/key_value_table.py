@@ -280,7 +280,8 @@ def create_table_state(
 
 
 # ---------------------------------------------------------------------------
-# Storage expansion (prefetch: decide and maybe expand before insert)
+# Storage expansion (expand before insert when needed)
+# Used in: prefetch HBM direct, cache write-back, generic forward, HybridStorage.load
 # ---------------------------------------------------------------------------
 
 
@@ -314,14 +315,15 @@ def _expand_key_index_map_and_tables_2x(
 ) -> None:
     """Expand key_index_map and table for the given tables only.
 
-    For tables that need expand: (1) create new key_index_map with 2x per_table_capacity for
-    those tables; (2) extend existing ExtendableBuffer for those tables; (3) for each such
-    table, for each export batch (key, score, src_index): insert that batch into new
+    For tables that need expand: (1) create new key_index_map with 2x per_table_capacity
+    for those tables; (2) extend existing ExtendableBuffer for those tables; (3) for each
+    such table, for each export batch (key, score, src_index): insert that batch into new
     key_index_map, load values at src_index, collect (dst_index, values), then store each
     batch's values to dst_index (no key concatenation; load-then-store per batch avoids
-    src/dst overlap). For tables that do not expand, key_index_map for that table is copied
-    directly from the old key_index_map (copy_table_from). Other fields (e.g. overflow) stay
-    consistent. Mutates state."""
+    src/dst overlap). For tables that do not expand, key_index_map for that table is
+    copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
+    capacity, overflow_offsets; state.no_eviction_next_index is not changed (expansion
+    does not change the key set). Mutates state."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -395,12 +397,20 @@ def maybe_expand_storage_before_insert(
 ) -> None:
     """Decide whether to expand Storage (key_index_map and/or table) before insert; do it if needed.
 
-    Non-NO_EVICTION: use max_load_factor and max_capacity; only the table(s) that need to expand
-    get their key_index_map per_table_capacity and table buffer doubled (others unchanged).
+    Callers must invoke this on the relevant state before insert. It is used in:
+    prefetch HBM direct, cache write-back (DynamicEmbStorage), generic forward
+    (DynamicEmbStorage or HybridStorage._host), and HybridStorage.load (before
+    inserting evicted keys into _host).
 
-    NO_EVICTION: key_index_map uses effective max_load_factor=0.5. Expand key_index_map (and table)
-    when (1) table row count does not fit new keys (needed > table_rows), or (2) key_index_map
-    would be full (size + n_new > capacity). Then _expand_key_index_map_and_tables_2x doubles both.
+    Non-NO_EVICTION: use max_load_factor and max_capacity; only the table(s) that
+    need to expand get their key_index_map per_table_capacity and table buffer
+    doubled (others unchanged).
+
+    NO_EVICTION: key_index_map uses effective max_load_factor=0.5. Expand
+    key_index_map (and table) when (1) table row count does not fit new keys
+    (needed > table_rows), or (2) key_index_map would be full
+    (size + n_new > capacity). _expand_key_index_map_and_tables_2x doubles both
+    for the affected table(s).
     """
     from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 
@@ -1777,6 +1787,7 @@ class HybridStorage(Storage):
             store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
 
             if num_evicted != 0:
+                # Expand host tier if needed before inserting evicted keys (supports NO_EVICTION).
                 num_new_per_table = _per_table_new_key_counts(
                     evicted_keys,
                     evicted_table_ids,
