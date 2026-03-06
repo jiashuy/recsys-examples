@@ -15,14 +15,12 @@
 
 import pytest
 import torch
-from dynamicemb.extendable_tensor import HostExtendableBuffer
+from dynamicemb.extendable_tensor import DeviceExtendableBuffer, HostExtendableBuffer
 
 
 @pytest.mark.parametrize("init_capacity", [1, 1023, 1024, 1 << 30])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "buffer", [HostExtendableBuffer]
-)  # [DeviceExtendableBuffer, HostExtendableBuffer])
+@pytest.mark.parametrize("buffer", [DeviceExtendableBuffer, HostExtendableBuffer])
 def test_vmm_buffer(init_capacity, dtype, buffer):
     device = torch.device("cuda", torch.cuda.current_device())
 
@@ -32,6 +30,9 @@ def test_vmm_buffer(init_capacity, dtype, buffer):
     real_capaicty = buffer.capacity()
     pointer = buffer.tensor().data_ptr()
     print(f"Base address: {hex(pointer)}")
+
+    print(f"buffer.tensor().is_cuda: {buffer.tensor().is_cuda}")
+    print(f"buffer.is_device_buffer(): {buffer.is_device_buffer()}")
 
     try:
         while True:

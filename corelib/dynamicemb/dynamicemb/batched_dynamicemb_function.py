@@ -158,9 +158,12 @@ class PrefetchState:
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
+    """True if values live in GPU device memory (HBM). Use buffer type, not
+    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
+    """
     return (
         isinstance(storage, DynamicEmbStorage)
-        and storage._state.tables[0].tensor().is_cuda
+        and storage._state.tables[0].is_device_buffer()
     )
 
 

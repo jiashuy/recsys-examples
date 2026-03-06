@@ -21,6 +21,10 @@ from dynamicemb_extensions import HostVMMTensor, VMMTensor
 
 
 class ExtendableBuffer(abc.ABC):
+    """Base for host/device extendable buffers. Use is_device_buffer to distinguish
+    device (HBM) from host; tensor.is_cuda can be True for host memory registered
+    to CUDA address space and is not reliable for this."""
+
     @abc.abstractmethod
     def capacity(self) -> int:
         capacity: int
@@ -35,6 +39,11 @@ class ExtendableBuffer(abc.ABC):
         tensor: torch.Tensor
         return tensor
 
+    def is_device_buffer(self) -> bool:
+        """True if storage is GPU device memory (HBM); False if host memory.
+        Prefer this over tensor().is_cuda when host may be CUDA-registered."""
+        return False
+
 
 class DeviceExtendableBuffer(ExtendableBuffer):
     def __init__(self, capacity, dtype, device: torch.device = None):
@@ -45,6 +54,9 @@ class DeviceExtendableBuffer(ExtendableBuffer):
         self._device = device_id
 
         self.vmm_tensor = VMMTensor(capacity, dtype, device_id)
+
+    def is_device_buffer(self) -> bool:
+        return True
 
     def extend(self, capacity) -> None:
         torch.cuda.synchronize()
