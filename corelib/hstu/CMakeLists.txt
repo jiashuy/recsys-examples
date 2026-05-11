@@ -28,7 +28,8 @@ set(CUDA_SEPARABLE_COMPILATION ON)
 
 #if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   foreach(arch_name ${SM})
-      if (arch_name STREQUAL 90 OR
+      if (arch_name STREQUAL 100 OR
+          arch_name STREQUAL 90 OR
           arch_name STREQUAL 80 OR
           arch_name STREQUAL 89 OR
           arch_name STREQUAL 75 OR

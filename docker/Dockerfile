@@ -45,7 +45,7 @@ RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
-    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
+    python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
 
 # -- Layer 4: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
@@ -66,7 +66,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    HSTU_ARCH_LIST="8.0 9.0" \
+    HSTU_ARCH_LIST="8.0 9.0 10.0" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
@@ -84,7 +84,7 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     mv nvcomp-linux-x86_64-5.1.0.21_cuda12-archive nvcomp && \
     rm nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
       ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \

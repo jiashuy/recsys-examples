@@ -28,17 +28,6 @@ namespace dyn_emb {
 #define EV_NUM 32
 #define WARP_SIZE 32
 
-DEVICE_INLINE unsigned int GlobalThreadId() {
-  unsigned int smid;
-  unsigned int warpid;
-  unsigned int laneid;
-  asm("mov.u32 %0, %%smid;" : "=r"(smid));
-  asm("mov.u32 %0, %%warpid;" : "=r"(warpid));
-  asm("mov.u32 %0, %%laneid;" : "=r"(laneid));
-  /// TODO: align with device property.
-  return smid * 2048 + warpid * 32 + laneid;
-}
-
 template <typename T> struct Vec4T {};
 
 template <> struct Vec4T<__half> {
