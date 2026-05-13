@@ -53,7 +53,14 @@ print('skip:already fixed') if '--device-entity-has-hidden-visibility=false' in 
     cd fbgemm/fbgemm_gpu && \
     MAX_JOBS=32 python setup.py install --build-target=default --build-variant=cuda \
     -DTORCH_CUDA_ARCH_LIST="10.0" \
-    '-DCMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false -static-global-template-stub=false'
+    '-DCMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false -static-global-template-stub=false' && \
+    (command -v patchelf >/dev/null || apt-get update && apt-get install -y patchelf) && \
+    cd /usr/local/lib/python3.12/dist-packages/fbgemm_gpu && \
+    for lib in fbgemm_gpu_tbe_training_backward_vbe.so \
+               fbgemm_gpu_tbe_training_backward_gwd.so \
+               fbgemm_gpu_tbe_training_backward_dense.so; do \
+        patchelf --add-needed fbgemm_gpu_tbe_training_backward.so "$lib"; \
+    done
 
 # -- Layer 4: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
