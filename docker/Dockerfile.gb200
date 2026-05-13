@@ -36,7 +36,7 @@ RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
-    python setup.py install --build-target=default --build-variant=cuda \
+    MAX_JOBS=32 python setup.py install --build-target=default --build-variant=cuda \
     -DTORCH_CUDA_ARCH_LIST="10.0"
 
 # -- Layer 4: TorchRec ---
@@ -52,7 +52,7 @@ import re, pathlib; f=pathlib.Path('setup.py'); c=f.read_text(); \
 patched=re.sub(r'def get_package_version\(\):.*?(?=\ndef |\nclass |\Z)', \
 'def get_package_version():\n    return \"2.7.4+local\"\n\n', c, flags=re.DOTALL); \
 f.write_text(patched); print('Patched get_package_version')" && \
-    pip install --no-deps --no-build-isolation -e .
+    MAX_JOBS=32 pip install --no-deps --no-build-isolation -e .
 
 # Install fbgemm_gpu_hstu targeting Blackwell only
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
@@ -64,7 +64,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
     HSTU_ARCH_LIST="10.0" \
-    pip install --no-build-isolation . && \
+    MAX_JOBS=32 pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
 FROM --platform=linux/arm64 ${DEVEL_IMAGE} AS build
@@ -76,19 +76,19 @@ WORKDIR /workspace/recsys-examples
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
-    python setup.py install && \
+    MAX_JOBS=32 python setup.py install && \
     cd /workspace/deps && rm -rf nvcomp && \
     wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-aarch64/nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
     tar -xf nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
     mv nvcomp-linux-aarch64-5.1.0.21_cuda12-archive nvcomp && \
     rm nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
-    TORCH_CUDA_ARCH_LIST="10.0" python3 setup.py install && \
+    MAX_JOBS=32 TORCH_CUDA_ARCH_LIST="10.0" python3 setup.py install && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/aarch64-linux-gnu/libcuda.so.1 && \
       ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1 \
             /usr/lib/aarch64-linux-gnu/libcuda.so.1 && \
       cd /workspace/recsys-examples/corelib/dynamicemb && \
       mkdir -p torch_binding_build && cd torch_binding_build && \
-      cmake .. && make -j; \
+      cmake .. && make -j32; \
     fi
