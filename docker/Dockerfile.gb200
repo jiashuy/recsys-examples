@@ -52,7 +52,8 @@ new='PROPERTIES COMPILE_OPTIONS\n            \"\${args_NVCC_FLAGS}\")\n        i
 print('skip:already fixed') if '--device-entity-has-hidden-visibility=false' in c else (f.write_text(c.replace(old,new,1)) or print('patched GpuCppLibrary.cmake'))" && \
     cd fbgemm/fbgemm_gpu && \
     MAX_JOBS=32 python setup.py install --build-target=default --build-variant=cuda \
-    -DTORCH_CUDA_ARCH_LIST="10.0"
+    -DTORCH_CUDA_ARCH_LIST="10.0" \
+    '-DCMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false -static-global-template-stub=false'
 
 # -- Layer 4: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
