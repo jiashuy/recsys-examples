@@ -5,7 +5,8 @@
 
 set -e
 
-DEPS_DIR="${DEPS_DIR:-/lustre/fsw/coreai_devtech_all/jiashuy/GR-mon5-11/deps}"
+REPO_ROOT="${REPO_ROOT:-/lustre/fsw/coreai_devtech_all/jiashuy/GR-mon5-11}"
+DEPS_DIR="${DEPS_DIR:-${REPO_ROOT}/deps}"
 INSTALL_PREFIX="${DEPS_DIR}/python_pkgs"
 SRC_DIR="${DEPS_DIR}/src"
 
@@ -50,7 +51,25 @@ echo ">>> [5/8] flash-attention (arbitrary_mask)"
 [ -d "${SRC_DIR}/flash-attention" ] || \
   git clone -b arbitrary_mask https://github.com/jiayus-nvidia/flash-attention.git "${SRC_DIR}/flash-attention"
 cd "${SRC_DIR}/flash-attention"
-FLASH_ATTN_LOCAL_VERSION=nv pip install --no-deps --no-build-isolation -e .
+# Patch get_package_version to return a fixed version string,
+# bypassing NGC torch version parsing which fails on non-standard version strings
+# like "2.11.0a0+eb65b36914.nv26.02"
+python3 - << 'PYEOF'
+import re, pathlib
+f = pathlib.Path("setup.py")
+c = f.read_text()
+patched = re.sub(
+    r"def get_package_version\(\):.*?(?=\ndef |\nclass |\Z)",
+    'def get_package_version():\n    return "2.7.4+local"\n\n',
+    c, flags=re.DOTALL
+)
+if patched != c:
+    f.write_text(patched)
+    print("Patched get_package_version for NGC torch compatibility")
+else:
+    print("WARNING: get_package_version pattern not found, proceeding without patch")
+PYEOF
+pip install --no-deps --no-build-isolation -e .
 
 echo ">>> [6/8] fbgemm_gpu_hstu (Blackwell only)"
 FBGEMM_HSTU_DIR="${SRC_DIR}/fbgemm_hstu"
@@ -85,4 +104,5 @@ cd "${REPO_ROOT}/examples/commons"
 TORCH_CUDA_ARCH_LIST="10.0" python3 setup.py install --prefix="${INSTALL_PREFIX}"
 
 echo ">>> All dependencies installed to: ${DEPS_DIR}"
-echo ">>> To use, set: export PYTHONPATH=${INSTALL_PREFIX}/lib/pythonX.Y/site-packages:\$PYTHONPATH"
+PY_VER=$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+echo ">>> To use, set: export PYTHONPATH=${INSTALL_PREFIX}/lib/${PY_VER}/site-packages:\$PYTHONPATH"

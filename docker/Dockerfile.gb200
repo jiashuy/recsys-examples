@@ -47,7 +47,12 @@ RUN pip install --no-deps tensordict orjson && \
 
 RUN git clone -b arbitrary_mask https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
-    pip install --no-deps -e .
+    python3 -c "\
+import re, pathlib; f=pathlib.Path('setup.py'); c=f.read_text(); \
+patched=re.sub(r'def get_package_version\(\):.*?(?=\ndef |\nclass |\Z)', \
+'def get_package_version():\n    return \"2.7.4+local\"\n\n', c, flags=re.DOTALL); \
+f.write_text(patched); print('Patched get_package_version')" && \
+    pip install --no-deps --no-build-isolation -e .
 
 # Install fbgemm_gpu_hstu targeting Blackwell only
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
