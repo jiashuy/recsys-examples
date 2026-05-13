@@ -104,10 +104,10 @@ COPY . .
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     MAX_JOBS=32 python setup.py install && \
     cd /workspace/deps && rm -rf nvcomp && \
-    wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-aarch64/nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
-    tar -xf nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
-    mv nvcomp-linux-aarch64-5.1.0.21_cuda12-archive nvcomp && \
-    rm nvcomp-linux-aarch64-5.1.0.21_cuda12-archive.tar.xz && \
+    wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-sbsa/nvcomp-linux-sbsa-5.1.0.21_cuda13-archive.tar.xz && \
+    tar -xf nvcomp-linux-sbsa-5.1.0.21_cuda13-archive.tar.xz && \
+    mv nvcomp-linux-sbsa-5.1.0.21_cuda13-archive nvcomp && \
+    rm nvcomp-linux-sbsa-5.1.0.21_cuda13-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
     MAX_JOBS=32 TORCH_CUDA_ARCH_LIST="10.0" python3 setup.py install && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
