@@ -38,26 +38,32 @@ RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron
 # sm_75 and sm_86 are x86-only SKUs; GB200 only needs sm_100
 # Uninstall the base image's pre-built fbgemm_gpu first to avoid mixed .so conflicts
 #
-# Two CUDA 13 + cross-.so weak symbol issues are addressed at build time:
-#   1. CMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false
-#      -static-global-template-stub=false
-#      CUDA 13 defaults __global__ template host-stubs to STV_HIDDEN, making
-#      grad_mean_vbe_kernel (defined in _backward.so) invisible to _vbe.so at
-#      runtime. These flags restore STV_DEFAULT visibility.
-#   2. CMAKE_SHARED_LINKER_FLAGS=-Wl,--no-as-needed
-#      ld's default --as-needed drops a shared library from DT_NEEDED when its
-#      only contribution is weak symbols (which all template kernel host-stubs
-#      are). Without this flag _vbe/_gwd/_dense .so lose their DT_NEEDED on
-#      _backward.so and dlopen fails. --no-as-needed keeps every
-#      target_link_libraries dependency in DT_NEEDED.
+# Patch GpuCppLibrary.cmake: v1.5.0 predates the CUDA 13 visibility fix.
+# CUDA 13+ defaults __global__ functions to hidden visibility, causing
+# grad_mean_vbe_kernel (defined in _backward.so) to be invisible to _vbe.so
+# at runtime despite correct DT_NEEDED linkage.
+# Fix: add -static-global-template-stub=false --device-entity-has-hidden-visibility=false
+# (same fix present in third_party/FBGEMM commit eb1ae89a).
 RUN pip uninstall -y fbgemm-gpu fbgemm-gpu-nightly 2>/dev/null || true && \
     pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
+    python3 -c "import pathlib; \
+f=pathlib.Path('fbgemm/cmake/modules/GpuCppLibrary.cmake'); \
+c=f.read_text(); \
+old='PROPERTIES COMPILE_OPTIONS\n            \"\${args_NVCC_FLAGS}\")'; \
+new='PROPERTIES COMPILE_OPTIONS\n            \"\${args_NVCC_FLAGS}\")\n        if((FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA) AND\n            (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL \"13.0\"))\n            set_source_files_properties(\${\${args_PREFIX}_sources_cu}\n                PROPERTIES COMPILE_OPTIONS\n                \"\${args_NVCC_FLAGS};-static-global-template-stub=false;--device-entity-has-hidden-visibility=false\")\n        endif()'; \
+print('skip:already fixed') if '--device-entity-has-hidden-visibility=false' in c else (f.write_text(c.replace(old,new,1)) or print('patched GpuCppLibrary.cmake'))" && \
     cd fbgemm/fbgemm_gpu && \
     MAX_JOBS=32 python setup.py install --build-target=default --build-variant=cuda \
     -DTORCH_CUDA_ARCH_LIST="10.0" \
-    '-DCMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false -static-global-template-stub=false' \
-    '-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--no-as-needed'
+    '-DCMAKE_CUDA_FLAGS=--device-entity-has-hidden-visibility=false -static-global-template-stub=false' && \
+    (command -v patchelf >/dev/null || apt-get update && apt-get install -y patchelf) && \
+    cd /usr/local/lib/python3.12/dist-packages/fbgemm_gpu && \
+    for lib in fbgemm_gpu_tbe_training_backward_vbe.so \
+               fbgemm_gpu_tbe_training_backward_gwd.so \
+               fbgemm_gpu_tbe_training_backward_dense.so; do \
+        patchelf --add-needed fbgemm_gpu_tbe_training_backward.so "$lib"; \
+    done
 
 # -- Layer 4: TorchRec ---
 RUN pip install --no-deps tensordict orjson && \
