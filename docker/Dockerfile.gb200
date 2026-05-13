@@ -33,8 +33,23 @@ RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron
 
 # -- Layer 3: FBGEMM (long build, own layer for caching) ---
 # sm_75 and sm_86 are x86-only SKUs; GB200 only needs sm_100
-RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
+# Uninstall the base image's pre-built fbgemm_gpu first to avoid mixed .so conflicts
+#
+# Patch GpuCppLibrary.cmake: v1.5.0 predates the CUDA 13 visibility fix.
+# CUDA 13+ defaults __global__ functions to hidden visibility, causing
+# grad_mean_vbe_kernel (defined in _backward.so) to be invisible to _vbe.so
+# at runtime despite correct DT_NEEDED linkage.
+# Fix: add -static-global-template-stub=false --device-entity-has-hidden-visibility=false
+# (same fix present in third_party/FBGEMM commit eb1ae89a).
+RUN pip uninstall -y fbgemm-gpu fbgemm-gpu-nightly 2>/dev/null || true && \
+    pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
+    python3 -c "import pathlib; \
+f=pathlib.Path('fbgemm/cmake/modules/GpuCppLibrary.cmake'); \
+c=f.read_text(); \
+old='PROPERTIES COMPILE_OPTIONS\n            \"\${args_NVCC_FLAGS}\")'; \
+new='PROPERTIES COMPILE_OPTIONS\n            \"\${args_NVCC_FLAGS}\")\n        if((FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA) AND\n            (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL \"13.0\"))\n            set_source_files_properties(\${\${args_PREFIX}_sources_cu}\n                PROPERTIES COMPILE_OPTIONS\n                \"\${args_NVCC_FLAGS};-static-global-template-stub=false;--device-entity-has-hidden-visibility=false\")\n        endif()'; \
+print('skip:already fixed') if '--device-entity-has-hidden-visibility=false' in c else (f.write_text(c.replace(old,new,1)) or print('patched GpuCppLibrary.cmake'))" && \
     cd fbgemm/fbgemm_gpu && \
     MAX_JOBS=32 python setup.py install --build-target=default --build-variant=cuda \
     -DTORCH_CUDA_ARCH_LIST="10.0"
