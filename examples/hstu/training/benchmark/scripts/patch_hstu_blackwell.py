@@ -1,29 +1,55 @@
 #!/usr/bin/env python3
-# Idempotent in-place patch for Blackwell (sm_10+).
+# Idempotent in-place patches for Blackwell (sm_10+).
 #
-# Why:
-#   examples/hstu/ops/fused_hstu_op.py unconditionally does
-#       import hstu.hstu_ops_gpu
-#   which tries to register a fake impl for fbgemm::hstu_varlen_fwd_80.
-#   That C++ op is not shipped for sm_10 in the current container, so
-#   `register_fake` raises RuntimeError at import time and the training
-#   process dies before main().
+# Two classes of patches:
 #
-# What this does:
-#   Wraps the offending import in an SM-version check. No-op if already
-#   patched, or if the file does not contain the exact target line.
+#   1) Guard `import hstu.hstu_ops_gpu` in fused_hstu_op.py:
+#      register_fake('fbgemm::hstu_varlen_fwd_80') fails at import time
+#      because the C++ op is not shipped for sm_10.
+#
+#   2) Widen hard-coded SM-version checks `elif sm == 9` (and the
+#      equivalent `elif sm_major_version == 9`) to `elif sm >= 9`,
+#      so Blackwell falls into the Hopper path instead of `raise`.
+#      Affects fused_hstu_op.py (4 sites) and paged_hstu_infer_layer.py.
+#
+# Idempotent: each patch is gated on a marker substring so re-runs are
+# no-ops. Files outside the listed target basenames are ignored.
 
 import pathlib
 import sys
 
-OLD = "import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export"
-NEW = (
-    "import torch as _t\n"
-    "if _t.cuda.is_available() and _t.cuda.get_device_capability() < (10, 0):\n"
-    "    import hstu.hstu_ops_gpu  # noqa: F401  # registers fake impls for torch.export"
-)
+# (target_basename, [(old, new, marker_that_indicates_already_patched), ...])
+RULES = {
+    "fused_hstu_op.py": [
+        (
+            "import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export",
+            (
+                "import torch as _t\n"
+                "if _t.cuda.is_available() and _t.cuda.get_device_capability() < (10, 0):\n"
+                "    import hstu.hstu_ops_gpu  # noqa: F401  # registers fake impls for torch.export"
+            ),
+            "get_device_capability",
+        ),
+        (
+            "elif sm == 9:",
+            "elif sm >= 9:",
+            "elif sm >= 9:",
+        ),
+        (
+            "elif sm_major_version == 9:",
+            "elif sm_major_version >= 9:",
+            "elif sm_major_version >= 9:",
+        ),
+    ],
+    "paged_hstu_infer_layer.py": [
+        (
+            "elif sm == 9:",
+            "elif sm >= 9:",
+            "elif sm >= 9:",
+        ),
+    ],
+}
 
-# Roots scanned by default; override by passing paths as argv.
 DEFAULT_ROOTS = [
     "/Workspace",
     "/workspace",
@@ -32,20 +58,45 @@ DEFAULT_ROOTS = [
     "/root",
 ]
 
+
+def patch_file(p: pathlib.Path, rules) -> int:
+    """Return number of edits applied to *p*."""
+    try:
+        s = p.read_text()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    edits = 0
+    for old, new, marker in rules:
+        # Skip if file shows no sign of the old pattern but already has marker,
+        # or if old isn't in the file at all.
+        if old not in s:
+            continue
+        # If marker is identical to `new`, that's fine: replacement is idempotent
+        # because s.replace(old, new) won't match `new` content.
+        if marker != new and marker in s:
+            continue
+        new_s = s.replace(old, new)
+        if new_s != s:
+            s = new_s
+            edits += 1
+    if edits:
+        p.write_text(s)
+        print(f"[blackwell-patch] {p}  ({edits} edit(s))")
+    return edits
+
+
 roots = sys.argv[1:] or DEFAULT_ROOTS
-patched = 0
+total_files = 0
+total_edits = 0
 for r in roots:
     p_root = pathlib.Path(r)
     if not p_root.exists():
         continue
-    for f in p_root.rglob("fused_hstu_op.py"):
-        try:
-            s = f.read_text()
-        except (OSError, UnicodeDecodeError):
-            continue
-        if OLD in s and "get_device_capability" not in s:
-            f.write_text(s.replace(OLD, NEW))
-            print(f"[blackwell-patch] {f}")
-            patched += 1
+    for basename, rules in RULES.items():
+        for f in p_root.rglob(basename):
+            n = patch_file(f, rules)
+            if n:
+                total_files += 1
+                total_edits += n
 
-print(f"[blackwell-patch] patched {patched} file(s)")
+print(f"[blackwell-patch] patched {total_edits} edit(s) across {total_files} file(s)")

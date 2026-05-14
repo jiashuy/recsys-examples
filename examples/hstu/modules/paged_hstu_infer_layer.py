@@ -154,7 +154,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         sm = torch.cuda.get_device_properties(0).major
         if sm == 8:
             self.addmm_silu_impl = triton_addmm_silu_fwd
-        elif sm == 9:
+        elif sm >= 9:
             self.addmm_silu_impl = torch_addmm_silu_fwd
         else:
             raise ValueError(f"Unsupported SM major version: {sm}")

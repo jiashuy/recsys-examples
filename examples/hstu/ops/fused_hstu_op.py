@@ -197,7 +197,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
                 addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
+            elif sm >= 9:
                 addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm}")
@@ -314,7 +314,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,
                     None,  # rab, func
                 )
-            elif sm_major_version == 9:
+            elif sm_major_version >= 9:
                 assert q.dtype in (
                     torch.bfloat16,
                     torch.float16,
@@ -420,7 +420,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
                 addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
+            elif sm >= 9:
                 addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm}")
@@ -662,7 +662,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,
                     False,  # rab, has_drab, func, deterministic
                 )
-            elif sm_major_version == 9:
+            elif sm_major_version >= 9:
                 assert dout.dtype in (
                     torch.bfloat16,
                     torch.float16,
