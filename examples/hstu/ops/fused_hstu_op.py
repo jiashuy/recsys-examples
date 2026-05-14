@@ -16,10 +16,16 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
-import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
-import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
 import nvtx
 import torch
+
+import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
+
+# Blackwell (sm_10+) ships no fbgemm C++ HSTU kernel, so the fake-impl
+# registration in hstu.hstu_ops_gpu would fail with
+# "operator fbgemm::hstu_varlen_fwd_80 does not exist". Skip it on Blackwell.
+if torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
+    import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
 from commons.utils.clear_tensor_data import clear_tensor_data
 from configs import KernelBackend
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd

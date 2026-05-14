@@ -243,6 +243,7 @@ WRAPPER_EOF
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
         bash -c "
+            (python3 ${HSTU_ROOT}/training/benchmark/scripts/patch_hstu_blackwell.py || true) && \
             nvidia-smi && \
             cd ${HSTU_ROOT} && \
             export PYTHONPATH=${HSTU_ROOT}:${HSTU_ROOT}/..:\${PYTHONPATH} && \
@@ -277,7 +278,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}:${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "(python3 ${HSTU_ROOT}/training/benchmark/scripts/patch_hstu_blackwell.py || true) && nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}:${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
