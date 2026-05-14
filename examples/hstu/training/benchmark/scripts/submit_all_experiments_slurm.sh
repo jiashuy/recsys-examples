@@ -23,6 +23,8 @@
 #   --container-image=IMAGE  Container image (built from docker/Dockerfile)
 #   --nodes=N            Number of nodes (default: 2)
 #   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
+#   --segment=N          SLURM topology segment size (optional, e.g. 18 to keep
+#                        all nodes within a single GB200 NVL72 rack)
 #   --time=HH:MM:SS      Job time limit (default: 00:30:00)
 #   -y, --yes            Skip confirmation prompt
 #   --dry-run            Print sbatch commands only, do not submit
@@ -87,6 +89,7 @@ JOB_PREFIX=""
 CONTAINER_IMAGE=""  # Set to your container image, e.g. built from docker/Dockerfile
 NODES=2
 RANKS_PER_NODE=8
+SEGMENT=""
 TIME_LIMIT="00:30:00"
 DRY_RUN=0
 YES_FLAG=0
@@ -105,7 +108,7 @@ CACHE_DEBUG=${CACHE_DEBUG:-0}
 # Help Information
 # ============================================================================
 show_help() {
-    head -71 "$0" | tail -70
+    head -73 "$0" | tail -72
     exit 0
 }
 
@@ -204,6 +207,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ranks-per-node)
             RANKS_PER_NODE="$2"
+            shift 2
+            ;;
+        --segment=*)
+            SEGMENT="${1#*=}"
+            shift
+            ;;
+        --segment)
+            SEGMENT="$2"
             shift 2
             ;;
         --time=*)
@@ -321,7 +332,7 @@ BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
 if [ -z "$EXP_FILE" ]; then
     echo "⚠️  Missing experiment list file (--exp-file=<file>)"
     echo ""
-    head -71 "$0" | tail -69
+    head -73 "$0" | tail -71
     exit 0
 fi
 
@@ -409,6 +420,7 @@ echo "  Container:        ${CONTAINER_IMAGE}"
 echo "  Nodes:            ${NODES}"
 echo "  Ranks per node:   ${RANKS_PER_NODE}"
 echo "  Total ranks:      $((NODES * RANKS_PER_NODE))"
+[ -n "$SEGMENT" ] && echo "  Segment:          ${SEGMENT}"
 echo "  Time limit:       ${TIME_LIMIT}"
 echo "  Sequential mode:  $([ ${SEQUENTIAL} -eq 1 ] && echo 'YES' || echo 'NO')"
 echo ""
@@ -513,6 +525,9 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
     SBATCH_ARGS+=(--exclusive)
     SBATCH_ARGS+=(--network=sharp)
+    if [ -n "$SEGMENT" ]; then
+        SBATCH_ARGS+=(--segment="${SEGMENT}")
+    fi
     
     # Sequential execution mode: add dependency
     if [ ${SEQUENTIAL} -eq 1 ] && [ -n "$PREV_JOB_ID" ]; then
@@ -581,6 +596,7 @@ if [ ${DRY_RUN} -eq 0 ]; then
         echo "  Container:        ${CONTAINER_IMAGE}"
         echo "  Nodes:            ${NODES}"
         echo "  Ranks per node:   ${RANKS_PER_NODE}"
+        [ -n "$SEGMENT" ] && echo "  Segment:          ${SEGMENT}"
         echo "  Time limit:       ${TIME_LIMIT}"
         echo "  Sequential:       $([ ${SEQUENTIAL} -eq 1 ] && echo 'YES' || echo 'NO')"
         echo "  NSYS Profiling:   $([ ${ENABLE_NSYS} -eq 1 ] && echo 'YES' || echo 'NO')"
