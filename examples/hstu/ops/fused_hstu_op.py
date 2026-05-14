@@ -345,18 +345,22 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             elif sm_major_version >= 10:
                 # Blackwell: the fbgemm C++ HSTU kernel is not shipped for sm_10,
                 # so route through hstu's Blackwell-native Triton kernel.
-                # We're inside FusedHSTULayerFunction.forward (a torch.autograd.Function);
-                # backward recomputes via autograd, mirroring fbgemm's stateless pattern.
+                # The installed hstu.hstu_attn_varlen_func keeps the fbgemm-style
+                # signature with seqused_q/seqused_k/scaling_seqlen as required
+                # positionals.
                 import hstu as _hstu_mod
                 with torch.no_grad():
                     jagged_attn_output = _hstu_mod.hstu_attn_varlen_func(
                         q,
                         k,
                         v,
-                        cu_seqlens_q=seq_offsets_q,
-                        cu_seqlens_k=seq_offsets_q,
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_k=max_seqlen_q,
+                        seq_offsets_q,   # cu_seqlens_q
+                        seq_offsets_q,   # cu_seqlens_k
+                        None,            # seqused_q
+                        None,            # seqused_k
+                        max_seqlen_q,
+                        max_seqlen_q,    # max_seqlen_k
+                        scaling_seqlen,
                         num_contexts=num_contexts,
                         num_targets=num_targets,
                         target_group_size=target_group_size,
@@ -744,10 +748,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                         q_g,
                         k_g,
                         v_g,
-                        cu_seqlens_q=seq_offsets_q,
-                        cu_seqlens_k=seq_offsets_q,
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_k=max_seqlen_q,
+                        seq_offsets_q,   # cu_seqlens_q
+                        seq_offsets_q,   # cu_seqlens_k
+                        None,            # seqused_q
+                        None,            # seqused_k
+                        max_seqlen_q,
+                        max_seqlen_q,    # max_seqlen_k
+                        scaling_seqlen,
                         num_contexts=num_contexts,
                         num_targets=num_targets,
                         target_group_size=target_group_size,
