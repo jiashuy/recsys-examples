@@ -30,16 +30,20 @@ RULES = {
             ),
             "get_device_capability",
         ),
+        # Widen the addmm/silu dispatch (uses bare `sm`) so Blackwell falls
+        # into the Hopper branch which uses torch_addmm — works on cuBLAS.
         (
             "elif sm == 9:",
             "elif sm >= 9:",
             "elif sm >= 9:",
         ),
-        (
-            "elif sm_major_version == 9:",
-            "elif sm_major_version >= 9:",
-            "elif sm_major_version >= 9:",
-        ),
+        # NOTE: do NOT auto-widen `elif sm_major_version == 9:` — those are
+        # the HSTU attention dispatch sites and the SM9 branch calls
+        # fbgemm.hstu_varlen_fwd_90/bwd_90, which the Blackwell container
+        # does not ship. The host-side source already adds an explicit
+        # `elif sm_major_version >= 10:` branch that routes Blackwell to
+        # hstu.hstu_attn_varlen_func. Widening here would silently funnel
+        # Blackwell back into the broken fbgemm sm90 path.
     ],
     "paged_hstu_infer_layer.py": [
         (

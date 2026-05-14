@@ -314,7 +314,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,
                     None,  # rab, func
                 )
-            elif sm_major_version >= 9:
+            elif sm_major_version == 9:
                 assert q.dtype in (
                     torch.bfloat16,
                     torch.float16,
@@ -342,6 +342,27 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     -1,
                     output_dtype,  # quant_mode, output_dtype
                 )
+            elif sm_major_version >= 10:
+                # Blackwell: the fbgemm C++ HSTU kernel is not shipped for sm_10,
+                # so route through hstu's Blackwell-native Triton kernel.
+                # We're inside FusedHSTULayerFunction.forward (a torch.autograd.Function);
+                # backward recomputes via autograd, mirroring fbgemm's stateless pattern.
+                import hstu as _hstu_mod
+                with torch.no_grad():
+                    jagged_attn_output = _hstu_mod.hstu_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q=seq_offsets_q,
+                        cu_seqlens_k=seq_offsets_q,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_q,
+                        num_contexts=num_contexts,
+                        num_targets=num_targets,
+                        target_group_size=target_group_size,
+                        window_size=(-1, 0),
+                        alpha=alpha,
+                    )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             # in case of padding
@@ -662,7 +683,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,
                     False,  # rab, has_drab, func, deterministic
                 )
-            elif sm_major_version >= 9:
+            elif sm_major_version == 9:
                 assert dout.dtype in (
                     torch.bfloat16,
                     torch.float16,
@@ -710,6 +731,34 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     output_dtype,
                     False,  # deterministic
                 )
+            elif sm_major_version >= 10:
+                # Blackwell: recompute fwd with grad enabled, then extract
+                # dq/dk/dv via autograd. Mirrors how fbgemm bwd recomputes
+                # internally from q/k/v alone.
+                import hstu as _hstu_mod
+                q_g = q.detach().requires_grad_(True)
+                k_g = k.detach().requires_grad_(True)
+                v_g = v.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    _out = _hstu_mod.hstu_attn_varlen_func(
+                        q_g,
+                        k_g,
+                        v_g,
+                        cu_seqlens_q=seq_offsets_q,
+                        cu_seqlens_k=seq_offsets_q,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_q,
+                        num_contexts=num_contexts,
+                        num_targets=num_targets,
+                        target_group_size=target_group_size,
+                        window_size=(window_size_left, window_size_right),
+                        alpha=alpha,
+                    )
+                    dq, dk, dv = torch.autograd.grad(
+                        outputs=_out,
+                        inputs=(q_g, k_g, v_g),
+                        grad_outputs=dout,
+                    )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
 
