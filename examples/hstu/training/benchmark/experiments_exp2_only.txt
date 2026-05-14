@@ -1,0 +1,2 @@
+# Single-experiment list: only exp2 (CUTLASS attention)
+exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05
