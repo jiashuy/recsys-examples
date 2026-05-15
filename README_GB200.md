@@ -12,7 +12,7 @@ clusters (`dynamicemb` distributed embedding example on MovieLens-1M).
 docker.io/jiashuyao/distributed-recommender:arm_gb200
 ```
 
-Browse at <https://hub.docker.com/repository/docker/jiashuyao/distributed-recommender/general>.
+Browse at <https://hub.docker.com/r/jiashuyao/distributed-recommender>.
 
 **Mirror (internal NVIDIA GitLab registry, requires PAT):**
 
