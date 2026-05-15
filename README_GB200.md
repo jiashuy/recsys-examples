@@ -6,14 +6,24 @@ clusters (`dynamicemb` distributed embedding example on MovieLens-1M).
 
 ## 1. Container image
 
-**Image (in registry):**
+**Image (public, on Docker Hub):**
+
+```
+docker.io/jiashuyao/distributed-recommender:arm_gb200
+```
+
+Browse at <https://hub.docker.com/repository/docker/jiashuyao/distributed-recommender/general>.
+
+**Mirror (internal NVIDIA GitLab registry, requires PAT):**
 
 ```
 gitlab-master.nvidia.com/devtech-compute/distributed-recommender:arm_gb200
 ```
 
 The image is `linux/arm64`, built on top of an NGC PyTorch base and
-provisioned with FBGEMM, torchrec, and dynamicemb.
+provisioned with FBGEMM, torchrec, and dynamicemb. Pull from Docker Hub
+needs no authentication; the GitLab mirror is gated by an internal
+PAT (see section 3).
 
 ## 2. How the image is built
 
@@ -47,9 +57,12 @@ The image lands in the GitLab registry once the buildx push completes.
 
 ## 3. SLURM authentication for pyxis
 
-Pyxis/enroot does **not** read `~/.docker/config.json`. Put the GitLab
-PAT (with `read_registry` scope) in `~/.config/enroot/.credentials`
-(`chmod 600`), one line:
+If you pull from **Docker Hub** (`jiashuyao/distributed-recommender:arm_gb200`)
+no authentication is needed — it is a public image.
+
+If you pull from the **internal GitLab mirror**, pyxis/enroot does **not**
+read `~/.docker/config.json`. Put the GitLab PAT (with `read_registry`
+scope) in `~/.config/enroot/.credentials` (`chmod 600`), one line:
 
 ```
 machine gitlab-master.nvidia.com login <gitlab-username> password <PAT-token>
