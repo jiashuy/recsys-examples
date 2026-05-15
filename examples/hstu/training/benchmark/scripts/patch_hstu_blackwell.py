@@ -70,6 +70,21 @@ PER_FILE_RULES = {
             "elif sm >= 9:",
         ),
     ],
+    # The Blackwell HSTU bwd kernel asserts that the input tensors have a
+    # specific stride_order (e.g. (4, 3, 2, 0, 1)) when wrapping via
+    # cutlass.cute.from_dlpack(...).mark_compact_shape_dynamic(...). If the
+    # incoming tensor is non-contiguous (or has a stride order produced by
+    # autograd that doesn't match), the DSL raises:
+    #     RuntimeError: The stride_order is not consistent with the layout
+    # Force a .contiguous() right before from_dlpack so the wrapped tensor
+    # always has a well-defined stride pattern.
+    "hstu_ops_gpu.py": [
+        (
+            ".detach(), assumed_align=16",
+            ".detach().contiguous(), assumed_align=16",
+            ".detach().contiguous(), assumed_align=16",
+        ),
+    ],
     # The Blackwell HSTU Triton kernel only accepts head_dim ∈ {64, 128},
     # but the benchmark default is 4 heads × kv_channels=256. Re-pivot to
     # 8 heads × 128 = same 1024 hidden size, head_dim valid for sm_10.
@@ -125,8 +140,14 @@ def patch_file(p: pathlib.Path, rules) -> int:
             s = new_s
             edits += 1
     if edits:
-        p.write_text(s)
-        print(f"[blackwell-patch] {p}  ({edits} edit(s))")
+        try:
+            p.write_text(s)
+            print(f"[blackwell-patch] {p}  ({edits} edit(s))")
+        except (PermissionError, OSError) as e:
+            # Read-only copies (e.g. stale clones owned by another user
+            # under /Workspace/tmp/) — don't take down the whole sweep.
+            print(f"[blackwell-patch] SKIP {p}  ({type(e).__name__}: {e})")
+            return 0
     return edits
 
 
