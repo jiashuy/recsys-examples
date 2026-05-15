@@ -8,7 +8,10 @@ set -euo pipefail
 # but reshaped for srun + pyxis on a multi-node SLURM allocation.
 
 MASTER_PORT="${MASTER_PORT:-29500}"
-MASTER_ADDR_FILE=/Workspace/.master_addr.example.$SLURM_JOB_ID
+# Put the master-addr coordination file in CWD (set by --container-workdir),
+# which is the same shared-mount path on every node — works for both
+# dlcluster (/Workspace) and lyris (/lustre).
+MASTER_ADDR_FILE="$(pwd)/.master_addr.example.$SLURM_JOB_ID"
 
 {
   if [ "${SLURM_NODEID}" = "0" ]; then
