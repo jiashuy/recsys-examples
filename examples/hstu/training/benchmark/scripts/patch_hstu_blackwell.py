@@ -53,6 +53,15 @@ PER_FILE_RULES = {
         # does not ship. The host-side source adds an explicit
         # `elif sm_major_version >= 10:` branch that routes Blackwell to
         # hstu.hstu_attn_varlen_func.
+        #
+        # Blackwell HSTU Triton kernel does NOT support context mask; force
+        # num_contexts=None for our SM10 fwd/bwd dispatch sites. (No-op on
+        # any baked-in copy that doesn't already have the SM10 branch.)
+        (
+            "num_contexts=num_contexts,",
+            "num_contexts=None,  # Blackwell kernel rejects context mask",
+            "num_contexts=None",
+        ),
     ],
     "paged_hstu_infer_layer.py": [
         (

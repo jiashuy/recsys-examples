@@ -345,9 +345,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             elif sm_major_version >= 10:
                 # Blackwell: the fbgemm C++ HSTU kernel is not shipped for sm_10,
                 # so route through hstu's Blackwell-native Triton kernel.
-                # The installed hstu.hstu_attn_varlen_func keeps the fbgemm-style
-                # signature with seqused_q/seqused_k/scaling_seqlen as required
-                # positionals.
+                # NOTE: the Blackwell Triton kernel does NOT support the context
+                # mask (asserts num_contexts is None / all-zero). Pass None here
+                # — this drops the context-mask feature on Blackwell, which is
+                # acceptable for throughput benchmarking but does change
+                # attention semantics vs. the H100 cutlass path.
                 import hstu as _hstu_mod
                 with torch.no_grad():
                     jagged_attn_output = _hstu_mod.hstu_attn_varlen_func(
@@ -361,7 +363,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                         max_seqlen_q,
                         max_seqlen_q,    # max_seqlen_k
                         scaling_seqlen,
-                        num_contexts=num_contexts,
+                        num_contexts=None,
                         num_targets=num_targets,
                         target_group_size=target_group_size,
                         window_size=(-1, 0),
@@ -755,7 +757,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                         max_seqlen_q,
                         max_seqlen_q,    # max_seqlen_k
                         scaling_seqlen,
-                        num_contexts=num_contexts,
+                        num_contexts=None,   # Blackwell kernel rejects context mask; see fwd
                         num_targets=num_targets,
                         target_group_size=target_group_size,
                         window_size=(window_size_left, window_size_right),
