@@ -61,6 +61,21 @@ PER_FILE_RULES = {
             "elif sm >= 9:",
         ),
     ],
+    # The Blackwell HSTU Triton kernel only accepts head_dim ∈ {64, 128},
+    # but the benchmark default is 4 heads × kv_channels=256. Re-pivot to
+    # 8 heads × 128 = same 1024 hidden size, head_dim valid for sm_10.
+    "generate_gin_config.py": [
+        (
+            "NetworkArgs.num_attention_heads = 4",
+            "NetworkArgs.num_attention_heads = 8",
+            "NetworkArgs.num_attention_heads = 8",
+        ),
+        (
+            "NetworkArgs.kv_channels = 256",
+            "NetworkArgs.kv_channels = 128",
+            "NetworkArgs.kv_channels = 128",
+        ),
+    ],
 }
 
 # Global rules: applied to every .py file under the search roots.
