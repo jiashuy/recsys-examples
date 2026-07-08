@@ -298,6 +298,86 @@ def test_lru_lfu_custom_score_function_overrides_ranking(current_device):
     ), "custom score_function should evict the HIGH-frequency (hot) keys first"
 
 
+def _evict_oldest(scores, cur_timestamp, gamma):
+    # Pure LRU: rank by recency only, ignoring frequency. age = elapsed time
+    # since last access = cur_timestamp - scores[0] (a non-negative uint64 -- note
+    # the order: scores[0] - cur_timestamp would underflow). Eviction removes the
+    # LOWEST score, so returning -age evicts the LARGEST age (the oldest key).
+    return -float(cur_timestamp - scores[0])
+
+
+def test_lru_lfu_custom_decay_by_timestamp(current_device):
+    """A timestamp-based decay (age = cur_timestamp - scores[0]) evicts the OLDEST
+    key even when it has the HIGHEST frequency -- exercises the timestamp
+    subtraction path (must not underflow) and proves a recency decay overrides the
+    default LFU ranking (which would keep the high-frequency key)."""
+    from dynamicemb.jit import register_score_function
+
+    device = torch.cuda.current_device()
+    cc = torch.cuda.get_device_capability(device)
+    key = register_score_function(_evict_oldest, cc[0], cc[1])
+
+    bc = 128
+    table = get_scored_table(
+        capacity=[bc],
+        bucket_capacity=bc,
+        key_type=torch.int64,
+        score_specs=[
+            ScoreSpec(name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True)
+        ],
+        score_fn_key=key,
+    )
+
+    n = 110
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    ones = torch.ones(n, dtype=torch.uint64, device=device)
+    idx, _ = _insert(table, keys, tids, ones)
+
+    # Make keys[0] "hot but old": boost its frequency early, then never touch it.
+    hot = keys[:1]
+    hot_tid = tids[:1]
+    for _ in range(20):
+        table.lookup(
+            hot, hot_tid, ScoreArg(name="frequency", value=ones[:1], policy=ScorePolicy.LRU_LFU)
+        )
+    torch.cuda.synchronize()
+    assert table.gather_score_blocks(0, idx[:1])[0, 1] == 21, "hot key freq == 21"
+
+    # Re-access everyone else LATER so their last-access timestamps are newer than
+    # keys[0]'s -- keys[0] is now strictly the oldest.
+    rest = keys[1:]
+    rest_tid = tids[1:]
+    table.lookup(
+        rest, rest_tid, ScoreArg(name="frequency", value=ones[1:], policy=ScorePolicy.LRU_LFU)
+    )
+    torch.cuda.synchronize()
+
+    # Overflow the bucket. Pure-LRU decay evicts the oldest (keys[0]) despite its
+    # frequency being the highest -- the default LFU policy would keep it.
+    n_new = 60
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
+    ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
+        InsertResult.INIT.value
+    )
+    _, num_evicted, _, _, _, _ = table.insert_and_evict(
+        new_keys,
+        new_tids,
+        ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
+        ir,
+    )
+    assert num_evicted > 0, "eviction should have occurred"
+
+    _, founds_hot, _ = table.lookup(
+        hot, hot_tid, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    )
+    assert not torch.any(
+        founds_hot
+    ), "timestamp decay must evict the OLDEST key even though it has the highest frequency"
+
+
 # ---------------------------------------------------------------------------
 # Storage-level integration: dump/load round-trip and rehash preservation for
 # the LruLfu layout (LFU + need_incremental_dump). These exercise the Python

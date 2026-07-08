@@ -24,10 +24,13 @@ import math
 from numba.types import float32, int64, float64
 
 def compute_lfu_decay(scores, cur_timestamp: int64, gamma: float32) -> float64:
-    # scores[0] = last-access timestamp, scores[1] = frequency. This matches the
-    # internal AoS layout (word 0 = ts, word 1 = freq), so the device call passes
-    # the raw score words with no remapping and this formula works as written.
-    return float64(math.log(max(scores[1], 1)) + (scores[0] - cur_timestamp) * math.log(gamma))
+    # scores[0] = last-access timestamp, scores[1] = frequency (raw uint64 AoS
+    # words, no remapping). Use (cur_timestamp - scores[0]) -- the elapsed time
+    # since last access -- NOT (scores[0] - cur_timestamp): the latter underflows
+    # in uint64 (last < now) AND has the wrong sign. With age >= 0 and gamma in
+    # (0, 1) (so log(gamma) < 0), age*log(gamma) grows more negative with
+    # staleness, so stale keys score lower and are evicted first.
+    return float64(math.log(max(scores[1], 1)) + (cur_timestamp - scores[0]) * math.log(gamma))
 
 options = DynamicEmbTableOptions(
     dim=64,
@@ -83,10 +86,12 @@ scores[1] = frequency`**, matching both the example's formula and the internal
 AoS layout (word 0 = ts, word 1 = freq). Consequences:
 
 - The device call passes the raw AoS words to `user_fn` with **zero remapping**.
-- The example's formula `log(scores[1]) + (scores[0] - cur_ts) * log(gamma)`
-  works as written: `log(frequency)` decayed by elapsed time
-  `(last_ts - cur_ts) * log(gamma)` (with `gamma < 1`, `log(gamma) < 0`, and
-  `last_ts - cur_ts < 0`, so older keys score lower and are evicted first).
+- The example's formula `log(scores[1]) + (cur_ts - scores[0]) * log(gamma)`
+  decays `log(frequency)` by the elapsed time `age = cur_ts - scores[0] >= 0`.
+  With `gamma` in (0, 1) (so `log(gamma) < 0`), `age*log(gamma)` grows more
+  negative with staleness, so stale keys score lower and are evicted first.
+  NOTE: it must be `cur_ts - scores[0]`, not `scores[0] - cur_ts` -- the latter
+  underflows in uint64 (last < now) and has the wrong sign.
 - The internal layout is **unchanged** — word 0 stays the timestamp, so
   `incremental_dump` (thresholds on word 0) and `reduction_score` (the *last*
   word == frequency) keep working. The example's original comment
@@ -329,9 +334,10 @@ Remaining open / to-verify during impl:
 
 1. ⚠️ **Shared-pointer generic load** — confirm the numba `user_score_fn`
    dereferences a shared-memory `scores` pointer correctly (extend the smoke test).
-2. ⚠️ **uint64 timestamp arithmetic (R5)** — `scores[0] - cur_ts` on `uint64`
-   underflows; the contract/docs must require casting to `float64` first. Enforce
-   in the example and docs.
+2. ✅ **uint64 timestamp arithmetic (R5)** — resolved: the example computes the
+   age as `cur_ts - scores[0]` (a non-negative uint64), which avoids underflow and
+   has the correct sign; `scores[0] - cur_ts` would both underflow and invert the
+   decay direction.
 3. **Numba API surface** — pin exact `cuda.compile(..., cc=<device cc>,
    output='ltoir', abi='c', abi_info={'abi_name':'user_score_fn'})` (note: `cc`
    is required — default `sm_50` is rejected by CUDA 13.2 NVVM).
@@ -340,7 +346,14 @@ Remaining open / to-verify during impl:
 5. **Regression from Q** — `LFU + need_incremental_dump` now uses the cubin path;
    re-run its 18+7 tests.
 6. **Multi-GPU / determinism** — `%globaltimer` per-GPU; decay comparable only
-   within a rank (fine, eviction is per-table-shard).
+   within a rank (fine, eviction is per-table-shard). The evict-module cache is
+   device-keyed (one CUmodule per (device, key), since a CUmodule is bound to its
+   context), so multiple GPUs in one process are supported.
+7. ⚠️ **Heterogeneous multi-arch + custom score_function** — a registered custom
+   function links with the compute capability recorded at first registration (the
+   numba LTO-IR is arch-specific). If one process drives GPUs of *different* arch,
+   loading the module on a mismatched-arch device fails. Homogeneous GPUs (the
+   norm) are fine; heterogeneous would need per-arch numba compiles.
 
 ## 10. Implementation order (single delivery, not phased)
 

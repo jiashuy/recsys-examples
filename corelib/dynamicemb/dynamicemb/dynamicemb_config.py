@@ -351,9 +351,11 @@ class DynamicEmbTableOptions:
     """Optional custom eviction ranking for ``score_strategy == LRU_LFU``. A
     numba-compilable Python function ``(scores, cur_timestamp, gamma) -> float64``
     where ``scores[0]`` is the key's last-access timestamp and ``scores[1]`` its
-    frequency (raw uint64 words -- cast to ``float64`` before subtracting, or the
-    uint64 arithmetic underflows), ``cur_timestamp`` is the device ``%globaltimer``
-    at eviction, and ``gamma`` is ``lfu_decay_gamma``. It is JIT-compiled to LTO-IR
+    frequency (raw uint64 words), ``cur_timestamp`` is the device ``%globaltimer``
+    at eviction, and ``gamma`` is ``lfu_decay_gamma``. NOTE: these are uint64, so
+    compute elapsed time as ``cur_timestamp - scores[0]`` (a non-negative age),
+    NOT ``scores[0] - cur_timestamp`` which underflows in uint64. It is JIT-compiled
+    to LTO-IR
     (numba) and linked into the eviction kernel (nvJitLink); eviction removes the
     key(s) with the LOWEST returned score. When None, LRU_LFU uses the default
     policy (frequency, ties broken by older timestamp) with no numba. Only valid
