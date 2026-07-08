@@ -414,96 +414,51 @@ struct LinearBucket {
 
     int rank = threadIdx.x;
 
-    if (num_scores_ == 1) {
-      // Single-score fast path: scores are one word per key and contiguous, so
-      // BulkDim consecutive words == BulkDim consecutive keys.
-      Iterator iter = 0;
-      async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
-                                                  scores(iter));
-      __pipeline_commit();
-
-      for (; iter < capacity_; iter += BulkDim) {
-        if (iter < capacity_ - BulkDim) {
-          async_copy_bulk<ScoreType, BulkDim, Stride>(
-              &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
-              scores(iter) + BulkDim);
-        }
-        __pipeline_commit();
-        __pipeline_wait_prior(1);
-        ScoreType temp_scores[Stride];
-        ScoreType *src =
-            sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
-#pragma unroll
-        for (int k = 0; k < BulkDim; k += Stride) {
-          *reinterpret_cast<ScoreVector *>(temp_scores) =
-              *reinterpret_cast<ScoreVector *>(src + k);
-#pragma unroll
-          for (int j = 0; j < Stride; j += 1) {
-            ScoreType temp_score = temp_scores[j];
-            if (temp_score < dst_score) {
-              auto temp_key_slot =
-                  reinterpret_cast<AtomicKey *>(keys(iter + k + j));
-
-              auto temp_key =
-                  temp_key_slot->load(cuda::std::memory_order_relaxed);
-
-              if (temp_key != LockedKey && temp_key != EmptyKey) {
-                int64_t flat_idx = counter_offset + iter + k + j;
-                if (counter[flat_idx] > 0)
-                  continue;
-
-                dst_iter = iter + k + j;
-                dst_key = temp_key;
-                dst_score = temp_score;
-                succeed = true;
-              }
-            }
-          }
-        }
-      }
-      return succeed;
-    }
-
-    // Multi-score path (num_scores_ == 2, LruLfu): each key occupies two
-    // contiguous words [timestamp, frequency]. A ScoreVector (uint4 == 2
-    // ScoreType) therefore holds exactly one key's pair, so eviction ranks by
-    // word 1 (frequency, ScoreVector.y). We iterate over word offsets and map
-    // each pair back to its key index (word_offset / 2).
-    const int64_t total_words = capacity_ * num_scores_;
-    ScoreType *wbase = scores(Iterator(0)); // word 0 of key 0
+    // reduce() is single-score only: one word per key, contiguous, so BulkDim
+    // consecutive words == BulkDim consecutive keys. The LruLfu 2-word layout
+    // (num_scores_ == 2) evicts through reduce_ranked() in the driver-launched
+    // cubin, so it never reaches here (decision Q in the design doc); no
+    // num_scores_ branch is needed.
+    Iterator iter = 0;
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
-                                                wbase);
+                                                scores(iter));
     __pipeline_commit();
 
-    for (int64_t w = 0; w < total_words; w += BulkDim) {
-      if (w < total_words - BulkDim) {
+    for (; iter < capacity_; iter += BulkDim) {
+      if (iter < capacity_ - BulkDim) {
         async_copy_bulk<ScoreType, BulkDim, Stride>(
-            &sm_buffers[rank * BufferDim] + diff_buf(w / BulkDim) * BulkDim,
-            wbase + w + BulkDim);
+            &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
+            scores(iter) + BulkDim);
       }
       __pipeline_commit();
       __pipeline_wait_prior(1);
       ScoreType temp_scores[Stride];
       ScoreType *src =
-          sm_buffers + rank * BufferDim + same_buf(w / BulkDim) * BulkDim;
+          sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
 #pragma unroll
       for (int k = 0; k < BulkDim; k += Stride) {
         *reinterpret_cast<ScoreVector *>(temp_scores) =
             *reinterpret_cast<ScoreVector *>(src + k);
-        ScoreType freq = temp_scores[1]; // word 1 == frequency
-        Iterator key_it = (w + k) / num_scores_;
-        if (freq < dst_score) {
-          auto temp_key =
-              reinterpret_cast<AtomicKey *>(keys(key_it))
-                  ->load(cuda::std::memory_order_relaxed);
-          if (temp_key != LockedKey && temp_key != EmptyKey) {
-            int64_t flat_idx = counter_offset + key_it;
-            if (counter[flat_idx] > 0)
-              continue;
-            dst_iter = key_it;
-            dst_key = temp_key;
-            dst_score = freq;
-            succeed = true;
+#pragma unroll
+        for (int j = 0; j < Stride; j += 1) {
+          ScoreType temp_score = temp_scores[j];
+          if (temp_score < dst_score) {
+            auto temp_key_slot =
+                reinterpret_cast<AtomicKey *>(keys(iter + k + j));
+
+            auto temp_key =
+                temp_key_slot->load(cuda::std::memory_order_relaxed);
+
+            if (temp_key != LockedKey && temp_key != EmptyKey) {
+              int64_t flat_idx = counter_offset + iter + k + j;
+              if (counter[flat_idx] > 0)
+                continue;
+
+              dst_iter = iter + k + j;
+              dst_key = temp_key;
+              dst_score = temp_score;
+              succeed = true;
+            }
           }
         }
       }
