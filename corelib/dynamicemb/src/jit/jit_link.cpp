@@ -18,10 +18,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "jit_link.h"
 
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <nvJitLink.h>
@@ -35,11 +37,23 @@ struct EvictModule {
   CUfunction noovf = nullptr;
 };
 
+// Source material for a custom score_function, kept device-agnostic so the
+// module can be (re)linked per device. cc is the arch numba compiled the LTO-IR
+// for; all devices in a (homogeneous) process share it.
+struct RegInfo {
+  std::vector<char> ltoir;
+  std::vector<char> cust;
+  int cc_major = 0;
+  int cc_minor = 0;
+};
+
 std::mutex g_mu;
-std::vector<char> g_lex_fatbin;
-bool g_lex_loaded = false;
-EvictModule g_lex;                              // key 0 (default evictor)
-std::unordered_map<int64_t, EvictModule> g_custom; // key != 0
+std::vector<char> g_lex_fatbin;                 // device-agnostic default fatbin
+std::unordered_map<int64_t, RegInfo> g_reg;     // key != 0 -> registration source
+// A CUmodule is bound to the context it was loaded in, so cache one module per
+// (device, key). key 0 == default (Lex). This makes eviction correct when a
+// single process drives more than one GPU (each device gets its own module).
+std::map<std::pair<int, int64_t>, EvictModule> g_mod;
 
 void cu_check(CUresult r, const char *what) {
   if (r != CUDA_SUCCESS) {
@@ -50,7 +64,13 @@ void cu_check(CUresult r, const char *what) {
   }
 }
 
-EvictModule load_module(const void *image, const char *ctx) {
+int current_device() {
+  CUdevice d;
+  cu_check(cuCtxGetDevice(&d), "cuCtxGetDevice");
+  return static_cast<int>(d);
+}
+
+EvictModule load_from_image(const void *image, const char *ctx) {
   EvictModule m;
   cu_check(cuModuleLoadData(&m.module, image), ctx);
   cu_check(cuModuleGetFunction(&m.ovf, m.module, "dyn_emb_evict_entry_ovf"),
@@ -60,38 +80,14 @@ EvictModule load_module(const void *image, const char *ctx) {
   return m;
 }
 
-} // namespace
-
-void demb_set_lex_fatbin(const void *lex, size_t lex_size) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  // Set-once: the default (Lex) evictor is a single packaged fatbin, and the
-  // lazily-loaded g_lex module below is not reloaded on a re-set. Ignore repeat
-  // calls so the stored bytes never diverge from the loaded module. (Python's
-  // ensure_lex_fatbin_loaded() is already idempotent; this guards direct use.)
-  if (!g_lex_fatbin.empty())
-    return;
-  g_lex_fatbin.assign(static_cast<const char *>(lex),
-                      static_cast<const char *>(lex) + lex_size);
-}
-
-void demb_register_score_function(int64_t key, const void *ltoir,
-                                  size_t ltoir_size, const void *cust,
-                                  size_t cust_size, int cc_major,
-                                  int cc_minor) {
-  if (key == 0)
-    throw std::runtime_error("dynamicemb jit_link: score_function key 0 is "
-                             "reserved for the default evictor");
-  std::lock_guard<std::mutex> lk(g_mu);
-  if (g_custom.count(key))
-    return; // already linked
-
+EvictModule link_custom(const RegInfo &r) {
   char arch[32];
-  std::snprintf(arch, sizeof(arch), "-arch=sm_%d%d", cc_major, cc_minor);
+  std::snprintf(arch, sizeof(arch), "-arch=sm_%d%d", r.cc_major, r.cc_minor);
   const char *opts[] = {arch, "-lto"};
 
   nvJitLinkHandle handle;
-  auto jl_check = [&](nvJitLinkResult r, const char *what) {
-    if (r != NVJITLINK_SUCCESS) {
+  auto jl_check = [&](nvJitLinkResult res, const char *what) {
+    if (res != NVJITLINK_SUCCESS) {
       std::string log;
       size_t log_size = 0;
       if (nvJitLinkGetErrorLogSize(handle, &log_size) == NVJITLINK_SUCCESS &&
@@ -106,11 +102,11 @@ void demb_register_score_function(int64_t key, const void *ltoir,
 
   if (nvJitLinkCreate(&handle, 2, opts) != NVJITLINK_SUCCESS)
     throw std::runtime_error("dynamicemb jit_link: nvJitLinkCreate failed");
-  jl_check(nvJitLinkAddData(handle, NVJITLINK_INPUT_FATBIN, cust, cust_size,
-                            "evict_custom"),
+  jl_check(nvJitLinkAddData(handle, NVJITLINK_INPUT_FATBIN, r.cust.data(),
+                            r.cust.size(), "evict_custom"),
            "nvJitLinkAddData(custom fatbin)");
-  jl_check(nvJitLinkAddData(handle, NVJITLINK_INPUT_LTOIR, ltoir, ltoir_size,
-                            "user_score_fn"),
+  jl_check(nvJitLinkAddData(handle, NVJITLINK_INPUT_LTOIR, r.ltoir.data(),
+                            r.ltoir.size(), "user_score_fn"),
            "nvJitLinkAddData(user ltoir)");
   jl_check(nvJitLinkComplete(handle), "nvJitLinkComplete");
   size_t cubin_size = 0;
@@ -120,27 +116,70 @@ void demb_register_score_function(int64_t key, const void *ltoir,
   jl_check(nvJitLinkGetLinkedCubin(handle, cubin.data()),
            "nvJitLinkGetLinkedCubin");
   nvJitLinkDestroy(&handle);
+  return load_from_image(cubin.data(), "cuModuleLoadData(custom cubin)");
+}
 
-  g_custom[key] = load_module(cubin.data(), "cuModuleLoadData(custom cubin)");
+// Build (or fetch cached) the module for (dev, key) in the CURRENT context.
+// Caller must hold g_mu.
+EvictModule &get_module_locked(int dev, int64_t key) {
+  auto it = g_mod.find({dev, key});
+  if (it != g_mod.end())
+    return it->second;
+  EvictModule m;
+  if (key == 0) {
+    if (g_lex_fatbin.empty())
+      throw std::runtime_error("dynamicemb jit_link: default evict fatbin not "
+                               "set (call demb_set_lex_fatbin first)");
+    m = load_from_image(g_lex_fatbin.data(), "cuModuleLoadData(lex fatbin)");
+  } else {
+    auto r = g_reg.find(key);
+    if (r == g_reg.end())
+      throw std::runtime_error("dynamicemb jit_link: score_function key " +
+                               std::to_string(key) + " not registered");
+    m = link_custom(r->second);
+  }
+  return g_mod.emplace(std::make_pair(dev, key), m).first->second;
+}
+
+} // namespace
+
+void demb_set_lex_fatbin(const void *lex, size_t lex_size) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  // Set-once: the default (Lex) fatbin bytes are device-agnostic; per-device
+  // modules are loaded lazily from them. Ignore repeat calls so the stored bytes
+  // never diverge. (Python's ensure_lex_fatbin_loaded() is already idempotent.)
+  if (!g_lex_fatbin.empty())
+    return;
+  g_lex_fatbin.assign(static_cast<const char *>(lex),
+                      static_cast<const char *>(lex) + lex_size);
+}
+
+void demb_register_score_function(int64_t key, const void *ltoir,
+                                  size_t ltoir_size, const void *cust,
+                                  size_t cust_size, int cc_major,
+                                  int cc_minor) {
+  if (key == 0)
+    throw std::runtime_error("dynamicemb jit_link: score_function key 0 is "
+                             "reserved for the default evictor");
+  std::lock_guard<std::mutex> lk(g_mu);
+  RegInfo &r = g_reg[key];
+  if (r.ltoir.empty()) { // first registration of this key: record the source
+    r.ltoir.assign(static_cast<const char *>(ltoir),
+                   static_cast<const char *>(ltoir) + ltoir_size);
+    r.cust.assign(static_cast<const char *>(cust),
+                  static_cast<const char *>(cust) + cust_size);
+    r.cc_major = cc_major;
+    r.cc_minor = cc_minor;
+  }
+  // Eager-build for the current device so the link cost stays at table-creation
+  // time (not the first forward). Other devices link lazily on first use.
+  get_module_locked(current_device(), key);
 }
 
 CUfunction demb_get_evict_fn(int64_t key, bool overflow) {
   std::lock_guard<std::mutex> lk(g_mu);
-  if (key == 0) {
-    if (!g_lex_loaded) {
-      if (g_lex_fatbin.empty())
-        throw std::runtime_error("dynamicemb jit_link: default evict fatbin "
-                                 "not set (call demb_set_lex_fatbin first)");
-      g_lex = load_module(g_lex_fatbin.data(), "cuModuleLoadData(lex fatbin)");
-      g_lex_loaded = true;
-    }
-    return overflow ? g_lex.ovf : g_lex.noovf;
-  }
-  auto it = g_custom.find(key);
-  if (it == g_custom.end())
-    throw std::runtime_error("dynamicemb jit_link: score_function key " +
-                             std::to_string(key) + " not registered");
-  return overflow ? it->second.ovf : it->second.noovf;
+  EvictModule &m = get_module_locked(current_device(), key);
+  return overflow ? m.ovf : m.noovf;
 }
 
 void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,
