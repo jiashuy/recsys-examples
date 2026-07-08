@@ -18,6 +18,9 @@ word 0 = last-access timestamp, word 1 = frequency; eviction ranks by frequency,
 the timestamp serves time-based incremental dump). Scores are read back via the
 gather_score_blocks primitive so the CUDA kernels are directly observable."""
 
+import math
+
+import numpy as np
 import pytest
 import torch
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
@@ -26,6 +29,7 @@ from dynamicemb.key_value_table import DynamicEmbStorage, _expand_tables_impl
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
+from numba import float64
 
 
 @pytest.fixture
@@ -223,6 +227,223 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
     ), "copy_score_blocks_from must preserve both score words across tables"
 
 
+def _evict_high_freq_first(scores, cur_timestamp, gamma):
+    # scores[0] = timestamp, scores[1] = frequency. Eviction removes the LOWEST
+    # returned score, so -frequency evicts the HIGHEST-frequency key first -- the
+    # opposite of the default LFU ranking.
+    return -float64(scores[1])
+
+
+def _evict_oldest(scores, cur_timestamp, gamma):
+    # Pure LRU: rank by recency only. age = cur_timestamp - scores[0] (a
+    # non-negative uint64 -- note the order: scores[0] - cur_timestamp would
+    # underflow). -age evicts the LARGEST age (the oldest key), exercising the
+    # timestamp-subtraction path.
+    return -float64(cur_timestamp - scores[0])
+
+
+def _lfu_decay(scores, cur_timestamp, gamma):
+    # The reference decayed-LFU (mirrors compute_lfu_decay in the design doc /
+    # config docstring): log(frequency) decayed by elapsed age. Exercises the
+    # whole shipped formula through numba+nvJitLink -- both score words, gamma,
+    # math.log/max, and the safe (cur_timestamp - scores[0]) subtraction. With
+    # gamma in (0,1) and ns-scale ages the age term dominates, so the oldest key
+    # is evicted.
+    return float64(
+        math.log(max(scores[1], 1)) + (cur_timestamp - scores[0]) * math.log(gamma)
+    )
+
+
+@pytest.mark.parametrize(
+    "score_fn, evicted, survivor",
+    [
+        # -frequency ranks by the frequency word: evicts the highest-frequency
+        # key (probe_HF) and keeps the lowest-frequency one (probe_OLD). This also
+        # overrides the default LFU policy, which would keep probe_HF.
+        (_evict_high_freq_first, "HF", "OLD"),
+        # -age ranks by recency = cur_timestamp - scores[0]: evicts the OLDEST key
+        # (probe_OLD), keeps the most-recently-accessed one (probe_HF). The blended
+        # _lfu_decay gets its own whole-set oracle test below.
+        (_evict_oldest, "OLD", "HF"),
+    ],
+    ids=["evict_high_freq", "evict_oldest"],
+)
+def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
+    current_device, score_fn, evicted, survivor
+):
+    """Each custom score_function drives eviction by ITS OWN score dimension --
+    proven by having the frequency decay and the recency decays evict DIFFERENT
+    keys from the same table. Two probes sit at opposite extremes: probe_HF
+    (highest frequency, most recently accessed) and probe_OLD (lowest frequency,
+    oldest). -frequency evicts probe_HF (keeps probe_OLD); the recency decays
+    evict probe_OLD (keep probe_HF). The parametrized (evicted, survivor) pair --
+    not a shared assertion -- is what makes each case verify its own dimension."""
+    from dynamicemb.jit import register_score_function
+
+    device = torch.cuda.current_device()
+    cc = torch.cuda.get_device_capability(device)
+    key = register_score_function(score_fn, cc[0], cc[1])
+
+    bc = 128
+    table = get_scored_table(
+        capacity=[bc],
+        bucket_capacity=bc,
+        key_type=torch.int64,
+        score_specs=[
+            ScoreSpec(name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True)
+        ],
+        score_fn_key=key,
+        lfu_decay_gamma=0.9,  # used by _lfu_decay; ignored by the other two
+    )
+
+    n = 120
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    ones = torch.ones(n, dtype=torch.uint64, device=device)
+    _insert(table, keys, tids, ones)
+    probes = {"OLD": (keys[:1], tids[:1]), "HF": (keys[1:2], tids[1:2])}
+
+    # Re-access everyone EXCEPT probe_OLD (keys[0]), so probe_OLD stays both the
+    # oldest (timestamp) and the lowest frequency (never re-accessed).
+    table.lookup(
+        keys[1:], tids[1:], ScoreArg(name="frequency", value=ones[1:], policy=ScorePolicy.LRU_LFU)
+    )
+    torch.cuda.synchronize()
+    # Boost probe_HF (keys[1]) to the highest frequency and the most recent ts.
+    for _ in range(28):
+        table.lookup(
+            keys[1:2], tids[1:2], ScoreArg(name="frequency", value=ones[1:2], policy=ScorePolicy.LRU_LFU)
+        )
+    torch.cuda.synchronize()
+
+    # Overflow the bucket. Evicting a moderate count keeps each probe at the
+    # extreme of its decay's ordering: the target is evicted first, the survivor
+    # (opposite extreme) last.
+    n_new = 40
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
+    ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
+        InsertResult.INIT.value
+    )
+    _, num_evicted, _, _, _, _ = table.insert_and_evict(
+        new_keys,
+        new_tids,
+        ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
+        ir,
+    )
+    assert num_evicted > 0, "eviction should have occurred"
+
+    ev_keys, ev_tids = probes[evicted]
+    sv_keys, sv_tids = probes[survivor]
+    _, ev_found, _ = table.lookup(
+        ev_keys, ev_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    )
+    _, sv_found, _ = table.lookup(
+        sv_keys, sv_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    )
+    assert not torch.any(
+        ev_found
+    ), f"{score_fn.__name__} should evict the {evicted} probe (its own dimension's extreme)"
+    assert torch.all(
+        sv_found
+    ), f"{score_fn.__name__} should keep the {survivor} probe (opposite extreme)"
+
+
+def test_lru_lfu_decay_matches_python_oracle(current_device):
+    """Whole-set oracle check for the combined LFU+recency decay (_lfu_decay):
+    score = log(freq) + (cur_ts - ts)*log(gamma). Give the keys varied
+    frequencies and distinct access times, snapshot every key's stored (ts, freq),
+    recompute the exact score in NumPy, predict which keys the kernel SHOULD evict,
+    and assert it evicts exactly that set.
+
+    Ranking cancels cur_ts (a constant added to every key's score), so the CPU
+    oracle needs only the gathered (ts, freq): rank = log(freq) + (ts - ts_min) *
+    (-log(gamma)), evict the M lowest. Any two keys' rank difference is identical
+    on device and CPU, so the predicted victim set is exact. (At ns timescales
+    with gamma < 1 the recency term dominates the ordering, but the oracle still
+    evaluates the full decayed-LFU formula the kernel runs.)"""
+    from dynamicemb.jit import register_score_function
+
+    device = torch.cuda.current_device()
+    cc = torch.cuda.get_device_capability(device)
+    gamma = 0.9
+    key = register_score_function(_lfu_decay, cc[0], cc[1])
+
+    bc = 128
+    table = get_scored_table(
+        capacity=[bc],
+        bucket_capacity=bc,
+        key_type=torch.int64,
+        score_specs=[
+            ScoreSpec(name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True)
+        ],
+        score_fn_key=key,
+        lfu_decay_gamma=gamma,
+    )
+
+    n = 90
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    ones = torch.ones(n, dtype=torch.uint64, device=device)
+    idx, _ = _insert(table, keys, tids, ones)
+
+    # Give each key a distinct last-access time (staggered + synced) and a varied
+    # frequency, so both terms of the decay differ across keys.
+    for i in range(n):
+        reps = 1 + (i * 7) % 5  # frequency spread, not monotonic in i
+        one = keys[i : i + 1]
+        one_tid = tids[i : i + 1]
+        one_val = ones[i : i + 1]
+        for _ in range(reps):
+            table.lookup(
+                one, one_tid, ScoreArg(name="frequency", value=one_val, policy=ScorePolicy.LRU_LFU)
+            )
+        torch.cuda.synchronize()  # key i's last access precedes key i+1's
+
+    # Snapshot the exact stored (ts, freq) for every key BEFORE eviction.
+    blk = table.gather_score_blocks(0, idx).cpu().numpy()
+    ts = blk[:, 0].astype(np.uint64)
+    freq = blk[:, 1].astype(np.float64)
+
+    # Force eviction. New keys get the newest timestamp -> highest score -> they
+    # survive, so every victim is one of the existing keys.
+    n_new = 60
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
+    ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
+        InsertResult.INIT.value
+    )
+    _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
+        new_keys,
+        new_tids,
+        ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
+        ir,
+    )
+    m = int(num_evicted)
+    assert m == n + n_new - bc, "eviction count must be occupied + new - capacity"
+
+    # Oracle: rank = log(max(freq, 1)) + (ts - ts_min) * (-log(gamma)); kernel gets
+    # gamma as float32, so mirror that rounding. Predict the M lowest-rank keys.
+    g32 = float(np.float32(gamma))
+    recency = (ts - ts.min()).astype(np.float64)
+    rank = np.log(np.maximum(freq, 1.0)) + recency * (-math.log(g32))
+    order = np.argsort(rank, kind="stable")  # ascending: lowest score first
+    # No ambiguity at the eviction boundary (distinct timestamps -> distinct ranks).
+    assert (
+        rank[order[m]] - rank[order[m - 1]] > 1e-6
+    ), "eviction boundary must not fall on a rank tie"
+
+    keys_cpu = keys.cpu().numpy()
+    predicted = set(int(keys_cpu[i]) for i in order[:m])
+    actual = set(int(k) for k in evicted_keys.tolist())
+    assert actual == predicted, (
+        "kernel must evict exactly the M lowest-scoring keys predicted by the "
+        "decayed-LFU formula"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Storage-level integration: dump/load round-trip and rehash preservation for
 # the LruLfu layout (LFU + need_incremental_dump). These exercise the Python
@@ -324,3 +545,62 @@ def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
     assert torch.equal(
         after, before
     ), "rehash must preserve both score words (timestamp + frequency)"
+
+
+def _lru_lfu_strategy_storage(
+    dim=8, max_capacity=4096, init_capacity=None, score_function=None, gamma=1.0
+):
+    """DynamicEmbStorage built with the LRU_LFU *strategy* (vs LFU +
+    need_incremental_dump). Exercises create_table_state's LRU_LFU branch,
+    including score_function auto-registration. Constructing storage directly
+    bypasses the batched _create_score, so set evict_strategy=LFU explicitly."""
+    device_id = torch.cuda.current_device()
+    opts = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device_id,
+            dim=dim,
+            max_capacity=max_capacity,
+            init_capacity=init_capacity if init_capacity is not None else max_capacity,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3,
+            score_strategy=DynamicEmbScoreStrategy.LRU_LFU,
+            evict_strategy=DynamicEmbEvictStrategy.LFU,
+            score_function=score_function,
+            lfu_decay_gamma=gamma,
+        )
+    ]
+    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+
+
+def test_lru_lfu_strategy_create_table_state_wiring(current_device):
+    """create_table_state maps LRU_LFU -> the compound LruLfu policy (2 score
+    words); without a score_function the table uses the default evictor
+    (score_fn_key == 0), and with one create_table_state auto-registers it
+    (numba + nvJitLink) and threads a nonzero key + gamma to the table."""
+    default = _lru_lfu_strategy_storage()
+    assert default.key_index_map.num_scores_ == 2
+    assert default.key_index_map.score_fn_key_ == 0, "no score_function => key 0"
+
+    custom = _lru_lfu_strategy_storage(score_function=_evict_high_freq_first, gamma=0.9)
+    assert custom.key_index_map.num_scores_ == 2
+    assert (
+        custom.key_index_map.score_fn_key_ != 0
+    ), "score_function must be registered and routed via a nonzero key"
+    assert custom.key_index_map.lfu_decay_gamma_ == 0.9
+
+
+def test_score_function_requires_lru_lfu():
+    """score_function is only valid with score_strategy=LRU_LFU."""
+    with pytest.raises(ValueError):
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(),
+            dim=8,
+            max_capacity=128,
+            score_strategy=DynamicEmbScoreStrategy.LFU,
+            score_function=_evict_high_freq_first,
+        )

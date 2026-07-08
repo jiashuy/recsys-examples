@@ -139,10 +139,23 @@ def get_score_policy(score_strategy, need_incremental_dump=False):
     if need_incremental_dump and score_strategy not in (
         DynamicEmbScoreStrategy.TIMESTAMP,
         DynamicEmbScoreStrategy.LFU,
+        DynamicEmbScoreStrategy.LRU_LFU,
     ):
         raise NotImplementedError(
             "need_incremental_dump is currently supported only for "
-            "TIMESTAMP and LFU score strategies."
+            "TIMESTAMP, LFU, and LRU_LFU score strategies."
+        )
+    if score_strategy == DynamicEmbScoreStrategy.LRU_LFU:
+        # Compound LruLfu policy: two AoS words per key (word 0 = timestamp,
+        # word 1 = frequency). Eviction ranks by frequency (older-timestamp
+        # tiebreak) or a custom score_function; word 0 also serves incremental
+        # dump. num_scores is derived from the policy; the spec name maps to
+        # word 0 (the timestamp).
+        return ScoreSpec(
+            name="lru_lfu",
+            policy=ScorePolicy.LRU_LFU,
+            dtype=torch.uint64,
+            is_reduction=True,
         )
     if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
@@ -276,6 +289,22 @@ def create_table_state(
     # timestamp -- for the compound LruLfu policy).
     incremental_score_name = score_policy.name
 
+    # LRU_LFU custom eviction: numba-compile + nvJitLink-link the user
+    # score_function and route its inserts to that cubin via score_fn_key. Key 0
+    # (no score_function) selects the default freq->ts Lex evictor (no numba).
+    score_fn_key = 0
+    lfu_decay_gamma = base_opt.lfu_decay_gamma
+    if (
+        base_opt.score_strategy == DynamicEmbScoreStrategy.LRU_LFU
+        and base_opt.score_function is not None
+    ):
+        from dynamicemb.jit import register_score_function
+
+        cc_major, cc_minor = torch.cuda.get_device_capability(device_idx)
+        score_fn_key = register_score_function(
+            base_opt.score_function, cc_major, cc_minor
+        )
+
     # NO_EVICTION: key_index_map uses max_load_factor=0.5 to avoid eviction; table uses init_capacity.
     bucket_capacity = base_opt.bucket_capacity
     if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
@@ -300,6 +329,8 @@ def create_table_state(
         score_specs=[score_policy],
         device=device,
         enable_overflow=enable_overflow,
+        score_fn_key=score_fn_key,
+        lfu_decay_gamma=lfu_decay_gamma,
     )
     capacity = key_index_map.capacity()
 
@@ -479,6 +510,10 @@ def _expand_tables_impl(
         score_specs=[state.score_policy],
         device=device,
         enable_overflow=enable_overflow,
+        # Preserve the eviction routing (default Lex or custom score_function)
+        # across rehash.
+        score_fn_key=state.key_index_map.score_fn_key_,
+        lfu_decay_gamma=state.key_index_map.lfu_decay_gamma_,
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:

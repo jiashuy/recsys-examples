@@ -19,7 +19,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 from dynamicemb.optimizer import get_optimizer_state_dim
@@ -110,6 +110,24 @@ class DynamicEmbEvictStrategy(enum.Enum):
     CUSTOMIZED = EvictStrategy.KCustomized
 
 
+def _score_function_group_key(fn: Optional[Callable]):
+    """Stable, hashable identity for a score_function (for table grouping).
+
+    (module, qualname, source-hash) so two references to the same function group
+    together and different sources stay separate; falls back to object identity
+    when the source cannot be read."""
+    if fn is None:
+        return None
+    try:
+        import hashlib
+        import inspect
+
+        digest = hashlib.md5(inspect.getsource(fn).encode("utf-8")).hexdigest()
+        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), digest)
+    except (OSError, TypeError):
+        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), id(fn))
+
+
 class DynamicEmbScoreStrategy(enum.IntEnum):
     """
     Enumeration for different modes to set index-embedding's score.
@@ -133,6 +151,14 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
         Users have to set the score before every forward pass using `set_score` interface.
     LFU:
         If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+    LRU_LFU:
+        Stores both an access frequency and a last-access timestamp per key (the
+        compound ``LruLfu`` policy: two AoS score words, word 0 = timestamp,
+        word 1 = frequency). By default eviction ranks by frequency (LFU) and
+        breaks ties by evicting the older timestamp. An optional ``score_function``
+        (see ``DynamicEmbTableOptions.score_function``) instead ranks keys by a
+        user-defined decay score. Because word 0 is a timestamp, ``incremental_dump``
+        is implicitly supported. Users must not set scores under LRU_LFU mode.
     NO_EVICTION:
         The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
         When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
@@ -143,6 +169,7 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     CUSTOMIZED = 2
     LFU = 3
     NO_EVICTION = 4
+    LRU_LFU = 5
 
 
 @dataclass
@@ -320,10 +347,37 @@ class DynamicEmbTableOptions:
         score is not a device timestamp, and a dedicated timestamp column for
         these strategies is a follow-up."""
 
+    score_function: Optional[Callable] = None
+    """Optional custom eviction ranking for ``score_strategy == LRU_LFU``. A
+    numba-compilable Python function ``(scores, cur_timestamp, gamma) -> float64``
+    where ``scores[0]`` is the key's last-access timestamp and ``scores[1]`` its
+    frequency (raw uint64 words), ``cur_timestamp`` is the device ``%globaltimer``
+    at eviction, and ``gamma`` is ``lfu_decay_gamma``. NOTE: these are uint64, so
+    compute elapsed time as ``cur_timestamp - scores[0]`` (a non-negative age),
+    NOT ``scores[0] - cur_timestamp`` which underflows in uint64. It is JIT-compiled
+    to LTO-IR
+    (numba) and linked into the eviction kernel (nvJitLink); eviction removes the
+    key(s) with the LOWEST returned score. When None, LRU_LFU uses the default
+    policy (frequency, ties broken by older timestamp) with no numba. Only valid
+    with ``score_strategy == LRU_LFU``."""
+
+    lfu_decay_gamma: float = 1.0
+    """Decay factor passed to ``score_function`` (ignored otherwise). Typically in
+    (0, 1); smaller values decay stale keys faster in the reference formula."""
+
     def __post_init__(self):
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
         ), "eval_initializer_args must be constant initialization"
+        if (
+            self.score_function is not None
+            and self.score_strategy != DynamicEmbScoreStrategy.LRU_LFU
+        ):
+            raise ValueError(
+                "score_function is only supported with "
+                "score_strategy=DynamicEmbScoreStrategy.LRU_LFU (got "
+                f"{self.score_strategy})."
+            )
         if self.dist_type not in SUPPORTED_DIST_TYPES:
             raise ValueError(
                 f"Unsupported dist_type {self.dist_type!r}. "
@@ -352,6 +406,9 @@ class DynamicEmbTableOptions:
         grouped_key["score_strategy"] = self.score_strategy
         grouped_key["admit_strategy"] = self.admit_strategy
         grouped_key["need_incremental_dump"] = self.need_incremental_dump
+        # Tables with different eviction functions / decay must not be merged.
+        grouped_key["score_function"] = _score_function_group_key(self.score_function)
+        grouped_key["lfu_decay_gamma"] = self.lfu_decay_gamma
         return grouped_key
 
     def __hash__(self):
