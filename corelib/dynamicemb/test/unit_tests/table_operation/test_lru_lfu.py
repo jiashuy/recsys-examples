@@ -223,6 +223,81 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
     ), "copy_score_blocks_from must preserve both score words across tables"
 
 
+def _evict_high_freq_first(scores, cur_timestamp, gamma):
+    # scores[0] = timestamp, scores[1] = frequency. Eviction removes the LOWEST
+    # returned score, so returning -freq makes the HIGHEST-frequency key evict
+    # first -- the opposite of the default LFU ranking. If this function is
+    # actually used, the hot (high-frequency) keys are the ones evicted.
+    return -float(scores[1])
+
+
+def test_lru_lfu_custom_score_function_overrides_ranking(current_device):
+    """A custom score_function (JIT-compiled + nvJitLink-linked) drives eviction
+    instead of the default freq->ts policy. This decay evicts the HIGHEST
+    frequency first, so the hot keys -- which the default LFU would keep -- are
+    the ones evicted, proving the user function is used."""
+    from dynamicemb.jit import register_score_function
+
+    device = torch.cuda.current_device()
+    cc = torch.cuda.get_device_capability(device)
+    key = register_score_function(_evict_high_freq_first, cc[0], cc[1])
+
+    bc = 128
+    table = get_scored_table(
+        capacity=[bc],
+        bucket_capacity=bc,
+        key_type=torch.int64,
+        score_specs=[
+            ScoreSpec(name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True)
+        ],
+        score_fn_key=key,
+    )
+
+    n = 100
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    ones = torch.ones(n, dtype=torch.uint64, device=device)
+    idx, _ = _insert(table, keys, tids, ones)
+
+    # Boost a small hot subset far above the rest.
+    n_hot = 10
+    hot = keys[:n_hot]
+    hot_tids = tids[:n_hot]
+    for _ in range(20):
+        table.lookup(
+            hot,
+            hot_tids,
+            ScoreArg(name="frequency", value=ones[:n_hot], policy=ScorePolicy.LRU_LFU),
+        )
+    hot_blocks = table.gather_score_blocks(0, idx[:n_hot])
+    assert torch.all(hot_blocks[:, 1] == 21), "hot keys should have frequency 21"
+
+    # Overflow the bucket to force eviction.
+    n_new = 100
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
+    ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
+        InsertResult.INIT.value
+    )
+    _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
+        new_keys,
+        new_tids,
+        ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
+        ir,
+    )
+    assert num_evicted > 0, "eviction should have occurred"
+
+    # Custom decay evicts highest frequency first -> the hot keys are gone
+    # (the default LFU policy would have kept them).
+    _, founds_hot, _ = table.lookup(
+        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    )
+    assert not torch.any(
+        founds_hot
+    ), "custom score_function should evict the HIGH-frequency (hot) keys first"
+
+
 # ---------------------------------------------------------------------------
 # Storage-level integration: dump/load round-trip and rehash preservation for
 # the LruLfu layout (LFU + need_incremental_dump). These exercise the Python
@@ -324,3 +399,62 @@ def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
     assert torch.equal(
         after, before
     ), "rehash must preserve both score words (timestamp + frequency)"
+
+
+def _lru_lfu_strategy_storage(
+    dim=8, max_capacity=4096, init_capacity=None, score_function=None, gamma=1.0
+):
+    """DynamicEmbStorage built with the LRU_LFU *strategy* (vs LFU +
+    need_incremental_dump). Exercises create_table_state's LRU_LFU branch,
+    including score_function auto-registration. Constructing storage directly
+    bypasses the batched _create_score, so set evict_strategy=LFU explicitly."""
+    device_id = torch.cuda.current_device()
+    opts = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device_id,
+            dim=dim,
+            max_capacity=max_capacity,
+            init_capacity=init_capacity if init_capacity is not None else max_capacity,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3,
+            score_strategy=DynamicEmbScoreStrategy.LRU_LFU,
+            evict_strategy=DynamicEmbEvictStrategy.LFU,
+            score_function=score_function,
+            lfu_decay_gamma=gamma,
+        )
+    ]
+    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+
+
+def test_lru_lfu_strategy_create_table_state_wiring(current_device):
+    """create_table_state maps LRU_LFU -> the compound LruLfu policy (2 score
+    words); without a score_function the table uses the default evictor
+    (score_fn_key == 0), and with one create_table_state auto-registers it
+    (numba + nvJitLink) and threads a nonzero key + gamma to the table."""
+    default = _lru_lfu_strategy_storage()
+    assert default.key_index_map.num_scores_ == 2
+    assert default.key_index_map.score_fn_key_ == 0, "no score_function => key 0"
+
+    custom = _lru_lfu_strategy_storage(score_function=_evict_high_freq_first, gamma=0.9)
+    assert custom.key_index_map.num_scores_ == 2
+    assert (
+        custom.key_index_map.score_fn_key_ != 0
+    ), "score_function must be registered and routed via a nonzero key"
+    assert custom.key_index_map.lfu_decay_gamma_ == 0.9
+
+
+def test_score_function_requires_lru_lfu():
+    """score_function is only valid with score_strategy=LRU_LFU."""
+    with pytest.raises(ValueError):
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(),
+            dim=8,
+            max_capacity=128,
+            score_strategy=DynamicEmbScoreStrategy.LFU,
+            score_function=_evict_high_freq_first,
+        )

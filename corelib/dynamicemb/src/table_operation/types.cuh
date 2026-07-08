@@ -511,6 +511,73 @@ struct LinearBucket {
     return succeed;
   }
 
+  // Comparator-ranked eviction scan for the LruLfu 2-score layout. Same
+  // async-prefetch pipeline as the num_scores==2 path of reduce(), but the
+  // ranking is delegated to Comparator, which is handed a pointer to the key's
+  // prefetched [ts, freq] pair IN SHARED MEMORY (so the bulk prefetch is
+  // preserved). Tracks the Comparator::less() minimum. dst_score is set to the
+  // winner's frequency (reduction word) for the caller's post-lock race check.
+  // Used only by the LruLfu evict cubin (evict_lrulfu.cu); num_scores_ must be 2.
+  template <typename Comparator, int GroupSize, int BufferDim>
+  __forceinline__ __device__ bool
+  reduce_ranked(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
+                ScoreType *sm_buffers, int32_t const *__restrict__ counter,
+                int64_t counter_offset, uint64_t cur_ts, double gamma) const {
+    static_assert(GroupSize == 1);
+    bool succeed = false;
+    if (storage_ == nullptr or capacity_ == 0) {
+      return false;
+    }
+    static constexpr int BulkDim = BufferDim / 2;
+    static_assert(BulkDim == 4);
+    static constexpr int Stride = NumScorePerVector; // 2 words == 1 key
+    int rank = threadIdx.x;
+
+    using Rank = typename Comparator::Rank;
+    Comparator cmp;
+    Rank dst_rank = Comparator::worst();
+
+    const int64_t total_words = capacity_ * num_scores_;
+    ScoreType *wbase = scores(Iterator(0));
+    async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
+                                                wbase);
+    __pipeline_commit();
+
+    for (int64_t w = 0; w < total_words; w += BulkDim) {
+      if (w < total_words - BulkDim) {
+        async_copy_bulk<ScoreType, BulkDim, Stride>(
+            &sm_buffers[rank * BufferDim] + diff_buf(w / BulkDim) * BulkDim,
+            wbase + w + BulkDim);
+      }
+      __pipeline_commit();
+      __pipeline_wait_prior(1);
+      ScoreType *src =
+          sm_buffers + rank * BufferDim + same_buf(w / BulkDim) * BulkDim;
+#pragma unroll
+      for (int k = 0; k < BulkDim; k += Stride) {
+        // Shared-memory pointer to this key's [ts, freq] pair.
+        const ScoreType *pair = src + k;
+        Rank r = cmp.rank(pair, cur_ts, gamma);
+        Iterator key_it = (w + k) / num_scores_;
+        if (Comparator::less(r, dst_rank)) {
+          auto temp_key = reinterpret_cast<AtomicKey *>(keys(key_it))
+                              ->load(cuda::std::memory_order_relaxed);
+          if (temp_key != LockedKey && temp_key != EmptyKey) {
+            int64_t flat_idx = counter_offset + key_it;
+            if (counter[flat_idx] > 0)
+              continue;
+            dst_iter = key_it;
+            dst_key = temp_key;
+            dst_rank = r;
+            dst_score = pair[1]; // frequency == reduction word
+            succeed = true;
+          }
+        }
+      }
+    }
+    return succeed;
+  }
+
   uint8_t *__restrict__ storage_;
   int64_t capacity_;
   // Number of score columns per slot (>= 1). col0 drives eviction; columns
@@ -522,12 +589,16 @@ template <typename BucketType_> struct LinearBucketTable {
   using BucketType = BucketType_;
   using KeyType = typename BucketType::KeyType;
 
-  LinearBucketTable()
+  // __host__ __device__ so the AoT path can build the table on the host (and
+  // pass it by value) while the LruLfu evict cubin reconstructs it on the device
+  // from the raw pointers in EvictParams. Just member init -- safe on both.
+  __host__ __device__ LinearBucketTable()
       : storage_(nullptr), num_buckets_(0), bucket_capacity_(0),
         num_scores_(1) {}
 
-  LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
-                    int64_t bucket_capacity, int64_t num_scores = 1)
+  __host__ __device__ LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
+                                        int64_t bucket_capacity,
+                                        int64_t num_scores = 1)
       : storage_(storage), num_buckets_(num_buckets),
         bucket_capacity_(bucket_capacity), num_scores_(num_scores) {}
 

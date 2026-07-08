@@ -1171,6 +1171,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
             if (
                 option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
+                or option.score_strategy == DynamicEmbScoreStrategy.LRU_LFU
                 or option.need_incremental_dump
             ):
                 if ts is None:
@@ -1221,6 +1222,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
+                option.evict_strategy = DynamicEmbEvictStrategy.LFU
+                self._scores[table_name] = 1
+            elif option.score_strategy == DynamicEmbScoreStrategy.LRU_LFU:
+                # Same value wiring as LFU (evict_strategy LFU so the policy stays
+                # LRU_LFU rather than being downgraded to ASSIGN; lookups
+                # accumulate frequency by 1). The timestamp word is stamped by the
+                # LruLfu policy; eviction ranking (freq+ts, or custom decay) is
+                # handled by the evict cubin.
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
             elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:

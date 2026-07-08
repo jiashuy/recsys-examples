@@ -300,6 +300,8 @@ class LinearBucketTable(ScoredHashTable):
         bucket_capacity: Optional[int] = None,
         device: torch.device = None,
         enable_overflow: bool = False,
+        score_fn_key: int = 0,
+        lfu_decay_gamma: float = 1.0,
     ):
         """
         Args:
@@ -347,6 +349,21 @@ class LinearBucketTable(ScoredHashTable):
                 [score_spec.dtype] * score_policy_num_scores(score_spec.policy)
             )
             self.score_names_.append(score_spec.name)
+
+        # LruLfu eviction routing: score_fn_key selects the evictor cubin
+        # (0 = default Lex; nonzero = a registered custom score_function),
+        # gamma is passed to a custom decay function.
+        self.score_fn_key_ = score_fn_key
+        self.lfu_decay_gamma_ = lfu_decay_gamma
+
+        # LruLfu (num_scores == 2) routes insert-and-evict through the eviction
+        # cubin; make sure the default (Lex) evictor fatbin is loaded into the
+        # C++ side before any eviction. No numba, and the custom fatbin is only
+        # loaded when a score_function is actually registered.
+        if len(self.score_types_) > 1:
+            from dynamicemb.jit import ensure_lex_fatbin_loaded
+
+            ensure_lex_fatbin_loaded()
 
         # digest type
         self.digest_type_ = torch.uint8
@@ -653,6 +670,8 @@ class LinearBucketTable(ScoredHashTable):
             insert_results,
             score_out,
             num_scores=num_scores,
+            score_fn_key=self.score_fn_key_,
+            gamma=self.lfu_decay_gamma_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -813,6 +832,8 @@ class LinearBucketTable(ScoredHashTable):
             ovf_counter=self._ovf_counter,
             ovf_output_offsets=self.overflow_output_offsets_,
             num_scores=num_scores,
+            score_fn_key=self.score_fn_key_,
+            gamma=self.lfu_decay_gamma_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -1743,6 +1764,8 @@ def get_scored_table(
     reduction_type=ReductionType.LINEAR,
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
     enable_overflow: bool = False,
+    score_fn_key: int = 0,
+    lfu_decay_gamma: float = 1.0,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
@@ -1752,6 +1775,8 @@ def get_scored_table(
             bucket_capacity=bucket_capacity,
             device=device,
             enable_overflow=enable_overflow,
+            score_fn_key=score_fn_key,
+            lfu_decay_gamma=lfu_decay_gamma,
         )
     else:
         raise NotImplementedError
