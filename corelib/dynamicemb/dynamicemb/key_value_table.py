@@ -16,7 +16,7 @@
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -250,12 +250,20 @@ class DynamicEmbTableState:
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
+    # Retain-evicted-keys (last tier only): when True, each insert that evicts
+    # collects the victims' (key, table_id). Accumulated as GPU-tensor chunks and
+    # only concatenated + de-duplicated on pop_evicted_keys (no compaction while
+    # appending). One chunk per insert that evicted anything; drained on pop.
+    retain_evicted_keys: bool = False
+    evicted_key_chunks: List[torch.Tensor] = field(default_factory=list)
+    evicted_tid_chunks: List[torch.Tensor] = field(default_factory=list)
 
 
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
     enable_overflow: bool = False,
+    retain_evicted_keys: bool = False,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
@@ -418,6 +426,7 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
+        retain_evicted_keys=retain_evicted_keys,
     )
 
 
@@ -1018,6 +1027,53 @@ def _find_keys(
     )
 
 
+def _append_evicted(
+    state: DynamicEmbTableState,
+    evicted_keys: torch.Tensor,
+    evicted_table_ids: torch.Tensor,
+    num_evicted: torch.Tensor,
+) -> None:
+    """Append this insert's evicted (key, table_id) to the state's retain chunks.
+
+    ``evicted_keys`` / ``evicted_table_ids`` are sized at the batch upper bound;
+    only the first ``num_evicted`` entries are valid, so we slice + clone (freeing
+    the large per-batch buffers and keeping only the compact evicted rows). No
+    de-duplication here -- that happens on pop. One D2H sync per evicting insert
+    to read the count, acceptable since retain is opt-in.
+    """
+    n = int(num_evicted.item())
+    if n <= 0:
+        return
+    state.evicted_key_chunks.append(evicted_keys[:n].clone())
+    state.evicted_tid_chunks.append(evicted_table_ids[:n].clone())
+
+
+def _pop_state_evicted_keys(
+    state: DynamicEmbTableState, table_id: int
+) -> torch.Tensor:
+    """Pop (return + clear) the unique evicted keys retained for ``table_id``.
+
+    Concatenates all retained chunks, selects this table's rows, de-duplicates,
+    and rebuilds the chunks to keep only the OTHER tables' rows -- so this table's
+    retained keys are cleared while other tables' remain for their own pop.
+    Returns a 1-D tensor of unique keys on ``state.device``.
+    """
+    if not state.evicted_key_chunks:
+        return torch.empty(0, dtype=torch.int64, device=state.device)
+    keys = torch.cat(state.evicted_key_chunks)
+    tids = torch.cat(state.evicted_tid_chunks)
+    mask = tids == table_id
+    out = torch.unique(keys[mask])
+    keep = ~mask
+    if bool(keep.any()):
+        state.evicted_key_chunks = [keys[keep]]
+        state.evicted_tid_chunks = [tids[keep]]
+    else:
+        state.evicted_key_chunks = []
+        state.evicted_tid_chunks = []
+    return out
+
+
 def _insert_key_values(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
@@ -1038,9 +1094,21 @@ def _insert_key_values(
     score_out_flat: Optional[torch.Tensor] = None
     if state.no_eviction_next_index is not None:
         score_out_flat = torch.empty(n, dtype=torch.int64, device=unique_keys.device)
-    indices = state.key_index_map.insert(
-        unique_keys, table_ids, score_arg, score_out=score_out_flat
-    )
+    if state.retain_evicted_keys:
+        indices, num_evicted, evicted_keys, evicted_table_ids = (
+            state.key_index_map.insert(
+                unique_keys,
+                table_ids,
+                score_arg,
+                score_out=score_out_flat,
+                collect_evicted=True,
+            )
+        )
+        _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
+    else:
+        indices = state.key_index_map.insert(
+            unique_keys, table_ids, score_arg, score_out=score_out_flat
+        )
     if state.no_eviction_next_index is not None:
         flat_indices = (
             score_arg.value if score_arg.value is not None else score_out_flat
@@ -1681,6 +1749,9 @@ class DynamicEmbStorage(Storage):
         self._state = create_table_state(
             options,
             optimizer,
+            # DynamicEmbStorage is always a last tier (single tier or the backing
+            # store under a cache), so it honors retain_evicted_keys.
+            retain_evicted_keys=options[0].retain_evicted_keys,
         )
 
     @property
@@ -1819,6 +1890,14 @@ class DynamicEmbStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
+
+    def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
+        """Return + clear this rank's unique evicted keys retained for ``table_id``.
+
+        DynamicEmbStorage is always a last tier, so retained keys live on its
+        state. Returns an empty tensor when retain_evicted_keys is off or nothing
+        was evicted for the table since the last pop."""
+        return _pop_state_evicted_keys(self._state, table_id)
 
     # -- Storage interface --
 
@@ -2134,8 +2213,14 @@ class HybridStorage(Storage):
         host_options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
+        # Only the host tier is a last tier here: the HBM tier spills its
+        # evictions into the host tier (insert_and_evict), so it never retains.
         self._hbm = create_table_state(hbm_options, optimizer)
-        self._host = create_table_state(host_options, optimizer)
+        self._host = create_table_state(
+            host_options,
+            optimizer,
+            retain_evicted_keys=host_options[0].retain_evicted_keys,
+        )
         self.optimizer = optimizer
 
     @property
@@ -2201,6 +2286,14 @@ class HybridStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
         collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
+
+    def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
+        """Return + clear this rank's unique evicted keys retained for ``table_id``.
+
+        Only the host tier is a last tier here (the HBM tier spills to host), so
+        retained keys live on the host state. Empty tensor when retain is off or
+        nothing was evicted for the table since the last pop."""
+        return _pop_state_evicted_keys(self._host, table_id)
 
     # -- Two-tier find (with values) --
 

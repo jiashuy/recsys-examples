@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
+from .incremental_dump import pop_evicted_keys
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
     DynamicEmbCheckMode,
@@ -70,6 +71,7 @@ __all__ = [
     "string_to_evict_strategy",
     "DynamicEmbDump",
     "DynamicEmbLoad",
+    "pop_evicted_keys",
     "EmbOptimType",
     "OptimizerArgs",
 ]

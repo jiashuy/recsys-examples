@@ -1429,6 +1429,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
+    def pop_evicted_keys(
+        self, table_names: Optional[List[str]] = None
+    ) -> Dict[str, Tensor]:
+        """Return + clear this rank's retained evicted keys, per table.
+
+        Only tables configured with ``retain_evicted_keys=True`` are included;
+        others are omitted. Returns ``{table_name: 1-D unique int64 keys on
+        device}``. The keys are this rank's local shard only (row-wise sharded, so
+        disjoint across ranks); cross-rank aggregation is the model-level
+        ``pop_evicted_keys``'s job via ``pg``. Clearing affects only this rank.
+        """
+        storage = self._storage
+        if not hasattr(storage, "pop_evicted_keys"):
+            return {}
+        result: Dict[str, Tensor] = {}
+        for i, name in enumerate(self._table_names):
+            if not self._dynamicemb_options[i].retain_evicted_keys:
+                continue
+            if table_names is not None and name not in table_names:
+                continue
+            result[name] = storage.pop_evicted_keys(i)
+        return result
+
     def incremental_dump(
         self,
         named_thresholds: Dict[str, int] = None,

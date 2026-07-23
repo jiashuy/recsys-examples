@@ -346,3 +346,96 @@ def incremental_dump(
         ret_scores[collection_path] = collection_scores
 
     return ret_tensors, ret_scores
+
+
+def _all_gather_evicted_keys(
+    keys: torch.Tensor, pg: Optional[dist.ProcessGroup]
+) -> torch.Tensor:
+    """All-gather variable-length evicted keys within ``pg``, then concat + unique.
+
+    Each rank holds a disjoint set (row-wise sharding), so the group-wide union is
+    just the concatenation; ``unique`` is applied defensively. Implemented as a
+    size all_gather followed by a padded all_gather (NCCL has no native
+    variable-length gather).
+    """
+    world_size = dist.get_world_size(pg)
+    if world_size <= 1:
+        return keys
+    local_size = torch.tensor([keys.numel()], device=keys.device, dtype=torch.int64)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size, group=pg)
+    sizes = [int(s.item()) for s in size_list]
+    max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
+    padded = torch.zeros(max_size, dtype=keys.dtype, device=keys.device)
+    if keys.numel() > 0:
+        padded[: keys.numel()] = keys
+    gathered = [
+        torch.zeros(max_size, dtype=keys.dtype, device=keys.device)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(gathered, padded, group=pg)
+    parts = [g[:sz] for g, sz in zip(gathered, sizes) if sz > 0]
+    if not parts:
+        return keys[:0]
+    return torch.unique(torch.cat(parts))
+
+
+def pop_evicted_keys(
+    model: torch.nn.Module,
+    table_names: Optional[Dict[str, List[str]]] = None,
+    pg: Optional[dist.ProcessGroup] = None,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Return + clear the keys evicted (and retained) by last-tier storage, per table.
+
+    Only tables created with ``retain_evicted_keys=True`` are included; all other
+    tables are omitted from the result. This is the incremental "pop" of keys
+    evicted since the previous call -- the retained buffers are cleared on this
+    rank as they are read.
+
+    Args:
+        model (nn.Module): the model containing dynamic embedding tables.
+        table_names (Optional[Dict[str, List[str]]]): optional filter, keyed by
+            embedding-collection path. ``{collection_path: [table_name, ...]}``
+            pops only the listed collections/tables. ``None`` pops every
+            retain-enabled table in the model.
+        pg (Optional[dist.ProcessGroup]): optional process group. ``None`` returns
+            each rank's LOCAL evicted keys (row-wise sharded, hence disjoint across
+            ranks; zero communication). When given, keys are all_gathered within
+            ``pg`` so every rank in the group receives the group-wide union.
+            Clearing always affects only this rank's buffer, regardless of ``pg``.
+
+    Returns:
+        Dict[str, Dict[str, torch.Tensor]]:
+            ``{collection_path: {table_name: keys}}`` where ``keys`` is a 1-D
+            int64 tensor of table-unique evicted keys. Empty dict when the model
+            has no retain-enabled dynamic embedding tables (or none matched).
+    """
+    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
+    if len(collections_list) == 0:
+        warnings.warn(
+            "Input model don't have any TorchREC ShardedEmbeddingCollection or "
+            "ShardedEmbeddingBagCollection module, can't pop evicted keys!",
+            UserWarning,
+        )
+        return {}
+
+    ret: Dict[str, Dict[str, torch.Tensor]] = {}
+    for collection_path, _collection_name, collection_module in collections_list:
+        if table_names is not None and collection_path not in table_names:
+            continue
+        wanted = table_names.get(collection_path) if table_names is not None else None
+
+        collection_result: Dict[str, torch.Tensor] = {}
+        for dynamic_emb_module in get_dynamic_emb_module(collection_module):
+            if not hasattr(dynamic_emb_module, "pop_evicted_keys"):
+                continue
+            local = dynamic_emb_module.pop_evicted_keys(wanted)
+            for tname, keys in local.items():
+                if pg is not None:
+                    keys = _all_gather_evicted_keys(keys, pg)
+                collection_result[tname] = keys
+
+        if collection_result:
+            ret[collection_path] = collection_result
+
+    return ret

@@ -509,6 +509,14 @@ class DynamicEmbTableOptions:
     timestamp), no numba. Only valid with the ``(TIMESTAMP, LFU)`` compound
     strategy."""
 
+    retain_evicted_keys: bool = False
+    """When True, the *last-tier* storage retains the keys it evicts (instead of
+    silently dropping them) so they can be read back with ``pop_evicted_keys``.
+    Only the final tier that truly discards a key records it -- intermediate
+    cache / HBM tiers spill their evictions to the next tier and are NOT recorded.
+    Records the (key, table_id) only, no value/score. Default False (zero
+    overhead). Tables differing in this flag are not grouped onto shared storage."""
+
     def __post_init__(self):
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
@@ -559,6 +567,9 @@ class DynamicEmbTableOptions:
         # tuple order (logical score order, which the score_function is written
         # against) is already captured by score_strategy above.
         grouped_key["score_function"] = _score_function_group_key(self.score_function)
+        # The retain path swaps the last-tier insert kernel (collect vs drop), a
+        # per-storage choice, so tables differing in it must not share storage.
+        grouped_key["retain_evicted_keys"] = self.retain_evicted_keys
         return grouped_key
 
     def __hash__(self):

@@ -71,6 +71,59 @@ void launch_table_insert_kernel(
           table, num_total, keys_ptr, table_key_slots_ptr);
 }
 
+// Plain insert that ALSO retains each evicted victim's (key, table_id). Mirrors
+// launch_table_insert_kernel but routes to the collect entry / kernel and passes
+// the evicted_* output buffers. Used by the last-tier retain path.
+template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV>
+void launch_table_insert_collect_kernel(
+    Table table, int64_t *table_bucket_offsets_ptr, int *bucket_sizes_ptr,
+    int64_t num_total, typename Table::KeyType *keys_ptr,
+    int64_t *table_ids_ptr, InsertResult *insert_results_ptr,
+    IndexType *indices_ptr, ScoreType *score_input_ptr,
+    int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
+    int32_t *counter_ptr, CounterType *evicted_counter_ptr,
+    typename Table::KeyType *evicted_keys_ptr, int64_t *evicted_table_ids_ptr,
+    int64_t score_fn_key, cudaStream_t stream) {
+  constexpr int BLOCK_SIZE = 256;
+  using KernelTraits =
+      InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
+
+  if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
+    EvictParams p{};
+    p.table_storage = table.storage_;
+    p.num_buckets = table.num_buckets_;
+    p.bucket_capacity = table.bucket_capacity_;
+    p.num_scores = table.num_scores_;
+    p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.bucket_sizes = bucket_sizes_ptr;
+    p.batch = num_total;
+    p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
+    p.table_ids = table_ids_ptr;
+    p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
+    p.indices = indices_ptr;
+    p.score_input = score_input_ptr;
+    p.score_output = OutputScoreV ? score_output_ptr : nullptr;
+    p.table_key_slots = reinterpret_cast<int64_t **>(table_key_slots_ptr);
+    p.evicted_counter = evicted_counter_ptr;
+    p.evicted_keys = reinterpret_cast<int64_t *>(evicted_keys_ptr);
+    p.evicted_table_ids = evicted_table_ids_ptr;
+    p.counter = counter_ptr;
+    CUfunction fn = demb_get_insert_collect_fn(score_fn_key);
+    demb_launch_evict(fn, p, num_total, stream);
+  } else {
+    table_insert_collect_kernel<Table, KernelTraits>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
+            evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr);
+  }
+
+  table_unlock_kernel<Table>
+      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+          table, num_total, keys_ptr, table_key_slots_ptr);
+}
+
 void table_insert_single_score(at::Tensor table_storage,
                                at::Tensor table_bucket_offsets,
                                int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -176,6 +229,133 @@ at::Tensor table_insert(at::Tensor table_storage,
                             score_output, counter, num_scores, score_fn_key);
 
   return indices;
+}
+
+// Same dispatch as table_insert_single_score but routes to the collect launcher
+// and threads through the evicted_* output buffers (retain evicted keys).
+void table_insert_collect_single_score(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, at::Tensor indices,
+    std::optional<at::Tensor> insert_results,
+    std::optional<at::Tensor> score_output, at::Tensor counter,
+    int64_t num_scores, int64_t score_fn_key, at::Tensor evicted_counter,
+    at::Tensor evicted_keys, at::Tensor evicted_table_ids) {
+
+  auto key_type = get_data_type(keys);
+
+  ScoreType *score_input_ptr = nullptr;
+  at::Tensor score_input_tensor;
+  if (score_input.has_value() && score_input.value().defined()) {
+    at::Tensor in = score_input.value();
+    if (in.scalar_type() == torch::kUInt64) {
+      score_input_ptr = get_pointer<ScoreType>(score_input);
+    } else {
+      score_input_tensor = in.view(torch::kUInt64);
+      score_input_ptr = score_input_tensor.data_ptr<ScoreType>();
+    }
+  }
+
+  int64_t *score_output_ptr = nullptr;
+  if (score_output.has_value() && score_output.value().defined()) {
+    score_output_ptr = score_output.value().data_ptr<int64_t>();
+  }
+
+  auto indices_ptr = indices.data_ptr<IndexType>();
+  InsertResult *insert_results_ptr = get_pointer<InsertResult>(insert_results);
+  auto bucket_sizes_ptr = get_pointer<int>(bucket_sizes);
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
+  auto counter_ptr = counter.data_ptr<int32_t>();
+  auto evicted_counter_ptr =
+      reinterpret_cast<CounterType *>(evicted_counter.data_ptr<int64_t>());
+  auto evicted_table_ids_ptr = evicted_table_ids.data_ptr<int64_t>();
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  int64_t num_total = keys.size(0);
+
+  auto table_key_slots = at::zeros(
+      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+
+  bool output_score = (score_output_ptr != nullptr);
+
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    auto keys_ptr = get_pointer<KeyType>(keys);
+    auto table_key_slots_ptr = get_pointer<KeyType *>(table_key_slots);
+    auto evicted_keys_ptr = get_pointer<KeyType>(evicted_keys);
+
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
+    int64_t bucket_bytes = bucket_capacity * total_size;
+    int64_t num_buckets =
+        table_storage.numel() * table_storage.element_size() / bucket_bytes;
+
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+
+    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                       num_buckets, bucket_capacity, num_scores);
+
+    DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
+      if (output_score) {
+        launch_table_insert_collect_kernel<Table, PolicyTypeV, true>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
+            evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr,
+            score_fn_key, stream);
+      } else {
+        launch_table_insert_collect_kernel<Table, PolicyTypeV, false>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
+            evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr,
+            score_fn_key, stream);
+      }
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Plain insert that retains evicted victims. Returns
+// (indices, num_evicted[int64 scalar tensor], evicted_keys, evicted_table_ids);
+// the evicted_* tensors are allocated at the batch upper bound (one victim per
+// input key) -- the caller slices them to num_evicted. Same inputs as
+// table_insert otherwise.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_collect_evicted(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, at::Tensor counter,
+    std::optional<at::Tensor> insert_results,
+    std::optional<at::Tensor> score_output, int64_t num_scores,
+    int64_t score_fn_key) {
+
+  auto i64 = keys.options().dtype(torch::kInt64);
+  int64_t num_total = keys.size(0);
+  if (num_total == 0) {
+    at::Tensor empty_keys = torch::empty({0}, keys.options());
+    at::Tensor empty_i64 = torch::empty({0}, i64);
+    return std::make_tuple(empty_i64, torch::zeros({1}, i64), empty_keys,
+                           empty_i64);
+  }
+
+  at::Tensor indices = torch::empty({num_total}, i64);
+  at::Tensor evicted_keys = torch::empty({num_total}, keys.options());
+  at::Tensor evicted_table_ids = torch::empty({num_total}, i64);
+  at::Tensor evicted_counter = torch::zeros({1}, i64);
+
+  table_insert_collect_single_score(
+      table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes, keys,
+      table_ids, score_input, policy_type, indices, insert_results,
+      score_output, counter, num_scores, score_fn_key, evicted_counter,
+      evicted_keys, evicted_table_ids);
+
+  return std::make_tuple(indices, evicted_counter, evicted_keys,
+                         evicted_table_ids);
 }
 
 // Copy all score words for aligned (src_slot, dst_slot) pairs between two tables.
