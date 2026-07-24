@@ -25,6 +25,7 @@ from dynamicemb.key_value_table import (
     DynamicEmbCache,
     DynamicEmbStorage,
     Storage,
+    _append_evicted,
     _find_keys,
     eval_lookup,
     get_insert_score_arg,
@@ -662,11 +663,31 @@ def _prefetch_hbm_direct_path(
                 state, n_admitted, device, admitted_scores, table_ids=admitted_tids
             )
             with torch.cuda.nvtx.range("op:storage_insert"):
-                new_indices = state.key_index_map.insert(
-                    admitted_keys,
-                    admitted_tids,
-                    score_arg,
-                )
+                # HBM-direct is a last tier: this insert may evict, and the
+                # victims are dropped here (unlike the cache path, which spills
+                # to storage). Retain them when configured -- this is the
+                # forward-path analogue of the _insert_key_values collection.
+                if state.retain_evicted_keys:
+                    (
+                        new_indices,
+                        num_evicted,
+                        evicted_keys,
+                        evicted_table_ids,
+                    ) = state.key_index_map.insert(
+                        admitted_keys,
+                        admitted_tids,
+                        score_arg,
+                        collect_evicted=True,
+                    )
+                    _append_evicted(
+                        state, evicted_keys, evicted_table_ids, num_evicted
+                    )
+                else:
+                    new_indices = state.key_index_map.insert(
+                        admitted_keys,
+                        admitted_tids,
+                        score_arg,
+                    )
             new_indices = (
                 score_arg.value.to(torch.int64)
                 if state.no_eviction_next_index is not None

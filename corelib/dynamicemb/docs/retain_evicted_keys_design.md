@@ -41,27 +41,44 @@ DynamicEmb 的 key→slot 哈希表在 bucket 满时会按 score 逐出「受害
 
 ## 3. 端到端数据流
 
-```
-最后一级 storage 的一次 insert（retain 开启）
-  key_value_table._insert_key_values(state, keys, table_ids, values, ...)
-    └─ state.key_index_map.insert(..., collect_evicted=True)          # LinearBucketTable
-         └─ C++ table_insert_collect_evicted(...)                     # 新增 host 函数
-              ├─ AoT:    table_insert_collect_kernel                  # 非 LruLfu
-              └─ LruLfu: dyn_emb_insert_collect_entry (cubin)         # via jit_link
-                   └─ insert_body<Table, Evictor, CollectEvicted=true>
-                        · 驱逐点取 victim key
-                        · compaction 写 evicted_keys[out] = victim
-                                        evicted_table_ids[out] = table_ids[i]
-         → 返回 (indices, num_evicted, evicted_keys, evicted_table_ids)
-    └─ 取前 num_evicted 个，append 到 state.evicted_key_buffer (key 列 + table_id 列)
-       （超过软阈值则就地 torch.unique 压缩）
+**收集触发点（最后一级 insert 的两条路径）** —— retain 收集必须挂在所有「最后一级、
+会真正丢弃 victim」的 insert 上。经代码走查，实际有 **两处**（第二处最初被遗漏，
+module 级测试发现后补上）：
 
+- **(A) `storage.insert` 路径** → `key_value_table._insert_key_values`。用于：直接
+  `storage.insert`（`DynamicEmbStorage` / `HybridStorage` 的 host 层）、caching 模式
+  cache 驱逐写回 backing（`_prefetch_cache_path`）、`_generic_forward_path`。
+- **(B) forward HBM-direct 路径** → `batched_dynamicemb_function._prefetch_hbm_direct_path`。
+  用于：**非 caching 训练 forward**（HBM 单层 `DynamicEmbStorage`），它直接调
+  `key_index_map.insert()`（**不经** `_insert_key_values`）。
+
+两处共用同一个收集原语：
+
+```
+state.key_index_map.insert(..., collect_evicted=True)          # LinearBucketTable
+  └─ C++ table_insert_collect_evicted(...)                     # 新增 host 函数
+       ├─ AoT:    table_insert_collect_kernel                  # 非 LruLfu
+       └─ LruLfu: dyn_emb_insert_collect_entry (cubin)         # via jit_link
+            └─ insert_body<Table, Evictor, CollectEvicted=true>
+                 · 驱逐点取 victim key
+                 · compaction 写 evicted_keys[out]=victim, evicted_table_ids[out]=tid
+  → (indices, num_evicted, evicted_keys, evicted_table_ids)
+_append_evicted(state, ...): 取前 num_evicted 个 clone，追加到 state 的
+  evicted_key_chunks / evicted_tid_chunks（纯 append，不去重）
+```
+
+**ref-counter 与训练语义**：forward 中 prefetch 的 key `counter++`（正在使用），同一
+step 内无法驱逐它们（表现为 `Busy`，不算 `Evict`、不收集）；只有跨 step 的 backward
+把 counter 降回 0 后，后续 step 才会真正 `Evict` 并收集。所以训练中 retain 按 step
+边界产生驱逐——纯 forward（无 backward）不会收集到任何东西。
+
+```
 用户调用（任意时刻）
   dynamicemb.pop_evicted_keys(model, table_names=None, pg=None)
-    └─ 遍历 collection → 最后一级 storage → 每个 table_id：
-         本地 keys = unique(buffer[table_id==tid])
-         pg 给定 → all_gather + concat（disjoint，无需再去重）
-         清空本 rank buffer
+    └─ 遍历 collection → module.pop_evicted_keys → storage.pop_evicted_keys(tid)
+         本地 keys = torch.unique(cat(chunks)[tid==table_id])   # pop 时才去重
+         pg 给定 → all_gather + concat（各 rank disjoint）
+         清空本 rank 该 table 的 chunks
     → {collection_path: {table_name: 1-D int64 keys}}
 ```
 
@@ -319,17 +336,25 @@ def pop_evicted_keys(model, table_names=None, pg=None)
 
 ---
 
-## 8. 测试计划
+## 8. 测试（已在 EOS / H100 上编译并通过）
 
-- **table 级**（`test/unit_tests/table_operation/`）：小容量表，构造必然驱逐的输入，
-  校验 `table_insert_collect_evicted` 返回的 (evicted_keys, evicted_table_ids) 与 oracle 一致；
-  **AoT 与 LruLfu 两路**各测；多逻辑表共享存储时按 table_id 分流正确。
-- **storage / module 级**（`test/unit_tests/`）：`retain_evicted_keys=True`，喂多个 batch
-  触发最后一级驱逐，`pop_evicted_keys` 返回 unique 正确、二次调用为增量（已清空）、
-  未开启的表不返回。覆盖 caching / HybridStorage / 单层三种最后一级形态。
-- **分布式**（`test_distributed_dynamicemb.py`）：`pg=None` 各 rank disjoint；给 `pg`
-  时组内并集正确；清空只影响本 rank。
-- **回归**：`retain_evicted_keys=False`（默认）下所有现有 insert / evict 测试不变。
+- **table 级**（`test/unit_tests/table_operation/test_insert_collect_evicted.py`，5 例）：
+  whole-set eviction oracle 校验 `insert(collect_evicted=True)` 收集的
+  (evicted_keys, evicted_table_ids) —— **LruLfu cubin 与 AoT 两路各一**、多逻辑表按
+  table_id 分流、无驱逐为空、`DEMB_DETERMINISM_MODE` 报错。
+- **storage 级**（同文件，3 例）：`DynamicEmbStorage` 端到端（收集 → pop unique →
+  被逐 key 已不在表 → 二次 pop 空/增量）、`retain=False` 恒空、buffer 逻辑单元测试
+  （跨批去重 + table_id 过滤 + 清空隔离）。
+- **module 级**（`test/unit_tests/incremental_dump/test_pop_evicted_keys.py`，3 例）：
+  **非 caching 训练 forward（HBM-direct 路径）跨 step 驱逐被收集** —— 此测试发现并驱动了
+  §3(B) `_prefetch_hbm_direct_path` 的收集补丁；未开启表省略；`table_names` 过滤 +
+  table_id 隔离。均用完整 forward+backward step（见 §3 的 ref-counter 语义：纯 forward
+  不会驱逐）。
+- **分布式 + model 级**（`test/unit_tests/incremental_dump/test_distributed_dynamicemb.py`，
+  *待加*）：`pg=None` 各 rank disjoint；给 `pg` 组内并集；清空只本 rank；变长 all_gather；
+  以及 model 级 `dynamicemb.pop_evicted_keys(model, ...)` 遍历 sharded collection。
+- **回归**：`retain_evicted_keys=False`（默认）下现有 insert/evict 路径由 `if constexpr` /
+  Python 分支保证行为不变。
 
 ---
 
@@ -356,8 +381,11 @@ def pop_evicted_keys(model, table_names=None, pg=None)
 | `src/table_operation/table.cu` | 绑定 `table_insert_collect_evicted` |
 | `dynamicemb/dynamicemb_config.py` | `retain_evicted_keys` 配置项 |
 | `dynamicemb/scored_hashtable.py` | `LinearBucketTable.insert(collect_evicted=...)` |
-| `dynamicemb/key_value_table.py` | state retain buffer + `_insert_key_values` 收集 + storage `pop_evicted_keys` |
+| `dynamicemb/key_value_table.py` | state retain chunks + `_insert_key_values` 收集 + `_append_evicted` / `_pop_state_evicted_keys` + storage `pop_evicted_keys` |
+| `dynamicemb/batched_dynamicemb_function.py` | **forward HBM-direct 路径（`_prefetch_hbm_direct_path`）的 retain 收集（§3(B) gap 修复）** |
 | `dynamicemb/batched_dynamicemb_tables.py` | 传导配置 + module 级 `pop_evicted_keys` |
-| `dynamicemb/incremental_dump.py`（或新文件） | model 级 `pop_evicted_keys` |
+| `dynamicemb/incremental_dump.py` | model 级 `pop_evicted_keys` + 变长 all_gather |
 | `dynamicemb/__init__.py` | 导出 `pop_evicted_keys` |
-| `test/...` | table / storage / 分布式 测试 |
+| `test/unit_tests/table_operation/test_insert_collect_evicted.py` | table + storage 级（8 例）|
+| `test/unit_tests/incremental_dump/test_pop_evicted_keys.py` | module 级（3 例）|
+| `test/unit_tests/incremental_dump/test_distributed_dynamicemb.py` | 分布式 + model 级（待加）|
