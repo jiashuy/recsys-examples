@@ -1,94 +1,109 @@
-# Retain Evicted Keys — 设计与修改文档
+# Retain Evicted Keys — Design & Change Document
 
-> 分支：`feat/dynamicemb-retain-evicted-keys`（基于 PR #437 的 LruLfu / JIT 基础设施）
-> 目标：让**最后一级存储**在驱逐 key 时可选地保留被驱逐的 key，并暴露
-> `pop_evicted_keys(...)` API，按 table 取回「过去一段时间内被驱逐、去重后的 key」。
-
----
-
-## 1. 背景与动机
-
-DynamicEmb 的 key→slot 哈希表在 bucket 满时会按 score 逐出「受害者 key」。驱逐分两类，行为完全不同：
-
-- **`table_insert_and_evict`**（GPU 主表 / cache / HBM tier 用）：被驱逐 key 会写进
-  `evicted_keys/scores/indices/table_ids` 输出缓冲，然后由 Python 层**搬到下一级**（host/backing）。
-  这些 key 并未真正丢失。
-- **`table_insert`**（**最后一级** host / backing 表用）：evict 输出指针传 `nullptr`
-  （`kernels.cuh` 中 `insert_body` 目前把 `evict_key_out` 传 `nullptr`），被驱逐 key 被
-  **静默覆盖丢弃**——这是 key 真正从系统中消失的唯一位置，而这里当前没有任何缓冲区保留它。
-
-本功能就是给这条「最后一级 `insert`」路径加一个**可选的收集钩子**。
+> Branch: `feat/dynamicemb-retain-evicted-keys` (built on PR #437's LruLfu / JIT
+> infrastructure).
+> Goal: let the **last-tier storage** optionally retain the keys it evicts, and
+> expose a `pop_evicted_keys(...)` API to read back, per table, the deduplicated
+> keys evicted over a recent window of training.
 
 ---
 
-## 2. 已确定的设计决策（前期讨论结论）
+## 1. Background & Motivation
 
-| 决策点 | 选择 |
+DynamicEmb's key→slot hash table evicts a "victim key" by score when a bucket is
+full. There are two kinds of eviction, with completely different behavior:
+
+- **`table_insert_and_evict`** (used by the GPU main table / cache / HBM tier):
+  the evicted key is written to the `evicted_keys/scores/indices/table_ids`
+  output buffers, then the Python layer **moves it to the next tier**
+  (host/backing). Such keys are not truly lost.
+- **`table_insert`** (used by the **last-tier** host / backing table): the evict
+  output pointer is passed `nullptr` (`insert_body` in `kernels.cuh` currently
+  passes `nullptr` for `evict_key_out`), so the evicted key is **silently
+  overwritten and dropped** — this is the one place a key truly disappears from
+  the system, and there was no buffer retaining it.
+
+This feature adds an **optional collection hook** to that "last-tier `insert`"
+path.
+
+---
+
+## 2. Confirmed Design Decisions
+
+| Decision | Choice |
 |---|---|
-| 触发级别 | **仅最后一级**（真正丢弃 key 的那级）。中间层驱逐是搬运，不记录 |
-| 收集载体 | **`insert_body` 的编译期模板 sink**（不是 numba-JIT）。numba 那条线保留给 `user_score_fn` 数值函数 |
-| 收集内容 | 只 **key + table_id**（不含 score / value / index），最省内存、契合需求 |
-| 覆盖范围 | **所有 score policy**：AoT (`DefaultEvictor`) 与 LruLfu cubin (`RankedEvictor`) 两条 insert 路径都支持 |
-| 去重 & 内存 | **append buffer + 读时 `torch.unique`**（追加期不做任何压缩，只在 `pop` 时去重） |
-| 时间窗口 | **`pop` 读取即清空 / 增量**：返回上次调用以来新驱逐的 unique key |
-| 分布式 | `pg=None` 每 rank 返回本地部分（row-wise sharding → 天然 disjoint，零通信）；给 `pg` 则组内 `all_gather` 并集。**清空永远只清本 rank buffer** |
-| 配置项 | `DynamicEmbTableOptions.retain_evicted_keys: bool = False`（默认关闭，零开销） |
-| API 名 | `pop_evicted_keys` |
+| Trigger tier | **Last tier only** (the tier that truly drops a key). Intermediate-tier eviction is a spill and is not recorded |
+| Collection vehicle | **A compile-time template sink on `insert_body`** (not numba-JIT). The numba path stays reserved for the `user_score_fn` numeric function |
+| What is collected | Only **key + table_id** (no score / value / index) — minimal memory, matches the need |
+| Coverage | **All score policies**: both insert paths — AoT (`DefaultEvictor`) and the LruLfu cubin (`RankedEvictor`) |
+| Dedup & memory | **Append buffer + `torch.unique` on read** (no compaction while appending; dedup only on `pop`) |
+| Time window | **`pop` reads-and-clears / incremental**: returns the unique keys evicted since the previous call |
+| Distributed | `pg=None` returns each rank's local part (row-wise sharding → naturally disjoint, zero comm); with a `pg`, `all_gather` the group-wide union. **Clearing always clears only this rank's buffer** |
+| Config | `DynamicEmbTableOptions.retain_evicted_keys: bool = False` (off by default, zero overhead) |
+| API name | `pop_evicted_keys` |
 
-**待你确认的开放点**见 §9。
+The confirmed decisions are recorded in §9.
 
 ---
 
-## 3. 端到端数据流
+## 3. End-to-end Data Flow
 
-**收集触发点（最后一级 insert 的两条路径）** —— retain 收集必须挂在所有「最后一级、
-会真正丢弃 victim」的 insert 上。经代码走查，实际有 **两处**（第二处最初被遗漏，
-module 级测试发现后补上）：
+**Collection trigger points (two "last-tier insert" paths)** — retain collection
+must hook every "last-tier, truly-drops-the-victim" insert. A code walk found
+**two** such places (the second was missed initially and added after the
+module-level test caught it):
 
-- **(A) `storage.insert` 路径** → `key_value_table._insert_key_values`。用于：直接
-  `storage.insert`（`DynamicEmbStorage` / `HybridStorage` 的 host 层）、caching 模式
-  cache 驱逐写回 backing（`_prefetch_cache_path`）、`_generic_forward_path`。
-- **(B) forward HBM-direct 路径** → `batched_dynamicemb_function._prefetch_hbm_direct_path`。
-  用于：**非 caching 训练 forward**（HBM 单层 `DynamicEmbStorage`），它直接调
-  `key_index_map.insert()`（**不经** `_insert_key_values`）。
+- **(A) the `storage.insert` path** → `key_value_table._insert_key_values`. Used
+  by: a direct `storage.insert` (`DynamicEmbStorage` / the host tier of
+  `HybridStorage`), the caching-mode cache-eviction write-back to backing
+  (`_prefetch_cache_path`), and `_generic_forward_path`.
+- **(B) the forward HBM-direct path** →
+  `batched_dynamicemb_function._prefetch_hbm_direct_path`. Used by **non-caching
+  training forward** (single-tier HBM `DynamicEmbStorage`), which calls
+  `key_index_map.insert()` **directly** (bypassing `_insert_key_values`).
 
-两处共用同一个收集原语：
+Both share the same collection primitive:
 
 ```
 state.key_index_map.insert(..., collect_evicted=True)          # LinearBucketTable
-  └─ C++ table_insert_collect_evicted(...)                     # 新增 host 函数
-       ├─ AoT:    table_insert_collect_kernel                  # 非 LruLfu
+  └─ C++ table_insert_collect_evicted(...)                     # new host function
+       ├─ AoT:    table_insert_collect_kernel                  # non-LruLfu
        └─ LruLfu: dyn_emb_insert_collect_entry (cubin)         # via jit_link
             └─ insert_body<Table, Evictor, CollectEvicted=true>
-                 · 驱逐点取 victim key
-                 · compaction 写 evicted_keys[out]=victim, evicted_table_ids[out]=tid
+                 · grabs the victim key at the eviction point
+                 · compaction writes evicted_keys[out]=victim,
+                                     evicted_table_ids[out]=tid
   → (indices, num_evicted, evicted_keys, evicted_table_ids)
-_append_evicted(state, ...): 取前 num_evicted 个 clone，追加到 state 的
-  evicted_key_chunks / evicted_tid_chunks（纯 append，不去重）
+_append_evicted(state, ...): clone the first num_evicted entries and append to the
+  state's evicted_key_chunks / evicted_tid_chunks (pure append, no dedup)
 ```
 
-**ref-counter 与训练语义**：forward 中 prefetch 的 key `counter++`（正在使用），同一
-step 内无法驱逐它们（表现为 `Busy`，不算 `Evict`、不收集）；只有跨 step 的 backward
-把 counter 降回 0 后，后续 step 才会真正 `Evict` 并收集。所以训练中 retain 按 step
-边界产生驱逐——纯 forward（无 backward）不会收集到任何东西。
+**Ref-counter & training semantics**: in forward, prefetched keys are
+`counter++` (in use), so they cannot be evicted within the same step (this shows
+up as `Busy`, which is not `Evict` and is not collected); only after a
+cross-step backward decrements the counter back to 0 can a later step actually
+`Evict` and collect them. So during training, retain produces evictions at step
+boundaries — a bare forward (no backward) collects nothing.
 
 ```
-用户调用（任意时刻）
+User call (any time)
   dynamicemb.pop_evicted_keys(model, table_names=None, pg=None)
-    └─ 遍历 collection → module.pop_evicted_keys → storage.pop_evicted_keys(tid)
-         本地 keys = torch.unique(cat(chunks)[tid==table_id])   # pop 时才去重
-         pg 给定 → all_gather + concat（各 rank disjoint）
-         清空本 rank 该 table 的 chunks
-    → {collection_path: {table_name: 1-D int64 keys}}
+    └─ walk collections → module.pop_evicted_keys → storage.pop_evicted_keys(tid)
+         local keys = torch.unique(cat(chunks)[tid==table_id])   # dedup only on pop
+         with a pg → all_gather + concat (each rank disjoint)
+         clear this rank's chunks for that table
+    → {collection_path: {table_name: 1-D int64 keys}}  (host tensors)
 ```
 
 ---
 
-## 4. C++ 层改动（逐文件）
+## 4. C++ Changes (by file)
 
 ### 4.1 `src/table_operation/kernels.cuh`
 
-**(a) `insert_body` 加模板 sink + 输出参数**（模板参数追加在末尾，向后兼容；输出参数带默认 `nullptr`）
+**(a) `insert_body` gains a template sink + output params** (template param
+appended at the end for backward compatibility; output params default to
+`nullptr`)
 
 ```cpp
 template <typename Table, typename KernelTraits,
@@ -100,11 +115,13 @@ insert_body(..., int32_t *__restrict__ counter, uint64_t cur_ts = 0,
             CounterType *evicted_counter = nullptr) {
 ```
 
-- 现有实例化 `insert_body<Table, KernelTraits, DefaultEvictor>(..., counter, 0)` 与
-  `insert_body<..., RankedEvictor<C>>(..., counter, cur_ts)` **不受影响**（`CollectEvicted`
-  默认 false、新参数默认 nullptr）。
+- Existing instantiations `insert_body<Table, KernelTraits, DefaultEvictor>(...,
+  counter, 0)` and `insert_body<..., RankedEvictor<C>>(..., counter, cur_ts)` are
+  **unaffected** (`CollectEvicted` defaults to false, new params default to
+  nullptr).
 
-**(b) 驱逐点取 victim key**（当前把 `evict_key_out` 传 `nullptr`）
+**(b) grab the victim key at the eviction point** (currently passes `nullptr` for
+`evict_key_out`)
 
 ```cpp
     KeyType evict_key = KeyType();
@@ -113,9 +130,11 @@ insert_body(..., int32_t *__restrict__ counter, uint64_t cur_ts = 0,
         CollectEvicted ? &evict_key : static_cast<KeyType *>(nullptr),  // was nullptr
         static_cast<ScoreType *>(nullptr), counter, counter_offset, cur_ts);
 ```
-`CollectEvicted` 是编译期常量，false 分支折叠回 `nullptr` → 非收集路径代码不变。
+`CollectEvicted` is a compile-time constant; the false branch folds back to
+`nullptr`, so the non-collecting path's code is unchanged.
 
-**(c) 循环体末尾加 compaction 段（`if constexpr` 包裹，只写 key + table_id）**
+**(c) a compaction block at the loop tail (`if constexpr`-guarded, writes only key
++ table_id)**
 
 ```cpp
     if constexpr (CollectEvicted) {
@@ -141,14 +160,17 @@ insert_body(..., int32_t *__restrict__ counter, uint64_t cur_ts = 0,
       }
     }
 ```
-> **只收集 `InsertResult::Evict`**（表中已存在的老 key 被逐出）。**不**收集 `Busy`（新 key 因竞争/满桶未插入——那是插入失败，属 `safe_check_mode` 范畴，且该 key 会在后续 batch 再次出现）。【决策 1】
+> **Only `InsertResult::Evict` is collected** (an existing key pushed out). `Busy`
+> (a new key that failed to insert due to contention / a full bucket) is **not**
+> collected — that is an insert failure, in the `safe_check_mode` domain, and the
+> key reappears in a later batch. [Decision 1]
 
-**(d) 新增 AoT 收集版 `__global__`**（紧邻 `table_insert_kernel`）
+**(d) a new AoT collecting `__global__`** (next to `table_insert_kernel`)
 
 ```cpp
 template <typename Table, typename KernelTraits>
 __global__ void table_insert_collect_kernel(
-    /* 同 table_insert_kernel 参数 */ ..., int32_t *counter,
+    /* same params as table_insert_kernel */ ..., int32_t *counter,
     typename Table::KeyType *evicted_keys, int64_t *evicted_table_ids,
     CounterType *evicted_counter) {
   insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
@@ -159,7 +181,8 @@ __global__ void table_insert_collect_kernel(
 
 ### 4.2 `src/jit/evict_lrulfu.cu`
 
-新增 LruLfu cubin 的收集 entry（复用现有 `EvictParams` 已有字段 `evicted_keys / evicted_table_ids / evicted_counter`）：
+Add a collecting entry for the LruLfu cubin (reusing the existing `EvictParams`
+fields `evicted_keys / evicted_table_ids / evicted_counter`):
 
 ```cpp
 __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
@@ -181,211 +204,252 @@ extern "C" __global__ void dyn_emb_insert_collect_entry(EvictParams p) {
   run_insert_collect(p, read_globaltimer());
 }
 ```
-> `EvictParams` 结构体**不改**（字段已齐）。这条 entry 进 `evict_lrulfu_lex.fatbin`（AoT，默认 Lex evictor）与 custom fatbin 两份，与现有 3 个 entry 同批编译。
+> The `EvictParams` struct is **unchanged** (fields already present). This entry
+> goes into both `evict_lrulfu_lex.fatbin` (AoT, default Lex evictor) and the
+> custom fatbin, compiled alongside the existing 3 entries.
 
 ### 4.3 `src/jit/jit_link.h` / `jit_link.cpp`
 
-- `ModuleEntries` 增加 `CUfunction insert_collect;`
-- 加载时 `cuModuleGetFunction(&m.insert_collect, m.module, "dyn_emb_insert_collect_entry")`
-  （放入现有「任一 entry 缺失即卸载」的校验块）。
-- 新增 getter：
+- Add `CUfunction insert_collect;` to `EvictModule`.
+- On load, `cuModuleGetFunction(&m.insert_collect, m.module,
+  "dyn_emb_insert_collect_entry")` (inside the existing "unload if any entry is
+  missing" guard).
+- New getter:
   ```cpp
-  CUfunction demb_get_insert_collect_fn(int64_t key);  // 同 key 空间 / module
+  CUfunction demb_get_insert_collect_fn(int64_t key);  // same key space / module
   ```
-- launch 复用现有 `demb_launch_evict(fn, EvictParams, batch, stream)`，无需新 launcher。
+- Launch reuses the existing `demb_launch_evict(fn, EvictParams, batch, stream)`
+  — no new launcher.
 
 ### 4.4 `src/table_operation/insert.cu`
 
-- 新增 `launch_table_insert_collect_kernel<Table, PolicyTypeV, OutputScoreV>(...)`：与
-  `launch_table_insert_kernel` 同构，但
-  - LruLfu 分支：填 `EvictParams` 的 `evicted_keys/evicted_table_ids/evicted_counter`，
-    调 `demb_get_insert_collect_fn(score_fn_key)`；
-  - AoT 分支：调 `table_insert_collect_kernel`。
-  - 之后同样跟一个 `table_unlock_kernel`。
-- 新增 host 入口（**不改动现有 `table_insert` 签名**）：
+- New `launch_table_insert_collect_kernel<Table, PolicyTypeV, OutputScoreV>(...)`,
+  isomorphic to `launch_table_insert_kernel` but:
+  - LruLfu branch: fill `EvictParams`'s
+    `evicted_keys/evicted_table_ids/evicted_counter` and call
+    `demb_get_insert_collect_fn(score_fn_key)`;
+  - AoT branch: call `table_insert_collect_kernel`.
+  - followed by the same `table_unlock_kernel`.
+- New host entry (**without changing the existing `table_insert` signature**):
   ```cpp
-  // 返回 (indices, num_evicted, evicted_keys, evicted_table_ids)
+  // returns (indices, num_evicted, evicted_keys, evicted_table_ids)
   std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-  table_insert_collect_evicted(/* 同 table_insert 的入参 */ ...);
+  table_insert_collect_evicted(/* same inputs as table_insert */ ...);
   ```
-  内部分配 `evicted_keys[num_total]`、`evicted_table_ids[num_total]`（`int64`）、
-  `evicted_counter[1]=0`，dispatch 到 `launch_table_insert_collect_kernel`，返回缓冲与计数
-  （Python 侧按 `num_evicted` 切片）。缓冲上界 = 本 batch key 数（每个输入 key 至多逐出一个 victim）。
+  It allocates `evicted_keys[num_total]`, `evicted_table_ids[num_total]`
+  (`int64`), `evicted_counter[1]=0`, dispatches to
+  `launch_table_insert_collect_kernel`, and returns the buffers + count (the
+  Python side slices by `num_evicted`). The buffer upper bound is the batch key
+  count (each input key evicts at most one victim).
 
 ### 4.5 `src/table_operation/table.cu`
 
-在 `bind_table_operation` 中绑定 `table_insert_collect_evicted`（签名/返回与 4.4 一致）。
+Bind `table_insert_collect_evicted` in `bind_table_operation` (signature/return
+as in 4.4).
 
 ---
 
-## 5. Python 层改动（逐文件）
+## 5. Python Changes (by file)
 
 ### 5.1 `dynamicemb/dynamicemb_config.py`
-`DynamicEmbTableOptions` 新增字段：
+`DynamicEmbTableOptions` gains a field:
 ```python
 retain_evicted_keys: bool = False
 ```
-文档字符串说明：仅对最后一级存储生效；开启后可用 `pop_evicted_keys` 取回被驱逐 key。
+Docstring: effective on the last-tier storage only; when enabled, evicted keys
+can be read back with `pop_evicted_keys`.
 
 ### 5.2 `dynamicemb/scored_hashtable.py`
-`LinearBucketTable.insert` 增加可选参数（默认关，保持现返回类型）：
+`LinearBucketTable.insert` gains an optional param (off by default, return type
+unchanged in the default case):
 ```python
 def insert(self, keys, table_ids, score, insert_results=None, score_out=None,
            collect_evicted: bool = False):
     ...
     if collect_evicted:
-        indices, num_evicted, ev_keys, ev_tids = table_insert_collect_evicted(
-            ..., score_fn_key=self.score_fn_key_)
-        return indices, num_evicted, ev_keys, ev_tids
-    indices = table_insert(...)   # 现状
+        return table_insert_collect_evicted(
+            ..., score_fn_key=self.score_fn_key_)  # (indices, num_evicted, ev_keys, ev_tids)
+    indices = table_insert(...)   # as before
     return indices
 ```
-> `_deterministic_insert`（`DEMB_DETERMINISM_MODE`）路径**不支持**收集：`collect_evicted=True`
-> 命中该分支时抛明确的 `RuntimeError`（不静默回退）。【决策 3】
+> The `_deterministic_insert` path (`DEMB_DETERMINISM_MODE`) **does not support**
+> collection: `collect_evicted=True` there raises a clear `RuntimeError` (no
+> silent fallback). [Decision 3]
 
-### 5.3 `dynamicemb/key_value_table.py`（核心）
+### 5.3 `dynamicemb/key_value_table.py` (core)
 
-**(a) `DynamicEmbTableState` 增加 retain 状态**（`create_table_state` 里按 `retain_evicted_keys` 初始化，仅最后一级 state）：
+**(a) `DynamicEmbTableState` gains retain state** (initialized in
+`create_table_state` from `retain_evicted_keys`, only for a last-tier state):
 - `retain_evicted_keys: bool`
-- `evicted_key_buffer: Optional[DeviceExtendableBuffer]`（1-D int64，存 key）
-- `evicted_tid_buffer: Optional[DeviceExtendableBuffer]`（1-D int32/64，存 table_id）
+- `evicted_key_chunks: List[torch.Tensor]` (per-insert 1-D int64 key chunks)
+- `evicted_tid_chunks: List[torch.Tensor]` (per-insert 1-D int64 table_id chunks)
 
-> 追加期**不做**任何压缩/去重（【决策 2】）；去重只在 `pop` 时 `torch.unique`。
+> No compaction/dedup while appending ([Decision 2]); dedup happens only on `pop`
+> via `torch.unique`.
 
-**(b) `_insert_key_values`（最后一级统一入口，:1021）** 改为：
+**(b) `_insert_key_values` (the last-tier common entry)** becomes:
 ```python
 if state.retain_evicted_keys:
     indices, num_evicted, ev_keys, ev_tids = state.key_index_map.insert(
         unique_keys, table_ids, score_arg, score_out=score_out_flat,
         collect_evicted=True)
-    if num_evicted > 0:
-        _append_evicted(state, ev_keys[:num_evicted], ev_tids[:num_evicted])
+    _append_evicted(state, ev_keys, ev_tids, num_evicted)
 else:
-    indices = state.key_index_map.insert(...)   # 现状
+    indices = state.key_index_map.insert(...)   # as before
 ...
-store_to_flat(state, flat_indices, table_ids, unique_values)   # 不变
+store_to_flat(state, flat_indices, table_ids, unique_values)   # unchanged
 ```
-`_append_evicted` 只把 (key, tid) 追加到两个 buffer（纯 append，无压缩）。
+`_append_evicted` clones the first `num_evicted` entries and appends (key, tid)
+to the two chunk lists (pure append, no compaction).
 
-**(c) `pop` 辅助**（storage 层）
-- `DynamicEmbStorage.pop_evicted_keys(table_id) -> Tensor`：从其 state buffer 取
-  `key[tid==table_id]` → `torch.unique` → 清空**该 rank**的 buffer（整体清，或按 tid 分段清；见 §7）。
-- `HybridStorage.pop_evicted_keys(table_id)`：只读 `self._host` 的 buffer（最后一级）。
-- `DynamicEmbCache`：不参与（非最后一级）。
+**(c) `pop` helpers** (storage layer)
+- `DynamicEmbStorage.pop_evicted_keys(table_id) -> Tensor`: from its state chunks,
+  take `key[tid==table_id]` → `torch.unique` → clear **this rank's** entries for
+  that table (rebuild chunks keeping the other tables' rows).
+- `HybridStorage.pop_evicted_keys(table_id)`: reads `self._host`'s chunks only
+  (the last tier).
+- `DynamicEmbCache`: not involved (not a last tier).
 
-**(d) 最后一级判定**（`retain_evicted_keys` 只挂在真正会丢 key 的 state）
-- 非 caching 单层 `DynamicEmbStorage` → 其 state 是最后一级 ✔
-- `HybridStorage` → `self._host` state 是最后一级 ✔；`self._hbm` ✘（走 insert_and_evict 溢出）
-- caching → backing `self._storage`（`DynamicEmbStorage` 或 external PS）是最后一级 ✔；
-  `self._cache` ✘
+Module-/model-level `pop_evicted_keys` return **host** tensors (dedup + NCCL
+gather run on device, then `.cpu()`).
+
+**(d) Last-tier determination** (`retain_evicted_keys` hooks only the state that
+truly drops keys)
+- non-caching single-tier `DynamicEmbStorage` → its state is a last tier ✔
+- `HybridStorage` → `self._host` state is a last tier ✔; `self._hbm` ✘ (spills via
+  insert_and_evict)
+- caching → the backing `self._storage` (`DynamicEmbStorage` or an external PS) is
+  a last tier ✔; `self._cache` ✘
 
 ### 5.4 `dynamicemb/batched_dynamicemb_tables.py`
-- 构造时把每表的 `retain_evicted_keys` 传给**最后一级** storage 的 `create_table_state`
-  （在 `_create_cache_storage` 里按上面判定分派）。
-- 新增方法：
+- At construction, pass each table's `retain_evicted_keys` to the **last-tier**
+  storage's `create_table_state` (dispatched per the rules above in
+  `_create_cache_storage`).
+- New method:
   ```python
-  def pop_evicted_keys(self, table_names=None, pg=None) -> Dict[str, torch.Tensor]:
-      # 仅遍历开启 retain 的表；table_name→table_id = self._table_names.index(name)
-      # 调 self._storage.pop_evicted_keys(table_id)，pg 给定则 all_gather+concat
+  def pop_evicted_keys(self, table_names=None) -> Dict[str, torch.Tensor]:
+      # only retain-enabled tables; table_name -> table_id via
+      # self._table_names.index(name); calls self._storage.pop_evicted_keys(table_id)
+      # and returns host tensors. Cross-rank aggregation is the model-level API's job.
   ```
-  （对 caching：从 backing `self._storage` 取。）
+  (For caching: read from the backing `self._storage`.)
 
-### 5.5 `dynamicemb/incremental_dump.py`（或新增 `dynamicemb/evicted_keys.py`）
-model 级函数，风格对齐 `incremental_dump`：
+### 5.5 `dynamicemb/incremental_dump.py`
+Model-level function, styled after `incremental_dump`:
 ```python
 def pop_evicted_keys(
     model: torch.nn.Module,
-    table_names: Optional[Dict[str, List[str]]] = None,  # None = 所有开启 retain 的表
+    table_names: Optional[Dict[str, List[str]]] = None,  # None = all retain-enabled tables
     pg: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
-    # {collection_path: {table_name: 1-D int64 unique evicted keys}}
+    # {collection_path: {table_name: 1-D int64 unique evicted keys (host)}}
 ```
-复用 `find_sharded_modules` / `get_dynamic_emb_module` 遍历，逐 `BatchedDynamicEmbeddingTablesV2`
-调其 `pop_evicted_keys`。
+Walks via `find_sharded_modules` / `get_dynamic_emb_module`, calling
+`pop_evicted_keys` on each `BatchedDynamicEmbeddingTablesV2`; with a `pg` it
+`all_gather`s each table's keys within the group (variable-length gather).
 
 ### 5.6 `dynamicemb/__init__.py`
-`from .incremental_dump import pop_evicted_keys`（或新模块），并加入 `__all__`。
+`from .incremental_dump import pop_evicted_keys` and add it to `__all__`.
 
 ---
 
-## 6. `pop_evicted_keys` API 规格
+## 6. `pop_evicted_keys` API Spec
 
 ```python
 def pop_evicted_keys(model, table_names=None, pg=None)
     -> Dict[str, Dict[str, torch.Tensor]]
 ```
-- **返回**：`{collection_path: {table_name: keys}}`，`keys` 为 1-D `int64`、table 内 unique。
-- **`pg=None`**：每 rank 返回本地 shard 上被驱逐的 key（零通信）。
-- **`pg` 给定**：组内 `all_gather` 后 concat（各 rank disjoint，直接拼即全局 unique）。
-- **增量语义**：返回「上次调用以来」新驱逐的 key；调用后**清空本 rank buffer**（无论是否聚合，只清自己的）。
-- 未开启 `retain_evicted_keys` 的表：**从返回中省略**（不返回空张量）。【决策 4】
+- **Returns**: `{collection_path: {table_name: keys}}`, `keys` a 1-D `int64` host
+  tensor, unique within a table.
+- **`pg=None`**: each rank returns the keys evicted on its local shard (zero comm).
+- **With a `pg`**: `all_gather` within the group and concat (ranks are disjoint, so
+  the concatenation is the global unique set).
+- **Incremental semantics**: returns keys evicted "since the previous call", and
+  clears **this rank's buffer** afterward (only its own, regardless of aggregation).
+- Tables without `retain_evicted_keys=True`: **omitted** from the result (no empty
+  tensor). [Decision 4]
 
 ---
 
-## 7. 内存与语义细节
+## 7. Memory & Semantics Details
 
-- **收集上界**：一次 insert 的 evicted 数 ≤ 输入 key 数；C++ 侧按 `num_total` 预分配，
-  `evicted_counter` 给真实数量，Python 侧切片。
-- **buffer 增长**：`DeviceExtendableBuffer` 按需 `extend`，追加期不去重；内存 ≈ O(两次 pop 之间
-  被逐出的 key 总数，含重复)。去重只在 `pop` 时做（【决策 2】）。
-- **清空粒度**：`pop` 单表时理想是只清该 table 的条目。实现上 buffer 混存多表 → 用
-  `mask = tid != table_id` 保留其余、重建 buffer；或一次 `pop` 所有请求表后统一重建。
-- **disjoint 保证**：row-wise sharding 下同一 key 只落一个 rank，故跨 rank 聚合只需 concat。
-- **与 `incremental_dump` 正交**：两者独立；retain 记录「已离开表」的 key，incremental_dump
-  导出「仍在表内、score 达阈值」的 key。
-
----
-
-## 8. 测试（已在 EOS / H100 上编译并通过）
-
-- **table 级**（`test/unit_tests/table_operation/test_insert_collect_evicted.py`，5 例）：
-  whole-set eviction oracle 校验 `insert(collect_evicted=True)` 收集的
-  (evicted_keys, evicted_table_ids) —— **LruLfu cubin 与 AoT 两路各一**、多逻辑表按
-  table_id 分流、无驱逐为空、`DEMB_DETERMINISM_MODE` 报错。
-- **storage 级**（同文件，3 例）：`DynamicEmbStorage` 端到端（收集 → pop unique →
-  被逐 key 已不在表 → 二次 pop 空/增量）、`retain=False` 恒空、buffer 逻辑单元测试
-  （跨批去重 + table_id 过滤 + 清空隔离）。
-- **module 级**（`test/unit_tests/incremental_dump/test_pop_evicted_keys.py`，3 例）：
-  **非 caching 训练 forward（HBM-direct 路径）跨 step 驱逐被收集** —— 此测试发现并驱动了
-  §3(B) `_prefetch_hbm_direct_path` 的收集补丁；未开启表省略；`table_names` 过滤 +
-  table_id 隔离。均用完整 forward+backward step（见 §3 的 ref-counter 语义：纯 forward
-  不会驱逐）。
-- **分布式 + model 级**（`test/unit_tests/incremental_dump/test_distributed_dynamicemb.py`，
-  *待加*）：`pg=None` 各 rank disjoint；给 `pg` 组内并集；清空只本 rank；变长 all_gather；
-  以及 model 级 `dynamicemb.pop_evicted_keys(model, ...)` 遍历 sharded collection。
-- **回归**：`retain_evicted_keys=False`（默认）下现有 insert/evict 路径由 `if constexpr` /
-  Python 分支保证行为不变。
+- **Collection upper bound**: the evicted count of one insert ≤ the input key
+  count; the C++ side preallocates `num_total`, `evicted_counter` gives the real
+  count, and the Python side slices.
+- **Buffer growth**: chunks are appended with no dedup; memory ≈ O(total keys
+  evicted between two pops, including duplicates). Dedup is done only on `pop`
+  ([Decision 2]).
+- **Clear granularity**: a per-table `pop` should clear only that table's entries.
+  Chunks mix tables, so pop concatenates, selects `tid==table_id`, and rebuilds
+  the chunks keeping `tid != table_id`.
+- **Disjoint guarantee**: under row-wise sharding a key lands on exactly one rank,
+  so cross-rank aggregation is just a concat.
+- **Orthogonal to `incremental_dump`**: independent; retain records keys that have
+  **left** the table, while incremental_dump exports keys **still in** the table
+  whose score crosses a threshold.
 
 ---
 
-## 9. 决策记录（已确认）
+## 8. Tests (compiled and passing on EOS / H100)
 
-1. **收集范围**：只收集 `InsertResult::Evict`；**Busy 不算**。
-2. **无中途压缩**：追加期不压缩，去重只在 `pop` 时 `torch.unique`。
-3. **确定性模式**：`DEMB_DETERMINISM_MODE` 不支持收集，`collect_evicted=True` 命中即抛
-   `RuntimeError`。
-4. **未开启表**：从 `pop` 结果中省略（不返回空张量）。
-5. **API 落点**：`pop_evicted_keys` 放进 `dynamicemb/incremental_dump.py`。
-6. **无 `clear=False`**：只保留「读取即清空」语义，不加只读变体。
+All retain tests live under `test/unit_tests/retain_evicted_keys/`.
+
+- **Table level** (`test_insert_collect_evicted.py`, 5 cases): a whole-set
+  eviction oracle checks the (evicted_keys, evicted_table_ids) collected by
+  `insert(collect_evicted=True)` — **one each for the LruLfu cubin and the AoT
+  path**, table_id routing across logical tables sharing storage, empty on no
+  eviction, and the `DEMB_DETERMINISM_MODE` raise.
+- **Storage level** (same file, 3 cases): `DynamicEmbStorage` end-to-end (collect
+  → pop unique → evicted keys are gone from the table → second pop empty /
+  incremental), `retain=False` always empty, and a buffer-logic unit test
+  (cross-batch dedup + table_id filter + clear isolation).
+- **Module level** (`test_pop_evicted_keys.py`, 3 cases): **the non-caching
+  training forward (HBM-direct path) retains its cross-step evictions** — this
+  test found and drove the §3(B) `_prefetch_hbm_direct_path` fix; disabled tables
+  omitted; `table_names` filter + table_id isolation. All use full
+  forward+backward steps (see §3's ref-counter semantics: bare forward evicts
+  nothing).
+- **Distributed / model level** (`test_distributed_pop_evicted_keys.py`,
+  self-contained, launched with torchrun): row-wise sharded — `pg=None` disjoint
+  per rank, `pg` gives the group-wide union identical on every rank, clearing is
+  rank-local, plus the model-level `dynamicemb.pop_evicted_keys(model, ...)`
+  walking a sharded collection.
+- **Regression**: with `retain_evicted_keys=False` (default), the existing
+  insert/evict paths are unchanged by construction (`if constexpr` / Python
+  branches).
 
 ---
 
-## 10. 改动文件清单
+## 9. Decision Record (confirmed)
 
-| 文件 | 改动 |
+1. **Collection scope**: collect only `InsertResult::Evict`; **not `Busy`**.
+2. **No mid-flight compaction**: no compaction while appending; dedup only on
+   `pop` via `torch.unique`.
+3. **Determinism mode**: `DEMB_DETERMINISM_MODE` does not support collection;
+   `collect_evicted=True` there raises a `RuntimeError`.
+4. **Disabled tables**: omitted from the `pop` result (no empty tensor).
+5. **API location**: `pop_evicted_keys` lives in `dynamicemb/incremental_dump.py`.
+6. **No `clear=False`**: keep only the read-and-clear semantics; no read-only
+   variant.
+
+---
+
+## 10. Changed Files
+
+| File | Change |
 |---|---|
-| `src/table_operation/kernels.cuh` | `insert_body` 加 sink 模板 + compaction；新增 `table_insert_collect_kernel` |
-| `src/jit/evict_lrulfu.cu` | 新增 `dyn_emb_insert_collect_entry` |
-| `src/jit/jit_link.h` / `.cpp` | 缓存新 entry + `demb_get_insert_collect_fn` |
+| `src/table_operation/kernels.cuh` | `insert_body` sink template + compaction; new `table_insert_collect_kernel` |
+| `src/jit/evict_lrulfu.cu` | new `dyn_emb_insert_collect_entry` |
+| `src/jit/jit_link.h` / `.cpp` | cache the new entry + `demb_get_insert_collect_fn` |
 | `src/table_operation/insert.cu` | `launch_table_insert_collect_kernel` + host `table_insert_collect_evicted` |
-| `src/table_operation/table.cu` | 绑定 `table_insert_collect_evicted` |
-| `dynamicemb/dynamicemb_config.py` | `retain_evicted_keys` 配置项 |
+| `src/table_operation/table.cu` | bind `table_insert_collect_evicted` |
+| `dynamicemb/dynamicemb_config.py` | `retain_evicted_keys` option |
 | `dynamicemb/scored_hashtable.py` | `LinearBucketTable.insert(collect_evicted=...)` |
-| `dynamicemb/key_value_table.py` | state retain chunks + `_insert_key_values` 收集 + `_append_evicted` / `_pop_state_evicted_keys` + storage `pop_evicted_keys` |
-| `dynamicemb/batched_dynamicemb_function.py` | **forward HBM-direct 路径（`_prefetch_hbm_direct_path`）的 retain 收集（§3(B) gap 修复）** |
-| `dynamicemb/batched_dynamicemb_tables.py` | 传导配置 + module 级 `pop_evicted_keys` |
-| `dynamicemb/incremental_dump.py` | model 级 `pop_evicted_keys` + 变长 all_gather |
-| `dynamicemb/__init__.py` | 导出 `pop_evicted_keys` |
-| `test/unit_tests/table_operation/test_insert_collect_evicted.py` | table + storage 级（8 例）|
-| `test/unit_tests/incremental_dump/test_pop_evicted_keys.py` | module 级（3 例）|
-| `test/unit_tests/incremental_dump/test_distributed_dynamicemb.py` | 分布式 + model 级（待加）|
+| `dynamicemb/key_value_table.py` | state retain chunks + `_insert_key_values` collection + `_append_evicted` / `_pop_state_evicted_keys` + storage `pop_evicted_keys` |
+| `dynamicemb/batched_dynamicemb_function.py` | **retain collection on the forward HBM-direct path (`_prefetch_hbm_direct_path`) — §3(B) gap fix** |
+| `dynamicemb/batched_dynamicemb_tables.py` | thread the config through + module-level `pop_evicted_keys` |
+| `dynamicemb/incremental_dump.py` | model-level `pop_evicted_keys` + variable-length all_gather |
+| `dynamicemb/__init__.py` | export `pop_evicted_keys` |
+| `test/unit_tests/retain_evicted_keys/test_insert_collect_evicted.py` | table + storage level (8 cases) |
+| `test/unit_tests/retain_evicted_keys/test_pop_evicted_keys.py` | module level (3 cases) |
+| `test/unit_tests/retain_evicted_keys/test_distributed_pop_evicted_keys.py` | distributed + model level |
