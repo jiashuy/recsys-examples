@@ -483,3 +483,47 @@ def test_hybrid_storage_export_scores_and_embeddings(
             act_scores,
             {TABLE_NAME: set()},
         )
+
+
+def test_hybrid_incremental_dump_slot_index_tier():
+    """HybridStorage.incremental_dump packs a tier bit (bit 63) into slot_index so
+    the HBM and host tiers' independent key_index_map slot spaces stay
+    distinguishable: bit 63 = tier (HBM=0 / host=1), bits 0..62 = key_slot. Fill
+    both tiers (insert more unique keys than the HBM tier holds), dump everything
+    (TIMESTAMP threshold 0, pg=None -> local view), and assert both tier bits
+    appear and key_slot stays non-negative.
+    """
+    _require_cuda_dist()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    num_embeddings, embedding_dim = 256, 16
+    # 0.5 -> ~half the rows fit in the HBM tier; the rest spill to host.
+    storage = _build_storage(
+        num_embeddings,
+        embedding_dim,
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        0.5,
+        EmbOptimType.SGD,
+    )
+    storage.training = True
+
+    n = num_embeddings  # more unique keys than the HBM tier holds -> spill to host
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    vals = torch.full((n, embedding_dim), 1e-1, dtype=torch.float32, device=device)
+    storage.insert(keys, tids, vals)
+    torch.cuda.synchronize()
+
+    dump_keys, _, slot_index = storage.incremental_dump(0, 0, None)
+    assert dump_keys.numel() > 0
+    assert slot_index.numel() == dump_keys.numel()
+    assert slot_index.dtype == torch.int64
+
+    # bit 63 = tier: the host tier sets it, so those entries are negative int64;
+    # the HBM tier leaves it 0 (non-negative). Both tiers must be present.
+    is_host = slot_index < 0
+    assert bool(is_host.any()), "host tier must contribute dumped keys"
+    assert bool((~is_host).any()), "HBM tier must contribute dumped keys"
+
+    # key_slot = bits 0..62 (clear the tier bit) -> a valid non-negative slot.
+    key_slot = slot_index & 0x7FFFFFFFFFFFFFFF
+    assert int(key_slot.min()) >= 0

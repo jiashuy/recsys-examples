@@ -982,16 +982,20 @@ def inc_dump(args, runtime: RuntimeContext):
 
             if batch_idx % 100 == 0:
                 # reset undumped_score here.
-                ret_tensors, undumped_score = incremental_dump(model, undumped_score)
-                dump_number = 0
-                for module_path, named_tensors in ret_tensors.items():
-                    for (
-                        table_name,
-                        tensors,
-                    ) in (
-                        named_tensors.items()
-                    ):  # tensors[0] and tensors[1] are keys and values.
-                        dump_number += tensors[0].size(0)
+                res = incremental_dump(model, undumped_score)
+                # res: {collection_path: DeltaDumpResult}. Rebuild the per-table
+                # threshold for the next call from each DeltaDumpResult's meta.
+                undumped_score = {
+                    cp: {
+                        tn: dr.meta[j]["current_score"]
+                        for j, tn in enumerate(dr.table_names)
+                    }
+                    for cp, dr in res.items()
+                }
+                # dr.keys[i] is table i's dumped keys (aligned with dr.values[i]).
+                dump_number = sum(
+                    keys.size(0) for dr in res.values() for keys in dr.keys
+                )
                 print(
                     f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, dump number: {dump_number}"
                 )

@@ -3025,6 +3025,17 @@ def test_table_expansion_capacity_growth(
     """
     pytest.importorskip("torchrec")
 
+    # HybridStorage (non-caching, partial-HBM: hbm_budget_ratio < 1.0) no longer
+    # supports NO_EVICTION -- it raises at construction. Skip that combination.
+    if (
+        score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+        and not caching
+        and hbm_budget_ratio < 1.0
+    ):
+        pytest.skip(
+            "HybridStorage (non-caching partial-HBM) does not support NO_EVICTION"
+        )
+
     assert torch.cuda.is_available()
     device_id = torch.cuda.current_device()
     device = torch.device(f"cuda:{device_id}")

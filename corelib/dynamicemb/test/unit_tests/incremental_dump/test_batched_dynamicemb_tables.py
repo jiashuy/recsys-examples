@@ -34,6 +34,16 @@ def current_device():
     return torch.cuda.current_device()
 
 
+def _dumped_keys(res, table_name):
+    """Per-table dumped keys from a module-level DeltaDumpResult."""
+    return res.keys[res.table_names.index(table_name)]
+
+
+def _current_scores(res):
+    """{table_name: current_score} from a DeltaDumpResult (next dump threshold)."""
+    return {tn: res.meta[j]["current_score"] for j, tn in enumerate(res.table_names)}
+
+
 class CustomizedScore:
     def __init__(self, table_names: List[int]):
         self.table_names_ = table_names
@@ -188,9 +198,10 @@ def test_without_eviction(
                 model(indices, offsets)
 
             print("Dump score=", undump_score)
-            ret_tensors, undump_score = model.incremental_dump(undump_score)
+            res = model.incremental_dump(undump_score)
+            undump_score = _current_scores(res)
             for table_name, indices in zip(table_names, unique_indices):
-                dumped_indices = set(ret_tensors[table_name][0].tolist())
+                dumped_indices = set(_dumped_keys(res, table_name).tolist())
                 # must match
                 assert len(dumped_indices) == len(indices)
                 assert dumped_indices == indices
@@ -210,9 +221,10 @@ def test_without_eviction(
                 model.set_score(customized_score.get())
 
             print("Dump score=", undump_score)
-            ret_tensors, undump_score = model.incremental_dump(undump_score)
+            res = model.incremental_dump(undump_score)
+            undump_score = _current_scores(res)
             for table_name, indices in zip(table_names, unique_indices):
-                dumped_indices = set(ret_tensors[table_name][0].tolist())
+                dumped_indices = set(_dumped_keys(res, table_name).tolist())
                 # must match
                 assert len(dumped_indices) == len(indices)
                 assert dumped_indices == indices
@@ -270,17 +282,20 @@ def test_lfu_incremental_dump_retouch(current_device, caching):
     # Window 1: touch A -> dump returns exactly A.
     indices, offsets = _feature_from_keys(keys_a, device)
     model(indices, offsets)
-    ret_tensors, score = model.incremental_dump(score)
-    assert set(ret_tensors[table_name][0].tolist()) == set(keys_a)
+    res = model.incremental_dump(score)
+    score = _current_scores(res)
+    assert set(_dumped_keys(res, table_name).tolist()) == set(keys_a)
 
     # Window 2: re-touch B and touch new C; A\B left untouched.
     indices, offsets = _feature_from_keys(keys_b + keys_c, device)
     model(indices, offsets)
-    ret_tensors, score = model.incremental_dump(score)
-    dumped = set(ret_tensors[table_name][0].tolist())
+    res = model.incremental_dump(score)
+    score = _current_scores(res)
+    dumped = set(_dumped_keys(res, table_name).tolist())
     assert dumped == set(keys_b) | set(keys_c)
     assert dumped.isdisjoint(untouched)
 
     # Window 3: no access -> empty dump.
-    ret_tensors, score = model.incremental_dump(score)
-    assert set(ret_tensors[table_name][0].tolist()) == set()
+    res = model.incremental_dump(score)
+    score = _current_scores(res)
+    assert set(_dumped_keys(res, table_name).tolist()) == set()

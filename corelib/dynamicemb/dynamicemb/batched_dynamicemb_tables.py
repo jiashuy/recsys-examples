@@ -511,6 +511,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_option == other_option
             ), "All tables must match in grouped keys."
         self._dynamicemb_options = table_options
+        # world_size the table is sharded across at creation. dynamicemb only
+        # supports ROW_WISE sharding over the global WORLD (no 2D / sub-pg
+        # sharding), so the global ``dist.get_world_size()`` here equals the
+        # ``pg.size()`` that input_dist uses as the key->rank modulo base -- they
+        # are the authoritative shard count and this merely mirrors it. Recorded
+        # because DeltaDumpResult meta needs it for replay's key->rank
+        # reconstruction, independent of the gather ``pg`` passed to
+        # incremental_dump (which is only a comm scope). Constructed after DMP
+        # sharding, so dist is already init here; single-GPU (no dist) -> 1.
+        self._shard_world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
@@ -747,15 +757,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
-                    # NO_EVICTION mode: HBM uses TIMESTAMP, host uses NO_EVICTION
+                    # HybridStorage does not support NO_EVICTION: its slot_index
+                    # packs only a tier bit + key_slot (which assumes key_slot ==
+                    # value_row); NO_EVICTION's independent value row breaks that.
                     if (
                         self._dynamicemb_options[0].score_strategy
                         == DynamicEmbScoreStrategy.NO_EVICTION
                     ):
-                        for hbm_option in hbm_options:
-                            hbm_option.score_strategy = (
-                                DynamicEmbScoreStrategy.TIMESTAMP
-                            )
+                        raise ValueError(
+                            "NO_EVICTION is not supported with HybridStorage "
+                            "(non-caching partial-HBM storage). Use caching=True "
+                            "(the backing store keeps NO_EVICTION) or a single-tier "
+                            "configuration."
+                        )
 
                     self._storage = HybridStorage(
                         hbm_options, host_options, self._optimizer
@@ -1449,15 +1463,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
             if table_names is not None and name not in table_names:
                 continue
-            result[name] = storage.pop_evicted_keys(i)
+            result[name] = storage.pop_evicted_keys(i).cpu()  # host tensor
         return result
 
     def incremental_dump(
         self,
         named_thresholds: Dict[str, int] = None,
         pg: Optional[dist.ProcessGroup] = None,
-    ) -> Tuple[Dict[str, Tuple[Tensor, Tensor]], Dict[str, int]]:
-        """Dump keys/values whose score crosses the per-table threshold.
+    ) -> "DeltaDumpResult":
+        """Dump keys/values (+ evicted keys + meta) whose score crosses the threshold.
+
+        Returns a :class:`DeltaDumpResult` for this module (column-aligned lists by
+        table). ``meta[i]`` carries current_score / slot_index / current_capacity /
+        world_size / table_options; ``evicted_keys[i]`` is the retained evicted keys
+        for a ``retain_evicted_keys=True`` table (drained here) else ``None``.
 
         The meaning of the threshold depends on the table's score strategy:
 
@@ -1472,6 +1491,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
           score is not less than the threshold are dumped. This is not a time-based
           increment.
         """
+        from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
+            DeltaDumpResult,
+            _all_gather_evicted_keys,
+        )
+
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
             raise TypeError(
@@ -1480,8 +1504,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
             flush_cache(self._cache, storage)
-        ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
-        ret_scores: Dict[str, int] = {}
+        res = DeltaDumpResult()
         ts: Optional[int] = None
         for table_name, threshold in named_thresholds.items():
             if table_name not in self._table_names:
@@ -1493,13 +1516,44 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
                 continue
             table_id = self._table_names.index(table_name)
-            keys_cat, values_cat = storage.incremental_dump(table_id, threshold, pg)
-            ret_tensors[table_name] = (keys_cat, values_cat)
+            keys_cat, values_cat, slot_index = storage.incremental_dump(
+                table_id, threshold, pg
+            )
             option = self._dynamicemb_options[table_id]
             if score_strategy_has_timestamp_column(option.score_strategy):
                 if ts is None:
                     ts = device_timestamp()
-                ret_scores[table_name] = ts
+                current_score = ts
             else:
-                ret_scores[table_name] = self._scores[table_name]
-        return ret_tensors, ret_scores
+                current_score = self._scores[table_name]
+            # evicted keys: only retain-enabled tables; drain the buffer, aggregate
+            # within the SAME pg as keys/values, return on host.
+            if option.retain_evicted_keys and hasattr(storage, "pop_evicted_keys"):
+                ev = storage.pop_evicted_keys(table_id)
+                if pg is not None:
+                    ev = _all_gather_evicted_keys(ev, pg)
+                ev = ev.cpu()
+            else:
+                ev = None
+            # current_capacity: DynamicEmbStorage has one key_index_map; a
+            # HybridStorage sums its tiers.
+            if hasattr(storage, "key_index_map"):
+                current_capacity = storage.key_index_map.capacity(table_id)
+            else:
+                current_capacity = sum(
+                    s.key_index_map.capacity(table_id) for s in storage.tables
+                )
+            res.table_names.append(table_name)
+            res.keys.append(keys_cat)
+            res.values.append(values_cat)
+            res.evicted_keys.append(ev)
+            res.meta.append(
+                {
+                    "current_score": current_score,
+                    "slot_index": slot_index,
+                    "current_capacity": current_capacity,
+                    "world_size": self._shard_world_size,
+                    "table_options": option,
+                }
+            )
+        return res

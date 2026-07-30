@@ -75,12 +75,14 @@ from torch import Tensor, nn  # usort:skip
 def _all_gather_dumped_keys_values(
     keys: Tensor,
     values: Tensor,
+    slot_index: Tensor,
     pg: dist.ProcessGroup,
-) -> Tuple[Tensor, Tensor]:
-    """Gather (keys, values) from all ranks into concatenated CPU tensors.
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Gather (keys, values, slot_index) from all ranks into concatenated CPU tensors.
 
-    keys: (N,) int64 on device; values: (N, D) on device.
-    Returns (out_keys_cpu, out_values_cpu) with all ranks' data in rank order.
+    keys: (N,) int64 on device; values: (N, D) on device; slot_index: (N,) int64
+    on device. Returns (out_keys_cpu, out_values_cpu, out_slot_index_cpu) with all
+    ranks' data in rank order, column-aligned across the three.
     """
     device = keys.device
     world_size = dist.get_world_size(group=pg)
@@ -93,13 +95,17 @@ def _all_gather_dumped_keys_values(
     dtype_val = values.dtype
     keys_pad = torch.zeros(max_n, dtype=torch.int64, device=device)
     values_pad = torch.zeros(max_n, emb_dim, dtype=dtype_val, device=device)
+    slot_pad = torch.zeros(max_n, dtype=torch.int64, device=device)
     if n > 0:
         keys_pad[:n] = keys
         values_pad[:n, :] = values
+        slot_pad[:n] = slot_index
     gathered_keys = [torch.empty_like(keys_pad) for _ in range(world_size)]
     gathered_values = [torch.empty_like(values_pad) for _ in range(world_size)]
+    gathered_slots = [torch.empty_like(slot_pad) for _ in range(world_size)]
     dist.all_gather(gathered_keys, keys_pad, group=pg)
     dist.all_gather(gathered_values, values_pad, group=pg)
+    dist.all_gather(gathered_slots, slot_pad, group=pg)
     out_keys = torch.cat(
         [gathered_keys[i][: gathered_counts[i].item()] for i in range(world_size)],
         dim=0,
@@ -108,7 +114,11 @@ def _all_gather_dumped_keys_values(
         [gathered_values[i][: gathered_counts[i].item()] for i in range(world_size)],
         dim=0,
     ).cpu()
-    return out_keys, out_values
+    out_slots = torch.cat(
+        [gathered_slots[i][: gathered_counts[i].item()] for i in range(world_size)],
+        dim=0,
+    ).cpu()
+    return out_keys, out_values, out_slots
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +751,46 @@ def _flat_row_indices_from_slots_and_scores(
     if state.no_eviction_next_index is not None:
         return stored_scores.to(device=state.device, dtype=torch.int64)
     return slot_indices.to(device=state.device, dtype=torch.int64)
+
+
+def _encode_slot_index(
+    state: DynamicEmbTableState,
+    slot_indices: torch.Tensor,
+    flat_rows: torch.Tensor,
+    tier: Optional[int] = None,
+) -> torch.Tensor:
+    """int64 ``slot_index`` for a dumped table (for precise replay_increment).
+
+    Single-tier storage (``tier is None``):
+      - normal policies: the key_index_map slot IS the value flat row, so the
+        single slot value locates both key and value -> return the slot as-is.
+      - NO_EVICTION: key slot and value row are independent (row == score,
+        auto-increment), so pack both into one int64: high 32 bits = key slot,
+        low 32 bits = value row (tables are small, < 2^32; asserted).
+
+    HybridStorage (``tier in {0, 1}``, called once per tier, HBM=0 / host=1):
+      layout ``bit 63 = tier | bits 0..62 = key_slot``. HybridStorage does NOT
+      support NO_EVICTION (rejected at construction), so every tier is a normal
+      policy with key_slot == value_row -- one value locates both. Only the tier
+      bit is added so replay can tell the two tiers' independent slot spaces apart.
+    """
+    slot_indices = slot_indices.to(device=state.device, dtype=torch.int64)
+    if tier is not None:  # HybridStorage: bit 63 = tier, bits 0..62 = key_slot
+        if slot_indices.numel() > 0:
+            assert int(slot_indices.max()) < (
+                1 << 63
+            ), "HybridStorage key_slot exceeds 63 bits"
+        if int(tier):
+            return slot_indices | (torch.ones_like(slot_indices) << 63)
+        return slot_indices
+    if state.no_eviction_next_index is None:
+        return slot_indices  # key slot == value row
+    flat_rows = flat_rows.to(device=state.device, dtype=torch.int64)
+    if slot_indices.numel() > 0:
+        assert int(slot_indices.max()) < (1 << 32) and int(flat_rows.max()) < (
+            1 << 32
+        ), "NO_EVICTION slot/row exceeds 32 bits; cannot pack into int64 slot_index"
+    return (slot_indices << 32) | flat_rows
 
 
 def load_from_flat(
@@ -2079,9 +2129,18 @@ class DynamicEmbStorage(Storage):
         table_id: int,
         threshold: int,
         pg: Optional[dist.ProcessGroup],
-    ) -> Tuple[Tensor, Tensor]:
-        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Dump keys, embeddings and slot_index for one table (score >= threshold).
+
+        Multi-rank: all_gather so the result is concatenated from all ranks.
+        ``slot_index`` is the packed key-slot/value-row for precise replay (see
+        :func:`_encode_slot_index`), column-aligned with keys/values."""
         state = self._state
+        if state.options_list[table_id].dist_type == "continuous":
+            raise NotImplementedError(
+                "incremental_dump with slot_index does not support dist_type "
+                "'continuous' (replay cannot reconstruct the owning rank from a key)."
+            )
         states_to_dump = [state]
         do_multi_rank_gather = (
             pg is not None
@@ -2090,6 +2149,7 @@ class DynamicEmbStorage(Storage):
         )
         all_keys: List[Tensor] = []
         all_values: List[Tensor] = []
+        all_slots: List[Tensor] = []
         for s in states_to_dump:
             keys, named_scores, indices = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
@@ -2105,35 +2165,43 @@ class DynamicEmbStorage(Storage):
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            slot = _encode_slot_index(s, indices, flat_rows)
             if not do_multi_rank_gather:
                 value = value.cpu()
                 key = key.cpu() if key.is_cuda else key
+                slot = slot.cpu()
             all_keys.append(key)
             all_values.append(value)
+            all_slots.append(slot)
         device_for_gather = state.device
         emb_dim_t = state.table_emb_dims_cpu[table_id]
         if all_keys:
             keys_cat = torch.cat(all_keys)
             values_cat = torch.cat(all_values, dim=0)
+            slots_cat = torch.cat(all_slots)
         else:
             if do_multi_rank_gather:
                 keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
                 values_cat = torch.empty(
                     0, emb_dim_t, dtype=state.emb_dtype, device=device_for_gather
                 )
+                slots_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
             else:
                 keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
                 values_cat = torch.empty(0, emb_dim_t, dtype=state.emb_dtype)
+                slots_cat = torch.empty(0, dtype=torch.int64, device="cpu")
         if do_multi_rank_gather:
             keys_cat = keys_cat.to(device_for_gather)
             values_cat = values_cat.to(device_for_gather)
-            keys_cat, values_cat = _all_gather_dumped_keys_values(
-                keys_cat, values_cat, pg
+            slots_cat = slots_cat.to(device_for_gather)
+            keys_cat, values_cat, slots_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, slots_cat, pg
             )
         elif keys_cat.device.type == "cuda":
             keys_cat = keys_cat.cpu()
             values_cat = values_cat.cpu()
-        return keys_cat, values_cat
+            slots_cat = slots_cat.cpu()
+        return keys_cat, values_cat, slots_cat
 
     # -- Export --
 
@@ -2521,9 +2589,18 @@ class HybridStorage(Storage):
         table_id: int,
         threshold: int,
         pg: Optional[dist.ProcessGroup],
-    ) -> Tuple[Tensor, Tensor]:
-        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Dump keys, embeddings and slot_index for one table (score >= threshold).
+
+        Multi-rank: all_gather so the result is concatenated from all ranks.
+        ``slot_index`` is the packed key-slot/value-row for precise replay (see
+        :func:`_encode_slot_index`), column-aligned with keys/values."""
         states_to_dump = self.tables
+        if states_to_dump[0].options_list[table_id].dist_type == "continuous":
+            raise NotImplementedError(
+                "incremental_dump with slot_index does not support dist_type "
+                "'continuous' (replay cannot reconstruct the owning rank from a key)."
+            )
         do_multi_rank_gather = (
             pg is not None
             and dist.is_initialized()
@@ -2531,7 +2608,10 @@ class HybridStorage(Storage):
         )
         all_keys = []
         all_values = []
-        for s in states_to_dump:
+        all_slots = []
+        # tier index into self.tables: 0 = HBM tier, 1 = host tier. slot_index
+        # packs this tier bit (bit 63) so replay can tell the two tiers apart.
+        for tier, s in enumerate(states_to_dump):
             keys, named_scores, indices = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
                 pg=pg,
@@ -2546,35 +2626,43 @@ class HybridStorage(Storage):
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            slot = _encode_slot_index(s, indices, flat_rows, tier=tier)
             if not do_multi_rank_gather:
                 value = value.cpu()
                 key = key.cpu() if key.is_cuda else key
+                slot = slot.cpu()
             all_keys.append(key)
             all_values.append(value)
+            all_slots.append(slot)
         device_for_gather = states_to_dump[0].device
         emb_dim_t = states_to_dump[0].table_emb_dims_cpu[table_id]
         if all_keys:
             keys_cat = torch.cat(all_keys)
             values_cat = torch.cat(all_values, dim=0)
+            slots_cat = torch.cat(all_slots)
         else:
             if do_multi_rank_gather:
                 keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
                 values_cat = torch.empty(
                     0, emb_dim_t, dtype=self.embedding_dtype(), device=device_for_gather
                 )
+                slots_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
             else:
                 keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
                 values_cat = torch.empty(0, emb_dim_t, dtype=self.embedding_dtype())
+                slots_cat = torch.empty(0, dtype=torch.int64, device="cpu")
         if do_multi_rank_gather:
             keys_cat = keys_cat.to(device_for_gather)
             values_cat = values_cat.to(device_for_gather)
-            keys_cat, values_cat = _all_gather_dumped_keys_values(
-                keys_cat, values_cat, pg
+            slots_cat = slots_cat.to(device_for_gather)
+            keys_cat, values_cat, slots_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, slots_cat, pg
             )
         elif keys_cat.device.type == "cuda":
             keys_cat = keys_cat.cpu()
             values_cat = values_cat.cpu()
-        return keys_cat, values_cat
+            slots_cat = slots_cat.cpu()
+        return keys_cat, values_cat, slots_cat
 
     # -- Dump: write host first, then append HBM --
 

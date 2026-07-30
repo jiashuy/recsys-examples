@@ -14,12 +14,60 @@
 # limitations under the License.
 
 import warnings
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from torch import nn
+
+
+@dataclass
+class DeltaDumpResult:
+    """Incremental-dump result for one embedding collection.
+
+    All lists are column-aligned by index: element ``i`` of every list refers to
+    the same table, ``table_names[i]``. A collection with ``k`` dumped tables has
+    length-``k`` lists.
+
+    Attributes
+    ----------
+    table_names : List[str]
+        Names of the dynamic embedding tables dumped from this collection.
+    keys : List[torch.Tensor]
+        Per-table matched keys on host (created/modified keys to upsert).
+    values : List[torch.Tensor]
+        Per-table matched values on host, aligned with ``keys``.
+    evicted_keys : List[Optional[torch.Tensor]]
+        Per-table evicted keys on host (keys only, no value/score) retained since
+        the last ``incremental_dump``. ``evicted_keys[i]`` is ``None`` for a table
+        without ``retain_evicted_keys=True``; otherwise it holds that table's
+        retained evicted keys, and returning them drains and releases the table's
+        retained-evicted-keys buffer (each evicted key is reported exactly once
+        across successive ``incremental_dump`` calls).
+    meta : List[Dict[str, Any]]
+        Per-table dump metadata, aligned with ``table_names``. A flat dict with:
+            meta[i]["current_score"]:    int  -- table's score after this dump;
+                also the next forward pass's score / next ``incremental_dump``
+                threshold.
+            meta[i]["slot_index"]:       torch.Tensor -- int64 host tensor aligned
+                with ``keys[i]``; the storage slot each dumped key occupies, used
+                by ``replay_increment``. For NO_EVICTION tables it packs the key
+                slot (high 32 bits) and value row (low 32 bits) into one int64.
+            meta[i]["current_capacity"]: int  -- table's current capacity (slots).
+            meta[i]["world_size"]:       int  -- ranks the source table was
+                sharded across at creation (global WORLD), used by replay to
+                reconstruct key->rank. NOT the gather ``pg`` (a comm scope only).
+            meta[i]["table_options"]:    DynamicEmbTableOptions -- the table's
+                config object (a ``DynamicEmbTableOptions`` instance).
+    """
+
+    table_names: List[str] = field(default_factory=list)
+    keys: List[torch.Tensor] = field(default_factory=list)
+    values: List[torch.Tensor] = field(default_factory=list)
+    evicted_keys: List[Optional[torch.Tensor]] = field(default_factory=list)
+    meta: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def is_valid_score_threshold(score_threshold: Any) -> bool:
@@ -218,14 +266,13 @@ def incremental_dump(
     model: torch.nn.Module,
     score_threshold: Union[int, Dict[str, Dict[str, int]]],
     pg: Optional[dist.ProcessGroup] = None,
-) -> Union[
-    Tuple[
-        Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor]]],
-        Dict[str, Dict[str, int]],
-    ],
-    None,
-]:
+) -> Dict[str, "DeltaDumpResult"]:
     """Dump the model's embedding tables incrementally based on the score threshold. The index-embedding pair whose score is not less than the threshold will be returned.
+
+    Returns ``{collection_path: DeltaDumpResult}`` -- one DeltaDumpResult per
+    embedding collection, packing that collection's per-table keys/values, evicted
+    keys (for retain-enabled tables) and meta (see :class:`DeltaDumpResult`). An
+    empty dict if the model has no dynamic embedding tables.
 
     Args:
         model(nn.Module):The model containing dynamic embedding tables.
@@ -262,7 +309,7 @@ def incremental_dump(
             "Input model don't have any TorchREC ShardedEmbeddingCollection or ShardedEmbeddingBagCollection module, can't incremental dump!",
             UserWarning,
         )
-        return
+        return {}
 
     # check if the model have dynamic embedding
     check_dynamic_emb_modules_lists: List[List[nn.Module]] = []
@@ -284,7 +331,7 @@ def incremental_dump(
             "Input model don't have any Dynamic embedding tables, can't incremental dump!",
             UserWarning,
         )
-        return
+        return {}
     if not set_all_table:
         # filter the embedding collection
         collection_paths_in_module = set()
@@ -307,14 +354,12 @@ def incremental_dump(
                     UserWarning,
                 )
 
-    ret_tensors: Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = {}
-    ret_scores: Dict[str, Dict[str, int]] = {}
+    ret: Dict[str, DeltaDumpResult] = {}
     for i, tmp_collection in enumerate(collections_list):
         collection_path, tmp_collection_name, tmp_collection_module = tmp_collection
         tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
 
-        collection_tensors: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        collection_scores: Dict[str, int] = {}
+        collection_result = DeltaDumpResult()
 
         for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
             tmp_table_names = dynamic_emb_module.table_names
@@ -335,17 +380,20 @@ def incremental_dump(
                 filtered_thresholds.extend([score_threshold] * len(tmp_table_names))
             if len(filtered_table_names) == 0:
                 continue
-            # do incremental dump
-            tensors, scores = dynamic_emb_module.incremental_dump(
+            # do incremental dump -> one DeltaDumpResult per module; merge into
+            # this collection's result (lists stay column-aligned by table).
+            module_result = dynamic_emb_module.incremental_dump(
                 dict(zip(filtered_table_names, filtered_thresholds)), pg
             )
-            collection_tensors.update(tensors)
-            collection_scores.update(scores)
+            collection_result.table_names.extend(module_result.table_names)
+            collection_result.keys.extend(module_result.keys)
+            collection_result.values.extend(module_result.values)
+            collection_result.evicted_keys.extend(module_result.evicted_keys)
+            collection_result.meta.extend(module_result.meta)
 
-        ret_tensors[collection_path] = collection_tensors
-        ret_scores[collection_path] = collection_scores
+        ret[collection_path] = collection_result
 
-    return ret_tensors, ret_scores
+    return ret
 
 
 def _all_gather_evicted_keys(
@@ -353,31 +401,34 @@ def _all_gather_evicted_keys(
 ) -> torch.Tensor:
     """All-gather variable-length evicted keys within ``pg``, then concat + unique.
 
-    Each rank holds a disjoint set (row-wise sharding), so the group-wide union is
-    just the concatenation; ``unique`` is applied defensively. Implemented as a
-    size all_gather followed by a padded all_gather (NCCL has no native
-    variable-length gather).
+    Returns a host (CPU) tensor; the input may be on host or device (the NCCL
+    gather itself runs on the CUDA device). Each rank holds a disjoint set
+    (row-wise sharding), so the group-wide union is just the concatenation;
+    ``unique`` is applied defensively. Implemented as a size all_gather followed by
+    a padded all_gather (NCCL has no native variable-length gather).
     """
     world_size = dist.get_world_size(pg)
     if world_size <= 1:
-        return keys
-    local_size = torch.tensor([keys.numel()], device=keys.device, dtype=torch.int64)
+        return keys.cpu()
+    device = torch.device("cuda", torch.cuda.current_device())
+    keys = keys.to(device)
+    local_size = torch.tensor([keys.numel()], device=device, dtype=torch.int64)
     size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
     dist.all_gather(size_list, local_size, group=pg)
     sizes = [int(s.item()) for s in size_list]
     max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
-    padded = torch.zeros(max_size, dtype=keys.dtype, device=keys.device)
+    padded = torch.zeros(max_size, dtype=keys.dtype, device=device)
     if keys.numel() > 0:
         padded[: keys.numel()] = keys
     gathered = [
-        torch.zeros(max_size, dtype=keys.dtype, device=keys.device)
+        torch.zeros(max_size, dtype=keys.dtype, device=device)
         for _ in range(world_size)
     ]
     dist.all_gather(gathered, padded, group=pg)
     parts = [g[:sz] for g, sz in zip(gathered, sizes) if sz > 0]
     if not parts:
-        return keys[:0]
-    return torch.unique(torch.cat(parts))
+        return keys[:0].cpu()
+    return torch.unique(torch.cat(parts)).cpu()
 
 
 def pop_evicted_keys(

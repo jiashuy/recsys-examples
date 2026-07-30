@@ -17,6 +17,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [DynamicEmbDump](#dynamicembdump)
 - [DynamicEmbLoad](#dynamicembload)
 - [incremental_dump](#incremental_dump)
+- [pop_evicted_keys](#pop_evicted_keys)
 - [get_score](#get_score)
 - [set_score](#set_score)
 - [Counter](#counter)
@@ -615,7 +616,14 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         admission_counter : Optional[Counter], optional
             Counter for tracking the number of keys that have been admitted to the embedding table.
             If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
-            Default is None (no counter is used).    
+            Default is None (no counter is used).
+        retain_evicted_keys : bool, optional
+            When True, the *last-tier* storage retains the keys it evicts (instead of
+            silently dropping them) so they can be read back with ``pop_evicted_keys``.
+            Only the final tier that truly discards a key records it -- intermediate
+            cache / HBM tiers spill their evictions to the next tier and are not
+            recorded. Records the (key, table_id) only, no value/score. Default False
+            (zero overhead).
         
         Notes
         -----
@@ -654,6 +662,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         index_type: Optional[torch.dtype] = None
         admit_strategy: Optional[AdmissionStrategy] = None
         admission_counter: Optional[Counter] = None
+        retain_evicted_keys: bool = False
 
     ```
 
@@ -756,38 +765,86 @@ The meaning of the threshold depends on the table's `score_strategy`:
         model: torch.nn.Module,
         score_threshold: Union[int, Dict[str, Dict[str, int]]],
         pg: Optional[dist.ProcessGroup] = None,
-    ) -> Union[
-        Tuple[
-            Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor]]],
-            Dict[str, Dict[str, int]],
-        ],
-        None,
-    ]:
+    ) -> Dict[str, "DeltaDumpResult"]:
         """Dump the model's embedding tables incrementally based on the score threshold. The index-embedding pair whose score is not less than the threshold will be returned.
 
         Args:
             model(nn.Module):The model containing dynamic embedding tables.
-            score_threshold(Uinon[int, Dict[str, Dict[str, int]]]):
+            score_threshold(Union[int, Dict[str, Dict[str, int]]]):
                 int: All embedding table's score threshold will be this integer. It will dump matched results for all tables in the model.
                 Dict[str, Dict[str, int]]: the first `str` is the name of embedding collection in the model. 'str' in Dict[str, int] is the name of dynamic embedding table, and `int` in Dict[str, int] is the table's score threshold. It will dump for only tables whose names present in this Dict.
-            pg(Optional[dist.ProcessGroup]): optional. The process group used to control the communication scope in the dump. Defaults to None.
+            pg(Optional[dist.ProcessGroup]): optional. The process group used to control the communication scope in the dump (the all_gather of keys/values/slot_index). Defaults to None.
 
         Returns
         -------
-        Tuple:
-            Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor]]]:
-                The first 'str' is the name of embedding collection.
-                The second 'str' is the name of embedding table.
-                The first tensor in the Tuple is matched keys on hosts.
-                The second tensor in the Tuple is matched values on hosts.
-            Dict[str, Dict[str, int]]:
-                The first 'str' is the name of embedding collection.
-                The second 'str' is the name of embedding table.
-                `int` is the current score after finishing the dumping process, which will be used as the score for the next forward pass, and can also be used as the input of the next incremental_dump. If input score_threshold is `int`, the Dict will contain all dynamic embedding tables' current score, otherwise only dumped tables' current score will be returned.
+        Dict[str, DeltaDumpResult]:
+            ``{collection_path: DeltaDumpResult}`` -- one ``DeltaDumpResult`` per
+            embedding collection. Each ``DeltaDumpResult`` holds column-aligned
+            per-table lists (element ``i`` refers to ``table_names[i]``):
+
+            - ``table_names: List[str]`` -- the dumped table names.
+            - ``keys: List[torch.Tensor]`` -- per-table matched keys on host.
+            - ``values: List[torch.Tensor]`` -- per-table matched values on host.
+            - ``evicted_keys: List[Optional[torch.Tensor]]`` -- per-table retained
+              evicted keys on host for tables with ``retain_evicted_keys=True``,
+              else ``None``. Returning them drains that table's retained-evicted
+              buffer (each evicted key reported once across successive calls).
+            - ``meta: List[Dict[str, Any]]`` -- per-table metadata, a flat dict:
+                - ``"current_score": int`` -- the table's current score after this
+                  dump; usable as the next forward's score and as the next
+                  ``incremental_dump`` threshold.
+                - ``"slot_index": torch.Tensor`` -- int64 host tensor aligned with
+                  ``keys``; the storage slot each dumped key occupies (for
+                  ``replay_increment``).
+                - ``"current_capacity": int`` -- the table's current capacity.
+                - ``"world_size": int`` -- ranks the table was sharded across.
+                - ``"table_options": DynamicEmbTableOptions`` -- the table config.
         """
     ```
 
 More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main/corelib/dynamicemb/test/unit_tests/incremental_dump/test_distributed_dynamicemb.py)
+
+## pop_evicted_keys
+
+**Background**
+When a table's last-tier storage is full, evicting a key drops it from the system entirely. With `retain_evicted_keys=True` (see [DynamicEmbTableOptions](#dynamicembtableoptions)), the last tier instead retains the keys it evicts so they can be read back -- e.g. to feed a downstream key-value store, a cold-tier archive, or an offline pipeline.
+
+**Behavior**
+Returns, per table, the keys evicted since the previous call, deduplicated within a table. This is a read-and-clear (incremental) operation: each evicted key is reported exactly once across successive calls, and returning a table's keys drains its retained-evicted buffer on this rank. Tables without `retain_evicted_keys=True` are omitted from the result.
+
+    ```python
+    #How to import
+    from dynamicemb import pop_evicted_keys
+
+    #API arguments
+    def pop_evicted_keys(
+        model: torch.nn.Module,
+        table_names: Optional[Dict[str, List[str]]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Return (and clear) the keys evicted and retained by last-tier storage, per table.
+
+        Only tables created with retain_evicted_keys=True are included; all other tables are omitted.
+
+        Args:
+            model(nn.Module): the model containing dynamic embedding tables.
+            table_names(Optional[Dict[str, List[str]]]): optional filter, keyed by
+                embedding-collection path -> [table_name, ...]. None pops every
+                retain-enabled table in the model.
+            pg(Optional[dist.ProcessGroup]): optional. None returns each rank's LOCAL
+                evicted keys (row-wise sharded, hence disjoint across ranks; zero
+                communication). When given, keys are all_gathered within pg so every
+                rank in the group receives the group-wide union. Clearing always
+                affects only this rank's buffer, regardless of pg.
+
+        Returns
+        -------
+        Dict[str, Dict[str, torch.Tensor]]:
+            {collection_path: {table_name: keys}} where keys is a 1-D int64 host
+            tensor of table-unique evicted keys. Empty dict if the model has no
+            retain-enabled dynamic embedding tables.
+        """
+    ```
 
 ## get_score
 
