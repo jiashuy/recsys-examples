@@ -45,7 +45,9 @@ def current_device():
     return torch.cuda.current_device()
 
 
-def _build_model(device_id, retain, caching=False, table_num=1, max_capacity=256, dim=8):
+def _build_model(
+    device_id, retain, caching=False, table_num=1, max_capacity=256, dim=8
+):
     """A BatchedDynamicEmbeddingTablesV2 with one feature per table. Small
     max_capacity so training overflows the last tier and evicts across steps."""
     retain = [retain] * table_num if isinstance(retain, bool) else retain

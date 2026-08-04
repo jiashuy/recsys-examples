@@ -317,9 +317,17 @@ def _score_function_group_key(fn: Optional[Callable]):
         import inspect
 
         digest = hashlib.md5(inspect.getsource(fn).encode("utf-8")).hexdigest()
-        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), digest)
+        return (
+            getattr(fn, "__module__", None),
+            getattr(fn, "__qualname__", None),
+            digest,
+        )
     except (OSError, TypeError):
-        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), id(fn))
+        return (
+            getattr(fn, "__module__", None),
+            getattr(fn, "__qualname__", None),
+            id(fn),
+        )
 
 
 @dataclass

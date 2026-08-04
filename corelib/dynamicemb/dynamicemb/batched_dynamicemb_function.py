@@ -679,9 +679,7 @@ def _prefetch_hbm_direct_path(
                         score_arg,
                         collect_evicted=True,
                     )
-                    _append_evicted(
-                        state, evicted_keys, evicted_table_ids, num_evicted
-                    )
+                    _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
                 else:
                     new_indices = state.key_index_map.insert(
                         admitted_keys,

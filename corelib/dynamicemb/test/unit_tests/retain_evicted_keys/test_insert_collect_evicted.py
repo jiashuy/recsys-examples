@@ -85,7 +85,9 @@ def _ir(n, table, device):
 
 def _plain_insert(table, keys, tids, value, policy, name):
     table.insert(
-        keys, tids, ScoreArg(name=name, value=value, policy=policy),
+        keys,
+        tids,
+        ScoreArg(name=name, value=value, policy=policy),
         _ir(keys.numel(), table, keys.device),
     )
 
@@ -95,8 +97,11 @@ def _insert_collect(table, keys, tids, value, policy, name):
     evicted_table_ids[:m]) -- the evicted_* buffers are already sliced to the
     number actually evicted."""
     indices, num_evicted, evicted_keys, evicted_tids = table.insert(
-        keys, tids, ScoreArg(name=name, value=value, policy=policy),
-        _ir(keys.numel(), table, keys.device), collect_evicted=True,
+        keys,
+        tids,
+        ScoreArg(name=name, value=value, policy=policy),
+        _ir(keys.numel(), table, keys.device),
+        collect_evicted=True,
     )
     m = int(num_evicted)
     return indices, m, evicted_keys[:m], evicted_tids[:m]
@@ -124,7 +129,9 @@ def test_collect_evicted_lrulfu_cubin_matches_oracle(current_device):
         indices = table.insert(
             keys[s : s + per],
             tids[s : s + per],
-            ScoreArg(name="frequency", value=ones[s : s + per], policy=ScorePolicy.LRU_LFU),
+            ScoreArg(
+                name="frequency", value=ones[s : s + per], policy=ScorePolicy.LRU_LFU
+            ),
             _ir(per, table, device),
         )
         idx_parts.append(indices)
@@ -151,7 +158,9 @@ def test_collect_evicted_lrulfu_cubin_matches_oracle(current_device):
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
     actual = set(int(k) for k in evicted_keys.tolist())
-    assert actual == predicted, "cubin insert-collect must retain exactly the oracle victim set"
+    assert (
+        actual == predicted
+    ), "cubin insert-collect must retain exactly the oracle victim set"
     assert torch.all(evicted_tids == 0), "single table -> every evicted table_id is 0"
 
 
@@ -167,7 +176,9 @@ def test_collect_evicted_aot_assign_matches_oracle(current_device):
     n = 100
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
-    scores = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)  # score == key
+    scores = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(
+        torch.uint64
+    )  # score == key
     _plain_insert(table, keys, tids, scores, ScorePolicy.ASSIGN, "score1")
     torch.cuda.synchronize()
 
@@ -182,7 +193,9 @@ def test_collect_evicted_aot_assign_matches_oracle(current_device):
 
     predicted = set(range(1, 1 + m))  # the m lowest scores == the m smallest keys
     actual = set(int(k) for k in evicted_keys.tolist())
-    assert actual == predicted, "AoT insert-collect must retain exactly the lowest-score victims"
+    assert (
+        actual == predicted
+    ), "AoT insert-collect must retain exactly the lowest-score victims"
     assert torch.all(evicted_tids == 0)
 
 
@@ -198,12 +211,16 @@ def test_collect_evicted_table_id_routing(current_device):
     k0 = torch.arange(1, 101, dtype=torch.int64, device=device)
     k1 = torch.arange(1000, 1100, dtype=torch.int64, device=device)
     fill_keys = torch.cat([k0, k1])
-    fill_tids = torch.cat([
-        torch.zeros(100, dtype=torch.int64, device=device),
-        torch.ones(100, dtype=torch.int64, device=device),
-    ])
+    fill_tids = torch.cat(
+        [
+            torch.zeros(100, dtype=torch.int64, device=device),
+            torch.ones(100, dtype=torch.int64, device=device),
+        ]
+    )
     fill_scores = fill_keys.to(torch.uint64)
-    _plain_insert(table, fill_keys, fill_tids, fill_scores, ScorePolicy.ASSIGN, "score1")
+    _plain_insert(
+        table, fill_keys, fill_tids, fill_scores, ScorePolicy.ASSIGN, "score1"
+    )
     torch.cuda.synchronize()
 
     # Overflow both tables in one mixed batch with far-higher scores.
@@ -211,10 +228,12 @@ def test_collect_evicted_table_id_routing(current_device):
     nk0 = torch.arange(100000, 100000 + nn, dtype=torch.int64, device=device)
     nk1 = torch.arange(200000, 200000 + nn, dtype=torch.int64, device=device)
     new_keys = torch.cat([nk0, nk1])
-    new_tids = torch.cat([
-        torch.zeros(nn, dtype=torch.int64, device=device),
-        torch.ones(nn, dtype=torch.int64, device=device),
-    ])
+    new_tids = torch.cat(
+        [
+            torch.zeros(nn, dtype=torch.int64, device=device),
+            torch.ones(nn, dtype=torch.int64, device=device),
+        ]
+    )
     new_scores = torch.full((2 * nn,), 10_000_000, dtype=torch.uint64, device=device)
     _, m, evicted_keys, evicted_tids = _insert_collect(
         table, new_keys, new_tids, new_scores, ScorePolicy.ASSIGN, "score1"
@@ -230,7 +249,9 @@ def test_collect_evicted_table_id_routing(current_device):
         elif 1000 <= key <= 1099:
             assert tid == 1, f"key {key} belongs to table 1 but table_id={tid}"
         else:
-            raise AssertionError(f"unexpected evicted key {key} (a new key must never be a victim)")
+            raise AssertionError(
+                f"unexpected evicted key {key} (a new key must never be a victim)"
+            )
     # Both tables actually contributed victims.
     assert 0 in et and 1 in et, "both tables must have evicted something"
 
@@ -262,8 +283,11 @@ def test_collect_evicted_determinism_mode_raises(current_device, monkeypatch):
     scores = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)
     with pytest.raises(RuntimeError, match="collect_evicted"):
         table.insert(
-            keys, tids, ScoreArg(name="score1", value=scores, policy=ScorePolicy.ASSIGN),
-            _ir(n, table, device), collect_evicted=True,
+            keys,
+            tids,
+            ScoreArg(name="score1", value=scores, policy=ScorePolicy.ASSIGN),
+            _ir(n, table, device),
+            collect_evicted=True,
         )
 
 
@@ -316,10 +340,16 @@ def test_storage_retain_end_to_end(current_device):
     table; a second pop is empty (read-and-clear / incremental)."""
     device = current_device
     dim = 8
-    storage = _retain_storage(dim=dim, max_capacity=128, bucket_capacity=128, retain=True)
-    _storage_insert(storage, torch.arange(1, 129, dtype=torch.int64, device=device), dim, device)
+    storage = _retain_storage(
+        dim=dim, max_capacity=128, bucket_capacity=128, retain=True
+    )
+    _storage_insert(
+        storage, torch.arange(1, 129, dtype=torch.int64, device=device), dim, device
+    )
     # 58 new keys (freq 1, newer ts) evict the 58 oldest (Lex: freq tie -> ts asc).
-    _storage_insert(storage, torch.arange(1000, 1058, dtype=torch.int64, device=device), dim, device)
+    _storage_insert(
+        storage, torch.arange(1000, 1058, dtype=torch.int64, device=device), dim, device
+    )
 
     evk = storage.pop_evicted_keys(0)
     assert evk.numel() > 0, "a full-bucket overflow must have evicted something"
@@ -331,17 +361,27 @@ def test_storage_retain_end_to_end(current_device):
     )
     assert not bool(founds.any()), "evicted keys must no longer be in the table"
 
-    assert storage.pop_evicted_keys(0).numel() == 0, "second pop is empty (read-and-clear)"
+    assert (
+        storage.pop_evicted_keys(0).numel() == 0
+    ), "second pop is empty (read-and-clear)"
 
 
 def test_storage_retain_disabled_empty(current_device):
     """retain_evicted_keys=False: eviction still happens but nothing is retained."""
     device = current_device
     dim = 8
-    storage = _retain_storage(dim=dim, max_capacity=128, bucket_capacity=128, retain=False)
-    _storage_insert(storage, torch.arange(1, 129, dtype=torch.int64, device=device), dim, device)
-    _storage_insert(storage, torch.arange(1000, 1058, dtype=torch.int64, device=device), dim, device)
-    assert storage.pop_evicted_keys(0).numel() == 0, "retain disabled -> pop is always empty"
+    storage = _retain_storage(
+        dim=dim, max_capacity=128, bucket_capacity=128, retain=False
+    )
+    _storage_insert(
+        storage, torch.arange(1, 129, dtype=torch.int64, device=device), dim, device
+    )
+    _storage_insert(
+        storage, torch.arange(1000, 1058, dtype=torch.int64, device=device), dim, device
+    )
+    assert (
+        storage.pop_evicted_keys(0).numel() == 0
+    ), "retain disabled -> pop is always empty"
 
 
 def test_pop_dedup_and_table_id_filter(current_device):
@@ -365,7 +405,13 @@ def test_pop_dedup_and_table_id_filter(current_device):
     _append([5, 6], [0, 1])  # table 0: key 5; table 1: key 6
 
     ev0 = _pop_state_evicted_keys(state, 0)
-    assert sorted(ev0.tolist()) == [1, 2, 3, 4, 5], "table 0 pop must dedup and exclude table 1"
+    assert sorted(ev0.tolist()) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ], "table 0 pop must dedup and exclude table 1"
     ev1 = _pop_state_evicted_keys(state, 1)
     assert sorted(ev1.tolist()) == [6], "table 1 keys must survive table 0's pop"
     assert _pop_state_evicted_keys(state, 0).numel() == 0

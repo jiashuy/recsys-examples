@@ -1098,9 +1098,7 @@ def _append_evicted(
     state.evicted_tid_chunks.append(evicted_table_ids[:n].clone())
 
 
-def _pop_state_evicted_keys(
-    state: DynamicEmbTableState, table_id: int
-) -> torch.Tensor:
+def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch.Tensor:
     """Pop (return + clear) the unique evicted keys retained for ``table_id``.
 
     Concatenates all retained chunks, selects this table's rows, de-duplicates,
@@ -1145,14 +1143,17 @@ def _insert_key_values(
     if state.no_eviction_next_index is not None:
         score_out_flat = torch.empty(n, dtype=torch.int64, device=unique_keys.device)
     if state.retain_evicted_keys:
-        indices, num_evicted, evicted_keys, evicted_table_ids = (
-            state.key_index_map.insert(
-                unique_keys,
-                table_ids,
-                score_arg,
-                score_out=score_out_flat,
-                collect_evicted=True,
-            )
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_table_ids,
+        ) = state.key_index_map.insert(
+            unique_keys,
+            table_ids,
+            score_arg,
+            score_out=score_out_flat,
+            collect_evicted=True,
         )
         _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
     else:

@@ -410,9 +410,7 @@ def test_incremental_dump_api(
             if all_customized
             else {prefix_path: undump_score}
         )
-        res = incremental_dump(
-            model, param_scores, intra_and_cross_node_pg()[0]
-        )
+        res = incremental_dump(model, param_scores, intra_and_cross_node_pg()[0])
         dr = res[prefix_path]  # DeltaDumpResult for this collection
         undump_score = {
             tn: dr.meta[j]["current_score"] for j, tn in enumerate(dr.table_names)

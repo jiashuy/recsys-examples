@@ -155,7 +155,9 @@ def test_pop_evicted_keys_distributed(backend_session, optimizer_kwargs):
         feature_names=[feature_name],
         pooling=PoolingType.SUM,
     )
-    ebc = torchrec.EmbeddingBagCollection(device=torch.device("meta"), tables=[eb_config])
+    ebc = torchrec.EmbeddingBagCollection(
+        device=torch.device("meta"), tables=[eb_config]
+    )
 
     planner = _get_planner(
         table_name,
