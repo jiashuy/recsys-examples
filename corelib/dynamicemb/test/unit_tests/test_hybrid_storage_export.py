@@ -506,7 +506,15 @@ def test_hybrid_incremental_dump_slot_index_tier():
     )
     storage.training = True
 
-    n = num_embeddings  # more unique keys than the HBM tier holds -> spill to host
+    # HBM tier per-rank capacity = global capacity / world_size, so a fixed key
+    # count is world_size-dependent: on a single GPU (world_size 1) the HBM tier
+    # holds all of num_embeddings and nothing spills, leaving the host tier empty.
+    # Derive the insert count from the *actual* HBM capacity so the spill is
+    # guaranteed on any world_size -- fill the HBM tier, then overflow enough to
+    # spill into the host tier (bounded by host capacity).
+    hbm_cap = storage._hbm.key_index_map.capacity(0)
+    host_cap = storage._host.key_index_map.capacity(0)
+    n = hbm_cap + min(hbm_cap, host_cap)
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
     vals = torch.full((n, embedding_dim), 1e-1, dtype=torch.float32, device=device)
