@@ -522,7 +522,13 @@ def export_inference_gr_ranking(
             # === Warmup ===
             batch = next(dataloader_iter)
             batch, user_ids, total_history_lengths = prepare_on_gpu(batch)
-            logits, offload_task_ids = model(batch, user_ids, total_history_lengths)
+            logits, auxiliary_output = _split_model_outputs(
+                model(batch, user_ids, total_history_lengths)
+            )
+            if auxiliary_output is not None:
+                raise RuntimeError(
+                    "Expected the no-offload model to return logits only"
+                )
             print(f"[INFO] Warmup logits shape: {tuple(logits.shape)}")
             if stop_after_warmup:
                 print("[INFO] Stopped after kvcache warmup.")
@@ -545,12 +551,14 @@ def export_inference_gr_ranking(
             # Triton's PyTorch AOTI backend accepts builtin pytree containers plus
             # tensors, but rejects custom HSTUBatch / KeyedJaggedTensor nodes in the
             # exported input spec. Export a thin wrapper with only tensor inputs and
-            # rebuild the HSTUBatch internally.
+            # rebuild the HSTUBatch internally. Its batch_size is constant metadata
+            # required by HSTUBatch; graph execution derives the logical batch size
+            # from the input tensor shapes instead.
             class _PlainInputWrapper(torch.nn.Module):
                 def __init__(self, inner, example_batch):
                     super().__init__()
                     self.inner = inner
-                    self._batch_size = int(example_batch.batch_size)
+                    self._batch_size = config_max_batch_size
                     self._keys = list(example_batch.features.keys())
                     self._contextual_feature_names = list(
                         example_batch.contextual_feature_names
@@ -561,11 +569,7 @@ def export_inference_gr_ranking(
                         example_batch.feature_to_max_seqlen
                     )
                     self._max_num_candidates = int(example_batch.max_num_candidates)
-                    self._actual_batch_size = (
-                        int(example_batch.actual_batch_size)
-                        if example_batch.actual_batch_size is not None
-                        else None
-                    )
+                    self._actual_batch_size = config_max_batch_size
 
                 def _rebuild_batch(self, values, lengths, num_candidates):
                     offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
@@ -598,10 +602,16 @@ def export_inference_gr_ranking(
                     total_history_lengths,
                 ):
                     rebuilt = self._rebuild_batch(values, lengths, num_candidates)
-                    logits, task_ids = self.inner(
-                        rebuilt, user_ids.cpu(), total_history_lengths.cpu()
+                    logits, auxiliary_output = _split_model_outputs(
+                        self.inner(
+                            rebuilt, user_ids.cpu(), total_history_lengths.cpu()
+                        )
                     )
-                    return logits.float().cpu(), task_ids.long().cpu()
+                    if auxiliary_output is not None:
+                        raise RuntimeError(
+                            "Expected the no-offload model to return logits only"
+                        )
+                    return logits.float().cpu()
 
             export_model = _PlainInputWrapper(model, batch)
             example_values = batch.features.values()
@@ -629,7 +639,8 @@ def export_inference_gr_ranking(
             dim_batch = Dim("batch_size", min=1, max=8)
 
             num_features = len(batch.features.keys())
-            sc[example_values] = {0: Dim("tokens", min=1, max=40000)}
+            max_tokens = config_max_batch_size * total_max_seqlen
+            sc[example_values] = {0: Dim("tokens", min=1, max=max_tokens)}
             sc[example_lengths] = {0: dim_batch * num_features}
             sc[example_num_candidates] = {0: dim_batch}
             sc[user_ids_cuda] = {0: dim_batch}
@@ -693,7 +704,12 @@ def export_inference_gr_ranking(
 
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    logits, compiled_offload_task_ids = compiled_results[dump_idx]
+                    logits, auxiliary_output = compiled_results[dump_idx]
+                    if auxiliary_output is not None:
+                        raise RuntimeError(
+                            "Expected the compiled no-offload AOTI model to "
+                            "return logits only"
+                        )
 
                     if not feature_keys_dumped:
                         torch.save(
@@ -732,23 +748,8 @@ def export_inference_gr_ranking(
                             dump_dir, f"batch_{dump_idx:06d}_compiled_logits.pt"
                         ),
                     )
-                    if isinstance(compiled_offload_task_ids, torch.Tensor):
-                        _save_tensor_cpp_compatible(
-                            compiled_offload_task_ids.detach().cpu(),
-                            os.path.join(
-                                dump_dir,
-                                f"batch_{dump_idx:06d}_compiled_offload_task_ids.pt",
-                            ),
-                        )
-
-                    compiled_offload_shape = (
-                        tuple(compiled_offload_task_ids.shape)
-                        if isinstance(compiled_offload_task_ids, torch.Tensor)
-                        else None
-                    )
                     print(
-                        f"    [Batch {dump_idx + 1}] Dumped C++ replay tensors; "
-                        f"compiled offload task id shape={compiled_offload_shape}"
+                        f"    [Batch {dump_idx + 1}] Dumped C++ replay tensors"
                     )
                     dump_idx += 1
                     eval_module(logits.cuda(), batch.labels.values())
@@ -770,7 +771,7 @@ if __name__ == "__main__":
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
-    parser.add_argument("--max_bs", type=int, default=2)
+    parser.add_argument("--max_bs", type=int, default=8)
     parser.add_argument(
         "--kvcache_config_file",
         type=str,

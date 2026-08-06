@@ -469,6 +469,15 @@ def export_inference_gr_ranking(
             "    Benchmark on GPU:",
             torch.cuda.get_device_name(torch.cuda.current_device()),
         )
+        num_benchmark_batches = len(inputs)
+        num_logical_requests = sum(int(b.batch_size) for b in inputs)
+        if num_benchmark_batches == 0 or num_logical_requests == 0:
+            raise RuntimeError("No inputs were collected for benchmarking")
+        print(
+            "    Benchmark workload: "
+            f"{num_benchmark_batches} batches, "
+            f"{num_logical_requests} logical requests"
+        )
         import time
 
         compiled_time = []
@@ -489,8 +498,13 @@ def export_inference_gr_ranking(
             torch.cuda.synchronize()
             end = time.perf_counter()
             compiled_time.append(end - start)
+        compiled_time_avg = sum(compiled_time) / len(compiled_time)
         print(
-            f"    Compiled model elapsed time: {sum(compiled_time) / len(compiled_time):.6f} seconds"
+            f"    Compiled model elapsed time: {compiled_time_avg:.6f} seconds; "
+            f"{compiled_time_avg * 1000.0 / num_benchmark_batches:.3f} "
+            "ms/batch; "
+            f"{compiled_time_avg * 1000.0 / num_logical_requests:.3f} "
+            "ms/logical request"
         )
 
         for item in results:
@@ -510,8 +524,13 @@ def export_inference_gr_ranking(
             torch.cuda.synchronize()
             end = time.perf_counter()
             python_time.append(end - start)
+        python_time_avg = sum(python_time) / len(python_time)
         print(
-            f"    Python model elapsed time: {sum(python_time) / len(python_time):.6f} seconds"
+            f"    Python model elapsed time: {python_time_avg:.6f} seconds; "
+            f"{python_time_avg * 1000.0 / num_benchmark_batches:.3f} "
+            "ms/batch; "
+            f"{python_time_avg * 1000.0 / num_logical_requests:.3f} "
+            "ms/logical request"
         )
 
         for item in results:

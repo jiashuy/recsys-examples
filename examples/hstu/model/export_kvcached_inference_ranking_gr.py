@@ -139,13 +139,11 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            completed_offloads = torch.ops.kvcache_manager_ops.offload_reap_completed(
-                user_ids
-            )
+            logical_batch_size = user_ids.shape[0]
             lookup_res = torch.ops.kvcache_manager_ops.lookup(
                 user_ids,
                 total_history_lengths,
-                completed_offloads,
+                user_ids,
             )
             alloc_result = torch.ops.kvcache_manager_ops.allocate(
                 user_ids,
@@ -192,7 +190,7 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
 
             num_tokens = striped_batch.features.values().shape[0]
             jagged_data.values = self.dense_module._hstu_block.predict(
-                striped_batch.batch_size,
+                logical_batch_size,
                 num_tokens,
                 jagged_data.values,
                 jagged_data,
@@ -200,18 +198,5 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
                 use_cudagraph=False,
             )
 
-            offload_task_ids = torch.ops.kvcache_manager_ops.offload_launch(
-                user_ids,
-                total_history_lengths,
-                lookup_res[1],
-                lookup_res[5],
-                lookup_res[2],
-                lookup_res[3],
-                alloc_result[0],
-                alloc_result[2],
-                [self._offload_slot_mapping_sentinel.cpu()],
-                jagged_data.values,
-            )
-
             jagged_data = self.dense_module._hstu_block._postprocessor(jagged_data)
-            return self.dense_module._mlp(jagged_data.values), offload_task_ids
+            return self.dense_module._mlp(jagged_data.values)

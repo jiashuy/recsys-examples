@@ -310,86 +310,96 @@ void check_cuda_after(const char* label) {
 #endif
 }
 
-bool run_one_batch(
-    torch::inductor::AOTIModelPackageLoader& loader,
-    const std::string& dump_dir,
-    int batch_idx,
-    const c10::Device& device) {
+bool run_one_batch(torch::inductor::AOTIModelPackageLoader &loader,
+                   const std::string &dump_dir, int batch_idx,
+                   const c10::Device &device) {
   const std::string values_path = batch_file(dump_dir, batch_idx, "values");
   const std::string lengths_path = batch_file(dump_dir, batch_idx, "lengths");
-  const std::string num_candidates_path = batch_file(dump_dir, batch_idx, "num_candidates");
+  const std::string num_candidates_path =
+      batch_file(dump_dir, batch_idx, "num_candidates");
   const std::string user_ids_path = batch_file(dump_dir, batch_idx, "user_ids");
-  const std::string total_history_lengths_path = batch_file(dump_dir, batch_idx, "total_history_lengths");
-  const std::string compiled_logits_path = batch_file(dump_dir, batch_idx, "compiled_logits");
+  const std::string total_history_lengths_path =
+      batch_file(dump_dir, batch_idx, "total_history_lengths");
+  const std::string compiled_logits_path =
+      batch_file(dump_dir, batch_idx, "compiled_logits");
 
   if (!file_exists(values_path) || !file_exists(lengths_path) ||
       !file_exists(num_candidates_path) || !file_exists(user_ids_path) ||
-      !file_exists(total_history_lengths_path) || !file_exists(compiled_logits_path)) {
-    std::cerr << "[WARN] Skip batch " << batch_idx << " because one or more dump files are missing.\n";
+      !file_exists(total_history_lengths_path) ||
+      !file_exists(compiled_logits_path)) {
+    std::cerr << "[WARN] Skip batch " << batch_idx
+              << " because one or more dump files are missing.\n";
     return false;
   }
 
   auto values = load_tensor(values_path).to(device, torch::kInt64).contiguous();
-  auto lengths = load_tensor(lengths_path).to(device, torch::kInt64).contiguous();
-  auto num_candidates = load_tensor(num_candidates_path).to(device, torch::kInt64).contiguous();
-  auto user_ids = load_tensor(user_ids_path).to(torch::kCPU, torch::kInt64).contiguous();
-  auto total_history_lengths =
-      load_tensor(total_history_lengths_path).to(torch::kCPU, torch::kInt64).contiguous();
-  auto ref_logits_cpu = load_tensor(compiled_logits_path).to(torch::kCPU).contiguous();
+  auto lengths =
+      load_tensor(lengths_path).to(device, torch::kInt64).contiguous();
+  auto num_candidates =
+      load_tensor(num_candidates_path).to(device, torch::kInt64).contiguous();
+  auto user_ids =
+      load_tensor(user_ids_path).to(torch::kCPU, torch::kInt64).contiguous();
+  auto total_history_lengths = load_tensor(total_history_lengths_path)
+                                   .to(torch::kCPU, torch::kInt64)
+                                   .contiguous();
+  auto ref_logits_cpu =
+      load_tensor(compiled_logits_path).to(torch::kCPU).contiguous();
 
-    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " loader.run begin");
+  log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) +
+                 " loader.run begin");
   std::vector<torch::Tensor> outputs = loader.run(
       {values, lengths, num_candidates, user_ids, total_history_lengths});
-    log_demo_debug(
-      "[INFO] Batch " + std::to_string(batch_idx)
-      + " loader.run returned outputs=" + std::to_string(outputs.size()));
+  log_demo_debug(
+      "[INFO] Batch " + std::to_string(batch_idx) +
+      " loader.run returned outputs=" + std::to_string(outputs.size()));
   check_cuda_after("loader.run");
-  TORCH_CHECK(!outputs.empty(), "Model returned no outputs.");
+  TORCH_CHECK(outputs.size() == 1,
+              "Expected one logits output from the no-offload model, got ",
+              outputs.size(), ".");
 
-    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " logits copy to CPU begin");
+  log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) +
+                 " logits copy to CPU begin");
   torch::Tensor logits_cpu = outputs[0].to(torch::kCPU).contiguous();
-    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " logits copy to CPU done");
+  log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) +
+                 " logits copy to CPU done");
   torch::Tensor ref_cpu = ref_logits_cpu.to(logits_cpu.dtype()).contiguous();
   if (!logits_cpu.sizes().equals(ref_cpu.sizes())) {
-    std::cerr << "[ERROR] Batch " << batch_idx << " shape mismatch: logits="
-              << logits_cpu.sizes() << ", ref=" << ref_cpu.sizes() << '\n';
+    std::cerr << "[ERROR] Batch " << batch_idx
+              << " shape mismatch: logits=" << logits_cpu.sizes()
+              << ", ref=" << ref_cpu.sizes() << '\n';
     return false;
   }
 
-  torch::Tensor diff = (logits_cpu.to(torch::kFloat32) - ref_cpu.to(torch::kFloat32)).abs();
+  torch::Tensor diff =
+      (logits_cpu.to(torch::kFloat32) - ref_cpu.to(torch::kFloat32)).abs();
   const double max_abs_diff = diff.max().item<double>();
   const bool pass = max_abs_diff <= 0.0625;
 
-  torch::Tensor offload_task_ids;
-  if (outputs.size() > 1 && outputs[1].defined()) {
-    offload_task_ids = outputs[1].to(torch::kCPU, torch::kInt64).contiguous();
-  }
-
-  std::cout << "[INFO] Batch " << batch_idx
-            << ": max_abs_diff=" << max_abs_diff
-            << "; pass(max_abs_diff<=0.0625)=" << (pass ? "True" : "False");
-  if (offload_task_ids.defined()) {
-    std::cout << "; offload_task_ids_shape=" << offload_task_ids.sizes();
-  }
-  std::cout << '\n';
+  std::cout << "[INFO] Batch " << batch_idx << ": max_abs_diff=" << max_abs_diff
+            << "; pass(max_abs_diff<=0.0625)=" << (pass ? "True" : "False")
+            << '\n';
   return pass;
 }
 
-void load_required_libraries(const DemoConfig& cfg) {
+void load_required_libraries(const DemoConfig &cfg) {
   check_required_kvcache_config();
   try_load_fbgemm_operators();
   try_load_fbgemm_hstu_experimental_operators();
-  TORCH_CHECK(load_shared_library("inference_emb_ops", cfg.inference_emb_ops_path),
-              "inference_emb_ops is required.");
-  TORCH_CHECK(load_shared_library("hstu_cuda_ops_runtime", cfg.hstu_runtime_ops_path),
-              "hstu_cuda_ops_runtime is required.");
-  TORCH_CHECK(load_shared_library("paged_kvcache_ops", cfg.paged_kvcache_ops_path),
-              "paged_kvcache_ops is required.");
-  TORCH_CHECK(load_shared_library("kvcache_manager_ops", cfg.kvcache_manager_ops_path),
-              "kvcache_manager_ops is required.");
+  TORCH_CHECK(
+      load_shared_library("inference_emb_ops", cfg.inference_emb_ops_path),
+      "inference_emb_ops is required.");
+  TORCH_CHECK(
+      load_shared_library("hstu_cuda_ops_runtime", cfg.hstu_runtime_ops_path),
+      "hstu_cuda_ops_runtime is required.");
+  TORCH_CHECK(
+      load_shared_library("paged_kvcache_ops", cfg.paged_kvcache_ops_path),
+      "paged_kvcache_ops is required.");
+  TORCH_CHECK(
+      load_shared_library("kvcache_manager_ops", cfg.kvcache_manager_ops_path),
+      "kvcache_manager_ops is required.");
 }
 
-}  // namespace
+} // namespace
 
 int main(int argc, char** argv) {
   try {

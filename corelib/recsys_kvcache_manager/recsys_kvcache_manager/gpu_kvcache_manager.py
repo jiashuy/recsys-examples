@@ -101,6 +101,10 @@ class DeviceKVCache:
         lookup_results: KVLookupResult,
         output_kvcache_metadata: Optional[KVCacheMetadata] = None,
     ) -> KVCacheMetadata:
+        # GPUKVCacheManagerImpl uses int64_t* for sequence lengths.
+        # This is also the dtype used by the AOTI interface.
+        seq_hist_lengths = seq_hist_lengths.to(dtype=torch.int64).contiguous()
+
         new_hist_lengths = seq_hist_lengths - lookup_results.cached_lengths
 
         if output_kvcache_metadata is None:

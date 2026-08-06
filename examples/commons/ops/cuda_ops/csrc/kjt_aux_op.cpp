@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <nvtx3/nvtx3.hpp>
 #include <torch/library.h>
 #include <tuple>
 #include <vector>
@@ -222,49 +223,184 @@ std::vector<at::Tensor> permute_and_split_cuda(
   return permute_and_split_impl(jagged_features, jagged_lengths, jagged_offsets, num_static_features, num_dynamic_features, features_order, /*expect_cuda=*/true);
 }
 
+bool is_fixed_feature_order(const std::vector<int64_t> &feature_order) {
+  for (int64_t feature_idx = 0;
+       feature_idx < static_cast<int64_t>(feature_order.size());
+       ++feature_idx) {
+    if (feature_order[feature_idx] != feature_idx) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool can_use_strip_cached_tokens_v1(const at::Tensor &lengths,
+                                    const at::Tensor &length_offsets,
+                                    const at::Tensor &num_cached,
+                                    const std::vector<int64_t> &feature_order) {
+  return is_fixed_feature_order(feature_order) &&
+         lengths.scalar_type() == at::kLong &&
+         length_offsets.scalar_type() == at::kLong &&
+         num_cached.scalar_type() == at::kLong;
+}
+
+// Fast path for the production HSTU layout:
+//   [context feature 0, ..., context feature N - 1, item, action].
+//
+// Cached tokens consume the contextual features in order, followed by
+// alternating item/action tokens. In production a contextual feature is
+// normally either kept in full or stripped in full. The prefix formulation
+// below handles that common case without a per-feature loop, while remaining
+// correct for the uncommon partial-context boundary.
+std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_impl_v1(
+    const at::Tensor &values, const at::Tensor &lengths,
+    const at::Tensor &length_offsets, const at::Tensor &num_cached,
+    const std::vector<int64_t> &feature_order, bool expect_cuda) {
+  nvtx3::scoped_range profile_range{"hstu.aoti.kvcache.strip"};
+  nvtx3::scoped_range implementation_range{"hstu.aoti.kvcache.strip.impl_v1"};
+  const int64_t num_features = feature_order.size();
+  const int64_t batch_size = num_cached.numel();
+
+  TORCH_CHECK(values.dim() == 1 && lengths.dim() == 1 &&
+                  length_offsets.dim() == 1 && num_cached.dim() == 1,
+              "strip_cached_tokens expects 1D inputs");
+  TORCH_CHECK(num_features >= 2 && batch_size > 0,
+              "strip_cached_tokens requires at least item/action features and "
+              "a non-empty batch");
+  TORCH_CHECK(lengths.numel() == batch_size * num_features &&
+                  length_offsets.numel() == lengths.numel() + 1,
+              "invalid lengths or length_offsets shape");
+  TORCH_CHECK(lengths.device() == values.device() &&
+                  length_offsets.device() == values.device() &&
+                  num_cached.device() == values.device(),
+              "all strip_cached_tokens tensors must be on the same device");
+  TORCH_CHECK(expect_cuda ? values.is_cuda() : values.device().is_cpu(),
+              expect_cuda
+                  ? "strip_cached_tokens CUDA inputs must be CUDA tensors"
+                  : "strip_cached_tokens CPU inputs must be CPU tensors");
+
+  // This scalar check intentionally synchronizes for CUDA. A cache miss used
+  // to launch dozens of tiny kernels and copy every value through an index
+  // tensor, so returning after two direct clones is substantially cheaper.
+  if (num_cached.sum().item<int64_t>() == 0) {
+    return std::make_tuple(values.clone(), lengths.clone());
+  }
+
+  const int64_t num_context_features = num_features - 2;
+  const auto lengths_2d = lengths.view({num_features, batch_size});
+
+  at::Tensor context_strip_counts;
+  at::Tensor remaining_num_cached;
+  if (num_context_features == 0) {
+    context_strip_counts = at::empty({0, batch_size}, lengths.options());
+    remaining_num_cached = num_cached;
+  } else {
+    const auto context_lengths =
+        lengths_2d.narrow(/*dim=*/0, /*start=*/0, num_context_features);
+    const auto context_prefix_end = at::cumsum(context_lengths, /*dim=*/0);
+    const auto context_prefix_start = context_prefix_end - context_lengths;
+    context_strip_counts = at::minimum(
+        at::clamp_min(num_cached.unsqueeze(/*dim=*/0) - context_prefix_start,
+                      /*min=*/0),
+        context_lengths);
+    remaining_num_cached = at::clamp_min(
+        num_cached - context_prefix_end.select(
+                         /*dim=*/0, /*index=*/num_context_features - 1),
+        /*min=*/0);
+  }
+
+  const auto item_lengths =
+      lengths_2d.select(/*dim=*/0, /*index=*/num_features - 2);
+  const auto action_lengths =
+      lengths_2d.select(/*dim=*/0, /*index=*/num_features - 1);
+  const auto item_strip_counts =
+      at::minimum(at::floor_divide(remaining_num_cached + 1, 2), item_lengths);
+  const auto action_strip_counts =
+      at::minimum(at::floor_divide(remaining_num_cached, 2), action_lengths);
+
+  const auto strip_counts = at::cat(
+                                {
+                                    context_strip_counts,
+                                    item_strip_counts.unsqueeze(/*dim=*/0),
+                                    action_strip_counts.unsqueeze(/*dim=*/0),
+                                },
+                                /*dim=*/0)
+                                .reshape({-1});
+  const auto new_lengths = lengths - strip_counts;
+
+  const auto zero = at::zeros({1}, new_lengths.options());
+  const auto new_offsets =
+      at::cat({zero, at::cumsum(new_lengths, /*dim=*/0)}, /*dim=*/0);
+  const auto source_starts =
+      length_offsets.narrow(
+          /*dim=*/0, /*start=*/0, /*length=*/lengths.numel()) +
+      strip_counts;
+  const auto source_delta =
+      source_starts - new_offsets.narrow(
+                          /*dim=*/0, /*start=*/0, /*length=*/lengths.numel());
+  const auto repeated_delta = at::repeat_interleave(source_delta, new_lengths);
+  const auto source_indices =
+      at::arange(repeated_delta.numel(), repeated_delta.options()) +
+      repeated_delta;
+  return std::make_tuple(values.index_select(/*dim=*/0, source_indices),
+                         new_lengths);
+}
+
 std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_impl_v2(
-    const at::Tensor& values,
-    const at::Tensor& lengths,
-    const at::Tensor& length_offsets,
-    const at::Tensor& num_cached,
-    const std::vector<int64_t>& feature_order,
-    bool expect_cuda) {
+    const at::Tensor &values, const at::Tensor &lengths,
+    const at::Tensor &length_offsets, const at::Tensor &num_cached,
+    const std::vector<int64_t> &feature_order, bool expect_cuda) {
+  nvtx3::scoped_range profile_range{"hstu.aoti.kvcache.strip"};
+  nvtx3::scoped_range implementation_range{"hstu.aoti.kvcache.strip.impl_v2"};
   const int64_t num_strip_features = feature_order.size();
 
   TORCH_CHECK(values.dim() == 1, "values must be 1D, got dim=", values.dim());
-  TORCH_CHECK(lengths.dim() == 1, "lengths must be 1D, got dim=", lengths.dim());
-  TORCH_CHECK(length_offsets.dim() == 1, "length_offsets must be 1D, got dim=", length_offsets.dim());
-  TORCH_CHECK(num_cached.dim() == 1, "num_cached must be 1D, got dim=", num_cached.dim());
-  TORCH_CHECK(feature_order.size() >= 2, "feature_order must have at least item and action features");
+  TORCH_CHECK(lengths.dim() == 1,
+              "lengths must be 1D, got dim=", lengths.dim());
+  TORCH_CHECK(length_offsets.dim() == 1,
+              "length_offsets must be 1D, got dim=", length_offsets.dim());
+  TORCH_CHECK(num_cached.dim() == 1,
+              "num_cached must be 1D, got dim=", num_cached.dim());
+  TORCH_CHECK(feature_order.size() >= 2,
+              "feature_order must have at least item and action features");
   const int64_t batch_size = num_cached.numel();
   TORCH_CHECK(batch_size > 0, "batch_size must be > 0");
-  TORCH_CHECK(
-      lengths.numel() == batch_size * num_strip_features,
-      "lengths must have shape [batch_size * feature_order.size()]");
-  TORCH_CHECK(
-      length_offsets.numel() == lengths.numel() + 1,
-      "length_offsets must have shape [lengths.numel() + 1]");
-  TORCH_CHECK(lengths.device() == values.device(), "lengths must be on the same device as values");
-  TORCH_CHECK(length_offsets.device() == values.device(), "length_offsets must be on the same device as values");
-  TORCH_CHECK(num_cached.device() == values.device(), "num_cached must be on the same device as values");
+  TORCH_CHECK(lengths.numel() == batch_size * num_strip_features,
+              "lengths must have shape [batch_size * feature_order.size()]");
+  TORCH_CHECK(length_offsets.numel() == lengths.numel() + 1,
+              "length_offsets must have shape [lengths.numel() + 1]");
+  TORCH_CHECK(lengths.device() == values.device(),
+              "lengths must be on the same device as values");
+  TORCH_CHECK(length_offsets.device() == values.device(),
+              "length_offsets must be on the same device as values");
+  TORCH_CHECK(num_cached.device() == values.device(),
+              "num_cached must be on the same device as values");
 
   if (expect_cuda) {
     TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor for CUDA impl");
-    TORCH_CHECK(lengths.is_cuda(), "lengths must be a CUDA tensor for CUDA impl");
-    TORCH_CHECK(length_offsets.is_cuda(), "length_offsets must be a CUDA tensor for CUDA impl");
-    TORCH_CHECK(num_cached.is_cuda(), "num_cached must be a CUDA tensor for CUDA impl");
+    TORCH_CHECK(lengths.is_cuda(),
+                "lengths must be a CUDA tensor for CUDA impl");
+    TORCH_CHECK(length_offsets.is_cuda(),
+                "length_offsets must be a CUDA tensor for CUDA impl");
+    TORCH_CHECK(num_cached.is_cuda(),
+                "num_cached must be a CUDA tensor for CUDA impl");
   } else {
-    TORCH_CHECK(values.device().is_cpu(), "values must be a CPU tensor for CPU impl");
-    TORCH_CHECK(lengths.device().is_cpu(), "lengths must be a CPU tensor for CPU impl");
-    TORCH_CHECK(length_offsets.device().is_cpu(), "length_offsets must be a CPU tensor for CPU impl");
-    TORCH_CHECK(num_cached.device().is_cpu(), "num_cached must be a CPU tensor for CPU impl");
+    TORCH_CHECK(values.device().is_cpu(),
+                "values must be a CPU tensor for CPU impl");
+    TORCH_CHECK(lengths.device().is_cpu(),
+                "lengths must be a CPU tensor for CPU impl");
+    TORCH_CHECK(length_offsets.device().is_cpu(),
+                "length_offsets must be a CPU tensor for CPU impl");
+    TORCH_CHECK(num_cached.device().is_cpu(),
+                "num_cached must be a CPU tensor for CPU impl");
   }
 
   auto lengths_i64 = lengths.to(at::kLong);
   auto offsets_i64 = length_offsets.to(at::kLong);
   auto num_cached_i64 = num_cached.to(at::kLong);
   for (const auto feature_idx : feature_order) {
-    TORCH_CHECK(feature_idx >= 0 && feature_idx < num_strip_features, "feature_order contains invalid index: ", feature_idx);
+    TORCH_CHECK(feature_idx >= 0 && feature_idx < num_strip_features,
+                "feature_order contains invalid index: ", feature_idx);
   }
 
   auto batch_indices = at::arange(batch_size, lengths_i64.options());
@@ -277,13 +413,18 @@ std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_impl_v2(
   clipped_num_cached_vec.reserve(static_cast<size_t>(num_strip_features));
   new_lengths_vec.reserve(static_cast<size_t>(num_strip_features));
 
-  for (int64_t feature_order_idx = 0; feature_order_idx < num_strip_features - 2; ++feature_order_idx) {
+  for (int64_t feature_order_idx = 0;
+       feature_order_idx < num_strip_features - 2; ++feature_order_idx) {
     const auto feature_idx = feature_order[feature_order_idx];
     auto selected_feature_rows = feature_idx * batch_size + batch_indices;
     auto feature_lengths = lengths_i64.index_select(0, selected_feature_rows);
-    auto clipped_num_cached = at::minimum(remaining_num_cached, feature_lengths);
+    auto clipped_num_cached =
+        at::minimum(remaining_num_cached, feature_lengths);
     remaining_num_cached = remaining_num_cached - clipped_num_cached;
-    strip_counts.narrow(/*dim=*/0, /*start=*/feature_idx * batch_size, /*length=*/batch_size).copy_(clipped_num_cached);
+    strip_counts
+        .narrow(/*dim=*/0, /*start=*/feature_idx * batch_size,
+                /*length=*/batch_size)
+        .copy_(clipped_num_cached);
   }
 
   const auto item_feature_idx = feature_order[num_strip_features - 2];
@@ -296,13 +437,20 @@ std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_impl_v2(
   auto action_num_cached = at::floor_divide(remaining_num_cached, 2);
   auto item_strip_counts = at::minimum(item_num_cached, item_lengths);
   auto action_strip_counts = at::minimum(action_num_cached, action_lengths);
-  strip_counts.narrow(/*dim=*/0, /*start=*/item_feature_idx * batch_size, /*length=*/batch_size).copy_(item_strip_counts);
-  strip_counts.narrow(/*dim=*/0, /*start=*/action_feature_idx * batch_size, /*length=*/batch_size).copy_(action_strip_counts);
+  strip_counts
+      .narrow(/*dim=*/0, /*start=*/item_feature_idx * batch_size,
+              /*length=*/batch_size)
+      .copy_(item_strip_counts);
+  strip_counts
+      .narrow(/*dim=*/0, /*start=*/action_feature_idx * batch_size,
+              /*length=*/batch_size)
+      .copy_(action_strip_counts);
 
   for (const auto feature_idx : feature_order) {
     auto selected_feature_rows = feature_idx * batch_size + batch_indices;
     auto feature_lengths = lengths_i64.index_select(0, selected_feature_rows);
-    auto clipped_num_cached = strip_counts.index_select(0, selected_feature_rows);
+    auto clipped_num_cached =
+        strip_counts.index_select(0, selected_feature_rows);
     selected_rows_vec.push_back(selected_feature_rows);
     clipped_num_cached_vec.push_back(clipped_num_cached);
     new_lengths_vec.push_back(feature_lengths - clipped_num_cached);
@@ -314,29 +462,48 @@ std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_impl_v2(
 
   auto zero = at::zeros({1}, new_lengths_i64.options());
   auto new_offsets = at::cat({zero, at::cumsum(new_lengths_i64, 0)}, 0);
-  auto source_starts = offsets_i64.index_select(0, selected_rows) + clipped_num_cached;
-  auto source_delta = source_starts - new_offsets.narrow(0, 0, lengths_i64.numel());
+  auto source_starts =
+      offsets_i64.index_select(0, selected_rows) + clipped_num_cached;
+  auto source_delta =
+      source_starts - new_offsets.narrow(0, 0, lengths_i64.numel());
   auto repeated_delta = at::repeat_interleave(source_delta, new_lengths_i64);
-  auto source_indices = at::arange(repeated_delta.numel(), repeated_delta.options()) + repeated_delta;
-  return std::make_tuple(values.index_select(0, source_indices), new_lengths_i64.to(lengths.scalar_type()));
+  auto source_indices =
+      at::arange(repeated_delta.numel(), repeated_delta.options()) +
+      repeated_delta;
+  return std::make_tuple(values.index_select(0, source_indices),
+                         new_lengths_i64.to(lengths.scalar_type()));
 }
 
-std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_cpu(
-    const at::Tensor& values,
-    const at::Tensor& lengths,
-    const at::Tensor& length_offsets,
-    const at::Tensor& num_cached,
-    const std::vector<int64_t>& feature_order) {
-  return strip_cached_tokens_impl_v2(values, lengths, length_offsets, num_cached, feature_order, /*expect_cuda=*/false);
+std::tuple<at::Tensor, at::Tensor>
+strip_cached_tokens_cpu(const at::Tensor &values, const at::Tensor &lengths,
+                        const at::Tensor &length_offsets,
+                        const at::Tensor &num_cached,
+                        const std::vector<int64_t> &feature_order) {
+  if (can_use_strip_cached_tokens_v1(lengths, length_offsets, num_cached,
+                                     feature_order)) {
+    return strip_cached_tokens_impl_v1(values, lengths, length_offsets,
+                                       num_cached, feature_order,
+                                       /*expect_cuda=*/false);
+  }
+  return strip_cached_tokens_impl_v2(values, lengths, length_offsets,
+                                     num_cached, feature_order,
+                                     /*expect_cuda=*/false);
 }
 
-std::tuple<at::Tensor, at::Tensor> strip_cached_tokens_cuda(
-    const at::Tensor& values,
-    const at::Tensor& lengths,
-    const at::Tensor& length_offsets,
-    const at::Tensor& num_cached,
-    const std::vector<int64_t>& feature_order) {
-  return strip_cached_tokens_impl_v2(values, lengths, length_offsets, num_cached, feature_order, /*expect_cuda=*/true);
+std::tuple<at::Tensor, at::Tensor>
+strip_cached_tokens_cuda(const at::Tensor &values, const at::Tensor &lengths,
+                         const at::Tensor &length_offsets,
+                         const at::Tensor &num_cached,
+                         const std::vector<int64_t> &feature_order) {
+  if (can_use_strip_cached_tokens_v1(lengths, length_offsets, num_cached,
+                                     feature_order)) {
+    return strip_cached_tokens_impl_v1(values, lengths, length_offsets,
+                                       num_cached, feature_order,
+                                       /*expect_cuda=*/true);
+  }
+  return strip_cached_tokens_impl_v2(values, lengths, length_offsets,
+                                     num_cached, feature_order,
+                                     /*expect_cuda=*/true);
 }
 
 } // namespace

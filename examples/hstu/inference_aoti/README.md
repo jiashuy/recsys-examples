@@ -275,7 +275,8 @@ docker run \
     triton_pid=\$!
     sleep 30
 
-    python3 test_tritonserver_aoti_hstu_model.py > test_benchmark.log
+    python3 test_tritonserver_aoti_hstu_model.py \
+      --batch_size 2 > test_benchmark.log
     cat test_benchmark.log
     kill \$triton_pid || true
     kill -9 \$triton_pid || true

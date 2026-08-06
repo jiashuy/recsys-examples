@@ -1,9 +1,12 @@
 # Triton PyTorch AOTI backend config
 # Model input  slots: input__0 (values), input__1 (lengths), input__2 (num_candidates), input__3 (user_ids), input__4 (total_history_lengths)
-#       output slots: output__0 (logits), output__1 (kvcache_task_ids)
+#       output slots: output__0 (logits)
 
 name: "hstu_gr_ranking_kvcache"
 platform: "torch_aoti"
+# Triton's scheduler-level batching is disabled. The five tensors below encode
+# one logical HSTU batch inside a single Triton call. The AOTI dynamic-shape
+# contract and KV-cache runtime accept logical batch sizes from 1 through 8.
 max_batch_size: 0
 
 input [
@@ -39,11 +42,6 @@ output [
     name: "OUTPUT__0"
     data_type: TYPE_FP32
     dims: [ -1, 8 ]
-  },
-  {
-    name: "OUTPUT__1"
-    data_type: TYPE_INT64
-    dims: [ -1 ]
   }
 ]
 
@@ -51,6 +49,8 @@ instance_group [
   {
     count: 1
     kind: KIND_GPU
+    # The KV-cache runtime is configured for logical CUDA device 0.
+    gpus: [ 0 ]
   }
 ]
 

@@ -21,6 +21,8 @@
 #include "gpu_kvcache_manager_impl.h"
 #include <nvtx3/nvtx3.hpp>
 
+#include <utility>
+
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
@@ -74,12 +76,15 @@ GPUKVCacheManagerImpl::GPUKVCacheManagerImpl(
         _empty_pages.push(page_id);
 
     cudaCheck(cudaStreamCreateWithFlags(&alloc_stream, cudaStreamNonBlocking));
+    cudaCheck(cudaEventCreateWithFlags(&alloc_complete_event,
+                                       cudaEventDisableTiming));
     cudaCheck(cudaMallocHost((void**)&this->metadata_host_buffer, 
         (5 * max_batch_size + 4) * sizeof(int) /* for new_history_nnz and new_history_offsets */));
 }    
 
 GPUKVCacheManagerImpl::~GPUKVCacheManagerImpl() {
     cudaCheck(cudaFreeHost(this->metadata_host_buffer));
+    cudaCheck(cudaEventDestroy(alloc_complete_event));
     cudaCheck(cudaStreamDestroy(alloc_stream));
 }
 
@@ -188,55 +193,58 @@ bool GPUKVCacheManagerImpl::retain(int64_t uid)
     return found;
 };
 
-std::vector<int>& GPUKVCacheManagerImpl::alloc_single_sequence(
-    int64_t uid, 
-    int new_total_length, 
-    int host_cached_startpos, 
-    int host_cached_length, 
-    std::unordered_set<int64_t> freezed_uids)
-{
-    (void)host_cached_startpos;  // assume to be zero in current implementation.
-
-    int num_total_pages = int((new_total_length + this->num_tokens_per_page - 1) / this->num_tokens_per_page);  // duplicated computation
-
+std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
+    int64_t uid, int new_total_length, int host_cached_length,
+    const std::unordered_set<int64_t> &freezed_uids) {
     int cur_cached_start = 0;
     int cur_cached_len = 0;
-    bool found_in_gpu_cache = retain(uid);
-    if (found_in_gpu_cache) {  // duplicated lookup
-        cur_cached_start = _uid_to_paged_cache_startpos[uid];
-        cur_cached_len = _uid_to_paged_cache_length[uid];
+    const bool found_in_gpu_cache = retain(uid);
+    if (found_in_gpu_cache) {
+        cur_cached_start = _uid_to_paged_cache_startpos.at(uid);
+        cur_cached_len = _uid_to_paged_cache_length.at(uid);
     }
+
+    // The common second-pass path already has the complete history resident
+    // from token zero. Refresh the LRU entry, but keep the existing page
+    // vector and cache metadata unchanged.
+    if (found_in_gpu_cache && cur_cached_start == 0 &&
+        cur_cached_len == new_total_length) {
+        return _uid_to_page_id.at(uid);
+    }
+
+    const int num_total_pages =
+        (new_total_length + this->num_tokens_per_page - 1) /
+        this->num_tokens_per_page;
 
     // 1. allocate pages for host cached data
     int num_onload_pages = 0;
     if (cur_cached_len == 0) {
-        num_onload_pages = int((host_cached_length + this->num_tokens_per_page - 1) / this->num_tokens_per_page);
-        // Note: We would allow host_cached_length not aligned with this->num_tokens_per_page.
-        //       And in this case, num_cur_pages (below) will be 0. Thus, num_append_pages is correct.
+        num_onload_pages =
+            (host_cached_length + this->num_tokens_per_page - 1) /
+            this->num_tokens_per_page;
+        // Host cache length need not be page-aligned. If there is no current
+        // GPU cache, num_cur_pages remains zero and append-page accounting
+        // still covers the partial final page.
     } else if (cur_cached_start > 0) {
-        // cur_cached_start should align with this->num_tokens_per_page;
-        num_onload_pages = int(cur_cached_start / this->num_tokens_per_page);
-    } /* else {
-        assert(cur_cached_start == 0 && cur_cached_len > 0);
-        num_onload_pages = 0;
-    } */
-    
+        num_onload_pages = cur_cached_start / this->num_tokens_per_page;
+    }
+
     // 2. allocate pages for new data to be appended
-    int num_cur_pages = (cur_cached_len + this->num_tokens_per_page - 1) / this->num_tokens_per_page;
-    // assert((num_cur_pages == 0 && _uid_to_page_id.find(uid) == _uid_to_page_id.end()) ||
-    //        num_cur_pages == _uid_to_page_id[uid].size()                                  );
-    int num_append_pages = num_total_pages - num_onload_pages - num_cur_pages;
-    
-    int num_required_pages = num_onload_pages + num_append_pages;
+    const int num_cur_pages = (cur_cached_len + this->num_tokens_per_page - 1) /
+                              this->num_tokens_per_page;
+    const int num_append_pages =
+        num_total_pages - num_onload_pages - num_cur_pages;
+    const int num_required_pages = num_onload_pages + num_append_pages;
 
     // 3. Evict offloaded pages first; then evict by user until enough pages
     {
-        // std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
-
-        for (auto it = std::begin(_lru_list); it != std::end(_lru_list); ) {
-            if ((size_t)num_required_pages <= _empty_pages.size())
+        for (auto it = std::begin(_lru_list); it != std::end(_lru_list);) {
+            if (static_cast<size_t>(num_required_pages) <=
+                _empty_pages.size()) {
                 break;
-            if (this->_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end()) {
+            }
+            if (this->_uid_offload_lock.find((int64_t)*it) !=
+                _uid_offload_lock.end()) {
                 ++it;
                 continue;
             }
@@ -277,20 +285,20 @@ std::vector<int>& GPUKVCacheManagerImpl::alloc_single_sequence(
         page_ids[i] = _empty_pages.front();
         _empty_pages.pop();
     }
-    _uid_to_page_id[uid] = page_ids;
+    _uid_to_page_id[uid] = std::move(page_ids);
     _uid_to_paged_cache_startpos[uid] = 0;
     _uid_to_paged_cache_length[uid] = new_total_length;
 
-    return _uid_to_page_id[uid];
-};
+    return _uid_to_page_id.at(uid);
+}
 
 void GPUKVCacheManagerImpl::allocate(
     at::Tensor user_ids,
-    at::Tensor total_hist_lens,  // all histo w/o candi
-    at::Tensor host_cached_lengths,
-    at::Tensor page_ids_gpu_buffer,
+    at::Tensor total_hist_lens, // all histo w/o candi
+    at::Tensor host_cached_lengths, at::Tensor page_ids_gpu_buffer,
     at::Tensor metadata_gpu_buffer) {
-    // TODO(junyiq): page_ids_gpu_buffer &  metadata_gpu_buffer are allocated in main thread
+    // TODO(junyiq): page_ids_gpu_buffer &  metadata_gpu_buffer are allocated in
+    // main thread
     //               try with pybind gil guard and allocate here in future
 
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
@@ -300,15 +308,18 @@ void GPUKVCacheManagerImpl::allocate(
     int *host_cached_lengths_ptr = host_cached_lengths.data_ptr<int>();
 
     std::vector<int> page_indices;
-    std::vector<int> offload_page_ids;
+    page_indices.reserve(batch_size * ((this->max_sequence_length +
+                                        this->num_tokens_per_page - 1) /
+                                       this->num_tokens_per_page));
 
-    int *host_bufptr = static_cast<int*>(this->metadata_host_buffer);
+    const auto *total_hist_lens_ptr = total_hist_lens.data_ptr<int64_t>();
+    int *host_bufptr = static_cast<int *>(this->metadata_host_buffer);
 
-    int *page_indptr = host_bufptr + 0;
+    int *page_indptr = host_bufptr;
     int *last_page_len = host_bufptr + batch_size + 1;
     int *total_history_lengths = host_bufptr + batch_size * 2 + 1;
     int *total_history_offsets = host_bufptr + batch_size * 3 + 1;
-    int *new_history_nnz_cuda = host_bufptr + batch_size * 4 + 2;
+    int *new_history_nnz_host = host_bufptr + batch_size * 4 + 2;
     int *new_history_offsets = host_bufptr + batch_size * 4 + 3;
 
     page_indptr[0] = 0;
@@ -316,76 +327,145 @@ void GPUKVCacheManagerImpl::allocate(
     new_history_offsets[0] = 0;
 
     std::vector<int> cached_lengths;
-    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        int64_t uid = user_ids_ptr[seq_idx];
-        int gpu_cached_startpos = 0;
-        int gpu_cached_length = 0;
-        if (_uid_to_paged_cache_startpos.find(uid) != _uid_to_paged_cache_startpos.end()) {
-            gpu_cached_startpos = _uid_to_paged_cache_startpos[uid];
-            gpu_cached_length = _uid_to_paged_cache_length[uid];
+    cached_lengths.reserve(batch_size);
+    bool full_gpu_hit_no_new_history = batch_size > 0;
+    {
+        nvtx3::scoped_range range{
+            "hstu.aoti.kvcache.allocate.cache_bookkeeping"};
+        for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+            int64_t uid = user_ids_ptr[seq_idx];
+            int gpu_cached_startpos = 0;
+            int gpu_cached_length = 0;
+            const auto cached_start_it = _uid_to_paged_cache_startpos.find(uid);
+            if (cached_start_it != _uid_to_paged_cache_startpos.end()) {
+                gpu_cached_startpos = cached_start_it->second;
+                gpu_cached_length = _uid_to_paged_cache_length.at(uid);
+            }
+            const int total_history_length = total_hist_lens_ptr[seq_idx];
+            full_gpu_hit_no_new_history =
+                full_gpu_hit_no_new_history &&
+                host_cached_lengths_ptr[seq_idx] == 0 &&
+                gpu_cached_startpos == 0 &&
+                gpu_cached_length == total_history_length &&
+                gpu_cached_length > 0;
+            if (gpu_cached_length > 0 &&
+                host_cached_lengths_ptr[seq_idx] < gpu_cached_startpos) {
+                evict(uid);
+                cached_lengths.push_back(0);
+                full_gpu_hit_no_new_history = false;
+                continue;
+            }
+
+            cached_lengths.push_back(
+                std::max(host_cached_lengths_ptr[seq_idx],
+                         gpu_cached_startpos + gpu_cached_length));
+            // [update offloaded length]
+            // Note: host_cached_lengths is always larger
+            this->_uid_to_offloaded_length[uid] =
+                host_cached_lengths_ptr[seq_idx];
         }
-        if (gpu_cached_length > 0 && host_cached_lengths_ptr[seq_idx] < gpu_cached_startpos) {
-            evict(uid);
-            cached_lengths.push_back(0);
-            continue;
-        }
-        
-        cached_lengths.push_back(std::max(
-            host_cached_lengths_ptr[seq_idx],
-            _uid_to_paged_cache_startpos[uid] + _uid_to_paged_cache_length[uid]
-        ));
-        // [update offloaded length]
-        // Note: host_cached_lengths is always larger
-        this->_uid_to_offloaded_length[uid] = host_cached_lengths_ptr[seq_idx];
     }
 
-    const std::unordered_set<int64_t> freezed_uids(user_ids_ptr, user_ids_ptr + batch_size);
-    for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        int64_t uid = user_ids_ptr[seq_idx];
-        int total_history_length = total_hist_lens[seq_idx].item<int>();
+    const std::unordered_set<int64_t> freezed_uids(user_ids_ptr,
+                                                   user_ids_ptr + batch_size);
+    auto build_page_table = [&]() {
+        nvtx3::scoped_range range{"hstu.aoti.kvcache.allocate.page_table"};
+        for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+            int64_t uid = user_ids_ptr[seq_idx];
+            int total_history_length = total_hist_lens_ptr[seq_idx];
 
-        // [attention/get metadata]; changed due to no separated onload block
-        // Note: allocate pages for onboard kvcache, and revoke onboard pages upon failure.
-        std::vector<int>& page_ids = alloc_single_sequence(uid, total_history_length, 0, host_cached_lengths_ptr[seq_idx], freezed_uids);
-        page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
-        page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size();
-        last_page_len[seq_idx] = this->_uid_to_paged_cache_length[uid] % this->num_tokens_per_page;  // NOT duplicated lookup, updated
-        if (last_page_len[seq_idx] == 0) last_page_len[seq_idx] = this->num_tokens_per_page;
-        // int gpu_cache_startpos = this->_uid_to_paged_cache_startpos[uid];  // #1 -- NOT duplicated lookup, updated ; #2 -- assume to be zero after alloc and during inference
-
-        // [history metadata]
-        total_history_lengths[seq_idx] = total_history_length;  // used for [appending/put metadata]
-        total_history_offsets[seq_idx + 1] = total_history_offsets[seq_idx] + total_history_length;  // used as [attention metadata]: k/v seqlen_offsets (need adding jagged_data.num_candidates_offsets)
-        new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] + total_history_length - cached_lengths[seq_idx];  // used for [appending/put metadata]
-        // old_cached_lengths;  // used in [position encoding metadata]; from lookup results
+            // Allocate pages for both onboarded and newly appended history.
+            const std::vector<int> &page_ids = alloc_single_sequence(
+                uid, total_history_length, host_cached_lengths_ptr[seq_idx],
+                freezed_uids);
+            page_indices.insert(page_indices.end(), page_ids.begin(),
+                                page_ids.end());
+            page_indptr[seq_idx + 1] =
+                page_indptr[seq_idx] + static_cast<int>(page_ids.size());
+            last_page_len[seq_idx] = this->_uid_to_paged_cache_length.at(uid) %
+                                     this->num_tokens_per_page;
+            if (last_page_len[seq_idx] == 0) {
+                last_page_len[seq_idx] = this->num_tokens_per_page;
+            }
+            total_history_lengths[seq_idx] = total_history_length;
+            total_history_offsets[seq_idx + 1] =
+                total_history_offsets[seq_idx] + total_history_length;
+            new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] +
+                                               total_history_length -
+                                               cached_lengths[seq_idx];
+        }
+    };
+    if (full_gpu_hit_no_new_history) {
+        nvtx3::scoped_range range{
+            "hstu.aoti.kvcache.allocate.full_gpu_hit_no_new_history"};
+        build_page_table();
+    } else {
+        build_page_table();
     }
 
-    cudaCheck(cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr(), page_indices.data(), page_indptr[batch_size] * sizeof(int), cudaMemcpyHostToDevice, this->alloc_stream));
+    {
+        nvtx3::scoped_range range{"hstu.aoti.kvcache.allocate.page_ids_h2d"};
+        cudaCheck(cudaMemcpyAsync(page_ids_gpu_buffer.data_ptr(),
+                                  page_indices.data(),
+                                  page_indptr[batch_size] * sizeof(int),
+                                  cudaMemcpyHostToDevice, this->alloc_stream));
+    }
 
     // [appending/put metadata; for cudagraph only]
-    auto new_tokens = new_history_offsets[batch_size];
-    *new_history_nnz_cuda = new_tokens;
+    const int new_tokens = new_history_offsets[batch_size];
+    *new_history_nnz_host = new_tokens;
 
-    size_t host_buffer_d2h_size = (batch_size * 5 + 4) * sizeof(int);
-    cudaCheck(cudaMemcpyAsync(metadata_gpu_buffer.data_ptr(), this->metadata_host_buffer, host_buffer_d2h_size, cudaMemcpyHostToDevice, this->alloc_stream));
-    
-    // [appending/put metadata]
-    int *gpu_bufptr = metadata_gpu_buffer.data_ptr<int>();
-    int *total_history_lengths_dev = gpu_bufptr + batch_size * 2 + 1;
-    int *new_history_offsets_dev = gpu_bufptr + batch_size * 4 + 3;
-    int *batch_indices_dev = gpu_bufptr + batch_size * 5 + 4;
-    int *position_dev = gpu_bufptr + batch_size * 5 + 4 + new_tokens;
+    {
+        nvtx3::scoped_range range{
+            "hstu.aoti.kvcache.allocate.metadata_h2d_and_positions"};
+        {
+            nvtx3::scoped_range h2d_range{
+                "hstu.aoti.kvcache.allocate.metadata_h2d"};
+            const size_t host_buffer_h2d_size =
+                (batch_size * 5 + 4) * sizeof(int);
+            cudaCheck(cudaMemcpyAsync(
+                metadata_gpu_buffer.data_ptr(), this->metadata_host_buffer,
+                host_buffer_h2d_size, cudaMemcpyHostToDevice,
+                this->alloc_stream));
+        }
 
-    GetPagedBatchIndicesPositions(
-        batch_size,
-        new_history_offsets_dev,  // new_history_offsets
-        total_history_lengths_dev,  // total_history_lengths
-        batch_indices_dev,
-        position_dev,
-        this->alloc_stream
-    );
+        // [appending/put metadata]
+        int *gpu_bufptr = metadata_gpu_buffer.data_ptr<int>();
+        int *total_history_lengths_dev = gpu_bufptr + batch_size * 2 + 1;
+        int *new_history_offsets_dev = gpu_bufptr + batch_size * 4 + 3;
+        int *batch_indices_dev = gpu_bufptr + batch_size * 5 + 4;
+        int *position_dev = gpu_bufptr + batch_size * 5 + 4 + new_tokens;
 
-    cudaCheck(cudaStreamSynchronize(this->alloc_stream));
+        if (new_tokens > 0) {
+            nvtx3::scoped_range positions_range{
+                "hstu.aoti.kvcache.allocate.append_positions"};
+            GetPagedBatchIndicesPositions(
+                batch_size,
+                new_history_offsets_dev,   // new_history_offsets
+                total_history_lengths_dev, // total_history_lengths
+                batch_indices_dev, position_dev, this->alloc_stream);
+        } else {
+            nvtx3::scoped_range no_positions_range{
+                "hstu.aoti.kvcache.allocate."
+                "append_positions_skipped_no_new_history"};
+        }
+    }
+
+    {
+        nvtx3::scoped_range range{
+            "hstu.aoti.kvcache.allocate.stream_dependency"};
+        // Preserve cross-stream ordering without blocking the model-execution
+        // CPU thread. The exported Triton model deliberately has one instance,
+        // matching this manager's single pinned metadata staging buffer. A
+        // concurrent multi-instance configuration needs one staging buffer
+        // and completion event per in-flight allocation.
+        cudaCheck(
+            cudaEventRecord(this->alloc_complete_event, this->alloc_stream));
+        const auto current_stream =
+            c10::cuda::getCurrentCUDAStream(this->device.index());
+        cudaCheck(cudaStreamWaitEvent(current_stream.stream(),
+                                      this->alloc_complete_event, 0));
+    }
 }
 
 at::Tensor GPUKVCacheManagerImpl::check_for_offload(
@@ -562,5 +642,4 @@ void GPUKVCacheManagerImpl::release_offload_pages(
     // When offloaded == false, offload_lengths can be empty.
 }
 
-
-}  // namespace kvcache
+} // namespace kvcache

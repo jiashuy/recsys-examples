@@ -3,6 +3,7 @@
 
 #include <ATen/ATen.h>
 #include <iostream>
+#include <nvtx3/nvtx3.hpp>
 #include <string>
 #include <thread>
 
@@ -134,41 +135,67 @@ ExportKVCacheRuntime::~ExportKVCacheRuntime() {
     log_runtime_message("destructor exit");
 }
 
-std::vector<at::Tensor> ExportKVCacheRuntime::lookup_kvcache(
-    at::Tensor user_ids, at::Tensor seqlens) {
+std::vector<at::Tensor>
+ExportKVCacheRuntime::lookup_kvcache(at::Tensor user_ids, at::Tensor seqlens) {
     auto gpu_lookup_result = gpu_kvcache_->lookup(user_ids);
     auto gpu_cached_startpos = gpu_lookup_result[0];
     auto gpu_cached_lengths = gpu_lookup_result[1];
 
     const auto batch_size = user_ids.size(0);
-    auto task_ids = at::empty({batch_size}, at::dtype(torch::kInt64).device(at::kCPU));
-    auto host_cached_startpos = at::zeros_like(gpu_cached_startpos, at::dtype(torch::kInt32).device(at::kCPU));
-    auto host_cached_lengths = at::empty_like(gpu_cached_lengths, at::dtype(torch::kInt32).device(at::kCPU));
+    auto task_ids =
+        at::empty({batch_size}, at::dtype(torch::kInt64).device(at::kCPU));
+    auto host_cached_startpos = at::zeros_like(
+        gpu_cached_startpos, at::dtype(torch::kInt32).device(at::kCPU));
+    auto host_cached_lengths = at::empty_like(
+        gpu_cached_lengths, at::dtype(torch::kInt32).device(at::kCPU));
+
+    const auto *gpu_cached_startpos_ptr =
+        gpu_cached_startpos.data_ptr<int32_t>();
+    const auto *gpu_cached_lengths_ptr = gpu_cached_lengths.data_ptr<int32_t>();
+    const auto *user_ids_ptr = user_ids.data_ptr<int64_t>();
+    const auto *seqlens_ptr = seqlens.data_ptr<int64_t>();
+    auto *task_ids_ptr = task_ids.data_ptr<int64_t>();
+    auto *host_cached_lengths_ptr = host_cached_lengths.data_ptr<int32_t>();
 
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        int64_t uid = user_ids.data_ptr<int64_t>()[seq_idx];
-        int64_t seqlen = seqlens.data_ptr<int64_t>()[seq_idx];
+        // A cache entry rooted at token zero is already directly usable. Avoid
+        // the synchronous FlexKV/CPU lookup in this common GPU-cache-hit path.
+        // A zero host result and -1 task ID also make onboarding a no-op for
+        // this sequence.
+        if (gpu_cached_startpos_ptr[seq_idx] == 0 &&
+            gpu_cached_lengths_ptr[seq_idx] > 0) {
+            task_ids_ptr[seq_idx] = -1;
+            host_cached_lengths_ptr[seq_idx] = 0;
+            continue;
+        }
+
+        int64_t uid = user_ids_ptr[seq_idx];
+        int64_t seqlen = seqlens_ptr[seq_idx];
 
         auto user_namespace = "uid:" + std::to_string(uid);
         auto [task_id, cache_result] = flexkv_client_->get_match(
-            lookup_token_index_.slice(0, 0, seqlen),
-            std::nullopt,
-            num_layers_,
+            lookup_token_index_.slice(0, 0, seqlen), std::nullopt, num_layers_,
             {user_namespace});
-        task_ids.data_ptr<int64_t>()[seq_idx] = task_id;
+        task_ids_ptr[seq_idx] = task_id;
 
         int cached_length = cache_result.sum().item<int>();
-        host_cached_lengths.data_ptr<int>()[seq_idx] = cached_length;
+        host_cached_lengths_ptr[seq_idx] = cached_length;
     }
 
-    auto merge_cached_startpos = at::where(host_cached_lengths > 0, host_cached_startpos, gpu_cached_startpos);
-    auto merge_cached_lengths = at::where(gpu_cached_lengths > 0, 
-        at::max(gpu_cached_startpos, host_cached_startpos) + gpu_cached_lengths - merge_cached_startpos,
-        host_cached_lengths);
-    auto non_valid_caching = (gpu_cached_startpos > host_cached_lengths) & (gpu_cached_lengths > 0);
+    auto merge_cached_startpos = at::where(
+        host_cached_lengths > 0, host_cached_startpos, gpu_cached_startpos);
+    auto merge_cached_lengths =
+        at::where(gpu_cached_lengths > 0,
+                  at::max(gpu_cached_startpos, host_cached_startpos) +
+                      gpu_cached_lengths - merge_cached_startpos,
+                  host_cached_lengths);
+    auto non_valid_caching =
+        (gpu_cached_startpos > host_cached_lengths) & (gpu_cached_lengths > 0);
     non_valid_caching = non_valid_caching | (merge_cached_startpos > 0);
-    merge_cached_lengths = at::where(non_valid_caching, 0, merge_cached_lengths);
-    merge_cached_startpos = at::where(non_valid_caching, 0, merge_cached_startpos);
+    merge_cached_lengths =
+        at::where(non_valid_caching, 0, merge_cached_lengths);
+    merge_cached_startpos =
+        at::where(non_valid_caching, 0, merge_cached_startpos);
 
     return {
         merge_cached_startpos,
@@ -181,130 +208,203 @@ std::vector<at::Tensor> ExportKVCacheRuntime::lookup_kvcache(
     };
 }
 
-// std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>> 
 std::vector<at::Tensor>
-ExportKVCacheRuntime::allocate_kvcache(
-    at::Tensor user_ids,
-    at::Tensor seqlens,
-    at::Tensor merged_cached_lengths,
-    at::Tensor host_cached_lengths) {
+ExportKVCacheRuntime::allocate_kvcache(at::Tensor user_ids, at::Tensor seqlens,
+                                       at::Tensor merged_cached_lengths,
+                                       at::Tensor host_cached_lengths) {
     const auto batch_size = user_ids.size(0);
-    int num_total_pages = at::ceil(seqlens / this->gpu_kvcache_->num_tokens_per_page).to(torch::kInt32).sum().item<int>();
-    int num_new_tokens = (seqlens - merged_cached_lengths).sum().item<int>();
-    
-    at::Tensor page_ids_gpu_buffer = at::empty({num_total_pages}, at::dtype(torch::kInt32).device(at::kCUDA));
-    at::Tensor metadata_gpu_buffer = at::empty({5 * batch_size + 4 + num_new_tokens * 2}, at::dtype(torch::kInt32).device(at::kCUDA));
+    int num_total_pages;
+    int num_new_tokens;
+    {
+        nvtx3::scoped_range range{
+            "hstu.aoti.kvcache.allocate.shape_calculation"};
+        num_total_pages =
+            at::ceil(seqlens / this->gpu_kvcache_->num_tokens_per_page)
+                .to(torch::kInt32)
+                .sum()
+                .item<int>();
+        num_new_tokens = (seqlens - merged_cached_lengths).sum().item<int>();
+    }
 
-    gpu_kvcache_->allocate(
-        user_ids, 
-        seqlens, 
-        host_cached_lengths,
-        page_ids_gpu_buffer,
-        metadata_gpu_buffer
-    );
-    
-    auto new_history_nnz = at::tensor({num_new_tokens}, at::dtype(torch::kInt32).device(at::kCPU));
+    at::Tensor page_ids_gpu_buffer;
+    at::Tensor metadata_gpu_buffer;
+    {
+        nvtx3::scoped_range range{"hstu.aoti.kvcache.allocate.cuda_buffers"};
+        page_ids_gpu_buffer = at::empty(
+            {num_total_pages}, at::dtype(torch::kInt32).device(at::kCUDA));
+        metadata_gpu_buffer =
+            at::empty({5 * batch_size + 4 + num_new_tokens * 2},
+                      at::dtype(torch::kInt32).device(at::kCUDA));
+    }
+
+    {
+        nvtx3::scoped_range range{"hstu.aoti.kvcache.allocate.gpu_manager"};
+        gpu_kvcache_->allocate(user_ids, seqlens, host_cached_lengths,
+                               page_ids_gpu_buffer, metadata_gpu_buffer);
+    }
+
+    auto new_history_nnz =
+        at::tensor({num_new_tokens}, at::dtype(torch::kInt32).device(at::kCPU));
 
     return {
-            page_ids_gpu_buffer,
-            metadata_gpu_buffer,
-            metadata_gpu_buffer.narrow(0, 0, batch_size + 1),  // page_indptr
-            metadata_gpu_buffer.narrow(0, batch_size + 1, batch_size),  // last_page_lens
-            metadata_gpu_buffer.narrow(0, batch_size * 2 + 1, batch_size),  // total_history_lengths
-            metadata_gpu_buffer.narrow(0, batch_size * 3 + 1, batch_size + 1),  // total_history_offsets
-            metadata_gpu_buffer.narrow(0, batch_size * 4 + 3, batch_size + 1),  // new_history_offsets
-            metadata_gpu_buffer.narrow(0, batch_size * 5 + 4, num_new_tokens),  // batch_indices
-            metadata_gpu_buffer.narrow(0, batch_size * 5 + 4 + num_new_tokens, num_new_tokens),  // positions
+        page_ids_gpu_buffer,
+        metadata_gpu_buffer,
+        metadata_gpu_buffer.narrow(0, 0, batch_size + 1), // page_indptr
+        metadata_gpu_buffer.narrow(0, batch_size + 1,
+                                   batch_size), // last_page_lens
+        metadata_gpu_buffer.narrow(0, batch_size * 2 + 1,
+                                   batch_size), // total_history_lengths
+        metadata_gpu_buffer.narrow(0, batch_size * 3 + 1,
+                                   batch_size + 1), // total_history_offsets
+        metadata_gpu_buffer.narrow(0, batch_size * 4 + 3,
+                                   batch_size + 1), // new_history_offsets
+        metadata_gpu_buffer.narrow(0, batch_size * 5 + 4,
+                                   num_new_tokens), // batch_indices
+        metadata_gpu_buffer.narrow(0, batch_size * 5 + 4 + num_new_tokens,
+                                   num_new_tokens), // positions
 
-            new_history_nnz,
-            metadata_gpu_buffer.narrow(0, batch_size * 4 + 2, 1),  // new_history_nnz_cuda
+        new_history_nnz,
+        metadata_gpu_buffer.narrow(0, batch_size * 4 + 2,
+                                   1), // new_history_nnz_cuda
 
-            at::empty({batch_size}, at::dtype(torch::kInt32).device(at::kCPU)),  // kv_seqlens
-            at::empty({batch_size + 1}, at::dtype(torch::kInt32).device(at::kCPU)),  // kv_seqlen_offsets
-        };
+        at::empty({batch_size},
+                  at::dtype(torch::kInt32).device(at::kCPU)), // kv_seqlens
+        at::empty(
+            {batch_size + 1},
+            at::dtype(torch::kInt32).device(at::kCPU)), // kv_seqlen_offsets
+    };
 }
 
 std::vector<at::Tensor> ExportKVCacheRuntime::onboard_kvcache_launch(
-    at::Tensor user_ids,
-    at::Tensor seqlens,
-    at::Tensor merged_cached_lengths,
-    at::Tensor host_cached_lengths,
-    at::Tensor gpu_cached_startpos,
+    at::Tensor user_ids, at::Tensor seqlens, at::Tensor merged_cached_lengths,
+    at::Tensor host_cached_lengths, at::Tensor gpu_cached_startpos,
     at::Tensor gpu_cached_lengths,
-    at::Tensor& task_ids,  // from `get_match` in lookup and reuse in onboarding only, returned as masked
-    at::Tensor kv_page_indices,
-    at::Tensor kv_page_indptr
-) {
+    at::Tensor &task_ids, // from `get_match` in lookup and reuse in onboarding
+                          // only, returned as masked
+    at::Tensor kv_page_indices, at::Tensor kv_page_indptr) {
     const auto batch_size = user_ids.size(0);
+
+    bool full_gpu_hit_no_new_history = batch_size > 0;
+    const auto *seqlens_ptr = seqlens.data_ptr<int64_t>();
+    const auto *merged_cached_lengths_ptr =
+        merged_cached_lengths.data_ptr<int32_t>();
+    const auto *host_cached_lengths_ptr =
+        host_cached_lengths.data_ptr<int32_t>();
+    const auto *gpu_cached_startpos_ptr =
+        gpu_cached_startpos.data_ptr<int32_t>();
+    const auto *gpu_cached_lengths_ptr = gpu_cached_lengths.data_ptr<int32_t>();
+    auto *task_ids_ptr = task_ids.data_ptr<int64_t>();
+    for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+        full_gpu_hit_no_new_history =
+            full_gpu_hit_no_new_history &&
+            host_cached_lengths_ptr[seq_idx] == 0 &&
+            gpu_cached_startpos_ptr[seq_idx] == 0 &&
+            gpu_cached_lengths_ptr[seq_idx] == seqlens_ptr[seq_idx] &&
+            merged_cached_lengths_ptr[seq_idx] == seqlens_ptr[seq_idx];
+    }
+    if (full_gpu_hit_no_new_history) {
+        nvtx3::scoped_range range{"hstu.aoti.kvcache.onboard_launch."
+                                  "full_gpu_hit_no_new_history"};
+        std::vector<at::Tensor> empty_slot_mappings;
+        empty_slot_mappings.reserve(batch_size);
+        for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            task_ids_ptr[seq_idx] = -1;
+            empty_slot_mappings.push_back(
+                at::empty({0}, at::dtype(torch::kInt64).device(at::kCPU)));
+        }
+        return empty_slot_mappings;
+    }
 
     at::Tensor kv_page_indices_cpu = kv_page_indices.cpu();
     std::vector<at::Tensor> slot_mappings;
+    slot_mappings.reserve(batch_size);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        auto seqlen = seqlens.data_ptr<int64_t>()[seq_idx];
-        auto page_ids = kv_page_indices_cpu.slice(0, kv_page_indptr[seq_idx].item<int>(), kv_page_indptr[seq_idx + 1].item<int>());
+        const auto seqlen = seqlens_ptr[seq_idx];
+        auto page_ids =
+            kv_page_indices_cpu.slice(0, kv_page_indptr[seq_idx].item<int>(),
+                                      kv_page_indptr[seq_idx + 1].item<int>());
 
         if (page_ids.numel() > 0) {
-            auto slot_mapping = page_ids.unsqueeze(1) * this->gpu_kvcache_->num_tokens_per_page + token_slot_mappings_in_page_.unsqueeze(0);
-            slot_mappings.push_back(slot_mapping.reshape(-1).slice(0, 0, seqlen));
+            auto slot_mapping = page_ids.unsqueeze(1) *
+                                    this->gpu_kvcache_->num_tokens_per_page +
+                                token_slot_mappings_in_page_.unsqueeze(0);
+            slot_mappings.push_back(
+                slot_mapping.reshape(-1).slice(0, 0, seqlen));
         } else {
-            slot_mappings.push_back(at::empty({0}, at::dtype(torch::kInt64).device(at::kCPU)));
+            slot_mappings.push_back(
+                at::empty({0}, at::dtype(torch::kInt64).device(at::kCPU)));
         }
     }
 
     std::vector<int64_t> task_ids_tolaunch;
     std::vector<at::Tensor> slot_mappings_tolaunch;
+    task_ids_tolaunch.reserve(batch_size);
+    slot_mappings_tolaunch.reserve(batch_size);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        if (merged_cached_lengths.data_ptr<int>()[seq_idx] == 0 ||
-            host_cached_lengths.data_ptr<int>()[seq_idx] == 0      ) {
-            task_ids.data_ptr<int64_t>()[seq_idx] = -1;  // -1 indicates no cache to onboard for this sequence
+        if (merged_cached_lengths_ptr[seq_idx] == 0 ||
+            host_cached_lengths_ptr[seq_idx] == 0) {
+            // -1 indicates no cache to onboard for this sequence.
+            task_ids_ptr[seq_idx] = -1;
             continue;
-        };  // skip sequences without cache to onboard
+        }
 
-        bool tolaunch = false;
-        tolaunch = tolaunch || (host_cached_lengths.data_ptr<int>()[seq_idx] > gpu_cached_startpos.data_ptr<int>()[seq_idx] + gpu_cached_lengths.data_ptr<int>()[seq_idx]);
-        tolaunch = tolaunch || (gpu_cached_startpos.data_ptr<int>()[seq_idx] > 0);
+        const bool should_launch = host_cached_lengths_ptr[seq_idx] >
+                                       gpu_cached_startpos_ptr[seq_idx] +
+                                           gpu_cached_lengths_ptr[seq_idx] ||
+                                   gpu_cached_startpos_ptr[seq_idx] > 0;
 
-        if (tolaunch) {
-            task_ids_tolaunch.push_back(task_ids.data_ptr<int64_t>()[seq_idx]);
+        if (should_launch) {
+            task_ids_tolaunch.push_back(task_ids_ptr[seq_idx]);
             slot_mappings_tolaunch.push_back(slot_mappings[seq_idx]);
         } else {
-            task_ids.data_ptr<int64_t>()[seq_idx] = -1;  // -1 indicates no cache to onboard for this sequence
+            task_ids_ptr[seq_idx] = -1;
         }
     }
 
     if (!task_ids_tolaunch.empty()) {
-        flexkv_client_->launch_tasks(task_ids_tolaunch, slot_mappings_tolaunch, true);
+        flexkv_client_->launch_tasks(task_ids_tolaunch, slot_mappings_tolaunch,
+                                     true);
     }
 
     return slot_mappings;
 }
 
 void ExportKVCacheRuntime::onboard_kvcache_wait(
-    at::Tensor task_ids  // masked task ids from onboarding launch
+    at::Tensor task_ids // masked task ids from onboarding launch
 ) {
     const auto batch_size = task_ids.size(0);
+    const auto *task_ids_ptr = task_ids.data_ptr<int64_t>();
 
     std::vector<int64_t> task_ids_launched;
+    task_ids_launched.reserve(batch_size);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        if (task_ids.data_ptr<int64_t>()[seq_idx] == -1) continue;  // skip sequences without cache to onboard for this sequence
-        task_ids_launched.push_back(task_ids.data_ptr<int64_t>()[seq_idx]);
+        if (task_ids_ptr[seq_idx] == -1) {
+            continue;
+        }
+        task_ids_launched.push_back(task_ids_ptr[seq_idx]);
     }
     if (task_ids_launched.empty()) {
-        return;  // no onboard task launched, skip waiting
+        return; // no onboard task launched, skip waiting
     }
-    if (task_ids_launched.empty()) return;  // no onboard task launched, skip waiting
 
     auto wait_results = flexkv_client_->wait(task_ids_launched, 1000.f, true);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-        if (task_ids.data_ptr<int64_t>()[seq_idx] == -1) continue;  // skip sequences without cache to onboard for this sequence
-        int64_t task_id = task_ids.data_ptr<int64_t>()[seq_idx];
+        if (task_ids_ptr[seq_idx] == -1) {
+            continue;
+        }
+        const int64_t task_id = task_ids_ptr[seq_idx];
         auto it = wait_results.find(task_id);
         if (it == wait_results.end()) {
-            throw std::runtime_error("Did not receive result for onboard task_id " + std::to_string(task_id));
+            throw std::runtime_error(
+                "Did not receive result for onboard task_id " +
+                std::to_string(task_id));
         }
-        auto& result = it->second;
+        auto &result = it->second;
         if (result.status != KVResponseStatus::SUCCESS) {
-            throw std::runtime_error("Onboard task_id " + std::to_string(task_id) + " failed with status: " + std::to_string(static_cast<int>(result.status)));
+            throw std::runtime_error(
+                "Onboard task_id " + std::to_string(task_id) +
+                " failed with status: " +
+                std::to_string(static_cast<int>(result.status)));
         }
     }
 
@@ -432,4 +532,3 @@ void ExportKVCacheRuntime::evict_kvcache(at::Tensor user_ids, bool evict_gpu_onl
 }
 
 } // namespace kvcache_manager
-

@@ -64,8 +64,10 @@ public:
     void evict_all();
     bool retain(int64_t uid);
 
-    std::vector<int>& alloc_single_sequence(
-        int64_t uid, int new_total_length, int host_cached_startpos, int host_cached_length, std::unordered_set<int64_t> freezed_uids);
+    std::vector<int> &
+    alloc_single_sequence(int64_t uid, int new_total_length,
+                          int host_cached_length,
+                          const std::unordered_set<int64_t> &freezed_uids);
     void allocate(
         at::Tensor user_ids,
         at::Tensor total_hist_lens,  // all histo w/o candi
@@ -119,6 +121,7 @@ public:
 public:
     // allocation related
     cudaStream_t alloc_stream;
+    cudaEvent_t alloc_complete_event;
     void* metadata_host_buffer;   // preallocated pinned host buffer
 
 public:
@@ -130,4 +133,4 @@ public:
     at::Device device;  // check for c10::Device
 };
 
-}  // namespace kvcache
+} // namespace kvcache

@@ -306,7 +306,8 @@ cd ${HSTU_DIR}
 python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
   --dump_dir inference_aoti/export_test_dump \
   --url localhost:8000 \
-  --model_name hstu_gr_ranking_kvcache
+  --model_name hstu_gr_ranking_kvcache \
+  --batch_size 2
 ```
 
 This request path validates that:
