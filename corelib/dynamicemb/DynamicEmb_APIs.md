@@ -756,6 +756,8 @@ The meaning of the threshold depends on the table's `score_strategy`:
 - Strategies that carry a device-timestamp column — the single `TIMESTAMP` strategy, or a compound strategy that includes `TIMESTAMP` such as `(TIMESTAMP, LFU)` — produce a **time-based** incremental dump: only items whose last-access timestamp crosses the threshold (i.e. items that were touched/changed since the reference time) are dumped. Use the value returned by `get_score` as the reference threshold.
 - Strategies without a timestamp column (e.g. `STEP`, single `LFU`, `NO_EVICTION`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
 
+> **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin` and `hash_roundrobin` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key via `(key or hash(key)) % world_size`; `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
+
     ```python
     #How to import
     from dynamicemb.incremental_dump import incremental_dump
