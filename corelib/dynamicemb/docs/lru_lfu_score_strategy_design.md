@@ -53,7 +53,7 @@ options = DynamicEmbTableOptions(
 
 ## 2. What already exists (reuse, don't rebuild)
 
-The heavy lifting is already in the tree from the `need_incremental_dump` work:
+The heavy lifting is already in the tree from the earlier time-based `incremental_dump` work:
 
 - **`ScorePolicyType::LruLfu = 4`** (`src/table_operation/score.cuh`): a compound
   policy occupying **two contiguous AoS score words per key**:
@@ -77,7 +77,7 @@ The heavy lifting is already in the tree from the `need_incremental_dump` work:
 So the LRU+LFU strategy is largely "drive the existing `LruLfu` *policy* from the
 compound `(TIMESTAMP, LFU)` tuple, plus (a) a timestamp tiebreak in eviction and
 (b) an optional JIT decay function." It produces the same policy/layout as the
-earlier `LFU + need_incremental_dump=True` combination.
+earlier LruLfu tables that time-based `incremental_dump` already used.
 
 ### Current strategy/policy/evict enums
 
@@ -85,7 +85,7 @@ earlier `LFU + need_incremental_dump=True` combination.
   CUSTOMIZED=2, LFU=3, NO_EVICTION=4`. There is **no `LRU_LFU` enum**; the
   LRU+LFU strategy is the compound tuple `(TIMESTAMP, LFU)`.
 - `DynamicEmbEvictStrategy`: `LRU, LFU, EPOCH_LRU, EPOCH_LFU, CUSTOMIZED`.
-- `get_score_policy(score_strategy, need_incremental_dump)` maps strategy →
+- `get_score_policy(score_strategy)` maps strategy →
   `ScoreSpec(policy=...)`.
 
 ## 3. Design decisions (confirmed)
@@ -116,7 +116,7 @@ in the **logical (tuple) order** it configured, and dynamicemb statically
 The "equal frequency → evict older timestamp" tiebreak applies to the **whole
 2-score `LruLfu` `reduce()` path**, not just the new strategy. `reduce()` keys
 off `num_scores_ == 2` (it does not see the score strategy), which is also
-simplest. This makes today's `LFU + need_incremental_dump` eviction deterministic
+simplest. This makes today's existing incremental-dump LruLfu eviction deterministic
 (currently first-seen wins on a tie) — a strict improvement, accepted as an
 intentional behavior change to the existing path.
 
@@ -143,7 +143,7 @@ intentional behavior change to the existing path.
 
 - A `{TIMESTAMP, LFU}` strategy → `ScoreSpec(name="lru_lfu",
   policy=ScorePolicy.LRU_LFU, dtype=uint64, is_reduction=True)` (the same spec the
-  earlier `LFU + need_incremental_dump` built).
+  earlier incremental-dump LruLfu tables built).
 - `evict_strategy` for such tables is `LFU` (frequency-ranked reduce), with the
   tiebreak/decay layered on top via the cubin.
 - These tables implicitly support `incremental_dump` (word 0 is a timestamp).
@@ -151,10 +151,10 @@ intentional behavior change to the existing path.
 ## 5. Eviction: one comparator-templated reduce for ALL LruLfu tables
 
 **Scope decision (Q):** every table using the `LruLfu` policy (`num_scores == 2`)
-— both the compound `(TIMESTAMP, LFU)` strategy **and** the existing
-`LFU + need_incremental_dump` — routes insert-and-evict through a
+— both the compound `(TIMESTAMP, LFU)` strategy **and** existing
+incremental-dump LruLfu tables — route insert-and-evict through a
 **driver-launched cubin**. The AoT 2-score `reduce()` path retires. This gives
-`need_incremental_dump` the deterministic freq→ts tiebreak too (honors R1) at the
+those existing incremental-dump tables the deterministic freq→ts tiebreak too (honors R1) at the
 cost of changing that shipped feature's launch path (must re-run its 18+7
 regression).
 
@@ -190,7 +190,7 @@ generic addressing resolves shared on sm_90, but confirm).
 
 - **Default cubin** — `reduce<LexFreqTsComparator>`, **prebuilt at build** (`nvcc`),
   shipped as package_data. **No numba at runtime.** Used by any LruLfu table
-  without a `score_function` (incl. existing `LFU + need_incremental_dump`).
+  without a `score_function` (incl. existing incremental-dump LruLfu tables).
 - **Custom cubin** — `reduce<UserFnComparator>`: the LTO-IR fatbin (built with the
   `user_score_fn` undefined) + numba's user LTO-IR, linked via `nvJitLink` at first
   use, cached per (device, fn identity). Used by compound `{TIMESTAMP, LFU}` tables with a
@@ -310,7 +310,7 @@ For dynamicemb the reference `apply` entry becomes our three entries —
 - **Overflow eviction** stays counter-based (unchanged) — so a `score_function`
   does **not** affect eviction of keys living in the overflow table (R7). Overflow
   score words are still maintained for `LruLfu`.
-- **`LFU + need_incremental_dump` behavior change (from decision Q):** now routes
+- **Existing incremental-dump LruLfu behavior change (from decision Q):** now routes
   through the driver-launched Lex cubin, so its eviction gains the freq→ts
   tiebreak and its insert-and-evict launch path changes. Re-run its 18+7
   regression to confirm equivalence otherwise.
@@ -343,7 +343,7 @@ For dynamicemb the reference `apply` entry becomes our three entries —
 - ✅ **JIT approach** — resolved: unified comparator-templated reduce; both
   default (Lex) and custom (UserFn) run as driver-launched cubins.
 - ✅ **JIT scope** — resolved (Q): all `LruLfu` (`num_scores==2`) tables route
-  through the cubin, incl. existing `LFU + need_incremental_dump`.
+  through the cubin, incl. existing incremental-dump LruLfu tables.
 - ✅ **Default path dependency** — resolved (option ii): default Lex cubin is
   prebuilt at build; **numba only needed when a `score_function` is set**.
 - ✅ **Async-prefetch preserved** — resolved: comparator reads the shared-mem
@@ -367,7 +367,7 @@ Remaining open / to-verify during impl:
    is required — default `sm_50` is rejected by CUDA 13.2 NVVM).
 4. **`get_grouped_key` identity** — `(module, qualname, getsource-hash)`; fragile
    for lambdas/REPL-defined fns (fall back to `id`).
-5. **Regression from Q** — `LFU + need_incremental_dump` now uses the cubin path;
+5. **Regression from Q** — existing incremental-dump LruLfu tables now use the cubin path;
    re-run its 18+7 tests.
 6. **Multi-GPU / determinism** — `%globaltimer` per-GPU; decay comparable only
    within a rank (fine, eviction is per-table-shard). The evict-module cache is
@@ -401,7 +401,7 @@ verifiable:
    `_create_score` / `get_score`; route `num_scores==2` tables (plain insert AND
    insert_and_evict) to the cubin (custom vs prebuilt Lex).
 6. **`score_jit.py`** — numba compile + hand LTO-IR to C++ `link`; per-fn cache.
-7. **Tests** (§8) + EOS H100 end-to-end, incl. the `need_incremental_dump` 18+7
+7. **Tests** (§8) + EOS H100 end-to-end, incl. the existing incremental-dump LruLfu 18+7
    regression (decision Q changed its launch path).
 
 ## 11. Detailed design to neutralize the cubin/JIT risks
@@ -515,4 +515,4 @@ resolve, so a missing/misnamed entry fails the **build**, not runtime.
 - **First-use link latency (~100ms) + per-fn module cache** — acceptable; cache
   keyed by `(device, score_function group key)`.
 - **numba dependency** — only when `score_function` is set; default LruLfu
-  (incl. `need_incremental_dump`) loads the prebuilt Lex fatbin, no numba.
+  (incl. existing incremental-dump tables) loads the prebuilt Lex fatbin, no numba.
