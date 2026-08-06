@@ -1107,7 +1107,13 @@ def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch
     Returns a 1-D tensor of unique keys on ``state.device``.
     """
     if not state.evicted_key_chunks:
-        return torch.empty(0, dtype=torch.int64, device=state.device)
+        # Match the non-empty path's dtype: chunks carry key_index_map.key_type
+        # (== the table's index_type, which may be int32/uint32), so a hardcoded
+        # int64 here would make callers that concat/compare across empty and
+        # non-empty pops hit a dtype mismatch.
+        return torch.empty(
+            0, dtype=state.key_index_map.key_type, device=state.device
+        )
     keys = torch.cat(state.evicted_key_chunks)
     tids = torch.cat(state.evicted_tid_chunks)
     mask = tids == table_id
