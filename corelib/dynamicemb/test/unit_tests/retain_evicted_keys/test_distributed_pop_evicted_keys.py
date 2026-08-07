@@ -42,6 +42,7 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
 )
 from dynamicemb.incremental_dump import pop_evicted_keys
 from dynamicemb.planner import (
@@ -94,7 +95,7 @@ def _get_planner(table_name, eb_config, score_strategy, batch_size, device):
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.DEBUG,
             ),
-            retain_evicted_keys=True,
+            evicted_item_mode=EvictedItemMode.RETAIN_KEY,
         ),
     )
     platform = Platform(device)

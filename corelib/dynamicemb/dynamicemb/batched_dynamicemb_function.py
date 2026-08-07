@@ -18,7 +18,7 @@ from enum import Enum, auto
 from typing import List, Optional, Tuple
 
 import torch
-from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode
+from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, EvictedItemMode
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
@@ -667,7 +667,7 @@ def _prefetch_hbm_direct_path(
                 # victims are dropped here (unlike the cache path, which spills
                 # to storage). Retain them when configured -- this is the
                 # forward-path analogue of the _insert_key_values collection.
-                if state.retain_evicted_keys:
+                if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
                     (
                         new_indices,
                         num_evicted,

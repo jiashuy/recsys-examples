@@ -601,7 +601,7 @@ class LinearBucketTable(ScoredHashTable):
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
             if collect_evicted:
                 raise RuntimeError(
-                    "collect_evicted (retain_evicted_keys) is not supported under "
+                    "collect_evicted (evicted_item_mode=RETAIN_KEY) is not supported under "
                     "DEMB_DETERMINISM_MODE."
                 )
             assert (

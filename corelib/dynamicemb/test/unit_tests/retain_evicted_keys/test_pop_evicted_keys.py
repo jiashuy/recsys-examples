@@ -33,6 +33,7 @@ from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 
@@ -46,14 +47,20 @@ def current_device():
 
 
 def _build_model(
-    device_id, retain, caching=False, table_num=1, max_capacity=256, dim=8
+    device_id,
+    retain,
+    caching=False,
+    table_num=1,
+    max_capacity=256,
+    dim=8,
+    index_type=torch.int64,
 ):
     """A BatchedDynamicEmbeddingTablesV2 with one feature per table. Small
     max_capacity so training overflows the last tier and evicts across steps."""
     retain = [retain] * table_num if isinstance(retain, bool) else retain
     options_list = [
         DynamicEmbTableOptions(
-            index_type=torch.int64,
+            index_type=index_type,
             embedding_dtype=torch.float32,
             device_id=device_id,
             dim=dim,
@@ -63,7 +70,9 @@ def _build_model(
             local_hbm_for_values=1024**3,
             score_strategy=LRU_LFU,
             caching=caching,
-            retain_evicted_keys=retain[i],
+            evicted_item_mode=(
+                EvictedItemMode.RETAIN_KEY if retain[i] else EvictedItemMode.DISCARD
+            ),
         )
         for i in range(table_num)
     ]
@@ -124,7 +133,7 @@ def test_module_pop_hbm_direct_training_collects(current_device):
 
 
 def test_module_pop_retain_disabled_omitted(current_device):
-    """retain_evicted_keys=False: eviction still happens across steps but nothing
+    """evicted_item_mode=DISCARD: eviction still happens across steps but nothing
     is retained -> the table is omitted from the result entirely."""
     device = torch.device(f"cuda:{current_device}")
     model = _build_model(current_device, retain=False, caching=False, max_capacity=256)
@@ -150,3 +159,20 @@ def test_module_pop_table_names_filter(current_device):
     rest = model.pop_evicted_keys()
     assert "t_1" in rest and rest["t_1"].numel() > 0, "t_1 survives a t_0-only pop"
     assert rest.get("t_0", torch.empty(0)).numel() == 0, "t_0 was already drained"
+
+
+@pytest.mark.parametrize("index_type", [torch.int64, torch.uint64])
+def test_module_pop_empty_dtype_matches_key_type(current_device, index_type):
+    """The empty pop_evicted_keys path must return the table's key dtype
+    (``key_index_map.key_type`` == ``index_type``; the key map accepts only 64-bit
+    integer keys, int64/uint64), NOT a hardcoded int64. Otherwise a caller
+    concatenating an empty pop with a later non-empty pop would hit a dtype
+    mismatch. Regression: the empty guard used to hardcode int64."""
+    model = _build_model(current_device, retain=True, index_type=index_type)
+    # Retain-enabled table is present but has no evictions yet -> an empty tensor
+    # whose dtype must already be index_type (not a hardcoded int64).
+    empty = model.pop_evicted_keys()["t_0"]
+    assert empty.numel() == 0
+    assert (
+        empty.dtype == index_type
+    ), f"empty pop dtype {empty.dtype} != index_type {index_type}"

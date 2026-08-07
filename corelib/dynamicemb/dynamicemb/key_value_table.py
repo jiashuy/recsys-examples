@@ -25,6 +25,7 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
     align_to_table_size,
     score_dump_permutation,
     score_load_permutation,
@@ -260,11 +261,12 @@ class DynamicEmbTableState:
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
-    # Retain-evicted-keys (last tier only): when True, each insert that evicts
-    # collects the victims' (key, table_id). Accumulated as GPU-tensor chunks and
-    # only concatenated + de-duplicated on pop_evicted_keys (no compaction while
-    # appending). One chunk per insert that evicted anything; drained on pop.
-    retain_evicted_keys: bool = False
+    # Retain-evicted-keys (last tier only): when RETAIN_KEY, each insert that
+    # evicts collects the victims' (key, table_id). Accumulated as GPU-tensor
+    # chunks and only concatenated + de-duplicated on pop_evicted_keys (no
+    # compaction while appending). One chunk per insert that evicted anything;
+    # drained on pop.
+    evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
     evicted_key_chunks: List[torch.Tensor] = field(default_factory=list)
     evicted_tid_chunks: List[torch.Tensor] = field(default_factory=list)
 
@@ -273,7 +275,7 @@ def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
     enable_overflow: bool = False,
-    retain_evicted_keys: bool = False,
+    evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
@@ -436,7 +438,7 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
-        retain_evicted_keys=retain_evicted_keys,
+        evicted_item_mode=evicted_item_mode,
     )
 
 
@@ -1148,7 +1150,7 @@ def _insert_key_values(
     score_out_flat: Optional[torch.Tensor] = None
     if state.no_eviction_next_index is not None:
         score_out_flat = torch.empty(n, dtype=torch.int64, device=unique_keys.device)
-    if state.retain_evicted_keys:
+    if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
         (
             indices,
             num_evicted,
@@ -1807,8 +1809,8 @@ class DynamicEmbStorage(Storage):
             options,
             optimizer,
             # DynamicEmbStorage is always a last tier (single tier or the backing
-            # store under a cache), so it honors retain_evicted_keys.
-            retain_evicted_keys=options[0].retain_evicted_keys,
+            # store under a cache), so it honors evicted_item_mode.
+            evicted_item_mode=options[0].evicted_item_mode,
         )
 
     @property
@@ -1952,7 +1954,7 @@ class DynamicEmbStorage(Storage):
         """Return + clear this rank's unique evicted keys retained for ``table_id``.
 
         DynamicEmbStorage is always a last tier, so retained keys live on its
-        state. Returns an empty tensor when retain_evicted_keys is off or nothing
+        state. Returns an empty tensor when evicted_item_mode is DISCARD or nothing
         was evicted for the table since the last pop."""
         return _pop_state_evicted_keys(self._state, table_id)
 
@@ -2294,7 +2296,7 @@ class HybridStorage(Storage):
         self._host = create_table_state(
             host_options,
             optimizer,
-            retain_evicted_keys=host_options[0].retain_evicted_keys,
+            evicted_item_mode=host_options[0].evicted_item_mode,
         )
         self.optimizer = optimizer
 

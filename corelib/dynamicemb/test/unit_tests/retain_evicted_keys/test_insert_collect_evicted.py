@@ -33,7 +33,7 @@ oracle (mirroring test_lru_lfu.py) predicts the exact victim set.
 import numpy as np
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.key_value_table import (
     DynamicEmbStorage,
@@ -317,7 +317,9 @@ def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
             local_hbm_for_values=1024**3,
             score_strategy=LRU_LFU_TS_FIRST,
             evict_strategy=DynamicEmbEvictStrategy.LFU,
-            retain_evicted_keys=retain,
+            evicted_item_mode=(
+                EvictedItemMode.RETAIN_KEY if retain else EvictedItemMode.DISCARD
+            ),
         )
     ]
     return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
@@ -335,7 +337,7 @@ def _storage_insert(storage, keys, dim, device):
 
 
 def test_storage_retain_end_to_end(current_device):
-    """DynamicEmbStorage (a last tier) with retain_evicted_keys=True: a full-bucket
+    """DynamicEmbStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
     insert evicts; pop returns the unique evicted keys; those keys are gone from the
     table; a second pop is empty (read-and-clear / incremental)."""
     device = current_device
@@ -367,7 +369,7 @@ def test_storage_retain_end_to_end(current_device):
 
 
 def test_storage_retain_disabled_empty(current_device):
-    """retain_evicted_keys=False: eviction still happens but nothing is retained."""
+    """evicted_item_mode=DISCARD: eviction still happens but nothing is retained."""
     device = current_device
     dim = 8
     storage = _retain_storage(

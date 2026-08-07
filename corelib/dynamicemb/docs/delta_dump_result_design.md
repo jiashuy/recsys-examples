@@ -40,7 +40,7 @@ unifies them.
 |---|---|
 | Return shape | `incremental_dump` → `Dict[collection_path, DeltaDumpResult]` (**breaking change**) |
 | Evicted integration | `DeltaDumpResult.evicted_keys` as a **new second outlet**; the standalone `pop_evicted_keys` API **coexists**, underlying mechanism untouched |
-| Config naming | Keep **`retain_evicted_keys`** (no new `pack_evicted_keys`); `evicted_keys[i]` is present only if that table has `retain_evicted_keys=True`, else `None` |
+| Config naming | Use **`evicted_item_mode`** (enum; no new `pack_evicted_keys`); `evicted_keys[i]` is present only if that table has `evicted_item_mode=RETAIN_KEY`, else `None` |
 | pop return | `pop_evicted_keys` returns a **host tensor** (still GPU `unique` / NCCL gather internally, then `.cpu()`) |
 | Gather view | **Option B (global)**: `keys/values/evicted/slot_index` are all `all_gather`ed within the given `pg`; `pg=None` / `world_size==1` is a per-rank view |
 | Rank reconstruction | replay reconstructs rank from the key (rank not stored); **only `roundrobin`/`hash_roundrobin` supported** (`(key or hash(key)) % world_size`), `continuous` **unsupported** (`raise` on encounter) |
@@ -53,7 +53,7 @@ unifies them.
 
 Added to `dynamicemb/incremental_dump.py` (same file as `incremental_dump`). The
 only change relative to the initial draft is renaming the `pack_evicted_keys`
-wording in the docstring to `retain_evicted_keys`.
+wording in the docstring to `evicted_item_mode`.
 
 ```python
 @dataclass
@@ -66,7 +66,7 @@ class DeltaDumpResult:
     keys        : List[torch.Tensor]            # per-table matched keys on host
     values      : List[torch.Tensor]            # per-table matched values on host
     evicted_keys: List[Optional[torch.Tensor]]  # per-table evicted keys on host,
-        # None for a table without retain_evicted_keys=True; otherwise the table's
+        # None for a table without evicted_item_mode=RETAIN_KEY; otherwise the table's
         # retained evicted keys (returning them drains that table's buffer, each
         # evicted key reported exactly once across successive incremental_dump).
     meta        : List[Dict[str, Any]]          # per-table, flat dict:
@@ -150,7 +150,7 @@ for table_name, threshold in named_thresholds.items():
     opt = self._dynamicemb_options[table_id]
     # evicted: retain-enabled tables only; drain + host + aggregate within the
     # same pg (reusing _all_gather_evicted_keys)
-    if opt.retain_evicted_keys and hasattr(storage, "pop_evicted_keys"):
+    if opt.evicted_item_mode == EvictedItemMode.RETAIN_KEY and hasattr(storage, "pop_evicted_keys"):
         ev = storage.pop_evicted_keys(table_id)          # device tensor (local)
         ev = _all_gather_evicted_keys(ev, pg) if pg else ev
         ev = ev.cpu()                                    # host

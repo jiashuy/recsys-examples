@@ -35,6 +35,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
     get_eviction_score_strategy,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
@@ -1448,7 +1449,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> Dict[str, Tensor]:
         """Return + clear this rank's retained evicted keys, per table.
 
-        Only tables configured with ``retain_evicted_keys=True`` are included;
+        Only tables configured with ``evicted_item_mode=RETAIN_KEY`` are included;
         others are omitted. Returns ``{table_name: 1-D unique int64 keys on
         device}``. The keys are this rank's local shard only (row-wise sharded, so
         disjoint across ranks); cross-rank aggregation is the model-level
@@ -1459,7 +1460,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             return {}
         result: Dict[str, Tensor] = {}
         for i, name in enumerate(self._table_names):
-            if not self._dynamicemb_options[i].retain_evicted_keys:
+            if (
+                self._dynamicemb_options[i].evicted_item_mode
+                != EvictedItemMode.RETAIN_KEY
+            ):
                 continue
             if table_names is not None and name not in table_names:
                 continue
@@ -1476,7 +1480,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Returns a :class:`DeltaDumpResult` for this module (column-aligned lists by
         table). ``meta[i]`` carries current_score / slot_index / current_capacity /
         world_size / table_options; ``evicted_keys[i]`` is the retained evicted keys
-        for a ``retain_evicted_keys=True`` table (drained here) else ``None``.
+        for an ``evicted_item_mode=RETAIN_KEY`` table (drained here) else ``None``.
 
         The meaning of the threshold depends on the table's score strategy:
 
@@ -1528,7 +1532,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 current_score = self._scores[table_name]
             # evicted keys: only retain-enabled tables; drain the buffer, aggregate
             # within the SAME pg as keys/values, return on host.
-            if option.retain_evicted_keys and hasattr(storage, "pop_evicted_keys"):
+            if option.evicted_item_mode == EvictedItemMode.RETAIN_KEY and hasattr(
+                storage, "pop_evicted_keys"
+            ):
                 ev = storage.pop_evicted_keys(table_id)
                 if pg is not None:
                     ev = _all_gather_evicted_keys(ev, pg)

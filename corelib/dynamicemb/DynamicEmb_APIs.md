@@ -617,13 +617,14 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Counter for tracking the number of keys that have been admitted to the embedding table.
             If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
             Default is None (no counter is used).
-        retain_evicted_keys : bool, optional
-            When True, the *last-tier* storage retains the keys it evicts (instead of
-            silently dropping them) so they can be read back with ``pop_evicted_keys``.
+        evicted_item_mode : EvictedItemMode, optional
+            How the *last-tier* storage handles an item it evicts. ``DISCARD``
+            (default) drops evicted keys with zero overhead. ``RETAIN_KEY`` retains
+            the keys it evicts so they can be read back with ``pop_evicted_keys``.
             Only the final tier that truly discards a key records it -- intermediate
             cache / HBM tiers spill their evictions to the next tier and are not
-            recorded. Records the (key, table_id) only, no value/score. Default False
-            (zero overhead).
+            recorded. Records the (key, table_id) only, no value/score. Default
+            ``EvictedItemMode.DISCARD``.
         
         Notes
         -----
@@ -662,7 +663,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         index_type: Optional[torch.dtype] = None
         admit_strategy: Optional[AdmissionStrategy] = None
         admission_counter: Optional[Counter] = None
-        retain_evicted_keys: bool = False
+        evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
 
     ```
 
@@ -788,7 +789,7 @@ The meaning of the threshold depends on the table's `score_strategy`:
             - ``keys: List[torch.Tensor]`` -- per-table matched keys on host.
             - ``values: List[torch.Tensor]`` -- per-table matched values on host.
             - ``evicted_keys: List[Optional[torch.Tensor]]`` -- per-table retained
-              evicted keys on host for tables with ``retain_evicted_keys=True``,
+              evicted keys on host for tables with ``evicted_item_mode=RETAIN_KEY``,
               else ``None``. Returning them drains that table's retained-evicted
               buffer (each evicted key reported once across successive calls).
             - ``meta: List[Dict[str, Any]]`` -- per-table metadata, a flat dict:
@@ -809,10 +810,10 @@ More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main
 ## pop_evicted_keys
 
 **Background**
-When a table's last-tier storage is full, evicting a key drops it from the system entirely. With `retain_evicted_keys=True` (see [DynamicEmbTableOptions](#dynamicembtableoptions)), the last tier instead retains the keys it evicts so they can be read back -- e.g. to feed a downstream key-value store, a cold-tier archive, or an offline pipeline.
+When a table's last-tier storage is full, evicting a key drops it from the system entirely. With `evicted_item_mode=RETAIN_KEY` (see [DynamicEmbTableOptions](#dynamicembtableoptions)), the last tier instead retains the keys it evicts so they can be read back -- e.g. to feed a downstream key-value store, a cold-tier archive, or an offline pipeline.
 
 **Behavior**
-Returns, per table, the keys evicted since the previous call, deduplicated within a table. This is a read-and-clear (incremental) operation: each evicted key is reported exactly once across successive calls, and returning a table's keys drains its retained-evicted buffer on this rank. Tables without `retain_evicted_keys=True` are omitted from the result.
+Returns, per table, the keys evicted since the previous call, deduplicated within a table. This is a read-and-clear (incremental) operation: each evicted key is reported exactly once across successive calls, and returning a table's keys drains its retained-evicted buffer on this rank. Tables without `evicted_item_mode=RETAIN_KEY` are omitted from the result.
 
     ```python
     #How to import
@@ -826,7 +827,7 @@ Returns, per table, the keys evicted since the previous call, deduplicated withi
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         """Return (and clear) the keys evicted and retained by last-tier storage, per table.
 
-        Only tables created with retain_evicted_keys=True are included; all other tables are omitted.
+        Only tables created with evicted_item_mode=RETAIN_KEY are included; all other tables are omitted.
 
         Args:
             model(nn.Module): the model containing dynamic embedding tables.

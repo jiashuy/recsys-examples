@@ -42,7 +42,7 @@ class DeltaDumpResult:
     evicted_keys : List[Optional[torch.Tensor]]
         Per-table evicted keys on host (keys only, no value/score) retained since
         the last ``incremental_dump``. ``evicted_keys[i]`` is ``None`` for a table
-        without ``retain_evicted_keys=True``; otherwise it holds that table's
+        without ``evicted_item_mode=RETAIN_KEY``; otherwise it holds that table's
         retained evicted keys, and returning them drains and releases the table's
         retained-evicted-keys buffer (each evicted key is reported exactly once
         across successive ``incremental_dump`` calls).
@@ -438,7 +438,7 @@ def pop_evicted_keys(
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     """Return + clear the keys evicted (and retained) by last-tier storage, per table.
 
-    Only tables created with ``retain_evicted_keys=True`` are included; all other
+    Only tables created with ``evicted_item_mode=RETAIN_KEY`` are included; all other
     tables are omitted from the result. This is the incremental "pop" of keys
     evicted since the previous call -- the retained buffers are cleared on this
     rank as they are read.

@@ -110,6 +110,22 @@ class DynamicEmbEvictStrategy(enum.Enum):
     CUSTOMIZED = EvictStrategy.KCustomized
 
 
+class EvictedItemMode(enum.Enum):
+    """How the *last-tier* storage handles an item it evicts.
+
+    - ``DISCARD`` (default): the evicted key is dropped (existing behavior, zero
+      overhead).
+    - ``RETAIN_KEY``: the evicted keys are retained so they can be read back with
+      ``pop_evicted_keys``.
+
+    Additional modes (e.g. retaining values) can be added later without changing
+    this option's type.
+    """
+
+    DISCARD = 0
+    RETAIN_KEY = 1
+
+
 class DynamicEmbScoreStrategy(enum.IntEnum):
     """
     Enumeration for different modes to set index-embedding's score.
@@ -517,13 +533,14 @@ class DynamicEmbTableOptions:
     timestamp), no numba. Only valid with the ``(TIMESTAMP, LFU)`` compound
     strategy."""
 
-    retain_evicted_keys: bool = False
-    """When True, the *last-tier* storage retains the keys it evicts (instead of
-    silently dropping them) so they can be read back with ``pop_evicted_keys``.
-    Only the final tier that truly discards a key records it -- intermediate
-    cache / HBM tiers spill their evictions to the next tier and are NOT recorded.
-    Records the (key, table_id) only, no value/score. Default False (zero
-    overhead). Tables differing in this flag are not grouped onto shared storage."""
+    evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
+    """How the *last-tier* storage handles an item it evicts. ``DISCARD`` (default)
+    drops evicted keys with zero overhead. ``RETAIN_KEY`` retains the keys it
+    evicts so they can be read back with ``pop_evicted_keys``. Only the final tier
+    that truly discards a key records it -- intermediate cache / HBM tiers spill
+    their evictions to the next tier and are NOT recorded. Records the
+    (key, table_id) only, no value/score. Tables differing in this mode are not
+    grouped onto shared storage."""
 
     def __post_init__(self):
         assert (
@@ -577,7 +594,7 @@ class DynamicEmbTableOptions:
         grouped_key["score_function"] = _score_function_group_key(self.score_function)
         # The retain path swaps the last-tier insert kernel (collect vs drop), a
         # per-storage choice, so tables differing in it must not share storage.
-        grouped_key["retain_evicted_keys"] = self.retain_evicted_keys
+        grouped_key["evicted_item_mode"] = self.evicted_item_mode
         return grouped_key
 
     def __hash__(self):

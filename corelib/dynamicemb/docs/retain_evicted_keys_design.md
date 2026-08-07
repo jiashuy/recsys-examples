@@ -39,7 +39,7 @@ path.
 | Dedup & memory | **Append buffer + `torch.unique` on read** (no compaction while appending; dedup only on `pop`) |
 | Time window | **`pop` reads-and-clears / incremental**: returns the unique keys evicted since the previous call |
 | Distributed | `pg=None` returns each rank's local part (row-wise sharding → naturally disjoint, zero comm); with a `pg`, `all_gather` the group-wide union. **Clearing always clears only this rank's buffer** |
-| Config | `DynamicEmbTableOptions.retain_evicted_keys: bool = False` (off by default, zero overhead) |
+| Config | `DynamicEmbTableOptions.evicted_item_mode: EvictedItemMode = DISCARD` (DISCARD by default, zero overhead) |
 | API name | `pop_evicted_keys` |
 
 The confirmed decisions are recorded in §9.
@@ -254,7 +254,7 @@ as in 4.4).
 ### 5.1 `dynamicemb/dynamicemb_config.py`
 `DynamicEmbTableOptions` gains a field:
 ```python
-retain_evicted_keys: bool = False
+evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
 ```
 Docstring: effective on the last-tier storage only; when enabled, evicted keys
 can be read back with `pop_evicted_keys`.
@@ -279,8 +279,8 @@ def insert(self, keys, table_ids, score, insert_results=None, score_out=None,
 ### 5.3 `dynamicemb/key_value_table.py` (core)
 
 **(a) `DynamicEmbTableState` gains retain state** (initialized in
-`create_table_state` from `retain_evicted_keys`, only for a last-tier state):
-- `retain_evicted_keys: bool`
+`create_table_state` from `evicted_item_mode`, only for a last-tier state):
+- `evicted_item_mode: EvictedItemMode`
 - `evicted_key_chunks: List[torch.Tensor]` (per-insert 1-D int64 key chunks)
 - `evicted_tid_chunks: List[torch.Tensor]` (per-insert 1-D int64 table_id chunks)
 
@@ -289,7 +289,7 @@ def insert(self, keys, table_ids, score, insert_results=None, score_out=None,
 
 **(b) `_insert_key_values` (the last-tier common entry)** becomes:
 ```python
-if state.retain_evicted_keys:
+if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
     indices, num_evicted, ev_keys, ev_tids = state.key_index_map.insert(
         unique_keys, table_ids, score_arg, score_out=score_out_flat,
         collect_evicted=True)
@@ -313,7 +313,7 @@ to the two chunk lists (pure append, no compaction).
 Module-/model-level `pop_evicted_keys` return **host** tensors (dedup + NCCL
 gather run on device, then `.cpu()`).
 
-**(d) Last-tier determination** (`retain_evicted_keys` hooks only the state that
+**(d) Last-tier determination** (`evicted_item_mode` hooks only the state that
 truly drops keys)
 - non-caching single-tier `DynamicEmbStorage` → its state is a last tier ✔
 - `HybridStorage` → `self._host` state is a last tier ✔; `self._hbm` ✘ (spills via
@@ -322,7 +322,7 @@ truly drops keys)
   a last tier ✔; `self._cache` ✘
 
 ### 5.4 `dynamicemb/batched_dynamicemb_tables.py`
-- At construction, pass each table's `retain_evicted_keys` to the **last-tier**
+- At construction, pass each table's `evicted_item_mode` to the **last-tier**
   storage's `create_table_state` (dispatched per the rules above in
   `_create_cache_storage`).
 - New method:
@@ -366,7 +366,7 @@ def pop_evicted_keys(model, table_names=None, pg=None)
   the concatenation is the global unique set).
 - **Incremental semantics**: returns keys evicted "since the previous call", and
   clears **this rank's buffer** afterward (only its own, regardless of aggregation).
-- Tables without `retain_evicted_keys=True`: **omitted** from the result (no empty
+- Tables without `evicted_item_mode=RETAIN_KEY`: **omitted** from the result (no empty
   tensor). [Decision 4]
 
 ---
@@ -414,7 +414,7 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
   per rank, `pg` gives the group-wide union identical on every rank, clearing is
   rank-local, plus the model-level `dynamicemb.pop_evicted_keys(model, ...)`
   walking a sharded collection.
-- **Regression**: with `retain_evicted_keys=False` (default), the existing
+- **Regression**: with `evicted_item_mode=DISCARD` (default), the existing
   insert/evict paths are unchanged by construction (`if constexpr` / Python
   branches).
 
@@ -443,7 +443,7 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
 | `src/jit/jit_link.h` / `.cpp` | cache the new entry + `demb_get_insert_collect_fn` |
 | `src/table_operation/insert.cu` | `launch_table_insert_collect_kernel` + host `table_insert_collect_evicted` |
 | `src/table_operation/table.cu` | bind `table_insert_collect_evicted` |
-| `dynamicemb/dynamicemb_config.py` | `retain_evicted_keys` option |
+| `dynamicemb/dynamicemb_config.py` | `evicted_item_mode` option |
 | `dynamicemb/scored_hashtable.py` | `LinearBucketTable.insert(collect_evicted=...)` |
 | `dynamicemb/key_value_table.py` | state retain chunks + `_insert_key_values` collection + `_append_evicted` / `_pop_state_evicted_keys` + storage `pop_evicted_keys` |
 | `dynamicemb/batched_dynamicemb_function.py` | **retain collection on the forward HBM-direct path (`_prefetch_hbm_direct_path`) — §3(B) gap fix** |
