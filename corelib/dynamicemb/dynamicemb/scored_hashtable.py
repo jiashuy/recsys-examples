@@ -36,6 +36,7 @@ from dynamicemb_extensions import (
     table_gather_score_blocks,
     table_insert,
     table_insert_and_evict,
+    table_insert_collect_evicted,
     table_lookup,
     table_partition,
     table_scatter_score_blocks,
@@ -581,23 +582,49 @@ class LinearBucketTable(ScoredHashTable):
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        collect_evicted: bool = False,
+    ):
         """
         Keys have to be unique.
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
-            indices
+            indices; or, when ``collect_evicted`` is True, the 4-tuple
+            ``(indices, num_evicted, evicted_keys, evicted_table_ids)`` where the
+            evicted_* tensors are sized at the batch upper bound (slice to
+            ``num_evicted``). Used by the last-tier retain-evicted-keys path.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            if collect_evicted:
+                raise RuntimeError(
+                    "collect_evicted (evicted_item_mode=RETAIN_KEY) is not supported under "
+                    "DEMB_DETERMINISM_MODE."
+                )
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert(keys, table_ids, score_value, policy)
+
+        if collect_evicted:
+            return table_insert_collect_evicted(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                self._ref_counter,
+                insert_results,
+                score_out,
+                num_scores=num_scores,
+                score_fn_key=self.score_fn_key_,
+            )
 
         indices = table_insert(
             self.table_storage_,

@@ -16,7 +16,7 @@
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -25,6 +25,7 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
     align_to_table_size,
     score_dump_permutation,
     score_load_permutation,
@@ -75,12 +76,14 @@ from torch import Tensor, nn  # usort:skip
 def _all_gather_dumped_keys_values(
     keys: Tensor,
     values: Tensor,
+    slot_index: Tensor,
     pg: dist.ProcessGroup,
-) -> Tuple[Tensor, Tensor]:
-    """Gather (keys, values) from all ranks into concatenated CPU tensors.
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Gather (keys, values, slot_index) from all ranks into concatenated CPU tensors.
 
-    keys: (N,) int64 on device; values: (N, D) on device.
-    Returns (out_keys_cpu, out_values_cpu) with all ranks' data in rank order.
+    keys: (N,) int64 on device; values: (N, D) on device; slot_index: (N,) int64
+    on device. Returns (out_keys_cpu, out_values_cpu, out_slot_index_cpu) with all
+    ranks' data in rank order, column-aligned across the three.
     """
     device = keys.device
     world_size = dist.get_world_size(group=pg)
@@ -93,13 +96,17 @@ def _all_gather_dumped_keys_values(
     dtype_val = values.dtype
     keys_pad = torch.zeros(max_n, dtype=torch.int64, device=device)
     values_pad = torch.zeros(max_n, emb_dim, dtype=dtype_val, device=device)
+    slot_pad = torch.zeros(max_n, dtype=torch.int64, device=device)
     if n > 0:
         keys_pad[:n] = keys
         values_pad[:n, :] = values
+        slot_pad[:n] = slot_index
     gathered_keys = [torch.empty_like(keys_pad) for _ in range(world_size)]
     gathered_values = [torch.empty_like(values_pad) for _ in range(world_size)]
+    gathered_slots = [torch.empty_like(slot_pad) for _ in range(world_size)]
     dist.all_gather(gathered_keys, keys_pad, group=pg)
     dist.all_gather(gathered_values, values_pad, group=pg)
+    dist.all_gather(gathered_slots, slot_pad, group=pg)
     out_keys = torch.cat(
         [gathered_keys[i][: gathered_counts[i].item()] for i in range(world_size)],
         dim=0,
@@ -108,7 +115,11 @@ def _all_gather_dumped_keys_values(
         [gathered_values[i][: gathered_counts[i].item()] for i in range(world_size)],
         dim=0,
     ).cpu()
-    return out_keys, out_values
+    out_slots = torch.cat(
+        [gathered_slots[i][: gathered_counts[i].item()] for i in range(world_size)],
+        dim=0,
+    ).cpu()
+    return out_keys, out_values, out_slots
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +261,21 @@ class DynamicEmbTableState:
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
+    # Retain-evicted-keys (last tier only): when RETAIN_KEY, each insert that
+    # evicts collects the victims' (key, table_id). Accumulated as GPU-tensor
+    # chunks and only concatenated + de-duplicated on pop_evicted_keys (no
+    # compaction while appending). One chunk per insert that evicted anything;
+    # drained on pop.
+    evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
+    evicted_key_chunks: List[torch.Tensor] = field(default_factory=list)
+    evicted_tid_chunks: List[torch.Tensor] = field(default_factory=list)
 
 
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
     enable_overflow: bool = False,
+    evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
@@ -418,6 +438,7 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
+        evicted_item_mode=evicted_item_mode,
     )
 
 
@@ -734,6 +755,46 @@ def _flat_row_indices_from_slots_and_scores(
     return slot_indices.to(device=state.device, dtype=torch.int64)
 
 
+def _encode_slot_index(
+    state: DynamicEmbTableState,
+    slot_indices: torch.Tensor,
+    flat_rows: torch.Tensor,
+    tier: Optional[int] = None,
+) -> torch.Tensor:
+    """int64 ``slot_index`` for a dumped table (for precise replay_increment).
+
+    Single-tier storage (``tier is None``):
+      - normal policies: the key_index_map slot IS the value flat row, so the
+        single slot value locates both key and value -> return the slot as-is.
+      - NO_EVICTION: key slot and value row are independent (row == score,
+        auto-increment), so pack both into one int64: high 32 bits = key slot,
+        low 32 bits = value row (tables are small, < 2^32; asserted).
+
+    HybridStorage (``tier in {0, 1}``, called once per tier, HBM=0 / host=1):
+      layout ``bit 63 = tier | bits 0..62 = key_slot``. HybridStorage does NOT
+      support NO_EVICTION (rejected at construction), so every tier is a normal
+      policy with key_slot == value_row -- one value locates both. Only the tier
+      bit is added so replay can tell the two tiers' independent slot spaces apart.
+    """
+    slot_indices = slot_indices.to(device=state.device, dtype=torch.int64)
+    if tier is not None:  # HybridStorage: bit 63 = tier, bits 0..62 = key_slot
+        if slot_indices.numel() > 0:
+            assert int(slot_indices.max()) < (
+                1 << 63
+            ), "HybridStorage key_slot exceeds 63 bits"
+        if int(tier):
+            return slot_indices | (torch.ones_like(slot_indices) << 63)
+        return slot_indices
+    if state.no_eviction_next_index is None:
+        return slot_indices  # key slot == value row
+    flat_rows = flat_rows.to(device=state.device, dtype=torch.int64)
+    if slot_indices.numel() > 0:
+        assert int(slot_indices.max()) < (1 << 32) and int(flat_rows.max()) < (
+            1 << 32
+        ), "NO_EVICTION slot/row exceeds 32 bits; cannot pack into int64 slot_index"
+    return (slot_indices << 32) | flat_rows
+
+
 def load_from_flat(
     state: DynamicEmbTableState,
     indices: torch.Tensor,
@@ -1018,6 +1079,57 @@ def _find_keys(
     )
 
 
+def _append_evicted(
+    state: DynamicEmbTableState,
+    evicted_keys: torch.Tensor,
+    evicted_table_ids: torch.Tensor,
+    num_evicted: torch.Tensor,
+) -> None:
+    """Append this insert's evicted (key, table_id) to the state's retain chunks.
+
+    ``evicted_keys`` / ``evicted_table_ids`` are sized at the batch upper bound;
+    only the first ``num_evicted`` entries are valid, so we slice + clone (freeing
+    the large per-batch buffers and keeping only the compact evicted rows). No
+    de-duplication here -- that happens on pop. One D2H sync per evicting insert
+    to read the count, acceptable since retain is opt-in.
+    """
+    n = int(num_evicted.item())
+    if n <= 0:
+        return
+    state.evicted_key_chunks.append(evicted_keys[:n].clone())
+    state.evicted_tid_chunks.append(evicted_table_ids[:n].clone())
+
+
+def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch.Tensor:
+    """Pop (return + clear) the unique evicted keys retained for ``table_id``.
+
+    Concatenates all retained chunks, selects this table's rows, de-duplicates,
+    and rebuilds the chunks to keep only the OTHER tables' rows -- so this table's
+    retained keys are cleared while other tables' remain for their own pop.
+    Returns a 1-D tensor of unique keys on ``state.device``.
+    """
+    if not state.evicted_key_chunks:
+        # Match the non-empty path's dtype: chunks carry key_index_map.key_type
+        # (== the table's index_type, which may be int32/uint32), so a hardcoded
+        # int64 here would make callers that concat/compare across empty and
+        # non-empty pops hit a dtype mismatch.
+        return torch.empty(
+            0, dtype=state.key_index_map.key_type, device=state.device
+        )
+    keys = torch.cat(state.evicted_key_chunks)
+    tids = torch.cat(state.evicted_tid_chunks)
+    mask = tids == table_id
+    out = torch.unique(keys[mask])
+    keep = ~mask
+    if bool(keep.any()):
+        state.evicted_key_chunks = [keys[keep]]
+        state.evicted_tid_chunks = [tids[keep]]
+    else:
+        state.evicted_key_chunks = []
+        state.evicted_tid_chunks = []
+    return out
+
+
 def _insert_key_values(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
@@ -1038,9 +1150,24 @@ def _insert_key_values(
     score_out_flat: Optional[torch.Tensor] = None
     if state.no_eviction_next_index is not None:
         score_out_flat = torch.empty(n, dtype=torch.int64, device=unique_keys.device)
-    indices = state.key_index_map.insert(
-        unique_keys, table_ids, score_arg, score_out=score_out_flat
-    )
+    if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_table_ids,
+        ) = state.key_index_map.insert(
+            unique_keys,
+            table_ids,
+            score_arg,
+            score_out=score_out_flat,
+            collect_evicted=True,
+        )
+        _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
+    else:
+        indices = state.key_index_map.insert(
+            unique_keys, table_ids, score_arg, score_out=score_out_flat
+        )
     if state.no_eviction_next_index is not None:
         flat_indices = (
             score_arg.value if score_arg.value is not None else score_out_flat
@@ -1681,6 +1808,9 @@ class DynamicEmbStorage(Storage):
         self._state = create_table_state(
             options,
             optimizer,
+            # DynamicEmbStorage is always a last tier (single tier or the backing
+            # store under a cache), so it honors evicted_item_mode.
+            evicted_item_mode=options[0].evicted_item_mode,
         )
 
     @property
@@ -1819,6 +1949,14 @@ class DynamicEmbStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
+
+    def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
+        """Return + clear this rank's unique evicted keys retained for ``table_id``.
+
+        DynamicEmbStorage is always a last tier, so retained keys live on its
+        state. Returns an empty tensor when evicted_item_mode is DISCARD or nothing
+        was evicted for the table since the last pop."""
+        return _pop_state_evicted_keys(self._state, table_id)
 
     # -- Storage interface --
 
@@ -2000,9 +2138,18 @@ class DynamicEmbStorage(Storage):
         table_id: int,
         threshold: int,
         pg: Optional[dist.ProcessGroup],
-    ) -> Tuple[Tensor, Tensor]:
-        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Dump keys, embeddings and slot_index for one table (score >= threshold).
+
+        Multi-rank: all_gather so the result is concatenated from all ranks.
+        ``slot_index`` is the packed key-slot/value-row for precise replay (see
+        :func:`_encode_slot_index`), column-aligned with keys/values."""
         state = self._state
+        if state.options_list[table_id].dist_type == "continuous":
+            raise NotImplementedError(
+                "incremental_dump with slot_index does not support dist_type "
+                "'continuous' (replay cannot reconstruct the owning rank from a key)."
+            )
         states_to_dump = [state]
         do_multi_rank_gather = (
             pg is not None
@@ -2011,6 +2158,7 @@ class DynamicEmbStorage(Storage):
         )
         all_keys: List[Tensor] = []
         all_values: List[Tensor] = []
+        all_slots: List[Tensor] = []
         for s in states_to_dump:
             keys, named_scores, indices = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
@@ -2026,35 +2174,43 @@ class DynamicEmbStorage(Storage):
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            slot = _encode_slot_index(s, indices, flat_rows)
             if not do_multi_rank_gather:
                 value = value.cpu()
                 key = key.cpu() if key.is_cuda else key
+                slot = slot.cpu()
             all_keys.append(key)
             all_values.append(value)
+            all_slots.append(slot)
         device_for_gather = state.device
         emb_dim_t = state.table_emb_dims_cpu[table_id]
         if all_keys:
             keys_cat = torch.cat(all_keys)
             values_cat = torch.cat(all_values, dim=0)
+            slots_cat = torch.cat(all_slots)
         else:
             if do_multi_rank_gather:
                 keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
                 values_cat = torch.empty(
                     0, emb_dim_t, dtype=state.emb_dtype, device=device_for_gather
                 )
+                slots_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
             else:
                 keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
                 values_cat = torch.empty(0, emb_dim_t, dtype=state.emb_dtype)
+                slots_cat = torch.empty(0, dtype=torch.int64, device="cpu")
         if do_multi_rank_gather:
             keys_cat = keys_cat.to(device_for_gather)
             values_cat = values_cat.to(device_for_gather)
-            keys_cat, values_cat = _all_gather_dumped_keys_values(
-                keys_cat, values_cat, pg
+            slots_cat = slots_cat.to(device_for_gather)
+            keys_cat, values_cat, slots_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, slots_cat, pg
             )
         elif keys_cat.device.type == "cuda":
             keys_cat = keys_cat.cpu()
             values_cat = values_cat.cpu()
-        return keys_cat, values_cat
+            slots_cat = slots_cat.cpu()
+        return keys_cat, values_cat, slots_cat
 
     # -- Export --
 
@@ -2134,8 +2290,14 @@ class HybridStorage(Storage):
         host_options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
+        # Only the host tier is a last tier here: the HBM tier spills its
+        # evictions into the host tier (insert_and_evict), so it never retains.
         self._hbm = create_table_state(hbm_options, optimizer)
-        self._host = create_table_state(host_options, optimizer)
+        self._host = create_table_state(
+            host_options,
+            optimizer,
+            evicted_item_mode=host_options[0].evicted_item_mode,
+        )
         self.optimizer = optimizer
 
     @property
@@ -2201,6 +2363,14 @@ class HybridStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
         collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
+
+    def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
+        """Return + clear this rank's unique evicted keys retained for ``table_id``.
+
+        Only the host tier is a last tier here (the HBM tier spills to host), so
+        retained keys live on the host state. Empty tensor when retain is off or
+        nothing was evicted for the table since the last pop."""
+        return _pop_state_evicted_keys(self._host, table_id)
 
     # -- Two-tier find (with values) --
 
@@ -2428,9 +2598,18 @@ class HybridStorage(Storage):
         table_id: int,
         threshold: int,
         pg: Optional[dist.ProcessGroup],
-    ) -> Tuple[Tensor, Tensor]:
-        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Dump keys, embeddings and slot_index for one table (score >= threshold).
+
+        Multi-rank: all_gather so the result is concatenated from all ranks.
+        ``slot_index`` is the packed key-slot/value-row for precise replay (see
+        :func:`_encode_slot_index`), column-aligned with keys/values."""
         states_to_dump = self.tables
+        if states_to_dump[0].options_list[table_id].dist_type == "continuous":
+            raise NotImplementedError(
+                "incremental_dump with slot_index does not support dist_type "
+                "'continuous' (replay cannot reconstruct the owning rank from a key)."
+            )
         do_multi_rank_gather = (
             pg is not None
             and dist.is_initialized()
@@ -2438,7 +2617,10 @@ class HybridStorage(Storage):
         )
         all_keys = []
         all_values = []
-        for s in states_to_dump:
+        all_slots = []
+        # tier index into self.tables: 0 = HBM tier, 1 = host tier. slot_index
+        # packs this tier bit (bit 63) so replay can tell the two tiers apart.
+        for tier, s in enumerate(states_to_dump):
             keys, named_scores, indices = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
                 pg=pg,
@@ -2453,35 +2635,43 @@ class HybridStorage(Storage):
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            slot = _encode_slot_index(s, indices, flat_rows, tier=tier)
             if not do_multi_rank_gather:
                 value = value.cpu()
                 key = key.cpu() if key.is_cuda else key
+                slot = slot.cpu()
             all_keys.append(key)
             all_values.append(value)
+            all_slots.append(slot)
         device_for_gather = states_to_dump[0].device
         emb_dim_t = states_to_dump[0].table_emb_dims_cpu[table_id]
         if all_keys:
             keys_cat = torch.cat(all_keys)
             values_cat = torch.cat(all_values, dim=0)
+            slots_cat = torch.cat(all_slots)
         else:
             if do_multi_rank_gather:
                 keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
                 values_cat = torch.empty(
                     0, emb_dim_t, dtype=self.embedding_dtype(), device=device_for_gather
                 )
+                slots_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
             else:
                 keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
                 values_cat = torch.empty(0, emb_dim_t, dtype=self.embedding_dtype())
+                slots_cat = torch.empty(0, dtype=torch.int64, device="cpu")
         if do_multi_rank_gather:
             keys_cat = keys_cat.to(device_for_gather)
             values_cat = values_cat.to(device_for_gather)
-            keys_cat, values_cat = _all_gather_dumped_keys_values(
-                keys_cat, values_cat, pg
+            slots_cat = slots_cat.to(device_for_gather)
+            keys_cat, values_cat, slots_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, slots_cat, pg
             )
         elif keys_cat.device.type == "cuda":
             keys_cat = keys_cat.cpu()
             values_cat = values_cat.cpu()
-        return keys_cat, values_cat
+            slots_cat = slots_cat.cpu()
+        return keys_cat, values_cat, slots_cat
 
     # -- Dump: write host first, then append HBM --
 

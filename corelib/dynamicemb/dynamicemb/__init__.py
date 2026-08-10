@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
+from .incremental_dump import DeltaDumpResult, pop_evicted_keys
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
     DynamicEmbCheckMode,
@@ -21,6 +22,7 @@ from .dynamicemb_config import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    EvictedItemMode,
     ScoreStrategy,
     align_to_table_size,
     data_type_to_dtype,
@@ -61,6 +63,7 @@ __all__ = [
     "DynamicEmbPoolingMode",
     "DynamicEmbEvictStrategy",
     "DynamicEmbScoreStrategy",
+    "EvictedItemMode",
     "ScoreStrategy",
     "BATCH_SIZE_PER_DUMP",
     "data_type_to_dyn_emb",
@@ -70,6 +73,8 @@ __all__ = [
     "string_to_evict_strategy",
     "DynamicEmbDump",
     "DynamicEmbLoad",
+    "DeltaDumpResult",
+    "pop_evicted_keys",
     "EmbOptimType",
     "OptimizerArgs",
 ]

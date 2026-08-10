@@ -410,14 +410,16 @@ def test_incremental_dump_api(
             if all_customized
             else {prefix_path: undump_score}
         )
-        ret_tensors, ret_scores = incremental_dump(
-            model, param_scores, intra_and_cross_node_pg()[0]
-        )
-        undump_score = ret_scores[prefix_path]
+        res = incremental_dump(model, param_scores, intra_and_cross_node_pg()[0])
+        dr = res[prefix_path]  # DeltaDumpResult for this collection
+        undump_score = {
+            tn: dr.meta[j]["current_score"] for j, tn in enumerate(dr.table_names)
+        }
         for i, (table_name, indices) in enumerate(zip(table_names, unique_indices)):
             if use_dynamicembs[i]:
-                dump_keys = ret_tensors[prefix_path][table_name][0]
-                dump_vals = ret_tensors[prefix_path][table_name][1]
+                col = dr.table_names.index(table_name)
+                dump_keys = dr.keys[col]
+                dump_vals = dr.values[col]
                 dumped_indices = set(dump_keys.tolist())
                 assert indices.issubset(dumped_indices)
 

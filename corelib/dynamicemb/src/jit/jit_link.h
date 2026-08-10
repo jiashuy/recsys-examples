@@ -55,6 +55,12 @@ CUfunction demb_get_evict_fn(int64_t key, bool overflow);
 // demb_launch_evict (same by-value EvictParams contract).
 CUfunction demb_get_insert_fn(int64_t key);
 
+// Plain-insert entry that ALSO retains evicted victims' (key, table_id) into
+// EvictParams::evicted_keys / evicted_table_ids (count in evicted_counter). Same
+// key space / module as demb_get_insert_fn; the "retain evicted keys" last-tier
+// path for LruLfu tables. Launch with demb_launch_evict.
+CUfunction demb_get_insert_collect_fn(int64_t key);
+
 // Launch the evict kernel over `batch` keys (block 256), passing `params` as the
 // single by-value argument, on `stream`. Throws on launch error.
 void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,

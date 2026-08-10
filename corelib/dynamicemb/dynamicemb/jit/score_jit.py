@@ -77,6 +77,19 @@ def _remap_score_function(fn, perm):
     ``scores`` is the function's first parameter. Only integer-constant subscripts
     are allowed (the static remap requires it) and must be in ``[0, len(perm))``;
     anything else raises. The check runs even when *perm* is identity."""
+    # The source-level remap recompiles fn against ``fn.__globals__`` only (see
+    # below), so any value captured from an enclosing scope (a factory/closure)
+    # would be silently dropped and surface later as an opaque numba NameError.
+    # Reject closures up front with a clear, actionable error instead.
+    freevars = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+    if freevars:
+        raise ValueError(
+            f"score_function must not capture closure variables {freevars!r}: "
+            f"the source-level remap only sees module globals, so captured "
+            f"values are lost and numba later fails with an opaque NameError. "
+            f"Inline any constants into the function body instead of using a "
+            f"factory/closure."
+        )
     src = textwrap.dedent(inspect.getsource(fn))
     tree = ast.parse(src)
     func = tree.body[0]

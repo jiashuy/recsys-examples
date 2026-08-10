@@ -36,6 +36,7 @@ struct EvictModule {
   CUfunction ovf = nullptr;
   CUfunction noovf = nullptr;
   CUfunction insert = nullptr;
+  CUfunction insert_collect = nullptr;
 };
 
 // Source material for a custom score_function, kept device-agnostic so the
@@ -83,6 +84,9 @@ EvictModule load_from_image(const void *image, const char *ctx) {
              "cuModuleGetFunction(noovf)");
     cu_check(cuModuleGetFunction(&m.insert, m.module, "dyn_emb_insert_entry"),
              "cuModuleGetFunction(insert)");
+    cu_check(cuModuleGetFunction(&m.insert_collect, m.module,
+                                 "dyn_emb_insert_collect_entry"),
+             "cuModuleGetFunction(insert_collect)");
   } catch (...) {
     cuModuleUnload(m.module);
     throw;
@@ -202,6 +206,12 @@ CUfunction demb_get_insert_fn(int64_t key) {
   std::lock_guard<std::mutex> lk(g_mu);
   EvictModule &m = get_module_locked(current_device(), key);
   return m.insert;
+}
+
+CUfunction demb_get_insert_collect_fn(int64_t key) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  EvictModule &m = get_module_locked(current_device(), key);
+  return m.insert_collect;
 }
 
 void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,

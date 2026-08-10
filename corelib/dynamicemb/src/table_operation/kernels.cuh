@@ -326,8 +326,13 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 // never the single-score reduce(). Plain insert drops the evicted key (no
 // evicted-output collection), so cur_ts is the only extra input the ranked
 // evictor needs.
+// CollectEvicted=true additionally writes each evicted victim's (key, table_id)
+// to evicted_keys / evicted_table_ids (compacted; count in evicted_counter) --
+// the "retain evicted keys" hook for a last-tier table. Only InsertResult::Evict
+// (an existing key pushed out) is collected, never Busy. Default false keeps the
+// plain-insert path (drops the victim) byte-for-byte unchanged (if constexpr).
 template <typename Table, typename KernelTraits,
-          typename Evictor = DefaultEvictor>
+          typename Evictor = DefaultEvictor, bool CollectEvicted = false>
 __device__ __forceinline__ void
 insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             int *__restrict__ bucket_sizes, int64_t batch,
@@ -337,7 +342,10 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
             int64_t *__restrict__ score_output,
             typename Table::KeyType **__restrict__ table_key_slots,
-            int32_t *__restrict__ counter, uint64_t cur_ts = 0) {
+            int32_t *__restrict__ counter, uint64_t cur_ts = 0,
+            typename Table::KeyType *__restrict__ evicted_keys = nullptr,
+            int64_t *__restrict__ evicted_table_ids = nullptr,
+            CounterType *evicted_counter = nullptr) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -395,9 +403,11 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
                                    &iter, &result);
     int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+    KeyType evict_key = KeyType();
     insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
-        &iter, &result, static_cast<KeyType *>(nullptr),
+        &iter, &result,
+        CollectEvicted ? &evict_key : static_cast<KeyType *>(nullptr),
         static_cast<ScoreType *>(nullptr), counter, counter_offset, cur_ts);
 
     IndexType index = -1;
@@ -421,6 +431,31 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     if (insert_results) {
       insert_results[i] = result;
     }
+
+    if constexpr (CollectEvicted) {
+      // Retain-evicted-keys hook: record the (victim key, table_id) of an
+      // eviction. CompactTileSize == 1 for every insert instantiation
+      // (InsertKernelTraits<...,/*CompactTileSize=*/1,...> in insert.cu and
+      // evict_lrulfu.cu), so this size-1 tile ballot needs no cross-thread
+      // convergence and the `continue` on table_cap==0 above is harmless (those
+      // threads evicted nothing). Only Evict is collected, not Busy.
+      auto g = cg::tiled_partition<KernelTraits::CompactTileSize>(
+          cg::this_thread_block());
+      bool evicted = (result == InsertResult::Evict);
+      uint32_t vote = g.ballot(evicted);
+      int group_cnt = __popc(vote);
+      CounterType group_offset = 0;
+      if (g.thread_rank() == 0)
+        group_offset =
+            atomicAdd(evicted_counter, static_cast<CounterType>(group_cnt));
+      group_offset = g.shfl(group_offset, 0);
+      int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
+      int64_t out_id = group_offset + previous_cnt;
+      if (evicted) {
+        evicted_keys[out_id] = evict_key;
+        evicted_table_ids[out_id] = table_ids[i];
+      }
+    }
   }
 }
 
@@ -441,6 +476,28 @@ __global__ void table_insert_kernel(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       counter, /*cur_ts=*/0);
+}
+
+// AoT entry: plain insert that also retains each evicted victim's (key,
+// table_id). Mirrors table_insert_kernel with CollectEvicted=true; used by the
+// last-tier retain path for non-LruLfu score policies. The LruLfu insert cubin
+// has its own dyn_emb_insert_collect_entry (see evict_lrulfu.cu).
+template <typename Table, typename KernelTraits>
+__global__ void table_insert_collect_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids,
+    InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
+    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
+    typename Table::KeyType **__restrict__ table_key_slots,
+    int32_t *__restrict__ counter, CounterType *evicted_counter,
+    typename Table::KeyType *__restrict__ evicted_keys,
+    int64_t *__restrict__ evicted_table_ids) {
+  insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
+      table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
+      insert_results, indices, score_input, score_output, table_key_slots,
+      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter);
 }
 
 template <typename Table, typename KernelTraits, typename Evictor>
