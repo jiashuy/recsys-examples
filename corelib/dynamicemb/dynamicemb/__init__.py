@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
-from .incremental_dump import DeltaDumpResult, pop_evicted_keys
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
     DynamicEmbCheckMode,
@@ -33,6 +32,7 @@ from .dynamicemb_config import (
     string_to_evict_strategy,
 )
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
+from .incremental_dump import DeltaDumpResult, pop_evicted_keys
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
     BUCKET_ALIGNMENT,

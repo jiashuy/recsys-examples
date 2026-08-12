@@ -38,8 +38,7 @@ class TritonPythonModel:
 
         if self._max_batch_size < 1 or self._max_batch_size > 8:
             raise ValueError(
-                "HSTU_MAX_BATCH_SIZE must be in [1, 8], got "
-                f"{self._max_batch_size}"
+                "HSTU_MAX_BATCH_SIZE must be in [1, 8], got " f"{self._max_batch_size}"
             )
         for required_path in (hstu_root, gin_config, checkpoint_dir):
             if not required_path.exists():
@@ -82,9 +81,7 @@ class TritonPythonModel:
             data_processor._item_feature_name,
             data_processor._action_feature_name,
         ]
-        self._contextual_feature_names = list(
-            data_processor._contextual_feature_names
-        )
+        self._contextual_feature_names = list(data_processor._contextual_feature_names)
         self._item_feature_name = data_processor._item_feature_name
         self._action_feature_name = data_processor._action_feature_name
         self._max_num_candidates = int(dataset_args.max_num_candidates)
@@ -195,9 +192,7 @@ class TritonPythonModel:
                     device=self._device, dtype=torch.int64
                 )
 
-                batch = self._make_batch(
-                    values, lengths, num_candidates, batch_size
-                )
+                batch = self._make_batch(values, lengths, num_candidates, batch_size)
                 with torch.inference_mode():
                     logits = self._model(batch).float().cpu().numpy()
                 responses.append(

@@ -12,6 +12,153 @@ from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
+def _initialize_kvcache_metadata_for_cudagraph(
+    kvcache_metadata,
+    batch_size: int,
+    seqlen: int,
+    num_candidates: int,
+) -> None:
+    """Populate static paged-KV metadata with a valid capture-time workload.
+
+    The metadata buffers are allocated with ``torch.empty`` because normal
+    inference fills them through the KV-cache manager. CUDA graph capture runs
+    before that first allocation, so it needs a synthetic, internally
+    consistent batch for warmup and capture.
+    """
+    if not kvcache_metadata.kv_cache_table:
+        raise ValueError("CUDA graph KV metadata must reference a KV cache table")
+    if batch_size <= 0 or seqlen < 0:
+        raise ValueError(
+            f"Invalid CUDA graph shape: batch_size={batch_size}, seqlen={seqlen}"
+        )
+    if num_candidates < 0 or num_candidates > seqlen:
+        raise ValueError(
+            f"Invalid candidate count {num_candidates} for sequence length {seqlen}"
+        )
+
+    history_len = seqlen - num_candidates
+    new_history_nnz = batch_size * history_len
+    max_new_history_nnz = batch_size * seqlen
+
+    first_cache_table = kvcache_metadata.kv_cache_table[0]
+    if first_cache_table.ndim != 5:
+        raise ValueError(
+            "KV cache table must have shape "
+            "[num_pages, 2, page_size, num_heads, head_dim]"
+        )
+    page_size = first_cache_table.shape[2]
+    if page_size <= 0:
+        raise ValueError(f"Invalid KV cache page size {page_size}")
+
+    pages_per_sequence = math.ceil(history_len / page_size)
+    num_pages = batch_size * pages_per_sequence
+    for layer_idx, cache_table in enumerate(kvcache_metadata.kv_cache_table):
+        if cache_table.ndim != 5 or cache_table.shape[2] != page_size:
+            raise ValueError(
+                f"KV cache table {layer_idx} has an inconsistent shape or page size"
+            )
+        if cache_table.shape[0] < num_pages:
+            raise ValueError(
+                f"KV cache table {layer_idx} has {cache_table.shape[0]} pages, "
+                f"but CUDA graph capture needs {num_pages}"
+            )
+
+    required_capacities = {
+        "kv_indices": num_pages,
+        "kv_indptr": batch_size + 1,
+        "kv_last_page_len": batch_size,
+        "total_history_lengths": batch_size,
+        "total_history_offsets": batch_size + 1,
+        "new_history_offsets": batch_size + 1,
+        "batch_indices": new_history_nnz,
+        "position": new_history_nnz,
+        "new_history_nnz_cuda": 1,
+        "kv_seqlens": batch_size,
+        "kv_seqlen_offsets": batch_size + 1,
+    }
+    for name, required in required_capacities.items():
+        tensor = getattr(kvcache_metadata, name)
+        if tensor is None or tensor.numel() < required:
+            actual = 0 if tensor is None else tensor.numel()
+            raise ValueError(
+                f"KV metadata buffer {name} has capacity {actual}, "
+                f"but CUDA graph capture needs {required}"
+            )
+
+    # Initialize complete backing views, including the inactive tail. Reusing
+    # these buffers for a smaller graph must never expose stale values from a
+    # previously captured shape.
+    kvcache_metadata.kv_indices.zero_()
+    kvcache_metadata.kv_indptr.zero_()
+    kvcache_metadata.kv_last_page_len.zero_()
+    kvcache_metadata.total_history_lengths.zero_()
+    kvcache_metadata.total_history_offsets.zero_()
+    kvcache_metadata.new_history_offsets.zero_()
+    kvcache_metadata.batch_indices.zero_()
+    kvcache_metadata.position.zero_()
+    kvcache_metadata.new_history_nnz_cuda.zero_()
+    kvcache_metadata.kv_seqlens.zero_()
+    kvcache_metadata.kv_seqlen_offsets.zero_()
+
+    device = kvcache_metadata.kv_indptr.device
+    dtype = kvcache_metadata.kv_indptr.dtype
+    if num_pages > 0:
+        kvcache_metadata.kv_indices[:num_pages].copy_(
+            torch.arange(
+                num_pages,
+                dtype=kvcache_metadata.kv_indices.dtype,
+                device=device,
+            )
+        )
+    kvcache_metadata.kv_indptr[: batch_size + 1].copy_(
+        torch.arange(batch_size + 1, dtype=dtype, device=device) * pages_per_sequence
+    )
+    if kvcache_metadata.kv_indptr.numel() > batch_size + 1:
+        kvcache_metadata.kv_indptr[batch_size + 1 :].fill_(num_pages)
+
+    last_page_len = history_len % page_size
+    if history_len > 0 and last_page_len == 0:
+        last_page_len = page_size
+    kvcache_metadata.kv_last_page_len[:batch_size].fill_(last_page_len)
+    kvcache_metadata.total_history_lengths[:batch_size].fill_(history_len)
+
+    history_offsets = (
+        torch.arange(batch_size + 1, dtype=dtype, device=device) * history_len
+    )
+    kvcache_metadata.total_history_offsets[: batch_size + 1].copy_(history_offsets)
+    kvcache_metadata.new_history_offsets[: batch_size + 1].copy_(history_offsets)
+    if kvcache_metadata.total_history_offsets.numel() > batch_size + 1:
+        kvcache_metadata.total_history_offsets[batch_size + 1 :].fill_(new_history_nnz)
+        kvcache_metadata.new_history_offsets[batch_size + 1 :].fill_(new_history_nnz)
+
+    if new_history_nnz > 0:
+        kvcache_metadata.batch_indices[:new_history_nnz].copy_(
+            torch.arange(batch_size, dtype=dtype, device=device).repeat_interleave(
+                history_len
+            )
+        )
+        kvcache_metadata.position[:new_history_nnz].copy_(
+            torch.arange(history_len, dtype=dtype, device=device).repeat(batch_size)
+        )
+    kvcache_metadata.new_history_nnz_cuda.fill_(new_history_nnz)
+
+    kv_seqlen = history_len + num_candidates
+    kvcache_metadata.kv_seqlens[:batch_size].fill_(kv_seqlen)
+    kv_seqlen_offsets = (
+        torch.arange(batch_size + 1, dtype=dtype, device=device) * kv_seqlen
+    )
+    kvcache_metadata.kv_seqlen_offsets[: batch_size + 1].copy_(kv_seqlen_offsets)
+    if kvcache_metadata.kv_seqlen_offsets.numel() > batch_size + 1:
+        kvcache_metadata.kv_seqlen_offsets[batch_size + 1 :].fill_(
+            batch_size * kv_seqlen
+        )
+
+    # This Python integer is baked into the captured launch dimensions. Keep
+    # the full token count as the upper bound because replayed requests can
+    # contain fewer candidates (and therefore more new-history tokens).
+    kvcache_metadata.new_history_nnz = max_new_history_nnz
+
+
 class HSTUBlockInference(torch.nn.Module):
     """
     HSTUBlock module. A stack of HSTULayers.
@@ -262,11 +409,12 @@ class HSTUBlockInference(torch.nn.Module):
         )
 
         if static_kvcache_metadata is not None:
-            static_kvcache_metadata.kv_seqlen_offsets.copy_(
-                static_kvcache_metadata.total_history_offsets
-                + static_jagged_metadata.num_candidates_offsets
+            _initialize_kvcache_metadata_for_cudagraph(
+                static_kvcache_metadata,
+                batch_size=batch_size,
+                seqlen=seqlen,
+                num_candidates=default_num_candidates,
             )
-            static_kvcache_metadata.new_history_nnz = num_tokens
 
         # Warmup
         with torch.cuda.stream(graph_capture_warmup_stream):

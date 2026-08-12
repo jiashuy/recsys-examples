@@ -366,15 +366,40 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
             if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
                 kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
-            jagged_attn_output = self.hstu_attn_export_impl(
-                query,
-                key,
-                value,
-                jd,
-                kv_cache_metadata,
-                kv_cache_table,
-                batch_size,
-            )
+            if self._export_mode:
+                jagged_attn_output = self.hstu_attn_export_impl(
+                    query,
+                    key,
+                    value,
+                    jd,
+                    kv_cache_metadata,
+                    kv_cache_table,
+                    batch_size,
+                )
+            else:
+                jagged_attn_output = hstu_attn_varlen_func(
+                    query,
+                    key,
+                    value,
+                    jd.seqlen_offsets[: batch_size + 1],
+                    kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1],
+                    None,
+                    None,  # seqused_q, seqused_k
+                    jd.max_seqlen,
+                    jd.max_seqlen,
+                    jd.scaling_seqlen,
+                    None,  # num_contexts
+                    jd.num_candidates[:batch_size],
+                    self._target_group_size,
+                    (-1, 0),
+                    self._alpha,
+                    None,
+                    None,  # rab, func
+                    kv_cache_table,
+                    kv_cache_metadata.kv_indptr,
+                    kv_cache_metadata.kv_indices,
+                    kv_cache_metadata.kv_last_page_len,
+                )
         else:
             jagged_attn_output = hstu_attn_varlen_func(
                 query,

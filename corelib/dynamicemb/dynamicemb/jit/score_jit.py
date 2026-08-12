@@ -94,8 +94,9 @@ def _remap_score_function(fn, perm):
     tree = ast.parse(src)
     func = tree.body[0]
     if not isinstance(func, ast.FunctionDef) or not func.args.args:
-        raise TypeError("score_function must be a plain function taking "
-                        "(scores, cur_timestamp).")
+        raise TypeError(
+            "score_function must be a plain function taking " "(scores, cur_timestamp)."
+        )
     func.decorator_list = []  # don't re-apply decorators when we recompile
     scores_name = func.args.args[0].arg
     n = len(perm)
@@ -154,9 +155,7 @@ def score_function_key(fn, perm, cc_major: int, cc_minor: int) -> int:
     return key or 1
 
 
-def register_score_function(
-    fn, score_strategy, cc_major: int, cc_minor: int
-) -> int:
+def register_score_function(fn, score_strategy, cc_major: int, cc_minor: int) -> int:
     """numba-compile fn -> LTO-IR, link into the custom cubin, cache under its
     key. Returns the key to pass as score_fn_key on inserts. Idempotent.
 

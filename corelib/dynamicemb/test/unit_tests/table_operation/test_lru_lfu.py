@@ -450,12 +450,16 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
     probes = {"OLD": (keys[:1], tids[:1]), "HF": (keys[1:2], tids[1:2])}
 
     table.lookup(
-        keys[1:], tids[1:], ScoreArg(name="frequency", value=ones[1:], policy=ScorePolicy.LRU_LFU)
+        keys[1:],
+        tids[1:],
+        ScoreArg(name="frequency", value=ones[1:], policy=ScorePolicy.LRU_LFU),
     )
     torch.cuda.synchronize()
     for _ in range(28):
         table.lookup(
-            keys[1:2], tids[1:2], ScoreArg(name="frequency", value=ones[1:2], policy=ScorePolicy.LRU_LFU)
+            keys[1:2],
+            tids[1:2],
+            ScoreArg(name="frequency", value=ones[1:2], policy=ScorePolicy.LRU_LFU),
         )
     torch.cuda.synchronize()
 
@@ -477,12 +481,18 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
     ev_keys, ev_tids = probes[evicted]
     sv_keys, sv_tids = probes[survivor]
     _, ev_found, _ = table.lookup(
-        ev_keys, ev_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+        ev_keys,
+        ev_tids,
+        ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
     )
     _, sv_found, _ = table.lookup(
-        sv_keys, sv_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+        sv_keys,
+        sv_tids,
+        ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
     )
-    assert not torch.any(ev_found), f"{score_fn.__name__} should evict the {evicted} probe"
+    assert not torch.any(
+        ev_found
+    ), f"{score_fn.__name__} should evict the {evicted} probe"
     assert torch.all(sv_found), f"{score_fn.__name__} should keep the {survivor} probe"
 
 
@@ -506,7 +516,9 @@ def test_lru_lfu_decay_matches_python_oracle(current_device):
         one, one_tid, one_val = keys[i : i + 1], tids[i : i + 1], ones[i : i + 1]
         for _ in range(reps):
             table.lookup(
-                one, one_tid, ScoreArg(name="frequency", value=one_val, policy=ScorePolicy.LRU_LFU)
+                one,
+                one_tid,
+                ScoreArg(name="frequency", value=one_val, policy=ScorePolicy.LRU_LFU),
             )
         torch.cuda.synchronize()
 
@@ -551,8 +563,8 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
     physical frequency, so on identical tables they evict the SAME keys."""
     device = torch.cuda.current_device()
 
-    def _run(fn, strat):
-        table = _custom_table(fn, strat)
+    def _run(fn, strat):  # codespell:ignore strat
+        table = _custom_table(fn, strat)  # codespell:ignore strat
         n = 100
         keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
         tids = torch.zeros(n, dtype=torch.int64, device=device)
@@ -561,7 +573,9 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
         # Give each key a distinct frequency (key i looked up n-1-i extra times).
         for r in range(1, n):
             table.lookup(
-                keys[:r], tids[:r], ScoreArg(name="frequency", value=ones[:r], policy=ScorePolicy.LRU_LFU)
+                keys[:r],
+                tids[:r],
+                ScoreArg(name="frequency", value=ones[:r], policy=ScorePolicy.LRU_LFU),
             )
         torch.cuda.synchronize()
         n_new = 40
@@ -758,7 +772,9 @@ def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
     idx_parts = []
     for g in range(G):
         s = g * per
-        idx_g, _ = _insert(table, keys[s : s + per], tids[s : s + per], ones[s : s + per])
+        idx_g, _ = _insert(
+            table, keys[s : s + per], tids[s : s + per], ones[s : s + per]
+        )
         idx_parts.append(idx_g)
         torch.cuda.synchronize()
     idx = torch.cat(idx_parts)

@@ -603,9 +603,7 @@ def export_inference_gr_ranking(
                 ):
                     rebuilt = self._rebuild_batch(values, lengths, num_candidates)
                     logits, auxiliary_output = _split_model_outputs(
-                        self.inner(
-                            rebuilt, user_ids.cpu(), total_history_lengths.cpu()
-                        )
+                        self.inner(rebuilt, user_ids.cpu(), total_history_lengths.cpu())
                     )
                     if auxiliary_output is not None:
                         raise RuntimeError(
@@ -748,9 +746,7 @@ def export_inference_gr_ranking(
                             dump_dir, f"batch_{dump_idx:06d}_compiled_logits.pt"
                         ),
                     )
-                    print(
-                        f"    [Batch {dump_idx + 1}] Dumped C++ replay tensors"
-                    )
+                    print(f"    [Batch {dump_idx + 1}] Dumped C++ replay tensors")
                     dump_idx += 1
                     eval_module(logits.cuda(), batch.labels.values())
 

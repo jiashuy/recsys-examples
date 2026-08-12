@@ -179,10 +179,7 @@ def _merge_samples(samples: Sequence[InputSample]) -> list[np.ndarray]:
     lengths = np.concatenate(
         [
             np.asarray(
-                [
-                    sample.feature_lengths[feature_index]
-                    for sample in samples
-                ],
+                [sample.feature_lengths[feature_index] for sample in samples],
                 dtype=samples[0].feature_lengths.dtype,
             )
             for feature_index in range(num_features)
@@ -489,9 +486,11 @@ def main() -> int:
         print(f"Slept {args.post_warmup_sleep_seconds:.3f} seconds after warmup")
 
     result = None
-    for cache_set_index, user_id_offset, cache_set_input_cases in (
-        cache_measurement_sets
-    ):
+    for (
+        cache_set_index,
+        user_id_offset,
+        cache_set_input_cases,
+    ) in cache_measurement_sets:
         print(
             f"Cache measurement set {cache_set_index}/"
             f"{CACHE_MEASUREMENT_SET_COUNT}: user_id_offset={user_id_offset}"

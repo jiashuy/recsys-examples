@@ -108,7 +108,9 @@ def get_version():
 # DEMB_ARCHS="80;90;100".
 DEMB_ARCHS = [
     a.strip()
-    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120").replace(",", ";").split(";")
+    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120")
+    .replace(",", ";")
+    .split(";")
     if a.strip()
 ]
 
@@ -188,7 +190,6 @@ with open(os.path.join(os.path.dirname(__file__), "README.md"), encoding="utf8")
     readme = f.read()
 import time
 
-
 EVICT_TU = "src/jit/evict_lrulfu.cu"
 
 
@@ -211,9 +212,14 @@ def compile_evict_fatbins():
     # compiles the same kernels.cuh / <cub/cub.cuh> / cooperative_groups headers,
     # so it needs the same relaxed-constexpr + extended-lambda support to stay
     # buildable across CUDA versions.
-    common = ["-std=c++17", "-O3", "--use_fast_math",
-              "--expt-relaxed-constexpr", "--expt-extended-lambda",
-              f"-I{root_path / 'src'}"]
+    common = [
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        f"-I{root_path / 'src'}",
+    ]
 
     variants = [
         ("LexFreqTsComparator", "evict_lrulfu_lex.fatbin", "sm"),
@@ -221,8 +227,16 @@ def compile_evict_fatbins():
     ]
     for comparator, out_name, code_kind in variants:
         out = str(out_dir / out_name)
-        cmd = ([nvcc, "--fatbin", *_gencode_flags(code_kind), *common,
-                f"-DDEMB_EVICT_COMPARATOR={comparator}", src, "-o", out])
+        cmd = [
+            nvcc,
+            "--fatbin",
+            *_gencode_flags(code_kind),
+            *common,
+            f"-DDEMB_EVICT_COMPARATOR={comparator}",
+            src,
+            "-o",
+            out,
+        ]
         print(f"[dynamicemb] nvcc evict fatbin ({comparator}): {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         print(f"[dynamicemb] {out_name}: {os.path.getsize(out)} bytes")

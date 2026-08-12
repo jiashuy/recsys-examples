@@ -550,17 +550,22 @@ class TestModule:
             max_seq_len=4096,
             bf16=True,
         )
+        cuda_major, _ = torch.cuda.get_device_capability()
+        page_size = 128 if 10 <= cuda_major < 12 else 32
+        num_primary_cache_pages = math.ceil(10240 * 32 / page_size)
         kvcache_args = {
             "num_layers": hstu_config.num_layers,
             "num_heads": hstu_config.num_heads,
             "head_dim": hstu_config.head_dim,
-            "page_size": 32,
+            "page_size": page_size,
             "offload_chunksize": 1024,
-            "num_primary_cache_pages": 10240,
+            "num_primary_cache_pages": num_primary_cache_pages,
             "num_buffer_pages": 0,
             "host_capacity_per_layer": 0,
             "max_batch_size": hstu_config.max_batch_size,
-            "max_seq_len": math.ceil(hstu_config.max_seq_len * 2 / 32) * 32,
+            "max_seq_len": (
+                math.ceil(hstu_config.max_seq_len * 2 / page_size) * page_size
+            ),
             "dtype": torch.bfloat16,
             "device": torch.cuda.current_device(),
             "host_kvstorage_backend": "native",
@@ -606,10 +611,9 @@ class TestModule:
         self.static_jagged_metadata = get_jagged_metadata_buffer(
             self.max_batchsize, self.max_len_per_seq
         )
-        ((self.kvcache_config.max_seq_len + 31)) // 32 * 32
         self.static_kvcache_metadata = get_kvcache_metadata_buffer(
             batch_size=self.kvcache_config.max_batch_size,
-            num_new_tokens=self.kvcache_config.max_seq_len,
+            num_new_tokens=self.max_batchsize * self.max_len_per_seq,
             num_pages=self.reserved_pages,
             device=torch.cuda.current_device(),
         )
