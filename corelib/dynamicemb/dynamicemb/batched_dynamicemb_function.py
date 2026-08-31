@@ -179,29 +179,18 @@ class PrefetchState:
     emb_dtype: torch.dtype
     storage_mode: StorageMode
     slot_indices: Optional[torch.Tensor]
+    # Value-buffer row per key -- what forward and backward both address values
+    # with. It differs from ``slot_indices`` only under NO_EVICTION, whose rows
+    # come from a per-table auto-increment counter unrelated to where the key
+    # hashes, and whose key map is deliberately larger than the value buffer, so
+    # indexing values by slot reads past the end of it. Every other strategy
+    # points this at the slot tensor itself rather than leaving it unset, so a
+    # consumer never has to ask which of the two it is holding. Anything indexed
+    # by hash slot (the ref counter) uses ``slot_indices``.
+    value_row_indices: Optional[torch.Tensor] = None
     non_admitted_positions: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
-    # Value-buffer row per key, when that differs from the hash slot above.
-    # NO_EVICTION is the only strategy where it does: its rows come from a
-    # per-table auto-increment counter, unrelated to where the key hashes, and
-    # its key map is deliberately larger than the value buffer -- so indexing
-    # values by slot reads past the end of the buffer. ``None`` means "same as
-    # slot_indices" (every other strategy), so no extra tensor is allocated.
-    value_row_indices: Optional[torch.Tensor] = None
-
-    def rows_or_slots(self) -> Optional[torch.Tensor]:
-        """Indices to address the value buffer with, forward and backward alike.
-
-        Both passes want the same thing -- the row each key's value lives in --
-        so one accessor serves both. Anything indexed by hash slot (the ref
-        counter) must not go through here.
-        """
-        return (
-            self.value_row_indices
-            if self.value_row_indices is not None
-            else self.slot_indices
-        )
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -589,14 +578,15 @@ def _prefetch_hbm_direct_path(
     Only admitted keys are inserted.  Non-admitted keys get slot_indices = -1
     and their positions are returned for lazy initialization at forward time.
 
-    Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The two index spaces are kept apart because they only
-    coincide by accident: ``slot_indices`` addresses the hash table (and the ref
-    counter beside it), ``value_row_indices`` addresses the flat value buffer. For
-    NO_EVICTION they differ -- rows are handed out by a per-table auto-increment
-    counter while slots come from the key's hash, and the key map is sized
+    Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The
+    two index spaces are kept apart because they only coincide by accident:
+    ``slot_indices`` addresses the hash table (and the ref counter beside it),
+    ``value_row_indices`` addresses the flat value buffer. For NO_EVICTION they
+    differ -- rows are handed out by a per-table auto-increment counter while
+    slots come from the key's hash, and the key map is sized
     ``1 / max_load_factor`` times the value buffer, so a slot can point past the
-    end of it. ``value_row_indices`` is ``None`` for every other strategy, meaning
-    "same as the slot tensors".
+    end of it. Every other strategy returns the slot tensor itself as the rows,
+    so the caller always gets something it can address values with.
     """
     with torch.cuda.nvtx.range("_prefetch_hbm_direct_path"):
         state = storage._state
@@ -605,7 +595,7 @@ def _prefetch_hbm_direct_path(
 
         if h_num_total == 0:
             empty = torch.empty(0, dtype=torch.int64, device=device)
-            return empty, None, None
+            return empty, None, empty
 
         with torch.cuda.nvtx.range("op:storage_find"):
             (
@@ -631,12 +621,14 @@ def _prefetch_hbm_direct_path(
 
         # NO_EVICTION stores each key's value row IN its score word, so a lookup
         # hit yields the row in ``score_out`` -- ``indices`` stays a hash slot and
-        # must not be used to address the value buffer.
+        # must not be used to address the value buffer. Every other strategy
+        # addresses values by slot, so ``rows`` is ``indices`` itself and the
+        # writes below reach it for free.
         is_no_eviction = state.no_eviction_next_index is not None
         rows = (
             _flat_row_indices_for_value_load(state, found_mask, score_out, indices)
             if is_no_eviction
-            else None
+            else indices
         )
 
         if h_num_missing == 0:
@@ -735,13 +727,17 @@ def _prefetch_hbm_direct_path(
                 )
 
             indices[admitted_unique_positions] = new_indices
-            if rows is not None:
+            # Skipped while ``rows`` aliases ``indices``: the write above already
+            # covered it. Testing identity rather than ``is_no_eviction`` keeps
+            # this correct even if ``rows`` ever stops being an alias -- it would
+            # simply be filled explicitly with the same values.
+            if rows is not indices:
                 rows[admitted_unique_positions] = new_rows
 
         # Non-admitted keys: ensure slot_indices = -1
         if non_admitted_positions is not None:
             indices[non_admitted_positions] = -1
-            if rows is not None:
+            if rows is not indices:
                 rows[non_admitted_positions] = -1
 
         return indices, non_admitted_positions, rows
@@ -809,10 +805,6 @@ def dynamicemb_prefetch(
 
         slot_indices = None
         non_admitted_positions = None
-        # Only the HBM-direct path can see a value row that differs from the hash
-        # slot; the cache path addresses the cache's own buffer, where they always
-        # coincide (a cache is never NO_EVICTION -- it enables overflow, which
-        # NO_EVICTION rejects at construction).
         value_row_indices = None
         if caching:
             storage_mode = StorageMode.CACHE
@@ -851,6 +843,10 @@ def dynamicemb_prefetch(
                 admit_strategy,
                 admission_counter,
             )
+            # The cache addresses its own value buffer by cache slot: a cache is
+            # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
+            # at construction), so the two index spaces coincide here.
+            value_row_indices = slot_indices
         elif storage_mode == StorageMode.HBM_DIRECT:
             (
                 slot_indices,
@@ -1136,7 +1132,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         state,
                         # Value buffer: address by row, which is the slot for
                         # every strategy except NO_EVICTION.
-                        prefetch_state.rows_or_slots(),
+                        prefetch_state.value_row_indices,
                         prefetch_state.unique_table_ids,
                         copy_mode=CopyMode.EMBEDDING,
                     )
@@ -1215,7 +1211,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.slot_indices = prefetch_state.slot_indices
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
-            ctx.update_value_rows = prefetch_state.rows_or_slots()
+            ctx.update_value_rows = prefetch_state.value_row_indices
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
             ctx.pooling_mode = pooling_mode
