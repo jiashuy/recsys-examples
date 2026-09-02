@@ -135,8 +135,8 @@ RUN set -eux; \
     git clone --depth 1 \
       https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend; \
     cd pytorch_backend; \
-    git fetch --depth 1 origin r26.07; \
-    git checkout --detach ceeecb7; \
+    git fetch --depth 1 origin ceeecb748caa785b359095a74c05d55dace2591a; \
+    git checkout --detach FETCH_HEAD; \
     pinned_backend_commit="$(git rev-parse HEAD)"; \
     test "${pinned_backend_commit}" = ceeecb748caa785b359095a74c05d55dace2591a; \
     mkdir -p build; cd build; \
@@ -253,20 +253,45 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
     pip install --no-deps --no-build-isolation -e ./flash_attn/cute
 
-# -- Layer 4, 5: FlexKV and NVE. PYNVE_DISABLE_AVX512 only meaningful on x86;
-# leave it unset on arm64 (AVX512 doesn't exist there).
+# -- Layer 4: FlexKV.
 COPY third_party/FlexKV /workspace/deps/FlexKV
-COPY third_party/nv-embedding-cache /workspace/deps/nve
 RUN cd FlexKV && mkdir -p build && cd build && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake --build . -j8 && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
-    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
-    cd /workspace/deps/nve && \
-    cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
-    if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then AVX512_ENV=""; else AVX512_ENV="PYNVE_DISABLE_AVX512=1"; fi && \
-    env TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" PYNVE_WITH_TORCH_BINDINGS=1 ${AVX512_ENV} \
-    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
+    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install
+
+# -- Layer 5: NVE 26.05/default source trees and shared NVTX headers. The
+# default build follows the repository submodule; 26.05 uses its release tag.
+COPY third_party/nv-embedding-cache /workspace/deps/nve
+RUN git clone --recursive -b v26.05 \
+      https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05 && \
+    git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
+
+# Build into two isolated Python prefixes. NVE's upstream default feature set
+# is used for both builds and includes libnve-plugin-nvhm.so.
+RUN set -eux; \
+    if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
+      export PYNVE_DISABLE_AVX512=1; \
+    fi; \
+    for version in 26.05 default; do \
+      source_dir="/workspace/deps/nve"; \
+      if [ "${version}" = 26.05 ]; then source_dir="${source_dir}-26.05"; fi; \
+      mkdir -p "/opt/nve/${version}/python"; \
+      PYNVE_BUILD_DIR="/workspace/build/pynve-${version}" \
+      PYNVE_WITH_TORCH_BINDINGS=1 \
+      TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
+      CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+      python3 -m pip install --no-build-isolation --no-deps \
+        --target "/opt/nve/${version}/python" \
+        "${source_dir}"; \
+    done; \
+    rm -rf /workspace/build
+
+# The development image selects the submodule-backed NVE by default. Commands
+# selecting 26.05 replace this value rather than appending to it. Keep "." ahead
+# of the HSTU path so sibling examples resolve their own local modules.
+ENV PYTHONPATH=/opt/nve/default/python:.:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
@@ -315,18 +340,37 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     cmake .. && make -j
 
 # ============================================================================
-# AOTI additions: C++ replay executable, NVE init hook, optional checkpoint
-# export, and Triton runtime library staging.
+# AOTI additions: version-independent C++ replay, two NVE loader
+# plugins, the 26.05 Triton init hook, and existing runtime-library staging.
 # ============================================================================
 RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     mkdir -p build && cd build && \
     cmake .. && make -j
 
 RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" && \
-    cmake -S "./examples/hstu/inference_aoti/cpp_inference" -B "./examples/hstu/inference_aoti/cpp_inference/build" && \
+    cmake -S "./examples/hstu/inference_aoti/cpp_inference" \
+      -B "./examples/hstu/inference_aoti/cpp_inference/build" \
+      -DNVE_2605_ROOT=/workspace/deps/nve-26.05 \
+      -DNVE_DEFAULT_ROOT=/workspace/deps/nve \
+      -DNVE_2605_LIB_DIR=/opt/nve/26.05/python/pynve \
+      -DNVE_DEFAULT_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
     cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8 && \
-    cmake -S "./examples/hstu/inference_aoti/nve_init_hook" -B "./examples/hstu/inference_aoti/nve_init_hook/build" && \
-    cmake --build "./examples/hstu/inference_aoti/nve_init_hook/build" -j 8
+    cmake --install "./examples/hstu/inference_aoti/cpp_inference/build"
+
+RUN set -eux; \
+    torch_root="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"; \
+    export CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include:${torch_root}/include:${torch_root}/include/torch/csrc/api/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"; \
+    cmake -S ./examples/hstu/inference_aoti/nve_init_hook \
+      -B ./examples/hstu/inference_aoti/nve_init_hook/build \
+      -DNVE_ROOT=/workspace/deps/nve-26.05 \
+      -DNVE_LIB_DIR=/opt/nve/26.05/python/pynve; \
+    cmake --build ./examples/hstu/inference_aoti/nve_init_hook/build -j 8; \
+    test -f ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so; \
+    if ldd ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so | grep -q 'not found'; then \
+      ldd ./examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so | grep 'not found'; \
+      exit 1; \
+    fi
 
 RUN cd ./examples/hstu && \
     mkdir -p \
@@ -343,10 +387,8 @@ RUN cd ./examples/hstu && \
     cp -P /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/fbgemm_gpu/. triton_libs/fbgemm_gpu/ && \
-    cp -a /usr/local/lib/python3.12/dist-packages/pynve/. triton_libs/pynve/ && \
+    cp -a /opt/nve/26.05/python/pynve/. triton_libs/pynve/ && \
     find /usr/local/lib -maxdepth 1 \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} triton_libs/lib/ \; && \
-    cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/ && \
-    sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so"#' \
-      inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
+    cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/
 
 WORKDIR /workspace/recsys-examples/

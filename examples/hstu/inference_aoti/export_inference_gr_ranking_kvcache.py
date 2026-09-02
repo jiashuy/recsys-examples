@@ -19,9 +19,11 @@ import os
 import sys
 import time
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import gin
+import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
@@ -52,6 +54,7 @@ from model import get_ranking_model
 from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRankingGR
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
+from modules.nve_compat import imported_nve_generation
 from pynve.torch.nve_export import export_aot
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig, get_kvcache_config
 from torch.export import Dim, ShapesCollection
@@ -59,11 +62,16 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
+from inference_aoti.nve_aoti_compat import load_aoti, prepare_output_directories
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_EXPORT_DIR = SCRIPT_DIR / "hstu_gr_ranking_kvcache_model"
+DEFAULT_DUMP_DIR = SCRIPT_DIR / "export_test_dump"
 
 
 def start_flexkv_server(
@@ -400,7 +408,16 @@ def export_inference_gr_ranking(
     max_bs: int = 1,
     stop_after_warmup: bool = False,
     kvcache_config_file: Optional[str] = None,
+    export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
+    dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
+    export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
+    generation = imported_nve_generation()
+    print(
+        f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
+        f"{Path(pynve.__file__).resolve()}"
+    )
+
     def _split_model_outputs(outputs):
         if isinstance(outputs, torch.Tensor):
             return outputs, None
@@ -647,9 +664,6 @@ def export_inference_gr_ranking(
             print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
             # export & aoti_compile_and_package
-            export_dir = os.path.join(
-                os.path.dirname(__file__), "hstu_gr_ranking_kvcache_model"
-            )
             export_aot(
                 export_model,
                 example_inputs,
@@ -664,15 +678,15 @@ def export_inference_gr_ranking(
             print(
                 "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
             )
-            print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
+            print("       └── weights/*.nve              # NVE weight data (LinearUVM)")
 
             # === Test Compiled Model ===
-            compiled_model = torch._inductor.aoti_load_package(
-                os.path.join(export_dir, "model.pt2")
+            aoti_model_runtime, nve_layers = load_aoti(
+                export_dir,
+                device=torch.device("cuda", torch.cuda.current_device()),
             )
+            print(f"[INFO] Loaded {len(nve_layers)} NVE layer(s) for AOTI")
 
-            dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
-            os.makedirs(dump_dir, exist_ok=True)
             feature_keys_dumped = False
             dump_idx = 0
 
@@ -689,14 +703,14 @@ def export_inference_gr_ranking(
             compiled_results = []
             with torch.inference_mode():
                 for batch, user_ids, total_history_lengths in inputs:
-                    compiled_outputs = compiled_model(
-                        (
+                    compiled_outputs = aoti_model_runtime.run(
+                        [
                             batch.features.values(),
                             batch.features.lengths(),
                             batch.num_candidates,
                             user_ids,
                             total_history_lengths,
-                        )
+                        ]
                     )
                     compiled_results.append(_split_model_outputs(compiled_outputs))
 
@@ -775,6 +789,18 @@ if __name__ == "__main__":
         help="Static YAML config shared with the C++ KV-cache runtime.",
     )
     parser.add_argument("--stop_after_warmup", action="store_true")
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        default=str(DEFAULT_EXPORT_DIR),
+        help="Model export directory (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dump_dir",
+        type=str,
+        default=str(DEFAULT_DUMP_DIR),
+        help="Replay dump directory (default: %(default)s).",
+    )
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -788,6 +814,8 @@ if __name__ == "__main__":
 
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
+        export_dir_=args.export_dir,
+        dump_dir_=args.dump_dir,
         max_bs=args.max_bs,
         stop_after_warmup=args.stop_after_warmup,
         kvcache_config_file=args.kvcache_config_file,

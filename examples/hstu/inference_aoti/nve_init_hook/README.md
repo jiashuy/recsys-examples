@@ -20,13 +20,13 @@ Triton PyTorch backend (generic)          this repo (NVE-specific)
 ## Build
 
 Build in the same `nvcr.io/nvidia/pytorch:XX.YY-py3` image whose libtorch
-matches the `tritonserver:XX.YY-py3` you deploy on, with NVE available
+matches the `tritonserver:XX.YY-py3` you deploy on, with NVE 26.05 available
 (`pip install` nv-embedding-cache → libs at `.../dist-packages/pynve`, headers
-under `/workspace/deps/nve`):
+under `/workspace/deps/nve-26.05`):
 
 ```bash
 cd nve_init_hook && mkdir build && cd build
-cmake .. -DNVE_ROOT=/workspace/deps/nve \
+cmake .. -DNVE_ROOT=/workspace/deps/nve-26.05 \
          -DNVE_LIB_DIR=/usr/local/lib/python3.12/dist-packages/pynve
 make -j
 # -> libnve_init_hook.so

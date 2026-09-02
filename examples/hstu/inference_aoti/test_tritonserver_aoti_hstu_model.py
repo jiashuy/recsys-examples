@@ -12,13 +12,20 @@ import numpy as np
 import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_TENSORS = [
-    ("INPUT__0", "values"),
-    ("INPUT__1", "lengths"),
-    ("INPUT__2", "num_candidates"),
-    ("INPUT__3", "user_ids"),
-    ("INPUT__4", "total_history_lengths"),
-]
+WORKFLOW_INPUT_TENSORS = {
+    "non-kv": [
+        ("INPUT__0", "values"),
+        ("INPUT__1", "lengths"),
+        ("INPUT__2", "num_candidates"),
+    ],
+    "kv-cache": [
+        ("INPUT__0", "values"),
+        ("INPUT__1", "lengths"),
+        ("INPUT__2", "num_candidates"),
+        ("INPUT__3", "user_ids"),
+        ("INPUT__4", "total_history_lengths"),
+    ],
+}
 InputCase = tuple[int, list[np.ndarray]]
 SUPPORTED_BATCH_SIZES = (2, 4, 8)
 WARMUP_COUNT = 2
@@ -58,7 +65,8 @@ def _find_batch_indices(dump_dir: Path) -> list[int]:
     return sorted(indices)
 
 
-def _load_input_cases(dump_dir: Path) -> list[InputCase]:
+def _load_input_cases(dump_dir: Path, workflow: str) -> list[InputCase]:
+    input_tensors = WORKFLOW_INPUT_TENSORS[workflow]
     input_cases = []
     for batch_index in _find_batch_indices(dump_dir):
         prefix = dump_dir / f"batch_{batch_index:06d}"
@@ -67,7 +75,7 @@ def _load_input_cases(dump_dir: Path) -> list[InputCase]:
                 batch_index,
                 [
                     _load_dumped_tensor(Path(f"{prefix}_{suffix}.pt"))
-                    for _, suffix in INPUT_TENSORS
+                    for _, suffix in input_tensors
                 ],
             )
         )
@@ -76,34 +84,50 @@ def _load_input_cases(dump_dir: Path) -> list[InputCase]:
     return input_cases
 
 
-def _make_inputs(httpclient, input_case: list[np.ndarray]):
+def _make_inputs(
+    httpclient,
+    input_case: list[np.ndarray],
+    workflow: str,
+):
     return [
         _make_input(httpclient, input_name, array)
-        for (input_name, _), array in zip(INPUT_TENSORS, input_case)
+        for (input_name, _), array in zip(WORKFLOW_INPUT_TENSORS[workflow], input_case)
     ]
 
 
-def _logical_batch_size(input_case: Sequence[np.ndarray]) -> int:
-    values, lengths, num_candidates, user_ids, total_history_lengths = input_case
-    for name, array in (
+def _logical_batch_size(
+    input_case: Sequence[np.ndarray], workflow: str = "kv-cache"
+) -> int:
+    values, lengths, num_candidates = input_case[:3]
+    named_arrays = [
         ("values", values),
         ("lengths", lengths),
         ("num_candidates", num_candidates),
-        ("user_ids", user_ids),
-        ("total_history_lengths", total_history_lengths),
-    ):
+    ]
+    if workflow == "kv-cache":
+        user_ids, total_history_lengths = input_case[3:5]
+        named_arrays.extend(
+            [
+                ("user_ids", user_ids),
+                ("total_history_lengths", total_history_lengths),
+            ]
+        )
+        batch_size = int(user_ids.size)
+    else:
+        batch_size = int(num_candidates.size)
+
+    for name, array in named_arrays:
         if array.ndim != 1:
             raise ValueError(f"{name} must be one-dimensional, got {array.shape}")
 
-    batch_size = int(user_ids.size)
     if batch_size < 1 or batch_size > max(SUPPORTED_BATCH_SIZES):
         raise ValueError(f"Unsupported logical batch size: {batch_size}")
-    if num_candidates.size != batch_size:
+    if workflow == "kv-cache" and num_candidates.size != batch_size:
         raise ValueError(
             "num_candidates and user_ids disagree on logical batch size: "
             f"{num_candidates.size} versus {batch_size}"
         )
-    if total_history_lengths.size != batch_size:
+    if workflow == "kv-cache" and total_history_lengths.size != batch_size:
         raise ValueError(
             "total_history_lengths and user_ids disagree on logical batch size: "
             f"{total_history_lengths.size} versus {batch_size}"
@@ -334,11 +358,12 @@ def _run_input_cases(
     user_id_offset: int,
     request_sequence: int,
     profile_records: list[dict[str, Any]],
+    workflow: str = "kv-cache",
 ):
     result = None
     total_latency_ns = 0
     for batch_index, input_case in input_cases:
-        batch_size = _logical_batch_size(input_case)
+        batch_size = _logical_batch_size(input_case, workflow)
         request_id = (
             f"hstu-aoti-{phase}-s{cache_set_index}-r{run_index}-"
             f"bs{batch_size}-b{batch_index:06d}-q{request_sequence:06d}"
@@ -348,7 +373,7 @@ def _run_input_cases(
         try:
             result = client.infer(
                 model_name,
-                inputs=_make_inputs(httpclient, input_case),
+                inputs=_make_inputs(httpclient, input_case, workflow),
                 outputs=outputs,
                 request_id=request_id,
             )
@@ -386,7 +411,13 @@ def _write_profile_records(path: Path, records: list[dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay dumped HSTU KV-cache batches to Triton."
+        description="Replay dumped HSTU AOTI batches to Triton."
+    )
+    parser.add_argument(
+        "--workflow",
+        choices=("non-kv", "kv-cache"),
+        required=True,
+        help="Select the checked-in three-input or five-input Triton contract.",
     )
     parser.add_argument(
         "--dump_dir",
@@ -395,7 +426,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing batch_000000_*.pt dump files.",
     )
     parser.add_argument("--url", type=str, default="localhost:8000")
-    parser.add_argument("--model_name", type=str, default="hstu_gr_ranking_kvcache")
+    parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -407,10 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print_triton_request_count_only",
         action="store_true",
-        help=(
-            "Print the number of Triton calls in the two warmups and two "
-            "measured cache phases, then exit without connecting to Triton."
-        ),
+        help="Print the planned Triton call count, then exit without connecting.",
     )
     parser.add_argument(
         "--profile_jsonl",
@@ -426,8 +454,55 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    model_name = args.model_name or (
+        "hstu_gr_ranking" if args.workflow == "non-kv" else "hstu_gr_ranking_kvcache"
+    )
 
-    input_cases = _load_input_cases(args.dump_dir)
+    input_cases = _load_input_cases(args.dump_dir, args.workflow)
+
+    if args.workflow == "non-kv":
+        measured_input_cases = [
+            input_case
+            for input_case in input_cases
+            if _logical_batch_size(input_case[1], "non-kv") == args.batch_size
+        ]
+        if not measured_input_cases:
+            raise ValueError(
+                f"No non-KV input case has logical batch_size={args.batch_size}"
+            )
+        if args.print_triton_request_count_only:
+            print(len(measured_input_cases))
+            return 0
+
+        import tritonclient.http as httpclient
+
+        outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
+        client = httpclient.InferenceServerClient(url=args.url)
+        profile_records: list[dict[str, Any]] = []
+        result, _, _ = _run_input_cases(
+            client,
+            httpclient,
+            model_name,
+            measured_input_cases,
+            outputs,
+            phase="replay",
+            run_index=1,
+            cache_set_index=0,
+            user_id_offset=0,
+            request_sequence=0,
+            profile_records=profile_records,
+            workflow="non-kv",
+        )
+        if result is None:
+            raise RuntimeError("No Triton requests were sent")
+        if args.profile_jsonl is not None:
+            _write_profile_records(args.profile_jsonl, profile_records)
+        print(
+            f"Replayed {len(measured_input_cases)} non-KV batches with "
+            f"logical batch_size={args.batch_size}"
+        )
+        return 0
+
     warmup_case, measured_input_cases = _prepare_request_plan(
         input_cases, args.batch_size
     )
@@ -449,7 +524,7 @@ def main() -> int:
     outputs = [httpclient.InferRequestedOutput("OUTPUT__0")]
 
     client = httpclient.InferenceServerClient(url=args.url)
-    profile_records: list[dict[str, Any]] = []
+    profile_records = []
     request_sequence = 0
 
     warmup_batch_size = _logical_batch_size(warmup_case[1])
@@ -466,7 +541,7 @@ def main() -> int:
         _, request_sequence, _ = _run_input_cases(
             client,
             httpclient,
-            args.model_name,
+            model_name,
             [warmup_case],
             outputs,
             phase="warmup",
@@ -506,7 +581,7 @@ def main() -> int:
             result, request_sequence, _ = _run_input_cases(
                 client,
                 httpclient,
-                args.model_name,
+                model_name,
                 cache_set_input_cases,
                 outputs,
                 phase=phase,

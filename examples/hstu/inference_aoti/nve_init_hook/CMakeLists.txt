@@ -5,7 +5,7 @@
 # PyTorch (AOTI) backend (see README.md). Build it in the same
 # nvcr.io/nvidia/pytorch:XX.YY-py3 image whose libtorch matches the
 # tritonserver:XX.YY-py3 you deploy on, with NVE available (pip-installed at
-# .../dist-packages/pynve, headers under /workspace/deps/nve).
+# .../dist-packages/pynve, headers under /workspace/deps/nve-26.05).
 
 cmake_minimum_required(VERSION 3.18)
 project(nve_init_hook LANGUAGES CXX CUDA)
@@ -15,7 +15,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
 
-set(NVE_ROOT "/workspace/deps/nve"
+set(NVE_ROOT "/workspace/deps/nve-26.05"
     CACHE PATH "nv-embedding-cache source tree (for headers)")
 set(NVE_LIB_DIR "/usr/local/lib/python3.12/dist-packages/pynve"
     CACHE PATH "Directory containing libnve-*.so")

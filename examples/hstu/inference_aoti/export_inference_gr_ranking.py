@@ -17,8 +17,10 @@ import enum
 import os
 import sys
 import warnings
+from pathlib import Path
 
 import gin
+import pynve
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
@@ -30,17 +32,23 @@ from megatron.core import parallel_state
 from model import get_ranking_model
 from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
+from modules.nve_compat import imported_nve_generation
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
+from inference_aoti.nve_aoti_compat import load_aoti, prepare_output_directories
 from pretrain_gr_ranking import create_ranking_config
 from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_EXPORT_DIR = SCRIPT_DIR / "hstu_gr_ranking_model"
+DEFAULT_DUMP_DIR = SCRIPT_DIR / "export_test_dump"
 
 
 def init_single_rank_distributed():
@@ -185,7 +193,16 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
+    export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
+    dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
 ):
+    export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
+    generation = imported_nve_generation()
+    print(
+        f"[INFO] Selected NVE {generation} (pynve {pynve.__version__}) from "
+        f"{Path(pynve.__file__).resolve()}"
+    )
+
     def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
         """Save a tensor in a format compatible with C++ torch::load().
 
@@ -371,7 +388,6 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
         export_aot(
             export_model,
             example_inputs,
@@ -386,15 +402,15 @@ def export_inference_gr_ranking(
         print(
             "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
         )
-        print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
+        print("       └── weights/*.nve              # NVE weight data (LinearUVM)")
 
         # === Test Compiled Model ===
-        compiled_model = torch._inductor.aoti_load_package(
-            os.path.join(export_dir, "model.pt2")
+        aoti_model_runtime, nve_layers = load_aoti(
+            export_dir,
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
+        print(f"[INFO] Loaded {len(nve_layers)} NVE layer(s) for AOTI")
 
-        dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
-        os.makedirs(dump_dir, exist_ok=True)
         feature_keys_dumped = False
         dump_idx = 0
 
@@ -408,13 +424,13 @@ def export_inference_gr_ranking(
                 inputs.append(batch)
 
                 with torch.inference_mode():
-                    logits = compiled_model(
-                        (
+                    logits = aoti_model_runtime.run(
+                        [
                             batch.features.values(),
                             batch.features.lengths(),
                             batch.num_candidates,
-                        )
-                    )
+                        ]
+                    )[0]
                     ref_logits = model(batch)
                     ref_logits_cpu = ref_logits.detach().cpu()
 
@@ -487,13 +503,13 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    logits = compiled_model(
-                        (
+                    logits = aoti_model_runtime.run(
+                        [
                             b.features.values(),
                             b.features.lengths(),
                             b.num_candidates,
-                        )
-                    )
+                        ]
+                    )[0]
                     results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
@@ -544,6 +560,18 @@ if __name__ == "__main__":
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        default=str(DEFAULT_EXPORT_DIR),
+        help="Model export directory (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dump_dir",
+        type=str,
+        default=str(DEFAULT_DUMP_DIR),
+        help="Replay dump directory (default: %(default)s).",
+    )
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -557,6 +585,8 @@ if __name__ == "__main__":
 
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
+        export_dir_=args.export_dir,
+        dump_dir_=args.dump_dir,
         max_bs=args.max_bs,
         debug_flattened_inputs=args.debug_flattened_inputs,
     )

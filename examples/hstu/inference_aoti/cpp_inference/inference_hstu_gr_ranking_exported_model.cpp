@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "python/pynve/torch_bindings/nve_loader.hpp"
+#include "nve_loader_plugin.h"
 
 namespace {
 
@@ -113,7 +113,7 @@ struct DemoConfig {
 DemoConfig parse_args(int argc, char** argv) {
   if (argc < 3) {
     throw std::invalid_argument(
-        "Usage: inferece_hstu_gr_ranking_exported_model <hstu_gr_ranking_model.pt2> <dump_dir> "
+        "Usage: inference_hstu_gr_ranking_exported_model <aoti_package_dir> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
         "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so]");
   }
@@ -323,11 +323,11 @@ int main(int argc, char** argv) {
 
     load_required_libraries(cfg);
 
-    std::cout << std::endl;
-    std::cout << "Loading NVE layers from " << cfg.package_path << std::endl;
-    nve::LayerDirectory dir(cfg.package_path, cfg.device_index);
-    std::cout << "  Loaded " << dir.size() << " layer(s)" << std::endl;
-    std::cout << std::endl;
+    // Declared before the AOTI loader so NVE state outlives it.
+    recsys::nve_loader::NveLoaderPlugin nve_plugin(cfg.package_path);
+    if (!nve_plugin.requires_aoti_loader()) {
+      nve_plugin.create_state(nullptr, cfg.device_index);
+    }
 
     torch::inductor::AOTIModelPackageLoader loader(
         cfg.package_path + "/model.pt2",
@@ -335,6 +335,11 @@ int main(int argc, char** argv) {
         /*run_single_threaded=*/false,
         /*num_runners=*/1,
         cfg.device_index);
+    if (nve_plugin.requires_aoti_loader()) {
+      nve_plugin.create_state(&loader, cfg.device_index);
+    }
+    std::cout << "[INFO] Loaded NVE " << nve_plugin.selected_version()
+              << " state from " << cfg.package_path << '\n';
 
     auto call_spec = loader.get_call_spec();
     std::cout << "Input call spec:\n" << call_spec[0] << "\n\n";
@@ -347,7 +352,8 @@ int main(int argc, char** argv) {
       batch_indices = discover_batch_indices(cfg.dump_dir);
     }
 
-    TORCH_CHECK(!batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
+    TORCH_CHECK(
+        !batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
 
     int passed = 0;
     int total = 0;
@@ -357,7 +363,8 @@ int main(int argc, char** argv) {
         ++passed;
       }
     }
-    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
+    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/"
+              << total << " batches.\n";
 
     // Benchmark with all batches in a single run.
     run_one_round(loader, cfg.dump_dir, batch_indices, device);

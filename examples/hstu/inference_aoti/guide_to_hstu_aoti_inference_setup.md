@@ -2,6 +2,11 @@
 
 This guide expands the quick workflow in [README.md](./README.md). It follows the current repo layout for exporting `hstu_gr_ranking_kvcache_model`, replaying `export_test_dump`, and serving the exported package with Triton Server.
 
+This end-to-end Triton workflow selects NVE 26.05 because the current model-init
+hook supports only its legacy artifact contract. Standalone Python export and
+native replay also support the submodule-backed default NVE as described in the
+[README NVE section](./README.md#nve-support).
+
 ## Build
 
 ### Step 1: Build and Install Custom Ops Used by HSTU Inference
@@ -25,7 +30,7 @@ cmake .. && make -j
 # KV-cache manager ops
 cd ${REPO}/corelib/recsys_kvcache_manager/
 mkdir -p build && cd build
-cmake .. && make -j 
+cmake .. && make -j
 ```
 
 The HSTU runtime op and paged KV-cache ops from `examples/commons` are built in `inference_aoti/cpp_inference` together with the C++ replay executables in step 3.
@@ -42,13 +47,20 @@ ${REPO}/corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so
 Run the export workflow from the HSTU directory:
 
 ```bash
-cd ${HSTU_DIR}
-export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
+set -euo pipefail
+cd "${HSTU_DIR}"
+
+export NVE_INSTALL_ROOT=/opt/nve
+export NVE_VERSION=26.05
+export PYTHONPATH="${NVE_INSTALL_ROOT}/${NVE_VERSION}/python:${REPO}/examples:${HSTU_DIR}"
+export DYNAMICEMB_OPS_LIB_DIR="${REPO}/corelib/dynamicemb/torch_binding_build"
+export KVCACHE_MANAGER_CONFIG_FILE="${KVCACHE_CONFIG}"
+
 python3 inference_aoti/export_inference_gr_ranking_kvcache.py \
-  --gin_config_file ${GIN} \
-  --checkpoint_dir ${CKPT} \
+  --gin_config_file "${GIN}" \
+  --checkpoint_dir "${CKPT}" \
   --max_bs 2 \
-  --kvcache_config_file ${KVCACHE_MANAGER_CONFIG_FILE}
+  --kvcache_config_file "${KVCACHE_MANAGER_CONFIG_FILE}"
 ```
 
 `KVCACHE_MANAGER_CONFIG_FILE` must be set before Python starts because the fake
@@ -65,11 +77,17 @@ This step performs all of the following:
 ### Step 3: Build the C++ Replay Executable
 
 ```bash
+set -euo pipefail
+
 export PATH=/usr/local/cuda/bin:${PATH}
+export NVE_INSTALL_ROOT=/opt/nve
 export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')"
 
-cmake -S "${HSTU_DIR}/inference_aoti/cpp_inference" -B "${HSTU_DIR}/inference_aoti/cpp_inference/build"
+cmake -S "${HSTU_DIR}/inference_aoti/cpp_inference" \
+  -B "${HSTU_DIR}/inference_aoti/cpp_inference/build" \
+  -DNVE_INSTALL_ROOT="${NVE_INSTALL_ROOT}"
 cmake --build "${HSTU_DIR}/inference_aoti/cpp_inference/build" -j 8
+cmake --install "${HSTU_DIR}/inference_aoti/cpp_inference/build"
 ```
 
 Expected outputs:
@@ -77,6 +95,8 @@ Expected outputs:
 1. `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
 2. `examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so`
 3. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
+4. `/opt/nve/26.05/replay/librecsys_nve_loader.so`
+5. `/opt/nve/default/replay/librecsys_nve_loader.so`
 
 
 ### Step 4: Verify with the C++ AOTI Replay
@@ -97,7 +117,8 @@ python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --config_file ${KV
 Run the replay executable against the exported package and dumped tensors:
 
 ```bash
-${HSTU_DIR}/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
+NVE_VERSION=26.05 \
+  ${HSTU_DIR}/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
   ${HSTU_DIR}/inference_aoti/hstu_gr_ranking_kvcache_model \
   ${HSTU_DIR}/inference_aoti/export_test_dump
 ```
@@ -118,6 +139,9 @@ This section shows how to deploy the exported AOTI model with Triton Server. It 
 2. Set up the Triton Server runtime dependencies.
 3. Stage the exported AOTI model.
 4. Launch Triton with the exported model, custom operator libraries, and FlexKV runtime.
+
+The Triton image, staged NVE libraries, and model-init hook in this section are
+all fixed to NVE 26.05.
 
 
 #### Step 5.1: Build the Modified Triton PyTorch Backend
@@ -140,17 +164,19 @@ cmake \
   -DTRITON_PYTORCH_INCLUDE_PATHS="/usr/local/lib/python3.12/dist-packages/torch/include;/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include;/opt/pytorch/vision/torchvision/csrc" \
   -DTRITON_PYTORCH_LIB_PATHS="/usr/local/lib/python3.12/dist-packages/torch/lib" \
   -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
-  -DTRITON_BACKEND_REPO_TAG=r26.05 \
-  -DTRITON_CORE_REPO_TAG=r26.05 \
-  -DTRITON_COMMON_REPO_TAG=r26.05 \
+  -DTRITON_BACKEND_REPO_TAG=r26.06 \
+  -DTRITON_CORE_REPO_TAG=r26.06 \
+  -DTRITON_COMMON_REPO_TAG=r26.06 \
   ..
 cmake --build . -j"$(nproc)" --target install
 
 
 ## nve init hook (nve layer loader) used by HSTU aoti model ##
 cd ${HSTU_DIR}/inference_aoti/nve_init_hook
-mkdir -p build && cd build
-cmake .. && make -j
+cmake -S . -B build \
+  -DNVE_ROOT=/workspace/deps/nve-26.05 \
+  -DNVE_LIB_DIR=/opt/nve/26.05/python/pynve
+cmake --build build -j 8
 ```
 
 Expected backend output:
@@ -248,7 +274,7 @@ The libraries are gathered from the NVIDIA PyTorch container used in steps 1-4:
 2. `recsys_kvcache_manager/kvcache_manager_ops.so`: from `${REPO}/corelib/recsys_kvcache_manager/build` or the installed `recsys_kvcache_manager` package
 3. `fbgemm_gpu/`: from `/usr/local/lib/python3.12/dist-packages/fbgemm_gpu/`
 4. `hstu_attn/`: from `/usr/local/lib/python3.12/dist-packages/hstu/`
-5. `pynve/`: from `/usr/local/lib/python3.12/dist-packages/pynve/`
+5. `pynve/`: from `/opt/nve/26.05/python/pynve/`
 6. `libhstu_cuda_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
 7. `libpaged_kvcache_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
 8. `libpng16.so.16`: from `/usr/lib/x86_64-linux-gnu/`
@@ -304,6 +330,7 @@ Run the request replay client against the dumped tensors:
 ```bash
 cd ${HSTU_DIR}
 python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
+  --workflow kv-cache \
   --dump_dir inference_aoti/export_test_dump \
   --url localhost:8000 \
   --model_name hstu_gr_ranking_kvcache \

@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "python/pynve/torch_bindings/nve_loader.hpp"
+#include "nve_loader_plugin.h"
 
 namespace {
 
@@ -416,14 +416,16 @@ int main(int argc, char** argv) {
     load_required_libraries(cfg);
     init_kvcache_runtime();
 
-    std::cout << "Loading NVE layers from " << cfg.package_path << '\n';
-    nve::LayerDirectory dir(cfg.package_path, cfg.device_index);
-    std::cout << "  Loaded " << dir.size() << " layer(s)\n";
-
     const bool run_single_threaded = env_flag_enabled("KVCACHE_CPP_RUN_SINGLE_THREADED");
     log_demo_debug(
       std::string("[INFO] AOTI run_single_threaded=")
       + (run_single_threaded ? "true" : "false"));
+
+    // Declared before the AOTI loader so NVE state outlives it.
+    recsys::nve_loader::NveLoaderPlugin nve_plugin(cfg.package_path);
+    if (!nve_plugin.requires_aoti_loader()) {
+      nve_plugin.create_state(nullptr, cfg.device_index);
+    }
 
     torch::inductor::AOTIModelPackageLoader loader(
         cfg.package_path + "/model.pt2",
@@ -431,6 +433,11 @@ int main(int argc, char** argv) {
         /*run_single_threaded=*/run_single_threaded,
         /*num_runners=*/1,
         cfg.device_index);
+    if (nve_plugin.requires_aoti_loader()) {
+      nve_plugin.create_state(&loader, cfg.device_index);
+    }
+    std::cout << "[INFO] Loaded NVE " << nve_plugin.selected_version()
+              << " state from " << cfg.package_path << '\n';
 
     auto call_spec = loader.get_call_spec();
     std::cout << "Input call spec:\n" << call_spec[0] << "\n";
@@ -442,7 +449,8 @@ int main(int argc, char** argv) {
     } else {
       batch_indices = discover_batch_indices(cfg.dump_dir);
     }
-    TORCH_CHECK(!batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
+    TORCH_CHECK(
+        !batch_indices.empty(), "No dumped batches found in ", cfg.dump_dir);
 
     int passed = 0;
     int total = 0;
@@ -455,7 +463,8 @@ int main(int argc, char** argv) {
     }
 
     shutdown_kvcache_runtime();
-    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
+    std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/"
+              << total << " batches.\n";
     return (passed == total) ? 0 : 2;
   } catch (const c10::Error& e) {
     std::cerr << "PyTorch error: " << e.what() << std::endl;

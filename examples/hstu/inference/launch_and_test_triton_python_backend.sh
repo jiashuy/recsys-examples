@@ -3,7 +3,8 @@
 # Launch and test the Triton Python backend in the built container.
 # Run this script with `bash`, not `source`.
 # The Triton server and both clients run in this same container. The script
-# restores the model repository and Gin config after success or failure.
+# uses an isolated temporary model repository and restores the Gin config and
+# checkpoint ps_module directory after success or failure.
 set -Eeuo pipefail
 
 HSTU_DIR="${HSTU_DIR:-/workspace/recsys-examples/examples/hstu}"
@@ -92,10 +93,6 @@ cleanup() {
 
   if [[ -n "${STATE_DIR}" ]] && [[ -d "${STATE_DIR}" ]]; then
     cp -a -- "${STATE_DIR}/ranking.gin" "${GIN_CONFIG}"
-    cp -a -- "${STATE_DIR}/dense-config.pbtxt" "${DENSE_CONFIG}"
-    cp -a -- "${STATE_DIR}/sparse-config.pbtxt" "${SPARSE_CONFIG}"
-    restore_directory "${DENSE_MODEL_DIR}/1" "${STATE_DIR}/dense-version-1"
-    restore_directory "${SPARSE_MODEL_DIR}/1" "${STATE_DIR}/sparse-version-1"
     restore_directory "${PS_MODULE_DIR}" "${STATE_DIR}/ps_module"
     rm -rf -- "${STATE_DIR}"
   fi
@@ -157,17 +154,22 @@ main() {
     return 1
   fi
 
-  # Step 2: save every file or directory that this test changes temporarily.
+  # Step 2: save the source inputs changed temporarily and create an isolated
+  # Triton repository containing only the two Python-backend models.
   STATE_DIR="$(mktemp -d /tmp/hstu-python-backend.XXXXXX)"
   cp -a -- "${GIN_CONFIG}" "${STATE_DIR}/ranking.gin"
-  cp -a -- "${DENSE_CONFIG}" "${STATE_DIR}/dense-config.pbtxt"
-  cp -a -- "${SPARSE_CONFIG}" "${STATE_DIR}/sparse-config.pbtxt"
-  [[ ! -e "${DENSE_MODEL_DIR}/1" ]] || \
-    cp -a -- "${DENSE_MODEL_DIR}/1" "${STATE_DIR}/dense-version-1"
-  [[ ! -e "${SPARSE_MODEL_DIR}/1" ]] || \
-    cp -a -- "${SPARSE_MODEL_DIR}/1" "${STATE_DIR}/sparse-version-1"
   [[ ! -e "${PS_MODULE_DIR}" ]] || \
     cp -a -- "${PS_MODULE_DIR}" "${STATE_DIR}/ps_module"
+
+  local temporary_model_repository="${STATE_DIR}/model-repository"
+  mkdir -p "${temporary_model_repository}"
+  cp -a -- "${DENSE_MODEL_DIR}" "${SPARSE_MODEL_DIR}" \
+    "${temporary_model_repository}/"
+  MODEL_REPOSITORY="${temporary_model_repository}"
+  DENSE_MODEL_DIR="${MODEL_REPOSITORY}/hstu_model"
+  SPARSE_MODEL_DIR="${MODEL_REPOSITORY}/hstu_sparse"
+  DENSE_CONFIG="${DENSE_MODEL_DIR}/config.pbtxt"
+  SPARSE_CONFIG="${SPARSE_MODEL_DIR}/config.pbtxt"
 
   # Step 3: enable NVEmbedding and expose DynamicEmb files through ps_module.
   sed -i '/^[[:space:]]*NetworkArgs\.embedding_backend[[:space:]]*=/d' \

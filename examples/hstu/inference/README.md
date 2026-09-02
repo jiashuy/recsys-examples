@@ -64,9 +64,10 @@ KV cache, and Triton Server deployment.
 `launch_and_test_triton_python_backend.sh` prepares the HSTU model repository,
 starts Triton, waits for the sparse and dense models, and runs the HTTP client
 against both the evaluation and training datasets. The server and clients run
-in the same container. When testing finishes, the script stops its Triton
-process and restores the model configs, model-version directories, Gin config,
-and checkpoint `ps_module` directory.
+in the same container. The script copies only the sparse and dense models into
+an isolated temporary Triton repository, so other model directories are not
+loaded. When testing finishes, it stops Triton, removes the temporary model
+repository, and restores the Gin config and checkpoint `ps_module` directory.
 
 The workflow assumes an image built from this repository's Dockerfile with:
 

@@ -57,6 +57,11 @@ At the end of the KV-cache workflow, the following key artifacts are expected:
 3. C++ executable at `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
 4. AOTI/Triton runtime libraries under `examples/hstu/triton_libs/`
 
+The exporters keep these historical output locations when `--export_dir` and
+`--dump_dir` are omitted. Supply both options when separate runs need isolated
+model packages and replay data. Default and explicit destinations must be
+absent or empty.
+
 ---
 
 ## Exported Model Package
@@ -74,8 +79,12 @@ The complete exported model archive has this structure:
 path/to/model_archive
         ├── model.pt2                              # AOTI model package
         ├── metadata.json                          # NVEmbedding layer metadata
-        └── weights/{emb_layer_module_name}.nve    # NVEmbedding weight data
+        └── weights/*.nve                          # NVEmbedding weight data
 ```
+
+NVE 26.05 writes the legacy metadata contract, while the submodule-backed
+default NVE uses the newer contract. An export must be loaded by the same
+contract family.
 
 ---
 
@@ -84,17 +93,38 @@ path/to/model_archive
 1. PyTorch export, C++ replay, and development use the image built from
    `docker/Dockerfile`. It extends NVIDIA PyTorch 26.05
    (`nvcr.io/nvidia/pytorch:26.05-py3`) with the repository's FBGEMM, FlexKV,
-   NVE, HSTU, DynamicEmb, commons, and KV-cache manager builds. See the HSTU
-   example [README](../README.md) for broader training and inference context.
+   HSTU, DynamicEmb, commons, KV-cache manager, and isolated NVE 26.05 and
+   submodule-backed default versions. The image selects the default. See
+   the HSTU example [README](../README.md) for broader context.
 
 2. Triton Server testing uses `docker/Dockerfile.tritonserver`, based on NVIDIA
    Triton Server 26.06 (`nvcr.io/nvidia/tritonserver:26.06-py3`). It copies the
-   custom PyTorch backend, PyTorch installation, FlexKV, NVE, HSTU, FBGEMM,
-   custom-operator libraries, and Triton client dependencies from the AOTI
-   development image.
+   custom PyTorch backend, PyTorch installation, FlexKV, NVE 26.05, HSTU,
+   FBGEMM, custom-operator libraries, and Triton client dependencies from the
+   AOTI development image.
 
 3. KV-cache AOTI support depends on the FlexKV source under
    `third_party/FlexKV`, which `docker/Dockerfile` copies into the image.
+
+### NVE support
+
+Python export/reload and native C++ replay support NVE 26.05 and the
+submodule-backed default (26.06 or later). Upgrading the submodule updates the
+default without changing these workflows. The Triton model-init hook supports
+only 26.05.
+
+The default needs no `NVE_VERSION`. To select 26.05 before starting Python:
+
+```bash
+export NVE_INSTALL_ROOT=/opt/nve
+export NVE_VERSION=26.05
+export PYTHONPATH="${NVE_INSTALL_ROOT}/${NVE_VERSION}/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu"
+```
+
+A custom install root must be absolute, contain
+`<root>/{26.05,default}/python/pynve`, and remain outside Python's automatic
+`site-packages` directories. Do not expose a second NVE installation through
+`PYTHONPATH`, `.pth`, `LD_LIBRARY_PATH`, or `LD_PRELOAD`.
 
 ---
 
@@ -128,6 +158,9 @@ replay executable, NVE initialization hook, PyTorch backend, and staged Triton
 runtime libraries.
 
 ```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+
 # Build the reusable FBGEMM base image.
 DOCKER_BUILDKIT=1 docker build --progress=plain \
   --platform linux/amd64 \
@@ -210,8 +243,10 @@ docker run \
   recsys-examples-dev \
   bash -lecx "
     export FLEXKV_LOG_LEVEL=WARNING
+    export NVE_INSTALL_ROOT=/opt/nve
+    export NVE_VERSION=26.05
     export DYNAMICEMB_OPS_LIB_DIR=/workspace/recsys-examples/corelib/dynamicemb/torch_binding_build/
-    export PYTHONPATH=\${PYTHONPATH}:/workspace/recsys-examples/examples/
+    export PYTHONPATH=\${NVE_INSTALL_ROOT}/\${NVE_VERSION}/python:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
     cd /workspace/recsys-examples/examples/hstu
     export KVCACHE_MANAGER_CONFIG_FILE=./inference_aoti/kvcache_cpp_runtime.yaml
@@ -225,6 +260,7 @@ docker run \
     kvserver_pid=\$!
     sleep 10
     kill -0 \${kvserver_pid}
+    NVE_VERSION=26.05 \
     ./inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
       ./inference_aoti/hstu_gr_ranking_kvcache_model \
       ./inference_aoti/export_test_dump
@@ -236,6 +272,8 @@ docker run \
 ```
 
 ### 4. Package the Triton Server runtime image
+
+This runtime image intentionally packages NVE 26.05 only.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build --progress=plain \
@@ -276,6 +314,10 @@ docker run \
     sleep 30
 
     python3 test_tritonserver_aoti_hstu_model.py \
+      --workflow kv-cache \
+      --dump_dir export_test_dump \
+      --url localhost:8000 \
+      --model_name hstu_gr_ranking_kvcache \
       --batch_size 2 > test_benchmark.log
     cat test_benchmark.log
     kill \$triton_pid || true

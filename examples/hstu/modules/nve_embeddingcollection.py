@@ -22,7 +22,11 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 try:
     import pynve.torch.nve_ps as nve_ps
-    from pynve.torch.nve_layers import CacheType, NVEmbedding
+    from modules.nve_compat import (
+        gpu_only_constructor_kwargs,
+        hierarchical_constructor_kwargs,
+    )
+    from pynve.torch.nve_layers import NVEmbedding
 
     def get_nve_local_ps(vocab_size, embedding_dim, torch_dtype):
         return nve_ps.NVEParameterServer(vocab_size, embedding_dim, torch_dtype)
@@ -59,27 +63,29 @@ try:
                     gpu_cache_size *= torch.tensor(
                         [], dtype=embedding_config.data_type
                     ).element_size()
+                    storage = (
+                        sparse_shareables[embedding_config.name]
+                        if sparse_shareables
+                        else get_nve_local_ps(
+                            0, embedding_config.embedding_dim, torch.float32
+                        )
+                    )
                     self.embeddings[embedding_config.name] = NVEmbedding(
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=CacheType.Hierarchical,
                         gpu_cache_size=gpu_cache_size,
                         host_cache_size=0,
                         optimize_for_training=False,
-                        remote_interface=sparse_shareables[embedding_config.name]
-                        if sparse_shareables
-                        else get_nve_local_ps(
-                            0, embedding_config.embedding_dim, torch.float32
-                        ),
+                        **hierarchical_constructor_kwargs(storage),
                     )
                 else:
                     self.embeddings[embedding_config.name] = NVEmbedding(
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=CacheType.NoCache,
                         optimize_for_training=False,
+                        **gpu_only_constructor_kwargs(),
                     )
 
                 if not embedding_config.feature_names:
@@ -155,7 +161,7 @@ try:
         def is_weighted(self) -> bool:
             return self._is_weighted
 
-except:
+except ImportError:
     print("NV-Embeddings is not installed. NVEMB backend is not supported.")
     nve_layers = None
     InferenceNVEEmbeddingCollection = None  # type: ignore

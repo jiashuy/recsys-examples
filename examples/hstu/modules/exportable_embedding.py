@@ -78,15 +78,25 @@ from dynamicemb.exportable_tables import (
     InferenceEmbeddingCollection,
     create_inference_embedding_collection,
 )
+from modules.nve_compat import needs_legacy_embedding_lookup_fake_override
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
+if needs_legacy_embedding_lookup_fake_override():
+    # Import pynve.torch first so NVE owns the schema and installs its default
+    # fake. HSTU intentionally replaces only the legacy two-argument fake.
+    import pynve.torch as _pynve_torch  # noqa: F401
 
-# Register fake impl for nve_ops::embedding_lookup
-@torch.library.register_fake("nve_ops::embedding_lookup", allow_override=True)
-def _f(keys, layer_id):
-    ctx = torch.library.get_ctx()
-    return keys.new_empty((keys.size(0), ctx.new_dynamic_size()), dtype=torch.float32)
+    @torch.library.register_fake(
+        "nve_ops::embedding_lookup",
+        allow_override=True,
+    )
+    def _recsys_nve_2605_embedding_lookup_fake(keys, layer_id):
+        ctx = torch.library.get_ctx()
+        return keys.new_empty(
+            (keys.size(0), ctx.new_dynamic_size()),
+            dtype=torch.float32,
+        )
 
 
 @dataclass

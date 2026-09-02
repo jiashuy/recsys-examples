@@ -30,9 +30,31 @@ from dynamicemb_extensions import table_insert
 from torch.nn import ModuleDict
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
+_NVE_CACHE_NUM_WAYS = 8
+_NVE_CACHE_ALIGNMENT_BYTES = 16
+_NVE_CACHE_TAG_BYTES = 8
+_NVE_CACHE_COUNTER_BYTES = 4
+_NVE_CACHE_TIMESTAMP_BYTES = 8
+
+
 # ---------------------------------------------------------------------------
 # Helpers for InferenceEmbeddingTable construction
 # ---------------------------------------------------------------------------
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _linear_uvm_constructor_kwargs() -> Dict[str, object]:
+    """Return the LinearUVM selector for the imported NVE generation."""
+    if hasattr(nve_layers, "LayerType"):
+        return {"layer_type": nve_layers.LayerType.LinearUVM}
+    if hasattr(nve_layers, "CacheType"):
+        return {"cache_type": nve_layers.CacheType.LinearUVM}
+    raise RuntimeError(
+        "Unsupported pynve.torch.nve_layers API: expected LayerType or CacheType"
+    )
 
 
 def _resolve_capacity(opt: "DynamicEmbTableOptions") -> int:
@@ -64,6 +86,8 @@ def _resolve_embedding_dim(table_options: List["DynamicEmbTableOptions"]) -> int
 def _resolve_gpu_cache_size(
     table_options: List["DynamicEmbTableOptions"],
     total_size_bytes: int,
+    embedding_dim: int,
+    dtype_size: int,
 ) -> int:
     values = {int(opt.global_hbm_for_values or 0) for opt in table_options}
     if len(values) != 1:
@@ -72,7 +96,28 @@ def _resolve_gpu_cache_size(
         )
     gpu_cache_size = values.pop()
     if gpu_cache_size <= 0:
-        gpu_cache_size = int(total_size_bytes)
+        # NVE's cache size includes the aligned values, tags, counters, and
+        # timestamp for each 8-way set. Using only the embedding-table payload
+        # can be too small to form even one set for small inference tables.
+        tag_bytes_per_set = _align_up(
+            _NVE_CACHE_TAG_BYTES * _NVE_CACHE_NUM_WAYS,
+            _NVE_CACHE_ALIGNMENT_BYTES,
+        )
+        value_bytes_per_set = _align_up(
+            embedding_dim * dtype_size * _NVE_CACHE_NUM_WAYS,
+            _NVE_CACHE_ALIGNMENT_BYTES,
+        )
+        counter_bytes_per_set = _align_up(
+            _NVE_CACHE_COUNTER_BYTES * _NVE_CACHE_NUM_WAYS,
+            _NVE_CACHE_ALIGNMENT_BYTES,
+        )
+        min_cache_size = (
+            tag_bytes_per_set
+            + value_bytes_per_set
+            + counter_bytes_per_set
+            + _NVE_CACHE_TIMESTAMP_BYTES
+        )
+        gpu_cache_size = max(total_size_bytes, min_cache_size)
         print(
             "[INFO] global_hbm_for_values is 0 for all tables; "
             f"using fallback gpu_cache_size={gpu_cache_size}"
@@ -304,17 +349,22 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         total_rows = int(self.capacity_list_.sum().item())
         dtype_size = torch.finfo(output_dtype).bits // 8
         total_size_bytes = total_rows * self.emb_dim_ * dtype_size
-        self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
+        self.gpu_cache_size_ = _resolve_gpu_cache_size(
+            table_options,
+            total_size_bytes,
+            self.emb_dim_,
+            dtype_size,
+        )
 
         if self.pooling_mode_ == -1:
             self.nve_embedding_ = nve_layers.NVEmbedding(
                 num_embeddings=total_rows,
                 embedding_size=self.emb_dim_,
                 data_type=output_dtype,
-                cache_type=nve_layers.CacheType.LinearUVM,
                 gpu_cache_size=int(self.gpu_cache_size_),
                 optimize_for_training=False,
                 device=device,
+                **_linear_uvm_constructor_kwargs(),
             )
         else:
             if self.pooling_mode_ == 1:
@@ -325,11 +375,11 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 num_embeddings=total_rows,
                 embedding_size=self.emb_dim_,
                 data_type=output_dtype,
-                cache_type=nve_layers.CacheType.LinearUVM,
                 mode=mode,
                 gpu_cache_size=int(self.gpu_cache_size_),
                 optimize_for_training=False,
                 device=device,
+                **_linear_uvm_constructor_kwargs(),
             )
 
     def load_from_embedding_table(self, table_weights: torch.Tensor) -> None:
