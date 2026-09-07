@@ -1557,7 +1557,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table). ``values[i]`` is embeddings only, with the rest of each stored
         row in ``optimizer_states[i]`` and every score word in ``scores[i]``;
         ``meta[i]`` carries current_score / slot_index / current_capacity /
-        bucket_capacity / num_scores / world_size / table_options; ``evicted_keys[i]`` is the keys this table
+        row_capacity / bucket_capacity / num_scores / world_size /
+        table_options; ``evicted_keys[i]`` is the keys this table
         retained since the last dump -- evictions and explicit erases under
         ``RETAIN_KEY`` -- and ``erased_keys[i]`` the keys an explicit erase
         asked to have recorded. Both are drained here.
@@ -1627,14 +1628,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # Always drained: recording an erase is the erase call's decision,
             # so there is no table setting to gate on here.
             er = self._drain_retained(storage, "pop_erased_keys", True, table_id, pg)
-            # current_capacity: DynamicEmbStorage has one key_index_map; a
-            # HybridStorage sums its tiers.
-            if hasattr(storage, "key_index_map"):
-                current_capacity = storage.key_index_map.capacity(table_id)
-            else:
-                current_capacity = sum(
-                    s.key_index_map.capacity(table_id) for s in storage.tables
-                )
             res.table_names.append(table_name)
             res.keys.append(keys_cat)
             res.values.append(values_cat)
@@ -1646,7 +1639,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 {
                     "current_score": current_score,
                     "slot_index": slot_index,
-                    "current_capacity": current_capacity,
+                    "current_capacity": self._capacity_of(storage, table_id),
+                    "row_capacity": self._row_capacity_of(storage, table_id),
                     "bucket_capacity": self._bucket_capacity_of(storage),
                     "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
@@ -1678,12 +1672,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if src_options is None:
             return "delta carries no 'table_options' (dumped by an older version)"
 
-        if hasattr(storage, "key_index_map"):
-            capacity = storage.key_index_map.capacity(table_id)
-        else:
-            capacity = sum(s.key_index_map.capacity(table_id) for s in storage.tables)
         checks = [
-            ("capacity", meta.get("current_capacity"), capacity),
+            (
+                "capacity",
+                meta.get("current_capacity"),
+                self._capacity_of(storage, table_id),
+            ),
+            (
+                "row_capacity",
+                meta.get("row_capacity"),
+                self._row_capacity_of(storage, table_id),
+            ),
             (
                 "bucket_capacity",
                 meta.get("bucket_capacity"),
@@ -1962,15 +1961,50 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return out.cpu()
 
     @staticmethod
+    def _row_capacity_of(
+        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+    ) -> Tuple[int, ...]:
+        """Value-buffer rows per tier for one logical table.
+
+        A second bound, distinct from :meth:`_capacity_of`. That one is the key
+        map's capacity, which is the modulus for choosing a home bucket and so
+        decides whether a *slot* means the same thing in two tables. This one is
+        how many rows the value buffer actually has, which is what a *row* write
+        is bounded by.
+
+        The two coincide everywhere except NO_EVICTION, where the key map is
+        deliberately ``1 / max_load_factor`` times the value buffer -- and
+        rounding that up to a whole number of buckets makes the map's capacity
+        non-injective in the buffer's. With ``bucket_capacity=128``, an
+        ``init_capacity`` of 100 and of 128 both give a 256-slot key map while
+        leaving 100 and 128 rows: equal on :meth:`_capacity_of`, and a source
+        row of 127 written past the end of a 100-row target. Per tier rather
+        than summed, since ``slot_index`` routes each key to one tier and a
+        matching total would say nothing about either.
+
+        Note the two meanings of ``tables`` in play: a storage's tiers, each of
+        which has its own ``tables`` of value buffers indexed by logical table.
+        """
+        return tuple(s.tables[table_id].shape[0] for s in storage.tables)
+
+    @staticmethod
+    def _capacity_of(
+        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+    ) -> int:
+        """Slots one logical table has across the whole storage.
+
+        Summed over the tiers, because capacity is the one property here that a
+        second tier adds to rather than duplicates -- the others below read a
+        single tier.
+        """
+        return sum(s.key_index_map.capacity(table_id) for s in storage.tables)
+
+    @staticmethod
     def _bucket_capacity_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
         """The storage's hash-bucket capacity (HBM tier for a hybrid storage)."""
-        if hasattr(storage, "key_index_map"):
-            return storage.key_index_map.bucket_capacity_
         return storage.tables[0].key_index_map.bucket_capacity_
 
     @staticmethod
     def _num_scores_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
         """Score words per key (HBM tier for a hybrid storage)."""
-        if hasattr(storage, "key_index_map"):
-            return storage.key_index_map.num_scores_
         return storage.tables[0].key_index_map.num_scores_

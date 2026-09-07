@@ -95,7 +95,14 @@ class DeltaDumpResult:
                 with ``keys[i]``; the storage slot each dumped key occupies, used
                 by ``replay_increment``. For NO_EVICTION tables it packs the key
                 slot (high 32 bits) and value row (low 32 bits) into one int64.
-            meta[i]["current_capacity"]: int  -- table's current capacity (slots).
+            meta[i]["current_capacity"]: int  -- key-map slots for this table.
+                The modulus for choosing a home bucket, so it decides whether a
+                slot means the same thing in two tables.
+            meta[i]["row_capacity"]:     Tuple[int, ...] -- value-buffer rows per
+                storage tier. A second bound: ``current_capacity`` says where a
+                key may sit, this says how far a row write may reach. The two
+                coincide except under NO_EVICTION, whose key map is deliberately
+                larger than its value buffer.
             meta[i]["bucket_capacity"]:  int  -- slots per hash bucket; replay
                 compares it to decide whether the source slots are usable.
             meta[i]["num_scores"]:       int  -- score words per key; part of the

@@ -2307,6 +2307,16 @@ class DynamicEmbStorage(Storage):
     def key_index_map(self):
         return self._state.key_index_map
 
+    @property
+    def tables(self) -> List[DynamicEmbTableState]:
+        """The tiers this storage is made of -- one, here.
+
+        Mirrors :attr:`HybridStorage.tables` so that a caller asking a layout
+        question ("how much capacity does table i have across this storage?")
+        can iterate uniformly instead of branching on which storage it holds.
+        """
+        return [self._state]
+
     def fill_tables(
         self,
         load_factor: float = 0.95,
@@ -2926,6 +2936,12 @@ class HybridStorage(Storage):
 
     @property
     def tables(self) -> List[DynamicEmbTableState]:
+        """The tiers this storage is made of: HBM first, then host.
+
+        Order matters to callers that want a single tier's property rather than
+        a sum -- bucket capacity and score-word count are read off ``tables[0]``,
+        the HBM tier.
+        """
         return [self._hbm, self._host]
 
     # -- Score management --

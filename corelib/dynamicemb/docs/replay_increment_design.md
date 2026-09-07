@@ -17,7 +17,8 @@
 | `meta[i]` field | why replay needs it |
 |---|---|
 | `slot_index` | the exact key slot / value row each dumped key occupied |
-| `current_capacity` | a source slot is only transferable when the target's capacity matches |
+| `current_capacity` | a source slot is only transferable when the target's key-map capacity matches |
+| `row_capacity` | how far a row write may reach, which under NO_EVICTION is *not* the key-map capacity |
 | `world_size` | the source's row-wise fan-out (key → rank modulo base) |
 | `table_options` | `bucket_capacity` / `score_strategy` / `dim` / `dist_type` compatibility |
 | `current_score` | the table score after the dump |
@@ -115,7 +116,17 @@ the source's. §4.2 checks that up front and §4.3 re-checks it per key.
 A table is replayed only when **all** of these match; otherwise `replay_increment`
 raises `ValueError` naming the first mismatch, before writing anything:
 
-- `meta["current_capacity"]` vs target `key_index_map.capacity(table_id)`
+- `meta["current_capacity"]` vs target `key_index_map.capacity(table_id)` — the
+  modulus for choosing a home bucket, i.e. whether a *slot* means the same thing
+  in both tables
+- `meta["row_capacity"]` vs the target's value-buffer rows per tier — a separate
+  bound on where a *row* write may land. The two are the same number everywhere
+  except NO_EVICTION, whose key map is `1 / max_load_factor` times its value
+  buffer; rounding that up to whole buckets makes the map's capacity
+  non-injective in the buffer's, so equal `current_capacity` does not imply
+  equal row counts. With `bucket_capacity=128`, `init_capacity` 100 and 128 both
+  give a 256-slot key map over 100 and 128 rows -- and a source row of 127
+  written past the end of a 100-row target
 - `meta["table_options"].bucket_capacity` vs the target table's
 - `meta["table_options"].score_strategy` vs the target's, compared by
   **physical** word order — `(TIMESTAMP, LFU)` and `(LFU, TIMESTAMP)` are the

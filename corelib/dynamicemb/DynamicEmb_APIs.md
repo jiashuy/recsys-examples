@@ -822,7 +822,12 @@ The meaning of the threshold depends on the table's `score_strategy`:
                 - ``"slot_index": torch.Tensor`` -- int64 host tensor aligned with
                   ``keys``; the storage slot each dumped key occupies (for
                   ``replay_increment``).
-                - ``"current_capacity": int`` -- the table's current capacity.
+                - ``"current_capacity": int`` -- key-map slots: the modulus that
+                  decides a key's home bucket.
+                - ``"row_capacity": Tuple[int, ...]`` -- value-buffer rows per
+                  storage tier, which is what bounds a row write. Equal to
+                  `current_capacity` except under NO_EVICTION, whose key map is
+                  deliberately larger than its value buffer.
                 - ``"bucket_capacity": int`` -- slots per hash bucket.
                 - ``"num_scores": int`` -- score words per key; part of the
                   slot layout ``replay_increment`` compares against.
@@ -841,7 +846,7 @@ More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main
 **Behavior**
 For every table in the delta, `replay_increment` erases the table's `erased_keys` (so the target converges to the source) and then upserts `keys` / `values` at the slots in `meta["slot_index"]`. `evicted_keys` is never applied: the key that took an evicted key's slot is in the same delta and overwrites it.
 
-*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type`) against the target table, and a mismatch raises `ValueError` naming the first mismatching field, **before anything is written**. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
+*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `row_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type`) against the target table, and a mismatch raises `ValueError` naming the first mismatching field, **before anything is written**. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
 
 The same rule is enforced per key inside the kernel — a slot that does not land in its key's home bucket raises rather than dropping the key.
 
