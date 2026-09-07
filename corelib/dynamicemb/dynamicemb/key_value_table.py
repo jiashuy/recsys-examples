@@ -862,12 +862,14 @@ def _fresh_score_block(
 ) -> torch.Tensor:
     """``[N, num_scores]`` physical score block for keys written by replay.
 
-    A delta carries embeddings, not scores, so a replayed key is scored as if it
-    had just been inserted here: recency words get *timestamp*, every other word
-    gets *insert_score*. The replica therefore ranks its restored keys by when it
-    received them rather than by how the source ranked them -- acceptable because
-    the score only orders future evictions, and a replica that evicts on its own
-    schedule still holds correct embeddings.
+    Used when the caller did not ask for ``ReplayContent.SCORE``. The delta does
+    carry the source's scores, but they were not loaded, so a replayed key is
+    scored as if it had just been inserted here instead: recency words get
+    *timestamp*, every other word gets *insert_score*. The replica then ranks its
+    restored keys by when it received them rather than by how the source ranked
+    them -- acceptable because the score only orders future evictions, and a
+    replica that evicts on its own schedule still holds correct embeddings.
+    Ask for ``SCORE`` to inherit the source's ranking instead.
 
     *insert_score* is passed in rather than read off ``state.score``: that field
     is populated by the forward pass, and replay is the one write path that can
@@ -883,7 +885,12 @@ def _fresh_score_block(
         return value_rows.to(device=device, dtype=SCORE_TYPE).view(-1, 1)
     n = value_rows.numel()
     num_scores = state.key_index_map.num_scores_
-    block = torch.empty((n, num_scores), device=device, dtype=SCORE_TYPE)
+    # Zeros, not ``empty``: the loop below fills one column per configured
+    # strategy, while the width comes from the score policy. The two agree for
+    # every strategy there is, but they are derived from different places, so a
+    # future divergence should leave a quiet zero rather than whatever the
+    # allocator handed back.
+    block = torch.zeros((n, num_scores), device=device, dtype=SCORE_TYPE)
     physical = get_physical_score_order(state.options_list[table_id].score_strategy)
     for word, strategy in enumerate(physical):
         block[:, word] = (
