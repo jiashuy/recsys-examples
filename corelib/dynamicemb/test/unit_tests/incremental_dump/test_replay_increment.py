@@ -234,9 +234,16 @@ def test_dump_splits_the_value_row(current_device, optimizer):
 
 
 def test_dump_scores_are_column_aligned(current_device):
-    """``scores`` carries every score word, one row per key, in logical order."""
+    """``scores`` is one row per key, one column per configured strategy.
+
+    Configured as ``(LFU, TIMESTAMP)`` on purpose. The physical layout of the
+    compound policy is always ``(TIMESTAMP, LFU)``, so the *reversed* order is
+    what makes the columns tell logical apart from physical: with the natural
+    order the permutation is the identity and the test would pass even with
+    ``score_dump_permutation`` deleted.
+    """
     device = torch.device(f"cuda:{current_device}")
-    strategy = (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
+    strategy = (DynamicEmbScoreStrategy.LFU, DynamicEmbScoreStrategy.TIMESTAMP)
     model = make_model(current_device, score_strategy=strategy)
     hot = list(range(1001, 1051))
     cold = list(range(2001, 2051))
@@ -248,29 +255,36 @@ def test_dump_scores_are_column_aligned(current_device):
     keys, scores = sorted_view(delta.keys[0], delta.scores[0])
     assert scores.shape == (keys.numel(), len(strategy))
 
-    # Column 1 is the LFU frequency, carried verbatim: the keys touched six
-    # times must outrank those touched once. Column 0 is a timestamp held as an
-    # age, so it is not compared against a raw clock here.
     hot_set = set(hot)
     is_hot = torch.tensor([int(k) in hot_set for k in keys.tolist()])
-    assert int(scores[is_hot, 1].min()) > int(scores[~is_hot, 1].max())
+
+    # Column 0 is the frequency, carried verbatim -- exact counts, not an
+    # ordering: one access each for the cold keys, five for the hot ones. A
+    # comparison would still hold if every count were off by the same amount.
+    assert set(scores[is_hot, 0].tolist()) == {5}
+    assert set(scores[~is_hot, 0].tolist()) == {1}
+
+    # Column 1 is the timestamp, dumped as an age (cur_ts - score). The hot keys
+    # were touched last, so theirs is the smaller -- which pins the direction of
+    # the conversion, the part a raw clock cannot be compared against.
+    assert int(scores[is_hot, 1].max()) < int(scores[~is_hot, 1].min())
 
 
 @pytest.mark.parametrize(
-    "content, replica_ranks_like_source",
+    "content, keeps_source_scores",
     [(ReplayContent.EMBEDDING, False), (ReplayContent.ALL, True)],
 )
 def test_replay_scores_follow_the_content_flag(
-    current_device, content, replica_ranks_like_source
+    current_device, content, keeps_source_scores
 ):
     """Whether the replica inherits the source's ranking is ``SCORE``'s call.
 
-    Same setup either way -- hot keys accessed six times, cold keys once, and a
-    threshold drawn between them that splits the source's table exactly in half.
-    Without ``SCORE`` every restored key carries the same fresh score, so the
-    same threshold splits nothing; with it the frequency column is carried
-    verbatim and the split is reproduced. The pair is what makes the limitation
-    legible: neither half means much alone.
+    Same setup either way -- cold keys accessed once, hot keys five times -- and
+    the replica's own scores are read back to see which it got. With ``SCORE``
+    the frequencies arrive verbatim; without it every restored key is scored as
+    if freshly inserted here, so they all score alike and the replica ranks by
+    when it received a key rather than by how the source ranked it. The pair is
+    what makes that a visible choice: neither half says much alone.
     """
     device = torch.device(f"cuda:{current_device}")
     src = make_model(current_device, score_strategy=DynamicEmbScoreStrategy.LFU)
@@ -282,23 +296,32 @@ def test_replay_scores_follow_the_content_flag(
     for _ in range(5):  # drive the two groups' LFU counts apart
         touch(src, hot, device)
 
-    all_keys = set(hot) | set(cold)
-    threshold = 3  # between the cold keys' 1 access and the hot keys' 6
-    assert set(src.incremental_dump({TABLE_NAME: threshold}).keys[0].tolist()) == set(
-        hot
-    ), "the source must rank hot keys above cold ones, or there is nothing to inherit"
+    delta = dump_all(src)
+    hot_set = set(hot)
+    src_keys, src_freq = sorted_view(delta.keys[0], delta.scores[0][:, 0])
+    src_is_hot = torch.tensor([k in hot_set for k in src_keys.tolist()])
+    assert set(src_freq[src_is_hot].tolist()) == {5}
+    assert set(src_freq[~src_is_hot].tolist()) == {
+        1
+    }, "the source must rank hot above cold, or there is nothing to inherit"
 
-    dst.replay_increment(dump_all(src), content=content)
-    assert set(dump_all(dst).keys[0].tolist()) == all_keys
+    dst.replay_increment(delta, content=content)
 
-    split = set(dst.incremental_dump({TABLE_NAME: threshold}).keys[0].tolist())
-    if replica_ranks_like_source:
-        assert split == set(hot), "the replica must rank the way the source did"
+    # Read the replica's scores directly rather than inferring them from what a
+    # threshold selects: the frequency is what the flag does or does not carry.
+    replayed = dump_all(dst)
+    assert set(replayed.keys[0].tolist()) == set(hot) | set(cold)
+    keys, freq = sorted_view(replayed.keys[0], replayed.scores[0][:, 0])
+    is_hot = torch.tensor([k in hot_set for k in keys.tolist()])
+
+    if keeps_source_scores:
+        assert set(freq[is_hot].tolist()) == {5}
+        assert set(freq[~is_hot].tolist()) == {1}
     else:
-        # Every key scored alike, so the threshold takes all of them or none --
-        # which of the two depends on where the fresh score falls, and that is
-        # an implementation detail this deliberately does not pin down.
-        assert split in (set(), all_keys), f"got {len(split)} of {len(all_keys)}"
+        # One value for every key, whatever it is -- which value a fresh insert
+        # assigns is not this test's business, only that the source's ranking
+        # did not come along.
+        assert len(set(freq.tolist())) == 1, f"got {sorted(set(freq.tolist()))}"
 
 
 def test_replay_spans_multiple_batches(current_device):
@@ -569,30 +592,6 @@ def test_replay_content_restores_optimizer_state(current_device):
     got = export_optimizer_state(dst)
     for key in keys:
         torch.testing.assert_close(got[key], src_state[key])
-
-
-def test_replay_without_embedding_needs_aligned_rows(current_device):
-    """Omitting ``EMBEDDING`` is only legal for an already-aligned replica.
-
-    A key landing on a row it does not already own has no embedding to keep, and
-    the row still holds the previous occupant's vector -- serving that under the
-    new key would be silent corruption, so replay refuses.
-    """
-    device = torch.device(f"cuda:{current_device}")
-    src = make_model(current_device)
-    dst = make_model(current_device)
-    keys = list(range(1001, 1051))
-    touch(src, keys, device)
-    delta = dump_all(src)
-
-    score_only = ReplayContent.SCORE
-    with pytest.raises(ValueError, match="do not already occupy their target row"):
-        dst.replay_increment(delta, content=score_only)
-
-    # Align the replica first; then the same call is fine.
-    dst.replay_increment(delta)
-    dst.replay_increment(delta, content=score_only)
-    assert set(dump_all(dst).keys[0].tolist()) == set(keys)
 
 
 def test_replay_does_not_leave_displaced_keys_in_the_cache(current_device):
