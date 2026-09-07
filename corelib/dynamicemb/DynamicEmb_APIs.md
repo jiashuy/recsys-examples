@@ -849,7 +849,7 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 *Scores and optimizer state are dumped but not yet replayed.* `DeltaDumpResult.scores` and `.optimizer_states` carry them, but `replay_increment` ignores both for now: a restored key is scored as if it had just been inserted into the target, and keeps its optimizer state only if it already occupies the target row. So the replica ranks its own future evictions by when it received each key rather than by how the source ranked it. Embeddings are unaffected — the two models can evict in different orders, but never disagree on the value of a key they both hold. NO_EVICTION is the exception and is exact: its score word is a value row, not a score.
 
-*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's world size. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
+*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
 
 *Optimizer state* is not part of a delta. A key that already occupies its target row keeps its optimizer state; a row taken over from another key (or a brand-new one) is reset to the table's initial optimizer state.
 
@@ -861,14 +861,14 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
     def replay_increment(
         model: torch.nn.Module,
         deltas: Dict[str, "DeltaDumpResult"],
-        pg: Optional[dist.ProcessGroup] = None,
+        content: ReplayContent = ReplayContent.ALL,
     ) -> Dict[str, Dict[str, "ReplayStats"]]:
         """Write incremental_dump results back into a model's dynamic embedding tables.
 
         Args:
             model(nn.Module): The model containing dynamic embedding tables.
             deltas(Dict[str, DeltaDumpResult]): `incremental_dump`'s return value, keyed by embedding-collection path. Collections or tables the model does not have are skipped with a warning.
-            pg(Optional[dist.ProcessGroup]): optional. The process group defining this model's shard fan-out. Defaults to the world the tables were created against.
+            content(ReplayContent): which parts of each dumped row to write back — embedding, optimizer state, score, or any combination. Defaults to all three.
 
         Returns
         -------
@@ -899,7 +899,7 @@ Example — replicate a training model's deltas into a serving model:
                      for i in range(len(r.table_names))}
                  for c, r in deltas.items()}     # threshold for the NEXT dump
 
-    stats = replay_increment(serve_model, deltas, pg)   # raises if layouts differ
+    stats = replay_increment(serve_model, deltas)       # raises if layouts differ
     for collection, per_table in stats.items():
         for name, s in per_table.items():
             print(collection, name, s.upserted, "keys replayed at their source slot")

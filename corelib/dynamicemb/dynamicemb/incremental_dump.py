@@ -443,7 +443,6 @@ def incremental_dump(
 def replay_increment(
     model: torch.nn.Module,
     deltas: Dict[str, DeltaDumpResult],
-    pg: Optional[dist.ProcessGroup] = None,
     content: ReplayContent = ReplayContent.ALL,
 ) -> Dict[str, Dict[str, ReplayStats]]:
     """Write ``incremental_dump`` results back into a model's dynamic embedding tables.
@@ -505,8 +504,6 @@ def replay_increment(
         deltas (Dict[str, DeltaDumpResult]): ``incremental_dump``'s return value,
             keyed by embedding-collection path. Collections or tables that the
             model does not have are skipped with a warning.
-        pg (Optional[dist.ProcessGroup]): process group defining this model's
-            shard fan-out. Defaults to the world the tables were created against.
         content (ReplayContent): which parts of each dumped row to write back --
             embedding, optimizer state, score, or any combination. Defaults to
             all three.
@@ -562,7 +559,6 @@ def replay_increment(
             collection_stats.update(
                 dynamic_emb_module.replay_increment(
                     module_delta,
-                    pg=pg,
                     content=content,
                 )
             )

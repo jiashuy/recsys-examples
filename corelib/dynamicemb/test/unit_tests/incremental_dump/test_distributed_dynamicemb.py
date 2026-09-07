@@ -512,7 +512,7 @@ def test_replay_increment_distributed(
 
     pg = intra_and_cross_node_pg()[0]
     deltas = incremental_dump(train_model, 0, pg)
-    stats = replay_increment(serve_model, deltas, pg)
+    stats = replay_increment(serve_model, deltas)
 
     delta = deltas[prefix_path]
     for j, table_name in enumerate(delta.table_names):

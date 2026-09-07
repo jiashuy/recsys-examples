@@ -1710,7 +1710,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def replay_increment(
         self,
         delta: "DeltaDumpResult",
-        pg: Optional[dist.ProcessGroup] = None,
         content: ReplayContent = ReplayContent.ALL,
     ) -> Dict[str, ReplayStats]:
         """Write an ``incremental_dump`` delta back into this module's tables.
@@ -1747,8 +1746,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Args:
             delta: one collection's :class:`DeltaDumpResult`. Tables not present
                 in this module are skipped with a warning.
-            pg: process group used to size this model's shard fan-out. Defaults
-                to the world the tables were created against.
 
         Returns:
             ``{table_name: ReplayStats}`` -- keys written / removed / skipped
@@ -1772,12 +1769,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"replay_increment requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
             )
-        rank = dist.get_rank(group=pg) if dist.is_initialized() else 0
-        world_size = (
-            dist.get_world_size(group=pg)
-            if (pg is not None and dist.is_initialized())
-            else self._shard_world_size
-        )
+        # Both global. Ownership follows how the table was sharded -- row-wise
+        # over the whole world, which is what ``_shard_world_size`` records and
+        # what ``meta["world_size"]`` is checked against. There is deliberately
+        # no process-group argument: replay is local (filter by ownership, then
+        # write), so a group could only narrow the modulus and mis-route every
+        # key, leaving each claimed by several ranks and the one that owns it
+        # claiming nothing.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = self._shard_world_size
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
             # Push dirty cache entries down first so the storage copy this replay
             # is about to overwrite is the authoritative one.
