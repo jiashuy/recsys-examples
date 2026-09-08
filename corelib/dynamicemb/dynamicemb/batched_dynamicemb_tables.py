@@ -17,6 +17,7 @@ import os
 import warnings
 from collections import deque
 from copy import deepcopy
+from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from itertools import accumulate
@@ -173,6 +174,20 @@ def owned_key_mask(
     else:  # roundrobin
         owners = keys_np % np.uint64(world_size)
     return torch.from_numpy(owners == np.uint64(rank))
+
+
+def owned_keys(
+    keys: Optional[Tensor], rank: int, world_size: int, dist_type: str
+) -> Optional[Tensor]:
+    """:func:`owned_key_mask` applied, tolerating a list that is absent or empty.
+
+    Removal lists are optional and often empty, so the caller would otherwise
+    repeat that guard at every use.
+    """
+    if keys is None or keys.numel() == 0:
+        return keys
+    mask = owned_key_mask(keys, rank, world_size, dist_type)
+    return keys if mask is None else keys[mask]
 
 
 def get_loading_files(
@@ -492,6 +507,33 @@ def _print_memory_consume(
             "total memory ≈ HBM cache + Host/PS backing (no subtract)."
         )
     print(output)
+
+
+@dataclass
+class _ReplayJob:
+    """One table's share of a delta, resolved and checked, ready to write.
+
+    Produced by the planning pass and consumed by the applying one, so that "no
+    table is written until every table has been checked" is a property of the
+    control flow rather than something to be read out of a long loop.
+    """
+
+    table_id: int  # where this table sits among the module's own
+    name: str
+    keys: Tensor
+    values: Tensor
+    optimizer_states: Optional[Tensor]
+    scores: Optional[Tensor]
+    slot_index: Tensor
+    # Only ``erased_keys`` is ever replayed as a removal. ``evicted_keys`` is
+    # not one a replica has to perform -- the key that took the evicted one's
+    # slot is in this very delta and overwrites it -- but the cache is a second
+    # index that write does not reach, so it is carried for invalidation.
+    erased_keys: Optional[Tensor]
+    evicted_keys: Optional[Tensor]
+    # The source's score bookkeeping, adopted before writing so a restored key
+    # lands on the scale the replica will later threshold against.
+    current_score: Optional[int]
 
 
 class BatchedDynamicEmbeddingTablesV2(nn.Module):
@@ -1719,14 +1761,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         a ``ValueError`` rather than written some other way -- see
         :meth:`_replay_compatibility`.
 
-        *content* selects which parts of each row are written -- embedding,
-        optimizer state, score -- and defaults to all three, i.e. the replica
-        ends up holding what the source held. Dropping ``SCORE`` leaves restored
-        keys scored as if freshly inserted here, so the replica orders its own
-        future evictions by when it received each key rather than by how the
-        source ranked it; dropping ``OPTIMIZER_STATE`` keeps the state of a key
-        already on its target row and initialises any other. See
-        :class:`ReplayContent`.
+        The key and its embedding always travel; *content* selects what comes
+        along, and defaults to both, i.e. the replica ends up holding what the
+        source held. Dropping ``SCORE`` leaves restored keys scored as if freshly
+        inserted here, so the replica orders its own future evictions by when it
+        received each key rather than by how the source ranked it; dropping
+        ``OPTIMIZER_STATE`` keeps the state of a key already on its target row
+        and initialises any other. See :class:`ReplayContent`.
 
         ``delta.erased_keys`` is applied whenever it holds anything: those keys
         were explicitly removed at the source and nothing else will remove them
@@ -1768,68 +1809,71 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"replay_increment requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
             )
-        # Both global. Ownership follows how the table was sharded -- row-wise
-        # over the whole world, which is what ``_shard_world_size`` records and
-        # what ``meta["world_size"]`` is checked against. There is deliberately
-        # no process-group argument: replay is local (filter by ownership, then
-        # write), so a group could only narrow the modulus and mis-route every
-        # key, leaving each claimed by several ranks and the one that owns it
-        # claiming nothing.
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = self._shard_world_size
+        # Two passes on purpose. A delta usually spans a whole collection, so
+        # anything checked only when its table's turn came would raise after the
+        # earlier tables had been erased from and written to -- a partly applied
+        # delta, worse to recover from than a rejected one, and not what this
+        # promises. Planning touches nothing; applying validates nothing.
+        plan = self._plan_replay(delta, content, storage)
+
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
-            # Push dirty cache entries down first so the storage copy this replay
-            # is about to overwrite is the authoritative one.
+            # After planning, so a rejected delta leaves the model exactly as it
+            # was. Pushing dirty cache entries down first makes the storage copy
+            # this replay is about to overwrite the authoritative one.
             flush_cache(self._cache, storage)
 
         ts = device_timestamp()
-        results: Dict[str, ReplayStats] = {}
-        # Validate every table before writing any of them. A delta usually spans
-        # a whole collection, so checking table i only when its turn comes would
-        # let a mismatch on the last one raise after the first few had already
-        # been erased from and written to -- a partly-applied delta, which is
-        # worse than a rejected one and is not what this promises.
-        planned = []
+        return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}
+
+    def _plan_replay(
+        self,
+        delta: "DeltaDumpResult",
+        content: ReplayContent,
+        storage: Union[DynamicEmbStorage, HybridStorage],
+    ) -> List["_ReplayJob"]:
+        """Resolve and check every table in *delta*, writing nothing.
+
+        Raises on the first table that cannot be replayed, so a caller that sees
+        an exception knows the collection is untouched.
+        """
+        plan: List[_ReplayJob] = []
         for i, table_name in enumerate(delta.table_names):
             if table_name not in self._table_names:
                 warnings.warn(
                     f"replay_increment: table_name '{table_name}' is not in this "
                     f"module (available: {self._table_names}); skipping.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
                 continue
             table_id = self._table_names.index(table_name)
             meta = delta.meta[i]
 
-            keys = delta.keys[i]
-            values = delta.values[i]
-            opt_states = (
-                delta.optimizer_states[i]
-                if ReplayContent.OPTIMIZER_STATE in content
-                else None
-            )
-            scores = delta.scores[i] if ReplayContent.SCORE in content else None
             slot_index = meta.get("slot_index")
-            widths = {"values": values.size(0)}
-            if opt_states is not None:
-                widths["optimizer_states"] = opt_states.size(0)
-            if scores is not None:
-                widths["scores"] = scores.size(0)
-            if any(w != keys.numel() for w in widths.values()):
-                raise ValueError(
-                    f"replay_increment: delta columns for table '{table_name}' are "
-                    f"not row-aligned (keys={keys.numel()}, "
-                    + ", ".join(f"{k}={v}" for k, v in widths.items())
-                    + ")."
-                )
-
             if slot_index is None:
                 raise ValueError(
                     f"replay_increment: delta for table '{table_name}' carries no "
                     "slot_index; it was produced by an incompatible version of "
                     "incremental_dump."
                 )
+            job = _ReplayJob(
+                table_id=table_id,
+                name=table_name,
+                keys=delta.keys[i],
+                values=delta.values[i],
+                optimizer_states=(
+                    delta.optimizer_states[i]
+                    if ReplayContent.OPTIMIZER_STATE in content
+                    else None
+                ),
+                scores=delta.scores[i] if ReplayContent.SCORE in content else None,
+                slot_index=slot_index,
+                erased_keys=delta.erased_keys[i],
+                evicted_keys=delta.evicted_keys[i],
+                current_score=meta.get("current_score"),
+            )
+            self._check_delta_shapes(job, content, storage)
+
             mismatch = self._replay_compatibility(table_id, meta)
             if mismatch is not None:
                 raise ValueError(
@@ -1839,112 +1883,202 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "two tables share a layout; configure the target to match the "
                     "source, or rebuild it from a full checkpoint instead."
                 )
-            planned.append((i, table_name, table_id, keys, values, opt_states, scores))
+            plan.append(job)
+        return plan
 
-        for i, table_name, table_id, keys, values, opt_states, scores in planned:
-            meta = delta.meta[i]
-            option = self._dynamicemb_options[table_id]
-            slot_index = meta["slot_index"]
-            stats = ReplayStats()
+    def _check_delta_shapes(
+        self,
+        job: "_ReplayJob",
+        content: ReplayContent,
+        storage: Union[DynamicEmbStorage, HybridStorage],
+    ) -> None:
+        """Every shape the write path depends on, checked before it runs.
 
-            # Only ``erased_keys`` is ever replayed. ``evicted_keys`` is not a
-            # removal a replica has to perform: the key that took the evicted
-            # one's slot is in this very delta and overwrites it. That list
-            # exists for other consumers of the dump, and replay ignores it.
-            # An empty or absent list is normal -- nothing was erased, or rank
-            # filtering left this rank none of them.
-            erased = delta.erased_keys[i]
-            # Not replayed as a removal -- the delta's own writes reproduce an
-            # eviction in the storage -- but still needed to invalidate the
-            # cache, which those writes do not reach. See below.
-            evicted = delta.evicted_keys[i]
-            mask = owned_key_mask(keys, rank, world_size, option.dist_type)
-            if mask is not None:
-                stats.skipped = int(keys.numel() - mask.sum().item())
-                keys, values = keys[mask], values[mask]
-                if opt_states is not None:
-                    opt_states = opt_states[mask]
-                if scores is not None:
-                    scores = scores[mask]
-                slot_index = slot_index[mask]
-                if erased is not None and erased.numel() > 0:
-                    er_mask = owned_key_mask(erased, rank, world_size, option.dist_type)
-                    erased = erased[er_mask]
-                if evicted is not None and evicted.numel() > 0:
-                    ev_mask = owned_key_mask(
-                        evicted, rank, world_size, option.dist_type
-                    )
-                    evicted = evicted[ev_mask]
+        The storage layer checks the widths again -- it is callable on its own,
+        without this module's planning pass -- but by then a table's predecessors
+        have been written, so a malformed column on the last table of a
+        collection would leave the rest of it advanced.
+        """
+        option = self._dynamicemb_options[job.table_id]
+        n = job.keys.numel()
 
-            # Erase first: a key erased and then re-inserted inside the same
-            # window appears in BOTH lists, and must survive the replay.
-            if erased is not None and erased.numel() > 0:
-                # Not recorded into this model's own erased buffer: these
-                # removals came from upstream, and re-reporting them would make
-                # a chained replica replay what it already received. A model
-                # that is itself a dump source for someone further down would
-                # want the opposite -- say so when that case turns up.
-                stats.erased = storage.erase_keys(table_id, erased)
-
-            # Adopt the source's score bookkeeping BEFORE writing, so a
-            # restored key lands on the same scale the replica will later
-            # threshold its own incremental_dump against. Timestamp-based tables
-            # read their score off the device clock, so there is nothing to
-            # carry -- their restored keys are stamped with ``ts``.
-            current_score = meta.get("current_score")
-            if (
-                current_score is not None
-                and not score_strategy_has_timestamp_column(option.score_strategy)
-                and table_name in self._scores
-            ):
-                self._scores[table_name] = current_score
-            stats.merge(
-                storage.replay_increment(
-                    table_id,
-                    keys,
-                    values,
-                    opt_states,
-                    scores,
-                    slot_index,
-                    self._scores.get(table_name, 0),
-                    content=content,
-                    timestamp=ts,
-                )
+        rows = {"values": job.values.size(0), "slot_index": job.slot_index.numel()}
+        if job.optimizer_states is not None:
+            rows["optimizer_states"] = job.optimizer_states.size(0)
+        if job.scores is not None:
+            rows["scores"] = job.scores.size(0)
+        if any(r != n for r in rows.values()):
+            raise ValueError(
+                f"replay_increment: delta columns for table '{job.name}' are not "
+                f"row-aligned (keys={n}, "
+                + ", ".join(f"{k}={v}" for k, v in rows.items())
+                + ")."
             )
-            if self._cache is not None:
-                # The cache is a second index that writing a slot does not reach,
-                # so everything the storage just stopped holding has to be dropped
-                # from it explicitly:
-                #   upserted keys -- the next lookup must see the value just
-                #     written into the storage, not the cached one;
-                #   erased keys   -- a cached copy would resurrect them;
-                #   evicted keys  -- these lost their slot to a delta key. Replay
-                #     ignores them as removals, precisely because the write
-                #     reproduces the eviction *in the storage* -- but a cached
-                #     copy survives that, and ``flush_cache`` would write it back
-                #     down on the next dump, undoing the eviction.
-                #
-                # A source table that does not retain evictions (``DISCARD``)
-                # cannot report that last group, so a caching replica that has to
-                # converge exactly wants ``evicted_item_mode=RETAIN_KEY``.
-                parts = [keys]
-                for extra in (erased, evicted):
-                    if extra is not None and extra.numel() > 0:
-                        parts.append(extra.to(keys.dtype))
-                stale = torch.cat(parts) if len(parts) > 1 else keys
-                if stale.numel() > 0:
-                    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-                    self._cache.key_index_map.erase(
-                        stale.to(device=device),
-                        torch.full(
-                            (stale.numel(),),
-                            table_id,
-                            dtype=torch.int64,
-                            device=device,
-                        ),
+
+        if job.values.dim() != 2 or job.values.size(1) != option.dim:
+            raise ValueError(
+                f"replay_increment: table '{job.name}' has dim {option.dim}, but "
+                f"the delta's embeddings have shape {tuple(job.values.shape)}."
+            )
+
+        if job.scores is not None:
+            num_scores = self._num_scores_of(storage)
+            # A single-word block may arrive 1-D; the storage layer reshapes it,
+            # so accept the same two spellings here.
+            width = job.scores.size(1) if job.scores.dim() == 2 else 1
+            if job.scores.dim() > 2 or width != num_scores:
+                raise ValueError(
+                    f"replay_increment: table '{job.name}' has {num_scores} score "
+                    f"word(s) per key, but the delta carries a score block of "
+                    f"shape {tuple(job.scores.shape)}."
+                )
+
+        if ReplayContent.OPTIMIZER_STATE in content:
+            optimizer = storage.tables[0].optimizer
+            # Only meaningful where the table keeps per-row state at all; one
+            # without it ignores the column rather than rejecting it.
+            if optimizer.get_state_dim(option.dim) > 0:
+                ckpt_dim = optimizer.get_ckpt_state_dim(option.dim)
+                if job.optimizer_states is None:
+                    # A delta dumped from a table whose optimizer keeps no state
+                    # -- SGD into rowwise Adagrad, say. Nothing in the layout
+                    # check catches it, and the write path raises, so without
+                    # this the collection's earlier tables would already be in.
+                    raise ValueError(
+                        f"replay_increment: table '{job.name}' keeps optimizer "
+                        "state per row, but the delta carries none. Drop "
+                        "ReplayContent.OPTIMIZER_STATE, or replay a delta "
+                        "dumped from a table with the same optimizer."
                     )
-            results[table_name] = stats
-        return results
+                if (
+                    job.optimizer_states.dim() != 2
+                    or job.optimizer_states.size(1) != ckpt_dim
+                ):
+                    raise ValueError(
+                        f"replay_increment: table '{job.name}' dumps {ckpt_dim} "
+                        f"optimizer-state column(s) per row, but the delta "
+                        f"carries a block of shape "
+                        f"{tuple(job.optimizer_states.shape)}."
+                    )
+
+    def _apply_replay(
+        self,
+        job: "_ReplayJob",
+        content: ReplayContent,
+        storage: Union[DynamicEmbStorage, HybridStorage],
+        ts: int,
+    ) -> ReplayStats:
+        """Write one planned table. Everything here has already been checked."""
+        option = self._dynamicemb_options[job.table_id]
+        stats = ReplayStats()
+        keys, values = job.keys, job.values
+        opt_states, scores, slot_index = (
+            job.optimizer_states,
+            job.scores,
+            job.slot_index,
+        )
+
+        # An empty or absent list is normal -- nothing was erased, or rank
+        # filtering left this rank none of them.
+        erased, evicted = job.erased_keys, job.evicted_keys
+
+        # Both global. Ownership follows how the table was sharded -- row-wise
+        # over the whole world, which is what ``_shard_world_size`` records and
+        # what ``meta["world_size"]`` is checked against. There is deliberately
+        # no process-group argument: replay is local (filter by ownership, then
+        # write), so a group could only narrow the modulus and mis-route every
+        # key, leaving each claimed by several ranks and the one that owns it
+        # claiming nothing.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        mask = owned_key_mask(keys, rank, self._shard_world_size, option.dist_type)
+        if mask is not None:
+            stats.skipped = int(keys.numel() - mask.sum().item())
+            keys, values = keys[mask], values[mask]
+            if opt_states is not None:
+                opt_states = opt_states[mask]
+            if scores is not None:
+                scores = scores[mask]
+            slot_index = slot_index[mask]
+            ws, dt = self._shard_world_size, option.dist_type
+            erased = owned_keys(erased, rank, ws, dt)
+            evicted = owned_keys(evicted, rank, ws, dt)
+
+        # Erase first: a key erased and then re-inserted inside the same window
+        # appears in BOTH lists, and must survive the replay.
+        if erased is not None and erased.numel() > 0:
+            # Not recorded into this model's own erased buffer: these removals
+            # came from upstream, and re-reporting them would make a chained
+            # replica replay what it already received. A model that is itself a
+            # dump source for someone further down would want the opposite --
+            # say so when that case turns up.
+            stats.erased = storage.erase_keys(job.table_id, erased)
+
+        # Before writing, so a restored key lands on the same scale the replica
+        # will later threshold its own incremental_dump against. Timestamp-based
+        # tables read their score off the device clock, so there is nothing to
+        # carry -- their restored keys are stamped with ``ts``.
+        if (
+            job.current_score is not None
+            and not score_strategy_has_timestamp_column(option.score_strategy)
+            and job.name in self._scores
+        ):
+            self._scores[job.name] = job.current_score
+
+        stats.merge(
+            storage.replay_increment(
+                job.table_id,
+                keys,
+                values,
+                opt_states,
+                scores,
+                slot_index,
+                self._scores.get(job.name, 0),
+                content=content,
+                timestamp=ts,
+            )
+        )
+        self._invalidate_cache(job.table_id, keys, erased, evicted)
+        return stats
+
+    def _invalidate_cache(
+        self,
+        table_id: int,
+        keys: Tensor,
+        erased: Optional[Tensor],
+        evicted: Optional[Tensor],
+    ) -> None:
+        """Drop from the cache everything the storage just stopped holding.
+
+        The cache is a second index that writing a slot does not reach, so three
+        groups have to go explicitly:
+
+        - upserted keys, so the next lookup sees the value just written into the
+          storage rather than the cached one;
+        - erased keys, whose cached copy would resurrect them;
+        - evicted keys, which lost their slot to a delta key. Replay ignores
+          those as removals precisely because the write reproduces the eviction
+          *in the storage* -- but a cached copy survives that, and
+          ``flush_cache`` would write it back down on the next dump, undoing the
+          eviction.
+
+        A source table that does not retain evictions (``DISCARD``) cannot report
+        that last group, so a caching replica that has to converge exactly wants
+        ``evicted_item_mode=RETAIN_KEY``.
+        """
+        if self._cache is None:
+            return
+        parts = [keys]
+        for extra in (erased, evicted):
+            if extra is not None and extra.numel() > 0:
+                parts.append(extra.to(keys.dtype))
+        stale = torch.cat(parts) if len(parts) > 1 else keys
+        if stale.numel() == 0:
+            return
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self._cache.key_index_map.erase(
+            stale.to(device=device),
+            torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
+        )
 
     @staticmethod
     def _drain_retained(

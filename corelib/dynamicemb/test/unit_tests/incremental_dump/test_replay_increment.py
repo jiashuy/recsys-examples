@@ -436,7 +436,12 @@ def test_replay_accepts_swapped_score_order(current_device):
 
 
 def _two_table_model(current_device, capacities):
-    """A module whose one storage holds two logical tables, sized separately."""
+    """A module whose one storage holds two logical tables, sized separately.
+
+    Rowwise Adagrad rather than SGD so the rows carry optimizer state: a table
+    without any lets a malformed optimizer column through untouched, and these
+    tests are about columns being rejected.
+    """
     options = [
         DynamicEmbTableOptions(
             index_type=torch.int64,
@@ -458,8 +463,9 @@ def _two_table_model(current_device, capacities):
         feature_table_map=[0, 1],
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,
-        optimizer=EmbOptimType.SGD,
+        optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
         learning_rate=0.1,
+        initial_accumulator_value=0.0,
     )
 
 
@@ -491,6 +497,56 @@ def test_replay_rejects_a_multi_table_delta_without_writing_any(current_device):
     assert all(
         k.numel() == 0 for k in after.keys
     ), "t_0 must not have been written before t_1 was rejected"
+
+
+@pytest.mark.parametrize(
+    "broken", ["scores", "optimizer_states", "no_optimizer_states", "slot_index"]
+)
+def test_replay_rejects_a_malformed_column_before_writing_any_table(
+    current_device, broken
+):
+    """A bad column on a later table must not let an earlier one through.
+
+    Row counts are not the only shape the write path depends on: the score block
+    and the optimizer-state block each have a width, and slot_index a length.
+    Those are checked again down in the storage layer, which is callable on its
+    own -- but by then this table's predecessors have been written, so the
+    collection ends up half advanced. The check has to happen up front.
+    """
+    device = torch.device(f"cuda:{current_device}")
+    src = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+    dst = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+
+    keys = list(range(1001, 1101))
+    indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) * 2 + 1, dtype=torch.int64, device=device)
+    src(indices, offsets)
+    torch.cuda.synchronize()
+
+    delta = src.incremental_dump({"t_0": 0, "t_1": 0})
+    # Damage the second table only: the first is well formed and would be
+    # written first if the check came too late.
+    if broken == "scores":
+        delta.scores[1] = delta.scores[1].repeat(1, 3)
+    elif broken == "optimizer_states":
+        delta.optimizer_states[1] = torch.zeros(
+            delta.keys[1].numel(), 7, dtype=delta.values[1].dtype
+        )
+    elif broken == "no_optimizer_states":
+        # What a delta from a stateless optimizer looks like -- SGD dumped,
+        # rowwise Adagrad replayed. The layout check does not compare
+        # optimizers, so only this catches it before the write path does.
+        delta.optimizer_states[1] = None
+    else:
+        delta.meta[1]["slot_index"] = delta.meta[1]["slot_index"][:-1]
+
+    with pytest.raises(ValueError):
+        dst.replay_increment(delta)
+
+    after = dst.incremental_dump({"t_0": 0, "t_1": 0})
+    assert all(
+        k.numel() == 0 for k in after.keys
+    ), "t_0 must not have been written before t_1's column was rejected"
 
 
 def test_replay_rejects_missing_table_options(current_device):

@@ -33,12 +33,12 @@ Everything replay needs is already there; §3 records what deliberately is *not*
 |---|---|
 | Write-back | **By slot.** Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it |
 | Layout mismatch | **Raise**, before writing anything. Checked at table level (delta `meta` vs target) and enforced again per key in the kernel |
-| Per-key scores | **Dumped, not yet replayed** — `DeltaDumpResult.scores`; a restored key is scored as if freshly inserted into the target (§3) |
-| Optimizer state | **Dumped, not yet replayed** — `DeltaDumpResult.optimizer_states`, split out of the same value row as `values` (§3) |
+| Per-key scores | Dumped in `DeltaDumpResult.scores`, replayed under `ReplayContent.SCORE`; without it a restored key is scored as if freshly inserted into the target (§3) |
+| Optimizer state | Dumped in `DeltaDumpResult.optimizer_states`, split out of the same value row as `values`, replayed under `ReplayContent.OPTIMIZER_STATE` (§3) |
 | `evicted_keys` | **Never replayed.** Overwriting a slot already reproduces an eviction, so this list exists only for other consumers of the dump |
 | `erased_keys` | A separate buffer and a separate list, applied whenever non-empty, **erase before upsert** — nothing takes over an erased key's slot, so no write reproduces it |
-| What replay writes | `ReplayContent` flag: embedding / optimizer state / score, any combination, default all three |
-| Optimizer state | Never carried in the delta. A slot whose previous occupant was the *same* key keeps its optimizer state; any other slot is re-initialised |
+| What replay writes | The key and its embedding always; `ReplayContent` chooses what comes along (optimizer state / score), default both |
+| Rejection | Every table validated -- metadata *and* column shapes -- before any is written, so a delta applies whole or not at all |
 | `dist_type` | `roundrobin` / `hash_roundrobin` only — same restriction the dump side already enforces; `continuous` raises |
 
 ---
@@ -71,8 +71,10 @@ other column (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is verbatim.
 This is the same convention the file `dump`/`load` already uses for single-column
 LRU tables.
 
-**Replay does not consume either yet.** A restored key is scored as if it had
-just been inserted into the target (`_fresh_score_block`), and keeps its
+**Whether replay consumes either is `ReplayContent`'s call**, and it consumes
+both by default. Without `SCORE` a restored key is scored as if it had
+just been inserted into the target (`_fresh_score_block`); without
+`OPTIMIZER_STATE` it keeps its
 optimizer state only when it already occupies the target row. The consequence is
 worth stating plainly, because it is the one place a replica is *not* a copy of
 its source: **the two can evict in different orders.** What they never disagree
@@ -180,19 +182,20 @@ Mirrors `_encode_slot_index` (`docs/delta_dump_result_design.md` §4):
 
 ## 5. Value writes and optimizer state
 
-The delta carries embeddings only (`values[:, :emb_dim]`), never optimizer
-state. `store_to_flat_table_contiguous` copies `min(value_dim, input_dim)`
-columns from the row base, so writing an `[N, emb_dim]` tensor touches the
-embedding region and leaves the optimizer region untouched. Replay therefore
-splits every batch in two:
+A value row is an embedding followed by the optimizer state, and the write copies
+from the row base (`store_to_flat_single_table` copies `min(value_dim,
+input_dim)` columns), so there is no way to write the tail without the head. The
+embedding is therefore *always* written and the only question is what the tail
+gets — which is what `ReplayContent.OPTIMIZER_STATE` decides:
 
-| group | write |
+| | write |
 |---|---|
-| slot previously held the **same key** (`same_key` / `founds`) | embedding columns only — the key's own optimizer state survives |
-| new key, or the slot's previous occupant was a different key | embedding columns **plus** `initial_optim_state` for the optimizer region |
+| **with** `OPTIMIZER_STATE` | the delta carries the whole row: embedding plus the dumped state, widened back from checkpoint width to runtime width (`pad_optimizer_states_from_checkpoint`). Nothing is inferred, and a delta that carries no state for a table that keeps some raises |
+| **without** it, slot previously held the **same key** (`same_key` / `founds`) | embedding columns only — writing just the head leaves the key's own state in place |
+| **without** it, any other slot | embedding columns **plus** `initial_optim_state` — the tail still holds the previous occupant's moments, which a new key must not inherit |
 
-Without the second group a new key would silently inherit the evicted key's
-optimizer moments.
+A table whose optimizer keeps no per-row state (`get_state_dim == 0`) writes the
+embedding and ignores the flag.
 
 ---
 
@@ -278,17 +281,17 @@ For a module with a `DynamicEmbCache` in front of `DynamicEmbStorage`:
 def replay_increment(
     model: torch.nn.Module,
     deltas: Dict[str, DeltaDumpResult],
-    pg: Optional[dist.ProcessGroup] = None,
+    content: ReplayContent = ReplayContent.ALL,
 ) -> Dict[str, Dict[str, ReplayStats]]: ...
 
 # module level -- BatchedDynamicEmbeddingTables
 def replay_increment(self, delta, content=ReplayContent.ALL) -> Dict[str, ReplayStats]: ...
 
 # storage level -- DynamicEmbStorage / HybridStorage
-def replay_increment(self, table_id, keys, values, slot_index, insert_score,
-                     content=ReplayContent.ALL, timestamp=None
-                     ) -> ReplayStats: ...
-def erase_keys(self, table_id, keys) -> int: ...
+def replay_increment(self, table_id, keys, values, optimizer_states, scores,
+                     slot_index, insert_score, content=ReplayContent.ALL,
+                     timestamp=None) -> ReplayStats: ...
+def erase_keys(self, table_id, keys, mode=EvictedItemMode.DISCARD) -> int: ...
 ```
 
 `ReplayStats` (in `dynamicemb/types.py`, alongside the other shared dataclasses)
@@ -335,22 +338,25 @@ class ReplayStats:
 | `test_replay_round_trip` | keys, embeddings and **slot_index** all round-trip; parametrised over TIMESTAMP / STEP / LFU / compound `(TIMESTAMP, LFU)` / NO_EVICTION |
 | `test_dump_splits_the_value_row` | `values` + `optimizer_states` widths add up to the table's value row; a table with no per-row state reports `None`; parametrised over SGD / ROWWISE_ADAGRAD |
 | `test_dump_scores_are_column_aligned` | `scores` is `[N, num_scores]` in logical order, and the LFU column is verbatim (keys touched six times outrank those touched once) |
-| `test_replay_does_not_carry_scores` | the deliberate gap: a threshold that splits the source's table splits nothing on the replica, because every restored key carries the same fresh score |
-| `test_replay_is_idempotent` | replaying the same delta twice is a no-op |
+| `test_replay_scores_follow_the_content_flag` | parametrised pair: with `SCORE` the source's LFU frequencies arrive verbatim, without it every restored key is scored as if freshly inserted here |
+| `test_replay_spans_multiple_batches` | with `threads_in_wave` shrunk so the chunking actually runs, every column is cut along dimension 0 — 1-D `keys` / `slot_index` and 2-D `values` / `optimizer_states` / `scores` stay paired |
 | `test_replay_rejects_layout_mismatch` | capacity mismatch raises **and leaves the target untouched** (no partial write) |
 | `test_replay_rejects_score_strategy_mismatch` | a genuinely different score layout raises |
 | `test_replay_accepts_swapped_score_order` | `(TIMESTAMP, LFU)` vs `(LFU, TIMESTAMP)` is the *same* physical layout, so it must replay rather than be rejected |
 | `test_replay_rejects_missing_table_options` | a delta from an older version raises instead of writing blind |
 | `test_replay_applies_erasures_and_ignores_evictions` | `erased_keys` is applied, erase before upsert, an erased-then-readmitted key survives; a non-empty `evicted_keys` changes nothing |
 | `test_replay_content_restores_optimizer_state` | with `OPTIMIZER_STATE` the source's state lands even on a row the key is taking over, where the default would have initialised it |
-| `test_replay_content_restores_scores` | with `SCORE` the replica reproduces the source's ranking -- the mirror of the test above it |
-| `test_replay_without_embedding_needs_aligned_rows` | omitting `EMBEDDING` raises when a key does not already own its target row, and works once the replica is aligned |
-| `test_erased_and_evicted_use_separate_buffers` | an erase and an eviction land in different buffers, neither leaks into the other, both are read-and-clear |
-| `test_erase_retention_is_per_call_not_per_table` | the same table records one erase and not the next; a table that discards evictions still reports its erases |
+| `test_replay_rejects_a_multi_table_delta_without_writing_any` | a layout mismatch on the *second* table leaves the first unwritten |
+| `test_replay_rejects_a_malformed_column_before_writing_any_table` | the same, for a bad column rather than bad metadata: a wrong score width, a wrong optimizer-state width, a short `slot_index` |
+| `test_erased_and_evicted_use_separate_buffers`¹ | an erase and an eviction land in different buffers, neither leaks into the other, both are read-and-clear |
+| `test_erase_retention_is_per_call_not_per_table`¹ | the same table records one erase and not the next; a table that discards evictions still reports its erases |
 | `test_replay_erased_counts_only_keys_actually_present` | `erased` reports removals that really happened, not removals asked for |
-| `test_replay_tolerates_an_empty_removal_list` | nothing to remove is normal, not an error |
 | `test_replay_optimizer_state` | a key already at its target slot keeps its optimizer state, a fresh row is initialised |
 | `test_replay_with_caching` | a lookup after replay sees the replayed value, not a stale cached one |
+| `test_replay_does_not_leave_displaced_keys_in_the_cache` | a key whose slot a delta key takes over is dropped from the cache too, or `flush_cache` would resurrect it into storage on the next dump |
+
+¹ in `test/unit_tests/retain_evicted_keys/test_insert_collect_evicted.py`, with
+the rest of the retention coverage.
 
 | Test | Covers |
 |---|---|

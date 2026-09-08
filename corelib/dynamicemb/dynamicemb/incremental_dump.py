@@ -472,9 +472,10 @@ def replay_increment(
     loading/replaying from its source: a table that also takes independent writes
     can lose a key whose slot a delta key claims.
 
-    **What gets written** is *content*'s call -- embedding, optimizer state,
-    score, or any combination (see :class:`ReplayContent`). The default is all
-    three, so the replica ends up holding what the source held.
+    **The key and its embedding always travel**; *content* chooses what comes
+    along -- the optimizer state that shares the value row, the score words, or
+    both (see :class:`ReplayContent`). The default is both, so the replica ends
+    up holding what the source held.
 
     Dropping ``SCORE`` leaves a restored key scored as if it had just been
     inserted here, so the replica orders its own future evictions by when it
@@ -511,9 +512,9 @@ def replay_increment(
         deltas (Dict[str, DeltaDumpResult]): ``incremental_dump``'s return value,
             keyed by embedding-collection path. Collections or tables that the
             model does not have are skipped with a warning.
-        content (ReplayContent): which parts of each dumped row to write back --
-            embedding, optimizer state, score, or any combination. Defaults to
-            all three.
+        content (ReplayContent): what travels with each key besides its
+            embedding -- optimizer state, score words, or both. Defaults to
+            both; ``ReplayContent.EMBEDDING_ONLY`` for neither.
 
     Returns:
         Dict[str, Dict[str, ReplayStats]]:
