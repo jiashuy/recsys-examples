@@ -974,6 +974,19 @@ def inc_dump(args, runtime: RuntimeContext):
     so successive deltas partition the run rather than overlapping.
     """
     os.makedirs(_delta_dir(args), exist_ok=True)
+    # A dump run owns its rank's sequence outright. Numbering restarts at zero
+    # here, so a shorter run over a directory left by a longer one -- an earlier
+    # dump that was interrupted, or never loaded -- would overwrite the low
+    # numbers and leave the high ones behind. inc_load replays everything it
+    # matches, in order, so those stragglers would land last and write a previous
+    # run's embeddings over this one's. Nothing downstream can tell: same config
+    # means the same layout, so the stale slots validate and apply cleanly.
+    # Per rank rather than the whole directory, since each rank owns its own
+    # files and this then needs no coordination between them.
+    for stale in glob.glob(
+        os.path.join(_delta_dir(args), f"delta_rank{runtime.rank}_*.pt")
+    ):
+        os.remove(stale)
     train_dataset = MovieLensDataset(args.data_path, split="train")
     # Use global rank for proper data distribution across all processes
     train_sampler = DistributedSampler(
