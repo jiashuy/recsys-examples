@@ -1921,32 +1921,23 @@ def _replay_write_values(
 
     A value row is an embedding followed by the optimizer state, and the two are
     written together or not at all -- ``store_to_flat_single_table`` copies from
-    the row base, so there is no way to write the tail without the head. That
-    shapes the three cases:
+    the row base, so there is no way to write the tail without the head. The
+    embedding is therefore always written, and the only choice is what the tail
+    gets:
 
-    - **Both requested.** The delta carries the whole row; write it as it was
-      dumped. Nothing is inferred.
-    - **Embedding only** (the default for a serving replica). Rows that already
-      belonged to this same key keep their optimizer state, because writing just
-      the embedding columns leaves the tail untouched. Every other row is new to
-      this key, so its tail still holds the previous occupant's moments and has
-      to be reset to ``initial_optim_state``.
-    - **Optimizer state only.** Every row must already belong to this key -- the
-      caller has checked -- so the current embedding is read back and rewritten
-      unchanged ahead of the new tail.
+    - **With ``OPTIMIZER_STATE``**, the delta carries the whole row; write it as
+      it was dumped. Nothing is inferred.
+    - **Without it**, rows that already belonged to this same key keep their
+      state, because writing just the embedding columns leaves the tail
+      untouched. Every other row is new to this key, so its tail still holds the
+      previous occupant's moments and has to be reset to ``initial_optim_state``.
     """
     if rows.numel() == 0:
         return
     emb_dim_cfg = state.table_emb_dims_cpu[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     embeddings = embeddings.to(dtype=state.emb_dtype)
-    want_emb = ReplayContent.EMBEDDING in content
     want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
-
-    if not want_emb:
-        # Keep what is there: the caller guarantees every row already holds this
-        # key, so its embedding is the one the replica should go on serving.
-        embeddings = load_from_flat_single_table(state, rows, table_id)[:, :emb_dim_cfg]
 
     if optstate_dim == 0:
         store_to_flat_single_table(state, rows, table_id, embeddings)
@@ -2063,20 +2054,6 @@ def _replay_at_slots(
             "silently drop those keys."
         )
 
-    if ReplayContent.EMBEDDING not in content:
-        # Without an embedding to write, a row that did not already hold this key
-        # would keep the previous occupant's vector and serve it under the new
-        # key. Refuse rather than corrupt.
-        stale = torch.logical_not(same_key)
-        num_stale = int(stale.sum().item())
-        if num_stale:
-            example = int(keys[stale][0].item())
-            raise ValueError(
-                f"replay_increment: {num_stale} of {n} keys on table {table_id} "
-                f"do not already occupy their target row (e.g. key {example}), "
-                "so there is no embedding to keep. ReplayContent.EMBEDDING may "
-                "only be omitted for a replica already aligned with its source."
-            )
     _replay_write_values(
         state, table_id, value_rows, embeddings, optimizer_states, same_key, content
     )

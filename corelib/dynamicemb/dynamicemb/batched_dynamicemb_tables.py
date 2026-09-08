@@ -1784,6 +1784,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         ts = device_timestamp()
         results: Dict[str, ReplayStats] = {}
+        # Validate every table before writing any of them. A delta usually spans
+        # a whole collection, so checking table i only when its turn comes would
+        # let a mismatch on the last one raise after the first few had already
+        # been erased from and written to -- a partly-applied delta, which is
+        # worse than a rejected one and is not what this promises.
+        planned = []
         for i, table_name in enumerate(delta.table_names):
             if table_name not in self._table_names:
                 warnings.warn(
@@ -1795,8 +1801,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
             table_id = self._table_names.index(table_name)
             meta = delta.meta[i]
-            option = self._dynamicemb_options[table_id]
-            stats = ReplayStats()
 
             keys = delta.keys[i]
             values = delta.values[i]
@@ -1835,6 +1839,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "two tables share a layout; configure the target to match the "
                     "source, or rebuild it from a full checkpoint instead."
                 )
+            planned.append((i, table_name, table_id, keys, values, opt_states, scores))
+
+        for i, table_name, table_id, keys, values, opt_states, scores in planned:
+            meta = delta.meta[i]
+            option = self._dynamicemb_options[table_id]
+            slot_index = meta["slot_index"]
+            stats = ReplayStats()
 
             # Only ``erased_keys`` is ever replayed. ``evicted_keys`` is not a
             # removal a replica has to perform: the key that took the evicted

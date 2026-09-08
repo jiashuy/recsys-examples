@@ -142,39 +142,37 @@ class EvictedItemMode(enum.Flag):
 
 
 class ReplayContent(enum.Flag):
-    """Which parts of a dumped row ``replay_increment`` writes back.
+    """What travels with a key that ``replay_increment`` writes back.
 
-    A delta carries an embedding, the optimizer state that shares its value row,
-    and every score word (see :class:`DeltaDumpResult`). Which of them a replica
-    wants depends on what it is for: a serving replica needs the embedding and
-    nothing else, while a training replica that has to resume from the source's
-    exact state wants all three.
+    The key and its embedding always do -- that is what a delta is for, and
+    there is no way to write a key at a slot without deciding what its row
+    holds. The flags choose what comes *along*: the optimizer state that shares
+    the value row, and the score words.
+
+    Which of them a replica wants depends on what it is for: a serving replica
+    needs nothing beyond the embedding, while a training replica resuming from
+    its source's exact state wants both.
 
     Combine with ``|`` and test with ``in``::
 
-        replay_increment(model, deltas)                       # ALL, the default
-        replay_increment(model, deltas, content=ReplayContent.EMBEDDING)
-        replay_increment(
-            model, deltas,
-            content=ReplayContent.EMBEDDING | ReplayContent.SCORE,
-        )
+        replay_increment(model, deltas)                              # ALL, default
+        replay_increment(model, deltas, content=ReplayContent.SCORE)
+        replay_increment(model, deltas,
+                         content=ReplayContent.EMBEDDING_ONLY)       # nothing extra
 
-    The key itself is always written at its source slot -- that is what a replay
-    *is*, and the flags only choose what travels with it. Removals
-    (``DeltaDumpResult.erased_keys``) are likewise always applied; they are the
+    ``EMBEDDING_ONLY`` is the empty set rather than a peer of the others, so it
+    cannot combine with them: ``|`` absorbs it. Test for it as emptiness --
+    ``not content`` -- and **not** with ``in``, which is subset containment and
+    reports the empty set as present in everything.
+
+    Removals (``DeltaDumpResult.erased_keys``) are always applied; they are the
     source telling the replica a key is gone, not a payload to opt out of.
-
-    Omitting ``EMBEDDING`` is only meaningful for a replica already aligned with
-    its source, where every key still occupies the row it held there. A key that
-    lands on a row it did not already own has no embedding to keep, and serving
-    the previous occupant's vector under a new key would be silent corruption --
-    so ``replay_increment`` raises instead.
     """
 
-    EMBEDDING = enum.auto()
+    EMBEDDING_ONLY = 0
     OPTIMIZER_STATE = enum.auto()
     SCORE = enum.auto()
-    ALL = EMBEDDING | OPTIMIZER_STATE | SCORE
+    ALL = OPTIMIZER_STATE | SCORE
 
 
 class DynamicEmbScoreStrategy(enum.IntEnum):

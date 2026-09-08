@@ -272,7 +272,7 @@ def test_dump_scores_are_column_aligned(current_device):
 
 @pytest.mark.parametrize(
     "content, keeps_source_scores",
-    [(ReplayContent.EMBEDDING, False), (ReplayContent.ALL, True)],
+    [(ReplayContent.EMBEDDING_ONLY, False), (ReplayContent.ALL, True)],
 )
 def test_replay_scores_follow_the_content_flag(
     current_device, content, keeps_source_scores
@@ -435,6 +435,64 @@ def test_replay_accepts_swapped_score_order(current_device):
     torch.testing.assert_close(src_vals, dst_vals)
 
 
+def _two_table_model(current_device, capacities):
+    """A module whose one storage holds two logical tables, sized separately."""
+    options = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=current_device,
+            dim=DIM,
+            max_capacity=cap,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        )
+        for cap in capacities
+    ]
+    return BatchedDynamicEmbeddingTablesV2(
+        table_options=options,
+        output_dtype=torch.float32,
+        table_names=["t_0", "t_1"],
+        feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        use_index_dedup=False,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.1,
+    )
+
+
+def test_replay_rejects_a_multi_table_delta_without_writing_any(current_device):
+    """A mismatch on one table must leave the others untouched.
+
+    A delta normally spans a whole collection, so validating each table only when
+    its turn comes would let the last one's mismatch raise after the earlier ones
+    had already been written -- a partly applied delta, harder to recover from
+    than a rejected one. Here the first table matches and the second does not.
+    """
+    device = torch.device(f"cuda:{current_device}")
+    src = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+    dst = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY * 2])
+
+    keys = list(range(1001, 1101))
+    indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) * 2 + 1, dtype=torch.int64, device=device)
+    src(indices, offsets)
+    torch.cuda.synchronize()
+
+    delta = src.incremental_dump({"t_0": 0, "t_1": 0})
+    assert all(k.numel() == len(keys) for k in delta.keys), "both tables must dump"
+
+    with pytest.raises(ValueError, match="capacity mismatch"):
+        dst.replay_increment(delta)
+
+    after = dst.incremental_dump({"t_0": 0, "t_1": 0})
+    assert all(
+        k.numel() == 0 for k in after.keys
+    ), "t_0 must not have been written before t_1 was rejected"
+
+
 def test_replay_rejects_missing_table_options(current_device):
     """A delta without table_options must be rejected, not replayed with the
     score-order / dim / dist_type checks quietly skipped."""
@@ -548,7 +606,7 @@ def test_replay_optimizer_state(current_device):
     delta = dump_all(src)
 
     # First replay: brand-new rows, so the optimizer state starts at its initial.
-    dst.replay_increment(delta, content=ReplayContent.EMBEDDING)
+    dst.replay_increment(delta, content=ReplayContent.EMBEDDING_ONLY)
     fresh_state = export_optimizer_state(dst)
     assert fresh_state, "expected an optimizer state region for ROWWISE_ADAGRAD"
     for key in keys:
@@ -561,7 +619,7 @@ def test_replay_optimizer_state(current_device):
 
     # Second replay of the same delta: every key is already in its target slot,
     # so the embedding is overwritten but the optimizer state must survive.
-    dst.replay_increment(delta, content=ReplayContent.EMBEDDING)
+    dst.replay_increment(delta, content=ReplayContent.EMBEDDING_ONLY)
     after_state = export_optimizer_state(dst)
     for key in keys:
         torch.testing.assert_close(after_state[key], trained_state[key])
