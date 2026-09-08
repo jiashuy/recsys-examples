@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import glob
 import math
 import os
 import shutil
@@ -26,7 +27,7 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.incremental_dump import get_score, incremental_dump
+from dynamicemb.incremental_dump import get_score, incremental_dump, replay_increment
 from dynamicemb.optimizer import EmbOptimType
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -173,6 +174,13 @@ def parse_args():
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--dump", action="store_true")
     parser.add_argument("--incremental_dump", action="store_true")
+    parser.add_argument(
+        "--incremental_load",
+        action="store_true",
+        help="replay the delta files a previous --incremental_dump run wrote "
+        "into a second, eval-only model, and report its loss. Run "
+        "--incremental_dump first, with the same --save_dir.",
+    )
     parser.add_argument("--caching", action="store_true")
     parser.add_argument("--prefetch_pipeline", action="store_true")
     parser.add_argument("--external_storage", action="store_true")
@@ -944,8 +952,28 @@ def load(args, runtime: RuntimeContext):
     dist.barrier(device_ids=[runtime.local_rank])
 
 
+def _delta_dir(args):
+    return os.path.join(args.save_dir, "deltas")
+
+
+def _dense_path(args, runtime: RuntimeContext) -> str:
+    return os.path.join(args.save_dir, f"dense_rank{runtime.rank}.pt")
+
+
 def inc_dump(args, runtime: RuntimeContext):
-    os.makedirs(args.save_dir, exist_ok=True)
+    """Train, and periodically dump what changed since the last dump.
+
+    Each dump is written to its own file under ``--save_dir``, and the dense
+    weights alongside them at the end. A later ``--incremental_load`` run
+    replays those into a second model; the two are separate commands, so the
+    files are the whole handoff. Only the embeddings travel in a delta -- the
+    replica needs the trained MLP from somewhere too, or the loss it reports
+    would be a fresh model's.
+
+    Each dump's ``meta[i]["current_score"]`` becomes the next dump's threshold,
+    so successive deltas partition the run rather than overlapping.
+    """
+    os.makedirs(_delta_dir(args), exist_ok=True)
     train_dataset = MovieLensDataset(args.data_path, split="train")
     # Use global rank for proper data distribution across all processes
     train_sampler = DistributedSampler(
@@ -961,6 +989,20 @@ def inc_dump(args, runtime: RuntimeContext):
     criterion = nn.MSELoss()
 
     undumped_score = get_score(model)
+    saved = 0
+
+    def save_delta(res):
+        nonlocal saved
+        # Per rank: incremental_dump without a process group leaves each rank
+        # holding only its own shard, and the replica is this rank's.
+        path = os.path.join(
+            _delta_dir(args), f"delta_rank{runtime.rank}_{saved:04d}.pt"
+        )
+        # Not a weights-only payload: meta carries the source's
+        # DynamicEmbTableOptions, which replay compares against the target.
+        torch.save(res, path)
+        saved += 1
+        return os.path.basename(path)
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
@@ -997,11 +1039,77 @@ def inc_dump(args, runtime: RuntimeContext):
                     keys.size(0) for dr in res.values() for keys in dr.keys
                 )
                 print(
-                    f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, dump number: {dump_number}"
+                    f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, dump number: {dump_number}, saved {save_delta(res)}"
                 )
 
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{args.epochs}, Average Loss: {avg_loss:.4f}")
+
+    # Training carried on past the last periodic dump, so ship those updates too
+    # or the replica is simply out of date.
+    last = save_delta(incremental_dump(model, undumped_score))
+    # Embedding weights are not in state_dict (see load()), so this is the dense
+    # arch only -- exactly the part a delta does not carry.
+    torch.save({"model_state_dict": model.state_dict()}, _dense_path(args, runtime))
+    print(f"rank {runtime.rank}: final dump saved {last}, plus dense weights")
+
+
+def inc_load(args, runtime: RuntimeContext):
+    """Replay ``inc_dump``'s delta files into an eval-only model.
+
+    The consuming half. The replica is built with ``training=False``, so its
+    value rows hold embeddings alone -- a delta from a training model still
+    carries optimizer state, and replay writes what the target has room for and
+    drops the rest. Replaying every delta in order leaves it holding each key at
+    the latest value the training run gave it.
+
+    Note the loop: a replica catches up by applying every delta since it was
+    last current, not one big one.
+    """
+    delta_paths = sorted(
+        glob.glob(os.path.join(_delta_dir(args), f"delta_rank{runtime.rank}_*.pt"))
+    )
+    if not delta_paths:
+        raise FileNotFoundError(
+            f"no delta files under {_delta_dir(args)} -- run "
+            "`example.py --incremental_dump` first, with the same --save_dir"
+        )
+
+    test_dataset = MovieLensDataset(args.data_path, split="test")
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=False
+    )
+    test_loader = build_dataloader(test_dataset, test_sampler, args)
+
+    model = create_model(args, runtime, training=False)
+    model.to(runtime.device)
+    model.load_state_dict(
+        torch.load(_dense_path(args, runtime), weights_only=False)["model_state_dict"],
+        strict=False,
+    )
+
+    for path in delta_paths:
+        # weights_only=False for the reason given where these are written.
+        stats = replay_increment(model, torch.load(path, weights_only=False))
+        for collection, per_table in stats.items():
+            for name, st in per_table.items():
+                print(
+                    f"{os.path.basename(path)} {collection}/{name}: "
+                    f"upserted={st.upserted} erased={st.erased} skipped={st.skipped}"
+                )
+
+    # Trained MLP over replayed embeddings: comparable with what the training
+    # run reported, which is what makes the number worth printing.
+    test_one_epoch(model, test_loader, nn.MSELoss(), 0, 1, runtime)
+
+    dist.barrier(device_ids=[runtime.local_rank])
+    # Only global rank 0 should clean up, not local rank 0 on each node
+    if runtime.rank == 0:
+        try:
+            shutil.rmtree(args.save_dir)
+        except Exception as e:
+            print(f"Warning: Failed to remove {args.save_dir}: {e}")
+    dist.barrier(device_ids=[runtime.local_rank])
 
 
 def main():
@@ -1022,6 +1130,8 @@ def main():
             load(args, runtime)
         if args.incremental_dump:
             inc_dump(args, runtime)
+        if args.incremental_load:
+            inc_load(args, runtime)
     finally:
         cleanup_runtime(runtime)
 
