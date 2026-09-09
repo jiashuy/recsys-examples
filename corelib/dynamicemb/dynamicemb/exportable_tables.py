@@ -24,8 +24,13 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
     get_loading_files,
 )
-from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
+from dynamicemb.key_value_table import (
+    _iter_batches_from_files,
+    load_from_json,
+    resolve_checkpoint_value_layout,
+)
 from dynamicemb.scored_hashtable import ScorePolicy
+from dynamicemb.types import KEY_TYPE
 from dynamicemb_extensions import table_insert
 from torch.nn import ModuleDict
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -459,9 +464,10 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 continue
 
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
+            meta_data = {}
             if os.path.exists(meta_json_file):
                 try:
-                    _ = load_from_json(meta_json_file)
+                    meta_data = load_from_json(meta_json_file)
                 except Exception as e:
                     print(
                         f"[WARN] Failed to read meta json for {table_name} at {meta_json_file}: {e}"
@@ -488,6 +494,24 @@ class InferenceEmbeddingCollection(torch.nn.Module):
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
                 score_file = emb_score_files[i] if i < len(emb_score_files) else None
+                # The value file carries the dumping table's precision, which the
+                # meta records; a checkpoint written before it did is fp32. An
+                # unreadable meta leaves ``meta_data`` empty, which resolves to
+                # that same fp32 default.
+                num_keys = os.path.getsize(emb_key_files[i]) // KEY_TYPE.itemsize
+                (
+                    emb_dtype,
+                    opt_state_dtype,
+                    ckpt_dim,
+                ) = resolve_checkpoint_value_layout(
+                    meta_data, emb_value_files[i], num_keys, dim
+                )
+                if ckpt_dim != dim:
+                    raise ValueError(
+                        f"Embedding dim mismatch: {emb_value_files[i]} holds rows "
+                        f"of {ckpt_dim} but this collection is configured with "
+                        f"dim {dim}."
+                    )
                 for keys, embeddings, scores, _opt_states in _iter_batches_from_files(
                     emb_key_files[i],
                     emb_value_files[i],
@@ -496,6 +520,8 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                     dim,
                     0,
                     device,
+                    emb_dtype=emb_dtype,
+                    opt_state_dtype=opt_state_dtype,
                 ):
                     if keys.numel() == 0:
                         continue

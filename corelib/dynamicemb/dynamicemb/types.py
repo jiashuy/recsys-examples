@@ -106,8 +106,12 @@ class DynamicEmbInitializerArgs:
 
 
 KEY_TYPE = torch.int64
-EMBEDDING_TYPE = torch.float32
 SCORE_TYPE = torch.int64
+# Checkpoint value precision for a checkpoint whose meta JSON does not say --
+# i.e. every one written before the dump recorded ``embedding_dtype`` /
+# ``optim_state_dtype``, which were all fp32. A dump now writes the table's own
+# ``emb_dtype``; these are the compatibility fallback, not the format.
+EMBEDDING_TYPE = torch.float32
 OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
 DEMB_TABLE_ALIGN_SIZE = 16

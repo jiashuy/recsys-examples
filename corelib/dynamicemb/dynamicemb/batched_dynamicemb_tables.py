@@ -1567,6 +1567,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return this rank's (keys, embeddings) for one table.
+
+        Embeddings come back at the table's own precision, the same as they are
+        checkpointed and the same as ``incremental_dump`` reports them.
+        """
         self.flush()
 
         table_id = self._table_names.index(table_name)
@@ -1581,7 +1586,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if len(keys_list) == 0:
             return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
-                0, 0, device=device
+                0, 0, dtype=self._storage.embedding_dtype(), device=device
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 

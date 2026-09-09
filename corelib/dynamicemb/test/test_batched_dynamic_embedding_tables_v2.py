@@ -17,6 +17,7 @@ import json
 import os
 import random
 import time
+import warnings
 from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 
 import numpy as np
@@ -52,6 +53,7 @@ from dynamicemb.key_value_table import (
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
+    resolve_checkpoint_value_layout,
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
@@ -59,7 +61,7 @@ from dynamicemb.optimizer import (
     pad_optimizer_states_from_checkpoint,
     truncate_optimizer_states_for_checkpoint,
 )
-from dynamicemb.types import EMBEDDING_TYPE, KEY_TYPE, OPT_STATE_TYPE, CopyMode
+from dynamicemb.types import KEY_TYPE, CopyMode
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -649,9 +651,7 @@ def _kim_scan_keys_embeddings_dict(
             scores = named_scores[score_name]
             flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
             values = load_from_flat_single_table(state, flat_rows, tid)
-            embeddings = (
-                values[:, :emb_dim_t].to(dtype=EMBEDDING_TYPE).contiguous().to(device)
-            )
+            embeddings = values[:, :emb_dim_t].contiguous().to(device)
             keys_dev = keys.to(device=device)
             for i in range(keys.numel()):
                 k_int = int(keys_dev[i].item())
@@ -2699,6 +2699,300 @@ def test_multi_table_load_legacy_metadata_defaults_to_roundrobin(tmp_path):
     torch.testing.assert_close(vals1_src[idx1_src], vals1_dst[idx1_dst])
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint value layout: precision + dim recorded in meta, and the fp32
+# fallback for checkpoints written before it was.
+# ---------------------------------------------------------------------------
+
+_VALUE_LAYOUT_META_KEYS = ("embedding_dtype", "embedding_dim", "optim_state_dtype")
+
+
+def _init_single_rank_pg(device_id: int = 0) -> torch.device:
+    import torch.distributed as dist
+
+    assert torch.cuda.is_available()
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+    return torch.device(f"cuda:{device_id}")
+
+
+def _shard_file(save_dir: str, table_name: str, kind: str) -> str:
+    import torch.distributed as dist
+
+    return encode_checkpoint_file_path(
+        save_dir, table_name, dist.get_rank(), dist.get_world_size(), kind
+    )
+
+
+def _read_meta(save_dir: str, table_name: str) -> Dict[str, Any]:
+    with open(encode_meta_json_file_path(save_dir, table_name), "r") as f:
+        return json.load(f)
+
+
+def _write_meta(save_dir: str, table_name: str, meta: Dict[str, Any]) -> None:
+    with open(encode_meta_json_file_path(save_dir, table_name), "w") as f:
+        json.dump(meta, f)
+
+
+def _dumped_key_count(save_dir: str, table_name: str) -> int:
+    return os.path.getsize(_shard_file(save_dir, table_name, "keys")) // (
+        _dtype_element_size(KEY_TYPE)
+    )
+
+
+def _make_dump_load_tables(
+    dims: List[int],
+    table_names: List[str],
+    value_type: torch.dtype,
+    device_id: int = 0,
+) -> BatchedDynamicEmbeddingTablesV2:
+    return _make_multi_table_bdeb_for_dump_load(
+        EmbOptimType.SGD,
+        {"learning_rate": 0.3},
+        dims,
+        table_names,
+        list(range(len(table_names))),
+        1024,
+        torch.int64,
+        value_type,
+        device_id,
+    )
+
+
+def _dump_fp32_source(tmp_path, dims, table_names, device) -> str:
+    """Train an fp32 table and dump it; returns the save dir.
+
+    Every precision case starts from the same fp32 rows, so what a later dump
+    writes is the only thing under test.
+    """
+    src = _make_dump_load_tables(dims, table_names, torch.float32)
+    _train_multi_table_bdeb_once(src, torch.int64, device)
+    save_dir = os.path.join(str(tmp_path), "fp32")
+    os.makedirs(save_dir, exist_ok=True)
+    src.dump(save_dir)
+    return save_dir
+
+
+@pytest.mark.parametrize(
+    "value_type",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["fp32", "fp16", "bf16"],
+)
+def test_dump_stores_table_precision(value_type, tmp_path):
+    """A dump writes the table's own precision, and records how to read it back."""
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    fp32_dir = _dump_fp32_source(tmp_path, dims, table_names, device)
+
+    mid = _make_dump_load_tables(dims, table_names, value_type)
+    with warnings.catch_warnings():
+        # Reading fp32 rows into a narrower table warns by design; the warning
+        # itself is asserted in test_load_warns_when_checkpoint_precision_differs.
+        warnings.simplefilter("ignore", UserWarning)
+        mid.load(fp32_dir)
+
+    native_dir = os.path.join(str(tmp_path), "native")
+    os.makedirs(native_dir, exist_ok=True)
+    mid.dump(native_dir)
+
+    dtype_name = str(value_type).split(".")[-1]
+    for table_id, name in enumerate(table_names):
+        meta = _read_meta(native_dir, name)
+        assert meta["embedding_dtype"] == dtype_name
+        assert meta["optim_state_dtype"] == dtype_name
+        assert meta["embedding_dim"] == dims[table_id]
+
+        num_keys = _dumped_key_count(native_dir, name)
+        assert num_keys > 0, f"{name}: nothing was dumped, the test proves nothing"
+        expected = num_keys * dims[table_id] * _dtype_element_size(value_type)
+        assert os.path.getsize(_shard_file(native_dir, name, "values")) == expected
+
+    dst = _make_dump_load_tables(dims, table_names, value_type)
+    dst.load(native_dir)
+    for name in table_names:
+        keys_mid, vals_mid = mid.export_keys_values(name, device)
+        keys_dst, vals_dst = dst.export_keys_values(name, device)
+        assert vals_mid.dtype == value_type
+        assert vals_dst.dtype == value_type
+        order_mid = keys_mid.argsort()
+        order_dst = keys_dst.argsort()
+        torch.testing.assert_close(keys_mid[order_mid], keys_dst[order_dst])
+        # Same precision on both sides, so the round trip is exact.
+        torch.testing.assert_close(
+            vals_mid[order_mid], vals_dst[order_dst], rtol=0, atol=0
+        )
+
+
+def test_load_reads_legacy_checkpoint_without_value_layout_meta(tmp_path):
+    """A checkpoint predating the layout keys loads as fp32, dim from file size.
+
+    The two tables have different dims, so a dim recovered from one file cannot
+    accidentally stand in for the other.
+    """
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    src = _make_dump_load_tables(dims, table_names, torch.float32)
+    _train_multi_table_bdeb_once(src, torch.int64, device)
+    save_dir = str(tmp_path)
+    src.dump(save_dir)
+
+    for name in table_names:
+        meta = _read_meta(save_dir, name)
+        for key in _VALUE_LAYOUT_META_KEYS:
+            meta.pop(key, None)
+        _write_meta(save_dir, name, meta)
+
+    dst = _make_dump_load_tables(dims, table_names, torch.float32)
+    dst.load(save_dir)
+
+    for name in table_names:
+        keys_src, vals_src = src.export_keys_values(name, device)
+        keys_dst, vals_dst = dst.export_keys_values(name, device)
+        order_src = keys_src.argsort()
+        order_dst = keys_dst.argsort()
+        torch.testing.assert_close(keys_src[order_src], keys_dst[order_dst])
+        torch.testing.assert_close(vals_src[order_src], vals_dst[order_dst])
+
+
+@pytest.mark.parametrize("with_layout_meta", [True, False], ids=["meta", "legacy"])
+def test_load_rejects_embedding_dim_mismatch(with_layout_meta, tmp_path):
+    """Rows of the wrong width are rejected, whether meta says so or size does."""
+    device = _init_single_rank_pg()
+    table_names = ["table0", "table1"]
+
+    src = _make_dump_load_tables([8, 16], table_names, torch.float32)
+    _train_multi_table_bdeb_once(src, torch.int64, device)
+    save_dir = str(tmp_path)
+    src.dump(save_dir)
+
+    if not with_layout_meta:
+        for name in table_names:
+            meta = _read_meta(save_dir, name)
+            for key in _VALUE_LAYOUT_META_KEYS:
+                meta.pop(key, None)
+            _write_meta(save_dir, name, meta)
+
+    dst = _make_dump_load_tables([16, 16], table_names, torch.float32)
+    with pytest.raises(ValueError, match="Embedding dim mismatch"):
+        dst.load(save_dir)
+
+
+def test_load_rejects_truncated_value_file(tmp_path):
+    """A value file that does not hold whole rows is an error, not a partial load."""
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    src = _make_dump_load_tables(dims, table_names, torch.float32)
+    _train_multi_table_bdeb_once(src, torch.int64, device)
+    save_dir = str(tmp_path)
+    src.dump(save_dir)
+
+    values_path = _shard_file(save_dir, table_names[0], "values")
+    with open(values_path, "r+b") as f:
+        f.truncate(os.path.getsize(values_path) - _dtype_element_size(torch.float32))
+
+    dst = _make_dump_load_tables(dims, table_names, torch.float32)
+    with pytest.raises(ValueError, match="bytes but"):
+        dst.load(save_dir)
+
+
+def test_load_warns_when_checkpoint_precision_differs(tmp_path):
+    """Loading across precisions converts rather than failing, and says so."""
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    fp32_dir = _dump_fp32_source(tmp_path, dims, table_names, device)
+
+    dst = _make_dump_load_tables(dims, table_names, torch.bfloat16)
+    with pytest.warns(UserWarning, match="converted on load"):
+        dst.load(fp32_dir)
+
+    keys_dst, vals_dst = dst.export_keys_values(table_names[0], device)
+    assert vals_dst.dtype == torch.bfloat16
+    assert keys_dst.numel() > 0
+
+
+# -- resolve_checkpoint_value_layout, without a table behind it ---------------
+
+
+def _write_blob(tmp_path, name: str, nbytes: int) -> str:
+    path = os.path.join(str(tmp_path), name)
+    with open(path, "wb") as f:
+        f.write(b"\0" * nbytes)
+    return path
+
+
+def test_resolve_value_layout_legacy_defaults_to_fp32_and_derives_dim(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8)
+    emb_dtype, opt_state_dtype, dim = resolve_checkpoint_value_layout(
+        {}, path, num_keys=3, runtime_dim=999
+    )
+    assert emb_dtype == torch.float32
+    assert opt_state_dtype == torch.float32
+    # 96 bytes / (3 keys * 4 bytes) -- the runtime dim is not consulted.
+    assert dim == 8
+
+
+def test_resolve_value_layout_prefers_meta(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 2 * 3 * 8)
+    emb_dtype, opt_state_dtype, dim = resolve_checkpoint_value_layout(
+        {
+            "embedding_dtype": "bfloat16",
+            "embedding_dim": 8,
+            "optim_state_dtype": "bfloat16",
+        },
+        path,
+        num_keys=3,
+        runtime_dim=8,
+    )
+    assert emb_dtype == torch.bfloat16
+    assert opt_state_dtype == torch.bfloat16
+    assert dim == 8
+
+
+def test_resolve_value_layout_empty_shard_falls_back_to_runtime_dim(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 0)
+    _, _, dim = resolve_checkpoint_value_layout({}, path, num_keys=0, runtime_dim=16)
+    assert dim == 16
+
+
+def test_resolve_value_layout_rejects_size_disagreement(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8)
+    with pytest.raises(ValueError, match="bytes but"):
+        resolve_checkpoint_value_layout(
+            {"embedding_dtype": "float32", "embedding_dim": 7},
+            path,
+            num_keys=3,
+            runtime_dim=7,
+        )
+
+
+def test_resolve_value_layout_rejects_legacy_size_that_is_not_whole_rows(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8 + 1)
+    with pytest.raises(ValueError, match="row width cannot be recovered"):
+        resolve_checkpoint_value_layout({}, path, num_keys=3, runtime_dim=8)
+
+
+def test_resolve_value_layout_rejects_non_dtype_meta(tmp_path):
+    path = _write_blob(tmp_path, "values.bin", 0)
+    with pytest.raises(ValueError, match="not a torch dtype"):
+        resolve_checkpoint_value_layout(
+            {"embedding_dtype": "float33"}, path, num_keys=0, runtime_dim=8
+        )
+
+
 def _dtype_element_size(dtype: torch.dtype) -> int:
     return int(torch.empty(0, dtype=dtype).element_size())
 
@@ -2722,7 +3016,9 @@ def _assert_opt_values_ckpt_row_width(
         save_dir, table_name, rank, world_size, "opt_values"
     )
     key_el = _dtype_element_size(KEY_TYPE)
-    opt_el = _dtype_element_size(OPT_STATE_TYPE)
+    # Optimizer states share the value row, so they are checkpointed at the
+    # table's precision, not at a fixed fp32.
+    opt_el = _dtype_element_size(value_type)
     num_keys = os.path.getsize(keys_path) // key_el
     opt_sz = os.path.getsize(opt_path)
     ckpt_elems = get_optimizer_ckpt_state_dim(opt_type, emb_dim, value_type)

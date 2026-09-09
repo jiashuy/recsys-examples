@@ -16,6 +16,7 @@
 import json
 import math
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -191,6 +192,131 @@ def load_from_json(file_path: str) -> Dict[str, Any]:
         return data
     except Exception as e:
         raise RuntimeError(f"Error loading data from JSON file: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint value layout
+#
+# Key / embedding / score / optimizer-state files are bare row-major blobs with
+# no header, so the table's meta JSON is the only record of how to read them
+# back. Embeddings and optimizer states are dumped at the table's own precision
+# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
+# makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
+# decorative. Checkpoints written before those keys existed are always fp32, and
+# their dim is recoverable from the file size -- see
+# :func:`resolve_checkpoint_value_layout`.
+# ---------------------------------------------------------------------------
+
+META_EMBEDDING_DTYPE = "embedding_dtype"
+META_EMBEDDING_DIM = "embedding_dim"
+META_OPT_STATE_DTYPE = "optim_state_dtype"
+
+
+def dtype_to_meta_name(dtype: torch.dtype) -> str:
+    """``torch.bfloat16`` -> ``"bfloat16"``, the spelling checkpoint meta uses."""
+    return str(dtype).split(".", 1)[-1]
+
+
+def dtype_from_meta_name(name: Any, field_name: str) -> torch.dtype:
+    """Inverse of :func:`dtype_to_meta_name`, rejecting anything not a dtype.
+
+    Resolves against ``torch`` itself rather than a hand-kept table so any dtype
+    a table can be built with round-trips, and a corrupt or hand-edited meta
+    fails here instead of silently mis-striding the value file.
+    """
+    dtype = getattr(torch, name, None) if isinstance(name, str) else None
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(
+            f"Checkpoint meta field {field_name!r} is {name!r}, which is not a "
+            "torch dtype."
+        )
+    return dtype
+
+
+def resolve_checkpoint_value_layout(
+    meta_data: Dict[str, Any],
+    embedding_file_path: str,
+    num_keys: int,
+    runtime_dim: int,
+) -> Tuple[torch.dtype, torch.dtype, int]:
+    """Decide how to read a value file: (embedding dtype, opt-state dtype, dim).
+
+    Prefers what the dump recorded. For a checkpoint written before the meta
+    carried a dtype, the historical answer is fp32 for both value files, and the
+    row width is recovered from the value file's length -- exact, given the dtype
+    and the key count. An empty shard is the one case the length cannot answer,
+    so it defers to the runtime dim.
+
+    Either way the result is cross-checked against the file size, which turns a
+    wrong dtype assumption (or a truncated file) into an error here rather than
+    a silently misparsed table.
+
+    Raises:
+        ValueError: the value file's size disagrees with the resolved layout, or
+            a meta dtype field is not a torch dtype.
+    """
+    emb_dtype = (
+        dtype_from_meta_name(meta_data[META_EMBEDDING_DTYPE], META_EMBEDDING_DTYPE)
+        if META_EMBEDDING_DTYPE in meta_data
+        else EMBEDDING_TYPE
+    )
+    opt_state_dtype = (
+        dtype_from_meta_name(meta_data[META_OPT_STATE_DTYPE], META_OPT_STATE_DTYPE)
+        if META_OPT_STATE_DTYPE in meta_data
+        else OPT_STATE_TYPE
+    )
+
+    emb_bytes = os.path.getsize(embedding_file_path)
+    ckpt_dim = meta_data.get(META_EMBEDDING_DIM, None)
+    if ckpt_dim is None:
+        if num_keys == 0:
+            ckpt_dim = runtime_dim
+        else:
+            key_block = num_keys * emb_dtype.itemsize
+            if emb_bytes % key_block != 0:
+                raise ValueError(
+                    f"Embedding file {embedding_file_path} size {emb_bytes} is not "
+                    f"divisible by {key_block} (num_keys={num_keys}, dtype "
+                    f"{emb_dtype}), so its row width cannot be recovered. This "
+                    "checkpoint predates "
+                    f"{META_EMBEDDING_DIM!r}/{META_EMBEDDING_DTYPE!r} in the meta "
+                    "JSON, so it is assumed to be fp32."
+                )
+            ckpt_dim = emb_bytes // key_block
+    ckpt_dim = int(ckpt_dim)
+
+    expected_bytes = num_keys * ckpt_dim * emb_dtype.itemsize
+    if emb_bytes != expected_bytes:
+        raise ValueError(
+            f"Embedding file {embedding_file_path} holds {emb_bytes} bytes but "
+            f"{expected_bytes} were expected for {num_keys} keys of {ckpt_dim} "
+            f"{emb_dtype} elements."
+        )
+    return emb_dtype, opt_state_dtype, ckpt_dim
+
+
+def _raw_bytes(tensor: torch.Tensor) -> bytes:
+    """Little-endian raw bytes of *tensor*, for any dtype it can hold.
+
+    Views as uint8 instead of going through ``numpy().tobytes()`` because numpy
+    has no bfloat16, and value files now carry the table's own precision.
+    """
+    return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _tensor_from_bytes(
+    buf: bytes, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Decode *buf* as a 1-D tensor of *dtype* on *device*.
+
+    ``torch.frombuffer`` rather than ``np.frombuffer`` for the same bfloat16
+    reason as :func:`_raw_bytes`. The ``bytearray`` copy makes the buffer writable
+    so torch does not warn about aliasing read-only memory; the ``to(device)``
+    would copy regardless.
+    """
+    if len(buf) == 0:
+        return torch.empty(0, dtype=dtype, device=device)
+    return torch.frombuffer(bytearray(buf), dtype=dtype).to(device)
 
 
 def get_score_policy(score_strategy):
@@ -1462,6 +1588,11 @@ def export_keys_values_iter(
 ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
     """Export keys, embeddings, opt_states, scores for a logical table.
 
+    Embeddings and optimizer states come out at the table's own precision
+    (``state.emb_dtype``), matching what ``incremental_dump`` yields, so a
+    checkpoint stores what the table actually holds instead of an fp32 widening
+    of it. Callers that want fp32 cast on their own.
+
     NO_EVICTION tables load flat values by stored score (logical row index), not by
     hash slot ``indices`` from export.
     """
@@ -1483,11 +1614,9 @@ def export_keys_values_iter(
         scores = named_scores[state.score_policy.name]
         flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
         values = load_from_flat_single_table(state, flat_rows, table_id)
-        embeddings = values[:, :emb_dim_t].to(dtype=EMBEDDING_TYPE).contiguous()
+        embeddings = values[:, :emb_dim_t].contiguous()
         if optim_state_dim != 0:
-            opt_states = (
-                values[:, -optim_state_dim:].to(dtype=OPT_STATE_TYPE).contiguous()
-            ).to(device)
+            opt_states = values[:, -optim_state_dim:].contiguous().to(device)
         else:
             opt_states = None
         # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must
@@ -1535,6 +1664,18 @@ def _dump_table(
         meta_data.update(state.optimizer.get_opt_args())
         meta_data["evict_strategy"] = str(state.evict_strategy)
         meta_data["dist_type"] = state.options_list[table_id].dist_type
+        # How to read the value files back. They carry no header, so without
+        # these a loader can only assume the historical fp32 and guess the row
+        # width from the file length. Note this dict is rebuilt and rewritten
+        # whole on every dump (by rank 0 only, and not by the appending second
+        # tier of a hybrid dump): anything a loader needs has to be contributed
+        # here, because there is no later pass that merges into the file.
+        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(state.emb_dtype)
+        meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
+        # Optimizer states share the value row, hence the table's dtype too;
+        # recorded separately so the two can diverge later without breaking
+        # checkpoints written now.
+        meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(state.emb_dtype)
 
         if current_score is not None:
             meta_data["step_score"] = current_score
@@ -1551,7 +1692,7 @@ def _dump_table(
         state, device=device, table_id=table_id
     ):
         fkey.write(keys.cpu().numpy().tobytes())
-        fembedding.write(embeddings.cpu().numpy().tobytes())
+        fembedding.write(_raw_bytes(embeddings))
         if state.evict_strategy == EvictStrategy.KLru:
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
@@ -1561,7 +1702,7 @@ def _dump_table(
                 state.table_emb_dims_cpu[table_id],
                 opt_states_batch,
             )
-            fopt_states.write(to_write.cpu().numpy().tobytes())
+            fopt_states.write(_raw_bytes(to_write))
 
     fkey.close()
     fembedding.close()
@@ -1581,6 +1722,8 @@ def _iter_batches_from_files(
     device: torch.device,
     batch_size: int = 65536,
     num_scores: int = 1,
+    emb_dtype: torch.dtype = EMBEDDING_TYPE,
+    opt_state_dtype: torch.dtype = OPT_STATE_TYPE,
 ) -> Iterator[Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]]:
     """Yield (keys, embeddings, scores, opt_states) batches from checkpoint files.
 
@@ -1588,7 +1731,15 @@ def _iter_batches_from_files(
     > 1 (e.g. LruLfu's timestamp+frequency) the yielded ``scores`` is
     [n, num_scores]; otherwise it is [n].
 
-    Handles file I/O, numpy deserialization, and distributed world_size filtering.
+    *emb_dtype* / *opt_state_dtype* are the precisions the files were written at,
+    which is how far apart the batches step through them -- get them wrong and
+    the files misparse rather than fail. Callers holding the table's meta should
+    pass what :func:`resolve_checkpoint_value_layout` resolved; the fp32 defaults
+    are what every checkpoint written before the meta recorded a dtype used.
+    The yielded tensors keep the file's dtype; the insert path casts to the
+    table's.
+
+    Handles file I/O, deserialization, and distributed world_size filtering.
     Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
     """
     fkey = open(emb_key_path, "rb")
@@ -1615,12 +1766,8 @@ def _iter_batches_from_files(
                 device=device,
             )
 
-            emb_bytes = fembedding.read(EMBEDDING_TYPE.itemsize * dim * n)
-            embeddings = torch.tensor(
-                np.frombuffer(emb_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]),
-                dtype=EMBEDDING_TYPE,
-                device=device,
-            ).view(-1, dim)
+            emb_bytes = fembedding.read(emb_dtype.itemsize * dim * n)
+            embeddings = _tensor_from_bytes(emb_bytes, emb_dtype, device).view(-1, dim)
 
             scores = None
             if fscore:
@@ -1637,13 +1784,9 @@ def _iter_batches_from_files(
 
             opt_states = None
             if fopt:
-                opt_bytes = fopt.read(OPT_STATE_TYPE.itemsize * optstate_dim * n)
-                opt_states = torch.tensor(
-                    np.frombuffer(
-                        opt_bytes, dtype=torch_dtype_to_np_dtype[OPT_STATE_TYPE]
-                    ),
-                    dtype=OPT_STATE_TYPE,
-                    device=device,
+                opt_bytes = fopt.read(opt_state_dtype.itemsize * optstate_dim * n)
+                opt_states = _tensor_from_bytes(
+                    opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
             if world_size > 1:
@@ -1673,6 +1816,10 @@ class _LoadParams:
     file_optstate_dim: int
     include_optim: bool
     num_keys: int
+    # Precisions the value files were written at, resolved from meta (fp32 for
+    # checkpoints predating it). Pass both to ``_iter_batches_from_files``.
+    emb_dtype: torch.dtype = EMBEDDING_TYPE
+    opt_state_dtype: torch.dtype = OPT_STATE_TYPE
 
 
 def _validate_load_meta(
@@ -1687,8 +1834,9 @@ def _validate_load_meta(
 ) -> _LoadParams:
     """Shared validation for checkpoint loading.
 
-    Reads meta JSON, validates opt_type / evict_strategy, resolves
-    include_optim, and checks file-size consistency.
+    Reads meta JSON, validates opt_type / evict_strategy / dist_type, resolves
+    the value files' precision and row width, resolves include_optim, and checks
+    file-size consistency.
     """
     meta_data = load_from_json(meta_json_file_path)
     opt_type = meta_data.get("opt_type", None)
@@ -1733,12 +1881,24 @@ def _validate_load_meta(
         state.optimizer.set_opt_args(meta_data)
 
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
-    num_embeddings = (
-        os.path.getsize(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
+    emb_dtype, opt_state_dtype, ckpt_emb_dim = resolve_checkpoint_value_layout(
+        meta_data, embedding_file_path, num_keys, dim
     )
-    if num_keys != num_embeddings:
+    if ckpt_emb_dim != dim:
         raise ValueError(
-            f"The number of keys in {emb_key_path} does not match with number of embeddings in {embedding_file_path}."
+            f"Embedding dim mismatch: {embedding_file_path} holds rows of "
+            f"{ckpt_emb_dim} but the runtime table is configured with dim {dim}."
+        )
+    if emb_dtype != state.emb_dtype:
+        # Not fatal: the insert path casts, so this is a deliberate precision
+        # migration as often as it is a mistake. Say which way it goes, since
+        # narrowing loses bits that the checkpoint still has.
+        warnings.warn(
+            f"Checkpoint {embedding_file_path} stores {emb_dtype} embeddings but "
+            f"the runtime table is {state.emb_dtype}; values will be converted on "
+            "load.",
+            UserWarning,
+            stacklevel=2,
         )
     if score_file_path and os.path.exists(score_file_path):
         # The score file holds num_scores words per key (e.g. LruLfu = 2:
@@ -1759,11 +1919,11 @@ def _validate_load_meta(
                     f"Optimizer state file {opt_file_path} is non-empty but key file has no keys."
                 )
         else:
-            row_block = num_keys * OPT_STATE_TYPE.itemsize
+            row_block = num_keys * opt_state_dtype.itemsize
             if file_bytes % row_block != 0:
                 raise ValueError(
                     f"Optimizer state file {opt_file_path} size {file_bytes} is not divisible by "
-                    f"{row_block} (num_keys={num_keys}, dtype itemsize={OPT_STATE_TYPE.itemsize})."
+                    f"{row_block} (num_keys={num_keys}, dtype itemsize={opt_state_dtype.itemsize})."
                 )
             file_optstate_dim = file_bytes // row_block
             ckpt_dim = state.optimizer.get_ckpt_state_dim(dim)
@@ -1780,6 +1940,8 @@ def _validate_load_meta(
         file_optstate_dim=file_optstate_dim,
         include_optim=include_optim,
         num_keys=num_keys,
+        emb_dtype=emb_dtype,
+        opt_state_dtype=opt_state_dtype,
     )
 
 
@@ -2611,6 +2773,8 @@ class DynamicEmbStorage(Storage):
             params.file_optstate_dim,
             device,
             num_scores=num_scores,
+            emb_dtype=params.emb_dtype,
+            opt_state_dtype=params.opt_state_dtype,
         ):
             if (
                 scores is not None
@@ -3485,6 +3649,16 @@ class HybridStorage(Storage):
                 "dump is not yet supported for HybridStorage with multi-word "
                 "score layouts (e.g. the (TIMESTAMP, LFU) compound score with caching)."
             )
+        if self._host.emb_dtype != self._hbm.emb_dtype:
+            # The HBM tier is appended into the host tier's value files, under a
+            # single meta describing one dtype, so two precisions in one file
+            # would be unreadable. Both tiers are built from the same table
+            # options today, so this is a guard, not a supported configuration.
+            raise NotImplementedError(
+                "dump is not supported for HybridStorage whose tiers store "
+                f"different precisions (host {self._host.emb_dtype}, HBM "
+                f"{self._hbm.emb_dtype}); they share one value file."
+            )
         _dump_table(
             self._host,
             table_id,
@@ -3574,6 +3748,8 @@ class HybridStorage(Storage):
             params.dim,
             params.file_optstate_dim,
             device,
+            emb_dtype=params.emb_dtype,
+            opt_state_dtype=params.opt_state_dtype,
         ):
             if keys.numel() == 0:
                 continue
