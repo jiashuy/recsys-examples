@@ -2705,6 +2705,18 @@ def test_multi_table_load_legacy_metadata_defaults_to_roundrobin(tmp_path):
 
 _VALUE_LAYOUT_META_KEYS = ("embedding_dtype", "embedding_dim", "optim_state_dtype")
 
+# Rowwise Adagrad rather than SGD so the stored row is not embeddings alone.
+# Its checkpoint state is one accumulator per row while its runtime state is
+# ``16 // itemsize`` elements (4 at fp32, 8 at fp16/bf16), so a load has to
+# widen and re-type the block rather than copy it straight through -- the part
+# of _load_key_values that a stateless optimizer never reaches.
+_DUMP_LOAD_OPT_TYPE = EmbOptimType.EXACT_ROWWISE_ADAGRAD
+_DUMP_LOAD_OPT_PARAMS = {
+    "learning_rate": 0.01,
+    "eps": 1e-8,
+    "initial_accumulator_value": 0.0,
+}
+
 
 def _init_single_rank_pg(device_id: int = 0) -> torch.device:
     import torch.distributed as dist
@@ -2752,8 +2764,8 @@ def _make_dump_load_tables(
     device_id: int = 0,
 ) -> BatchedDynamicEmbeddingTablesV2:
     return _make_multi_table_bdeb_for_dump_load(
-        EmbOptimType.SGD,
-        {"learning_rate": 0.3},
+        _DUMP_LOAD_OPT_TYPE,
+        _DUMP_LOAD_OPT_PARAMS,
         dims,
         table_names,
         list(range(len(table_names))),
@@ -2774,7 +2786,7 @@ def _dump_fp32_source(tmp_path, dims, table_names, device) -> str:
     _train_multi_table_bdeb_once(src, torch.int64, device)
     save_dir = os.path.join(str(tmp_path), "fp32")
     os.makedirs(save_dir, exist_ok=True)
-    src.dump(save_dir)
+    src.dump(save_dir, optim=True)
     return save_dir
 
 
@@ -2796,11 +2808,11 @@ def test_dump_stores_table_precision(value_type, tmp_path):
         # Reading fp32 rows into a narrower table warns by design -- that is the
         # conversion path, not the thing under test here.
         warnings.simplefilter("ignore", UserWarning)
-        mid.load(fp32_dir)
+        mid.load(fp32_dir, optim=True)
 
     native_dir = os.path.join(str(tmp_path), "native")
     os.makedirs(native_dir, exist_ok=True)
-    mid.dump(native_dir)
+    mid.dump(native_dir, optim=True)
 
     dtype_name = str(value_type).split(".")[-1]
     for table_id, name in enumerate(table_names):
@@ -2811,11 +2823,23 @@ def test_dump_stores_table_precision(value_type, tmp_path):
 
         num_keys = _dumped_key_count(native_dir, name)
         assert num_keys > 0, f"{name}: nothing was dumped, the test proves nothing"
-        expected = num_keys * dims[table_id] * _dtype_element_size(value_type)
-        assert os.path.getsize(_shard_file(native_dir, name, "values")) == expected
+        elem = _dtype_element_size(value_type)
+        assert (
+            os.path.getsize(_shard_file(native_dir, name, "values"))
+            == num_keys * dims[table_id] * elem
+        )
+        # The optimizer block shares the value row, so it is written at the same
+        # precision -- check the file rather than trusting the meta string.
+        ckpt_opt_dim = get_optimizer_ckpt_state_dim(
+            _DUMP_LOAD_OPT_TYPE, dims[table_id], value_type
+        )
+        assert (
+            os.path.getsize(_shard_file(native_dir, name, "opt_values"))
+            == num_keys * ckpt_opt_dim * elem
+        )
 
     dst = _make_dump_load_tables(dims, table_names, value_type)
-    dst.load(native_dir)
+    dst.load(native_dir, optim=True)
     for name in table_names:
         keys_mid, vals_mid = mid.export_keys_values(name, device)
         keys_dst, vals_dst = dst.export_keys_values(name, device)
@@ -2843,7 +2867,7 @@ def test_load_reads_legacy_checkpoint_without_value_layout_meta(tmp_path):
     src = _make_dump_load_tables(dims, table_names, torch.float32)
     _train_multi_table_bdeb_once(src, torch.int64, device)
     save_dir = str(tmp_path)
-    src.dump(save_dir)
+    src.dump(save_dir, optim=True)
 
     for name in table_names:
         meta = _read_meta(save_dir, name)
@@ -2852,7 +2876,7 @@ def test_load_reads_legacy_checkpoint_without_value_layout_meta(tmp_path):
         _write_meta(save_dir, name, meta)
 
     dst = _make_dump_load_tables(dims, table_names, torch.float32)
-    dst.load(save_dir)
+    dst.load(save_dir, optim=True)
 
     for name in table_names:
         keys_src, vals_src = src.export_keys_values(name, device)
