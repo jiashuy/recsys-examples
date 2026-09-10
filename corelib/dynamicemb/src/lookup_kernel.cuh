@@ -967,8 +967,7 @@ template <typename CopyDesc>
 void copy_multi_to_one(CopyDesc &copy_desc, int ev_size, cudaStream_t stream) {
   if (copy_desc.num_vec_ == 0)
     return;
-  if (ev_size % 4 != 0 || copy_desc.accum_D % 4 != 0 ||
-      copy_desc.total_D % 4 != 0) {
+  if (ev_size % 4 != 0 || copy_desc.total_D % 4 != 0) {
     //  need to optimize for small ev_size
     constexpr int MAX_THREADS_PER_BLOCK = 1024;
     int grid_dim = copy_desc.num_vec_;

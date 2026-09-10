@@ -26,15 +26,13 @@ namespace dyn_emb {
 // D_offsets_ptr[f+1]-D_offsets_ptr[f] and the destination column start is
 // D_offsets_ptr[f].  Source rows use src_stride as the row stride.
 // When D_offsets_ptr is null (uniform-dim), every feature has dim ev_size and
-// the destination column start is accum_D + f * ev_size.
+// the destination column start is f * ev_size.
 template <typename SrcType, typename DstType, typename offset_t>
 struct ForwardMultiToOneFMLayoutDesc {
   using SrcT = SrcType;
   using DstT = DstType;
 
-  HOST_DEVICE_INLINE int get_offset(int i) {
-    return offset_ptr[i] - offset_ptr[0];
-  }
+  HOST_DEVICE_INLINE int get_offset(int i) { return offset_ptr[i]; }
   HOST_DEVICE_INLINE int get_vec_length(int i) {
     if (D_offsets_ptr) {
       int f = i / batch_size;
@@ -60,7 +58,7 @@ struct ForwardMultiToOneFMLayoutDesc {
     if (D_offsets_ptr) {
       return dst_ptr + b * total_D + D_offsets_ptr[f];
     }
-    return dst_ptr + b * total_D + accum_D + f * ev_size;
+    return dst_ptr + b * total_D + f * ev_size;
   }
 
   int num_vec_;
@@ -75,13 +73,12 @@ struct ForwardMultiToOneFMLayoutDesc {
   DstType *dst_ptr;
   int batch_size;
   int total_D;
-  int accum_D;
   const float *__restrict__ weights_ptr; // nullptr -> unweighted
 };
 
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, PoolingMode pooling_mode, int total_D,
-                     int accum_D, int ev_size, int src_stride, int num_vec,
+                     int ev_size, int src_stride, int num_vec,
                      int batch_size, DataType src_type, DataType dst_type,
                      DataType offset_type, cudaStream_t stream,
                      const int *D_offsets_ptr, const float *weights_ptr) {
@@ -101,7 +98,6 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                                    (dst_t *)dst_ptr,
                                    batch_size,
                                    total_D,
-                                   accum_D,
                                    weights_ptr};
         copy_multi_to_one(multi_to_one_desc, ev_size, stream);
       });

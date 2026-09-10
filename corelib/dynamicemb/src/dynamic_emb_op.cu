@@ -147,7 +147,7 @@ void gather_embedding_pooled(
   }
   dyn_emb::scatter_combine(
       input.data_ptr(), output.data_ptr(), offsets.data_ptr(), index.data_ptr(),
-      pooling_mode, total_D, /*accum_D=*/0, dim, src_stride, num_slots, batch_size,
+      pooling_mode, total_D, dim, src_stride, num_slots, batch_size,
       src_type, dst_type, offset_type, stream, d_D_offsets, d_weights);
 }
 // Generate permutation-aware gather_ids from CSR offsets.

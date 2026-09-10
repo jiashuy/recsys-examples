@@ -23,11 +23,11 @@ namespace dyn_emb {
 
 // Unified pooled gather (scatter-combine).
 // When D_offsets_ptr is non-null, multi-dim mode: ev_size is max_D (source row
-// stride), per-feature dims from D_offsets_ptr, accum_D ignored (pass 0).
+// stride), per-feature dims come from D_offsets_ptr.
 // When D_offsets_ptr is null, uniform-dim mode: ev_size is the embedding dim.
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, PoolingMode pooling_mode, int total_D,
-                     int accum_D, int ev_size, int src_stride, int num_vec,
+                     int ev_size, int src_stride, int num_vec,
                      int batch_size, DataType src_type, DataType dst_type,
                      DataType offset_type, cudaStream_t stream,
                      const int *D_offsets_ptr = nullptr,

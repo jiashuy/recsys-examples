@@ -269,7 +269,7 @@ def test_weighted_sum_mixed_D_matches_torchrec(current_device):
 
 
 # copy_multi_to_one falls back from the vec4 warp-per-ev kernel to the
-# cta-per-ev one as soon as ev_size, accum_D or total_D is not a multiple of 4,
+# cta-per-ev one as soon as ev_size or total_D is not a multiple of 4,
 # and the reduce kernels split the same way. The two tests above only ever hit
 # the vec4 side, so cover the other one in both the uniform and multi-dim shape.
 def test_weighted_sum_unaligned_dim_matches_torchrec(current_device):
