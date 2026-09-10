@@ -1142,14 +1142,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "pooling_weights requires pooling_mode=SUM (weighted pooling "
                     f"is only supported for SUM, got {self.pooling_mode})."
                 )
-            if not self.training:
-                raise ValueError(
-                    "pooling_weights is only supported in training mode."
-                )
             if pooling_weights.dtype != torch.float32:
                 raise ValueError(
-                    "pooling_weights must be float32, got "
-                    f"{pooling_weights.dtype}."
+                    f"pooling_weights must be float32, got {pooling_weights.dtype}."
                 )
             if pooling_weights.numel() != indices.numel():
                 raise ValueError(
@@ -1183,6 +1178,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.dims,
                 self.max_D,
                 self.D_offsets_t,
+                pooling_weights,
             )
 
         if any([not o.training for o in self._dynamicemb_options]):

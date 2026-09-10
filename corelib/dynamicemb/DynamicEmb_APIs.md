@@ -475,8 +475,8 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
         NONE = BagPoolingMode.KNone  # 2
     ```
 
-**Weighted SUM pooling (training only)** — `SUM` pooling supports optional per-position float32 weights: `out[b] = Σ wᵢ · embᵢ`. Supported only in
-**training mode**, only for `SUM` (no weighted-MEAN variant), and works with mixed-D tables. Two ways to use it:
+**Weighted SUM pooling** — `SUM` pooling supports optional per-position float32 weights: `out[b] = Σ wᵢ · embᵢ`. Supported in both training and
+eval mode, only for `SUM` (no weighted-MEAN variant), and works with mixed-D tables. Two ways to use it:
 
 - **Through TorchRec's `EmbeddingBagCollection`**: build the collection with
   `is_weighted=True` and attach the weights to the features KJT (`KeyedJaggedTensor(keys=..., values=indices, weights=weights, lengths=...)`);
@@ -484,7 +484,7 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
 - **Through `BatchedDynamicEmbeddingTablesV2.forward` directly**:
   `module(indices, offsets, pooling_weights=w)` where `w` is a float32 tensor aligned with `indices` (`w.numel() == indices.numel()`).
 
-Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights are not float32, `weights.numel() != indices.numel()`, or the module is in eval mode.
+Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights are not float32, `weights.numel() != indices.numel()`, or `frequency_counters` is passed alongside them (both are carried by the single KJT weights channel, so a caller has to pick one).
 
 ## DynamicEmbTableOptions
 
@@ -1217,7 +1217,7 @@ oracle in `test/unit_tests/test_weighted_pooled_embedding_v2.py` and end-to-end 
 `BatchedDynamicEmbeddingTablesV2.forward` previously took `per_sample_weights`, which was consumed as **LFU frequency counters**. That parameter is now split:
 
 - `frequency_counters: Optional[Tensor]` — per-position LFU frequency counters (the old `per_sample_weights` semantics).
-- `pooling_weights: Optional[Tensor]` — per-position float32 weights for weighted-SUM pooling (new; training only, SUM only).
+- `pooling_weights: Optional[Tensor]` — per-position float32 weights for weighted-SUM pooling (new; SUM only). The two are mutually exclusive.
 
 Callers that passed `per_sample_weights=...` for LFU counting must pass `frequency_counters=...` instead.
 

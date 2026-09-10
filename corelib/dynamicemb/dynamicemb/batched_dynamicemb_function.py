@@ -899,6 +899,7 @@ def dynamicemb_eval_forward(
     dims: Optional[List[int]] = None,
     max_D: int = 0,
     D_offsets: Optional[torch.Tensor] = None,
+    pooling_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only forward for all storage configurations (no autograd)."""
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
@@ -977,6 +978,7 @@ def dynamicemb_eval_forward(
             batch_size,
             D_offsets,
             max_D,
+            pooling_weights,
         )
         return output_embs
 
