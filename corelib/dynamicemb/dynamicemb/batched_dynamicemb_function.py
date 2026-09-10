@@ -1116,28 +1116,11 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             val_dim = storage.max_value_dim()
             emb_dtype = storage.embedding_dtype()
 
+            # pooling_weights is validated by the sole caller,
+            # BatchedDynamicEmbeddingTablesV2.forward (pooling mode, training
+            # mode, dtype, numel), and again by TORCH_CHECK in
+            # gather_embedding_pooled / reduce_grads.
             is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
-            if pooling_weights is not None:
-                if pooling_mode != DynamicEmbPoolingMode.SUM:
-                    raise ValueError(
-                        "pooling_weights requires pooling_mode=SUM (weighted "
-                        f"pooling is only supported for SUM, got {pooling_mode})."
-                    )
-                if pooling_weights.dtype != torch.float32:
-                    raise ValueError(
-                        "pooling_weights must be float32, got "
-                        f"{pooling_weights.dtype}."
-                    )
-                if (
-                    pooling_weights.numel()
-                    != prefetch_state.reverse_indices.numel()
-                ):
-                    raise ValueError(
-                        "pooling_weights.numel() "
-                        f"({pooling_weights.numel()}) must equal "
-                        "reverse_indices.numel() "
-                        f"({prefetch_state.reverse_indices.numel()})."
-                    )
             mixed_D = is_pooling and dims is not None and max_D > min(dims)
             out_dim = max_D if mixed_D else emb_dim
 

@@ -1127,6 +1127,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
         if pooling_weights is not None:
+            if frequency_counters is not None:
+                # Both are fed from the single KJT weights channel: the
+                # sequence path reads it as LFU frequency counters, the
+                # weighted-pooling path as per-sample weights. One KJT cannot
+                # mean both, so receiving both signals a misrouted caller.
+                raise ValueError(
+                    "pooling_weights and frequency_counters are mutually "
+                    "exclusive (both are derived from KeyedJaggedTensor "
+                    "weights); got both."
+                )
             if self.pooling_mode != DynamicEmbPoolingMode.SUM:
                 raise ValueError(
                     "pooling_weights requires pooling_mode=SUM (weighted pooling "

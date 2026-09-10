@@ -137,6 +137,12 @@ void gather_embedding_pooled(
     TORCH_CHECK(w.numel() == index.numel(),
                 "weights.numel() (", w.numel(),
                 ") must equal index.numel() (", index.numel(), ")");
+    // MEAN divides the weighted sum by the pool size, which is neither a
+    // weighted sum nor a weighted average -- reject it instead of silently
+    // producing that.
+    TORCH_CHECK(pooling_mode == PoolingMode::kSum,
+                "weights require pooling_mode=SUM, got ",
+                static_cast<int>(pooling_mode));
     d_weights = reinterpret_cast<const float *>(w.data_ptr());
   }
   dyn_emb::scatter_combine(
@@ -288,6 +294,10 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
                 ") must equal reverse_indices.numel() (", num_keys, ")");
     TORCH_CHECK(offsets.has_value(),
                 "weights are only supported for pooled (offsets) reduce");
+    // Must match the forward: see gather_embedding_pooled.
+    TORCH_CHECK(pooling_mode == PoolingMode::kSum,
+                "weights require pooling_mode=SUM, got ",
+                static_cast<int>(pooling_mode));
     at::Tensor sw = at::empty_like(w);
     DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
       size_t w_temp_bytes = 0;
@@ -941,19 +951,4 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("select_insert_failed_values", &select_insert_failed_values,
         "select_insert_failed_values", py::arg("indices"),
         py::arg("input_values"), py::arg("evicted_values"));
-
-  m.def("reduce_grads", &reduce_grads, "reduce grads",
-        py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
-        py::arg("batch_size"), py::arg("out_dim"),
-        py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
-        py::arg("pooling_mode") = dyn_emb::PoolingMode::kNone,
-        py::arg("total_D") = 0,
-        py::arg("weights") = py::none());
-
-  m.def("gather_embedding_pooled", &gather_embedding_pooled,
-        "Gather embedding with pooling (SUM/MEAN) based on index and offsets.",
-        py::arg("input"), py::arg("output"), py::arg("index"),
-        py::arg("offsets"), py::arg("pooling_mode"), py::arg("total_D"),
-        py::arg("batch_size"), py::arg("D_offsets") = py::none(),
-        py::arg("max_D") = 0, py::arg("weights") = py::none());
 }
