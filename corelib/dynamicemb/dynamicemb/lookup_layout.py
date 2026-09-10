@@ -26,8 +26,8 @@ uniform dims the pooled output ``[B, total_D]`` is also a free ``[B*F, D]``
 view, and ``r`` is the row index into that view.
 
 The two are transposes of each other. Converting between them is what the
-backward path does when it builds its gather ids, and it is the single most
-error-prone step in the lookup -- go through the helpers below rather than
+backward path does when it works out which gradient row each key reads, and it
+is the single most error-prone step in the lookup -- go through the helpers below rather than
 writing ``s / B`` or ``b * F`` by hand.
 
 Worked example: ``F=2``, ``B=3``, both tables dim 2, so ``total_D = 4``::

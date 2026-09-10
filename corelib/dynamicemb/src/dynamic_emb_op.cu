@@ -29,6 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <torch/torch.h>
@@ -178,24 +179,39 @@ void gather_embedding_pooled(
     });
   });
 }
-// For every key, the row of grads its gradient comes from.
+// For every key, the row of grads its gradient comes from, plus its pooling
+// weight.
 //
-// offsets numbers bags in the input's order, grads in the output's, so this is
-// the transpose (see pooled_layout.cuh).  Doing it here, once per key, is what
-// lets LocalReduce read grads directly instead of materializing a permuted
-// copy of it.  One thread per bag; every key in a bag shares the bag's row.
-template <typename offset_t, typename id_t>
+// offsets numbers bags in the input's order, grads in the output's, so the row
+// is the transpose (see pooled_layout.cuh).  Doing it here, once per key, is
+// what lets LocalReduce read grads directly instead of materializing a permuted
+// copy of it.  One thread per bag; every key in a bag shares the bag's row but
+// keeps its own weight.
+template <typename offset_t>
 __global__ void
-generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
-                                  id_t *__restrict__ gather_ids,
-                                  PooledLayout layout) {
+generate_grad_infos_pooled_kernel(const offset_t *__restrict__ offsets,
+                                  GradInfo *__restrict__ grad_infos,
+                                  PooledLayout layout,
+                                  const float *__restrict__ weights) {
   const int num_bags = layout.num_bags();
   for (int s = blockIdx.x * blockDim.x + threadIdx.x; s < num_bags;
        s += gridDim.x * blockDim.x) {
-    const id_t row = static_cast<id_t>(layout.output_index_of_input(s));
+    const int32_t row =
+        static_cast<int32_t>(layout.output_index_of_input(s));
     for (offset_t j = offsets[s]; j < offsets[s + 1]; ++j) {
-      gather_ids[j] = row;
+      grad_infos[j] = GradInfo{row, weights ? weights[j] : 1.0f};
     }
+  }
+}
+
+// Sequence lookups already have one grads row per key, so the row is the key's
+// own index and nothing is pooled, hence no weight.
+__global__ void
+generate_grad_infos_sequence_kernel(int64_t num_keys,
+                                    GradInfo *__restrict__ grad_infos) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < num_keys;
+       i += (int64_t)gridDim.x * blockDim.x) {
+    grad_infos[i] = GradInfo{static_cast<int32_t>(i), 1.0f};
   }
 }
 
@@ -208,15 +224,19 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
 	     const std::optional<at::Tensor> &weights = std::nullopt,
              bool feature_dims_vec4 = false) {
   // Pooled (offsets present): grads is [B, total_D], numbered in the output's
-  // order, while offsets numbers bags in the input's.  gather_ids bridges the
+  // order, while offsets numbers bags in the input's.  grad_infos bridges the
   // two -- one entry per key, holding the grads row that key's gradient comes
   // from -- so LocalReduce reads grads in place and no permuted copy of it is
   // ever materialized.  Mixed dims only change how a feature's columns are
   // found (layout.col_begin/col_width vs a uniform stride); MEAN scaling is
   // fused into the stage-1 kernel either way.  See pooled_layout.cuh.
   //
-  // Sequence (offsets absent): one grads row per key already, so gather_ids is
-  // just arange(num_keys).
+  // Sequence (offsets absent): one grads row per key already, so the row is
+  // just the key's index.
+  //
+  // The pooling weight rides in the same GradInfo as the row, so the single
+  // sort below carries it to the reduce; see GradInfo in lookup_backward.h for
+  // why that beats sorting the weights separately.
 
   int64_t num_keys = inverse_index.size(0);
 
@@ -239,14 +259,54 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
     return at::zeros({num_unique, out_dim}, grads.options());
   }
 
+  // GradInfo stores the grads row as int32.  On the sequence path that row is
+  // the key's own index; on the pooled path it is a bag number, bounded by the
+  // bag count checked below.
+  TORCH_CHECK(num_keys <= std::numeric_limits<int32_t>::max(),
+              "reduce_grads: ", num_keys,
+              " keys exceeds what GradInfo::grad_index (int32) can address");
+
   at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
 
-  // --- Generate gather_ids ---
-  at::Tensor gather_ids;
+  // Validated before anything reads it, since the grad_infos kernel below is
+  // the first consumer.
+  const float *d_weights = nullptr;
+  at::Tensor w;
+  if (weights.has_value()) {
+    w = weights.value().contiguous();
+    TORCH_CHECK(w.scalar_type() == at::kFloat, "weights must be float32, got ",
+                w.scalar_type());
+    TORCH_CHECK(w.is_cuda(), "weights must be a CUDA tensor");
+    TORCH_CHECK(w.numel() == num_keys, "weights.numel() (", w.numel(),
+                ") must equal inverse_index.numel() (", num_keys, ")");
+    TORCH_CHECK(offsets.has_value(),
+                "weights are only supported for pooled (offsets) reduce");
+    // Must match the forward: see gather_embedding_pooled.
+    TORCH_CHECK(pooling_mode == PoolingMode::kSum,
+                "weights require pooling_mode=SUM, got ",
+                static_cast<int>(pooling_mode));
+    d_weights = get_pointer<const float>(w);
+  }
+
+  // --- Generate grad_infos ---
+  // An int32 pair rather than an opaque byte buffer, so the tensor stays
+  // inspectable from Python; the kernels read it as GradInfo[num_keys].
+  at::Tensor grad_infos =
+      at::empty({num_keys, 2}, inverse_index.options().dtype(at::kInt));
+  auto *d_grad_infos = get_pointer<GradInfo>(grad_infos);
+
+  constexpr int kBlockSize = 256;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / kBlockSize);
+
   // Only meaningful on the pooled path; the sequence path never reads it.
   dyn_emb::PooledLayout layout{0, 0, 0, 0, nullptr};
   if (offsets.has_value()) {
     auto &offs = offsets.value();
+    TORCH_CHECK(offs.numel() - 1 <= std::numeric_limits<int32_t>::max(),
+                "reduce_grads: ", offs.numel() - 1,
+                " bags exceeds what GradInfo::grad_index (int32) can address");
     int num_slots = static_cast<int>(offs.numel() - 1);
     TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
     TORCH_CHECK(num_slots % batch_size == 0, "num_slots (", num_slots,
@@ -267,34 +327,31 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
     layout = {batch_size, num_features, total_D, static_cast<int>(out_dim),
               d_D_ptr};
 
-    constexpr int kBlockSize = 256;
-    auto &device_prop = DeviceProp::getDeviceProp();
-    const int max_grid_size =
-        device_prop.num_sms * (device_prop.max_thread_per_sm / kBlockSize);
-
     // One thread per bag; see the kernel for why this is done up front.
-    gather_ids = at::empty({num_keys}, inverse_index.options());
     int slot_grid = static_cast<int>(
         std::min(((int64_t)num_slots + kBlockSize - 1) / kBlockSize,
                  (int64_t)max_grid_size));
 
     DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
-      DISPATCH_INTEGER_DATATYPE_FUNCTION(index_dtype, id_t, [&] {
-        generate_gather_ids_pooled_kernel<offset_t, id_t>
-            <<<slot_grid, kBlockSize, 0, stream>>>(
-                get_pointer<const offset_t>(offs),
-                get_pointer<id_t>(gather_ids), layout);
-      });
+      generate_grad_infos_pooled_kernel<offset_t>
+          <<<slot_grid, kBlockSize, 0, stream>>>(
+              get_pointer<const offset_t>(offs), d_grad_infos, layout,
+              d_weights);
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-    gather_ids = at::arange(num_keys, inverse_index.options());
+    int key_grid = static_cast<int>(
+        std::min((num_keys + kBlockSize - 1) / kBlockSize,
+                 (int64_t)max_grid_size));
+    generate_grad_infos_sequence_kernel<<<key_grid, kBlockSize, 0, stream>>>(
+        num_keys, d_grad_infos);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  // --- Sort (inverse_index, gather_ids) by inverse_index, so that every key
+  // --- Sort (inverse_index, grad_infos) by inverse_index, so that every key
   //     landing on the same unique row ends up contiguous ---
   auto sorted_inverse_index = at::empty_like(inverse_index);
-  auto sorted_gather_ids = at::empty_like(gather_ids);
+  auto sorted_grad_infos = at::empty_like(grad_infos);
 
   int end_bit =
       (num_unique > 1)
@@ -303,76 +360,32 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   DISPATCH_INTEGER_DATATYPE_FUNCTION(index_dtype, id_t, [&] {
     size_t temp_storage_bytes = 0;
     cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_storage_bytes,
-        get_pointer<id_t>(inverse_index),
-        get_pointer<id_t>(sorted_inverse_index),
-        get_pointer<id_t>(gather_ids),
-        get_pointer<id_t>(sorted_gather_ids), num_keys, 0,
-        end_bit, stream);
+        nullptr, temp_storage_bytes, get_pointer<id_t>(inverse_index),
+        get_pointer<id_t>(sorted_inverse_index), d_grad_infos,
+        get_pointer<GradInfo>(sorted_grad_infos), num_keys, 0, end_bit, stream);
     auto temp_storage =
         at::empty({static_cast<int64_t>(temp_storage_bytes)},
                   at::TensorOptions().dtype(at::kByte).device(device_));
     cub::DeviceRadixSort::SortPairs(
         temp_storage.data_ptr(), temp_storage_bytes,
         get_pointer<id_t>(inverse_index),
-        get_pointer<id_t>(sorted_inverse_index),
-        get_pointer<id_t>(gather_ids),
-        get_pointer<id_t>(sorted_gather_ids), num_keys, 0,
-        end_bit, stream);
+        get_pointer<id_t>(sorted_inverse_index), d_grad_infos,
+        get_pointer<GradInfo>(sorted_grad_infos), num_keys, 0, end_bit, stream);
   });
 
-  // --- Sort weights with the same keys (radix sort is stable, so this
-  //     yields the identical permutation as the gather_ids sort) ---
-  std::optional<at::Tensor> sorted_weights;
-  if (weights.has_value()) {
-    auto w = weights.value().contiguous();
-    TORCH_CHECK(w.scalar_type() == at::kFloat,
-                "weights must be float32, got ", w.scalar_type());
-    TORCH_CHECK(w.is_cuda(), "weights must be a CUDA tensor");
-    TORCH_CHECK(w.numel() == num_keys,
-                "weights.numel() (", w.numel(),
-                ") must equal inverse_index.numel() (", num_keys, ")");
-    TORCH_CHECK(offsets.has_value(),
-                "weights are only supported for pooled (offsets) reduce");
-    // Must match the forward: see gather_embedding_pooled.
-    TORCH_CHECK(pooling_mode == PoolingMode::kSum,
-                "weights require pooling_mode=SUM, got ",
-                static_cast<int>(pooling_mode));
-    at::Tensor sw = at::empty_like(w);
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(index_dtype, id_t, [&] {
-      size_t w_temp_bytes = 0;
-      cub::DeviceRadixSort::SortPairs(
-          nullptr, w_temp_bytes,
-          get_pointer<id_t>(inverse_index),
-          get_pointer<id_t>(sorted_inverse_index),
-          get_pointer<float>(w),
-          get_pointer<float>(sw), num_keys, 0, end_bit,
-          stream);
-      auto w_temp = at::empty({static_cast<int64_t>(w_temp_bytes)},
-                              at::TensorOptions().dtype(at::kByte).device(device_));
-      cub::DeviceRadixSort::SortPairs(
-          w_temp.data_ptr(), w_temp_bytes,
-          get_pointer<id_t>(inverse_index),
-          get_pointer<id_t>(sorted_inverse_index),
-          get_pointer<float>(w),
-          get_pointer<float>(sw), num_keys, 0, end_bit,
-          stream);
-    });
-    sorted_weights = sw;
-  }
   // --- LocalReduce ---
-  // MEAN scaling is fused inside the reduce kernel for both uniform and
-  // multi-dim modes, so no separate scaling pass is needed.
+  // MEAN scaling and the pooling weights are both fused inside the reduce
+  // kernel, so no separate scaling pass is needed.
   LocalReduce localReduceOp(device_, num_keys, out_dim, index_dtype,
                             DataType::Float32);
 
   if (offsets.has_value()) {
-    localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
+    localReduceOp.local_reduce(grads, unique_grads, sorted_grad_infos,
                                sorted_inverse_index, stream, layout,
-                               feature_dims_vec4, offsets.value(), pooling_mode,
-                               sorted_weights);
+                               feature_dims_vec4, offsets.value(),
+                               pooling_mode);
   } else {
-    localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
+    localReduceOp.local_reduce(grads, unique_grads, sorted_grad_infos,
                                sorted_inverse_index, stream);
   }
 

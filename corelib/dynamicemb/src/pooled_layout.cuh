@@ -68,7 +68,8 @@ struct PooledLayout {
   HOST_DEVICE_INLINE int sample_of_output(int r) const {
     return r / feature_num;
   }
-  // The transpose. Backward applies it to every key when it builds gather ids.
+  // The transpose. Backward applies it to every key when it builds the
+  // GradInfo that says which row of the incoming gradient that key reads.
   HOST_DEVICE_INLINE int output_index_of_input(int s) const {
     return output_index(feature_of_input(s), sample_of_input(s));
   }
