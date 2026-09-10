@@ -32,7 +32,11 @@ def init_fn(x: torch.Tensor):
 
 
 def generate_sparse_feature(
-    feature_names, num_embeddings_list, multi_hot_sizes, local_batch_size
+    feature_names,
+    num_embeddings_list,
+    multi_hot_sizes,
+    local_batch_size,
+    weighted=False,
 ):
     feature_batch = len(feature_names) * local_batch_size
 
@@ -49,10 +53,15 @@ def generate_sparse_feature(
         indices.extend(list(cur_bag))
         lengths.append(cur_bag_size)
 
+    weights = None
+    if weighted:
+        weights = torch.rand(len(indices), dtype=torch.float32).cuda() * 1.5 + 0.5
+
     return torchrec.KeyedJaggedTensor(
         keys=feature_names,
         values=torch.tensor(indices, dtype=torch.int64).cuda(),
         lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
+        weights=weights,
     )
 
 
@@ -137,14 +146,18 @@ def backend_session():
 
 
 @pytest.mark.parametrize(
-    "table_num, num_embeddings, multi_hot_sizes",
+    "table_num, num_embeddings",
     [
-        pytest.param(1, [128 * 1024], [1]),
-        pytest.param(4, [i * 128 * 1024 for i in [1, 2, 3, 4]], [1] * 4),
+        pytest.param(1, [128 * 1024]),
+        pytest.param(4, [i * 128 * 1024 for i in [1, 2, 3, 4]]),
     ],
 )
+# The bag size belongs with the pooling mode: a sequence lookup has one
+# embedding per key by definition, while SUM has to actually accumulate several
+# of them -- with a bag of at most one key the reduction being tested never runs.
 @pytest.mark.parametrize(
-    "is_pooled, pooling_mode", [(True, PoolingType.SUM), (False, None)]
+    "is_pooled, pooling_mode, max_bag_size",
+    [(True, PoolingType.SUM, 8), (False, None, 1)],
 )
 @pytest.mark.parametrize("batch_size", [32, 2048])
 @pytest.mark.parametrize("num_iteration", [10])
@@ -154,21 +167,31 @@ def backend_session():
     ["sgd", "exact_row_wise_adagrad", "exact_adagrad"],
 )
 @pytest.mark.parametrize("use_index_dedup", [True, False])
+@pytest.mark.parametrize("is_weighted", [False, True])
 def test_twin_module(
     table_num: int,
     dim: int,
     num_embeddings: List[int],
     is_pooled: bool,
     pooling_mode,
+    max_bag_size: int,
     batch_size,
-    multi_hot_sizes,
     num_iteration,
     tolerance,
     seed,
     optimizer_name,
     backend_session,
     use_index_dedup,
+    is_weighted,
 ):
+    if is_weighted:
+        if not (is_pooled and pooling_mode == PoolingType.SUM):
+            pytest.skip("weighted pooling only exists for pooled SUM collections")
+        if optimizer_name != "exact_row_wise_adagrad":
+            # The weights only scale what reaches the gradient reduction; which
+            # optimizer consumes the result afterwards is orthogonal. Covering
+            # every optimizer again would triple this axis for no extra signal.
+            pytest.skip("weighted path is covered once, on exact_row_wise_adagrad")
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
@@ -182,6 +205,9 @@ def test_twin_module(
     optimizer_kwargs = copy.deepcopy(optimizer_dict[optimizer_name])
 
     dims = [dim] * table_num
+    # randint(0, max_bag_size) per bag, so lengths still vary and empty bags
+    # still occur; this only sets the upper end.
+    multi_hot_sizes = [max_bag_size] * table_num
 
     construct = ConstructTwinModule(
         table_num,
@@ -192,6 +218,7 @@ def test_twin_module(
         multi_hot_sizes,
         optimizer_kwargs=optimizer_kwargs,
         use_index_dedup=use_index_dedup,
+        is_weighted=is_weighted,
         rank=local_rank,
         world_size=world_size,
     )
@@ -202,7 +229,11 @@ def test_twin_module(
     for i in range(num_iteration):
         if i % 2 == 0:
             sparse_feature = generate_sparse_feature(
-                feature_names, num_embeddings, multi_hot_sizes, batch_size
+                feature_names,
+                num_embeddings,
+                multi_hot_sizes,
+                batch_size,
+                weighted=is_weighted,
             )
         ret = dynamicemb_model(sparse_feature)
         ret_compare = torchrec_model(sparse_feature)

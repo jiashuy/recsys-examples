@@ -8,6 +8,7 @@ FWD_BWD_TEST_FILES=(
     "test/test_unique_op.py"
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_pooled_embedding.sh"
+    "test/unit_tests/test_weighted_pooled_embedding_v2.py"
     "test/unit_tests/test_twin_module.sh"
     "test/unit_tests/test_alignment.sh"
     "test/unit_tests/test_hash_roundrobin_kuairand.py"
