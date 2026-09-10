@@ -51,6 +51,15 @@ enum class EvictStrategy : uint32_t {
   kCustomized = 4,
 };
 
+// How a bag of embeddings is combined into one output row.  The values match
+// dynamicemb.DynamicEmbPoolingMode on the Python side, so a pooling mode can be
+// handed straight to the kernels with no translation.
+enum class PoolingMode : int32_t {
+  kSum = 0,
+  kMean = 1,
+  kNone = 2, // sequence lookup: one output row per key, nothing to combine
+};
+
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
   case (enum_type): {                                                          \
     using HINT = type;                                                         \

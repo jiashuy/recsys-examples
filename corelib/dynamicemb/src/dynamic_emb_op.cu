@@ -105,7 +105,7 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
 
 void gather_embedding_pooled(
     at::Tensor input, at::Tensor output, at::Tensor index, at::Tensor offsets,
-    int combiner, int total_D, int batch_size,
+    PoolingMode pooling_mode, int total_D, int batch_size,
     const std::optional<at::Tensor> &D_offsets = std::nullopt, int max_D = 0,
     const std::optional<at::Tensor> &weights = std::nullopt) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -141,7 +141,7 @@ void gather_embedding_pooled(
   }
   dyn_emb::scatter_combine(
       input.data_ptr(), output.data_ptr(), offsets.data_ptr(), index.data_ptr(),
-      combiner, total_D, /*accum_D=*/0, dim, src_stride, num_slots, batch_size,
+      pooling_mode, total_D, /*accum_D=*/0, dim, src_stride, num_slots, batch_size,
       src_type, dst_type, offset_type, stream, d_D_offsets, d_weights);
 }
 // Generate permutation-aware gather_ids from CSR offsets.
@@ -173,7 +173,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
              int batch_size, int64_t out_dim,
              const std::optional<at::Tensor> &offsets = std::nullopt,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
-             int combiner = -1, int total_D = 0,
+             PoolingMode pooling_mode = PoolingMode::kNone, int total_D = 0,
 	     const std::optional<at::Tensor> &weights = std::nullopt) {
   // When D_offsets is provided (multi-dim pooling):
   //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
@@ -323,7 +323,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
     localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
                                sorted_reverse_indices, stream, D_offsets, offs,
-                               batch_size, num_features, total_D, combiner,
+                               batch_size, num_features, total_D, pooling_mode,
                                sorted_weights);
 
   } else {
@@ -869,11 +869,25 @@ void bind_dyn_emb_op(py::module &m) {
       .value("KCustomized", dyn_emb::EvictStrategy::kCustomized)
       .export_values();
 
+  // Single source of truth for the pooling mode: DynamicEmbPoolingMode on the
+  // Python side takes its values from here, the same way
+  // DynamicEmbEvictStrategy does for EvictStrategy.  Python imports it under
+  // the alias BagPoolingMode, since fbgemm already exports a PoolingMode.
+  py::enum_<dyn_emb::PoolingMode>(m, "PoolingMode")
+      .value("KSum", dyn_emb::PoolingMode::kSum)
+      .value("KMean", dyn_emb::PoolingMode::kMean)
+      .value("KNone", dyn_emb::PoolingMode::kNone)
+      .export_values();
+  // Keep plain ints working at the boundary so existing callers -- and
+  // DynamicEmbPoolingMode, which is an IntEnum -- can be passed straight through.
+  py::implicitly_convertible<py::int_, dyn_emb::PoolingMode>();
+
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
-        py::arg("combiner") = -1, py::arg("total_D") = 0,
+        py::arg("pooling_mode") = dyn_emb::PoolingMode::kNone,
+        py::arg("total_D") = 0,
 	py::arg("weights") = py::none());
 
   m.def("gather_embedding", &gather_embedding,
@@ -883,7 +897,7 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on index and offsets.",
         py::arg("input"), py::arg("output"), py::arg("index"),
-        py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
+        py::arg("offsets"), py::arg("pooling_mode"), py::arg("total_D"),
         py::arg("batch_size"), py::arg("D_offsets") = py::none(),
         py::arg("max_D") = 0, py::arg("weights") = py::none());
 
@@ -932,13 +946,14 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
-        py::arg("combiner") = -1, py::arg("total_D") = 0,
+        py::arg("pooling_mode") = dyn_emb::PoolingMode::kNone,
+        py::arg("total_D") = 0,
         py::arg("weights") = py::none());
 
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on index and offsets.",
         py::arg("input"), py::arg("output"), py::arg("index"),
-        py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
+        py::arg("offsets"), py::arg("pooling_mode"), py::arg("total_D"),
         py::arg("batch_size"), py::arg("D_offsets") = py::none(),
         py::arg("max_D") = 0, py::arg("weights") = py::none());
 }

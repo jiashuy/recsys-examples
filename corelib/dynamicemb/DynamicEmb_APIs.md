@@ -445,9 +445,17 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
     from dynamicemb import DynamicEmbPoolingMode
 
     #API arguments
+    @enum.unique
     class DynamicEmbPoolingMode(enum.IntEnum):
         """
         Enumeration for pooling modes in dynamic embedding lookup.
+
+        The values are taken from the bound C++ enum ``dyn_emb::PoolingMode``
+        (``src/utils.h``), which is the single source of truth, in the same way
+        ``DynamicEmbEvictStrategy`` takes its values from ``EvictStrategy``. It
+        is an ``IntEnum`` because a pooling mode is handed straight to the
+        kernels and compared as an integer, so it stays usable wherever a plain
+        ``int`` was before (``SUM == 0``, dict keys, JSON).
 
         Attributes
         ----------
@@ -462,9 +470,9 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
             No pooling (sequence mode). Each index produces its own embedding row.
             Output shape: (total_indices, D).
         """
-        SUM = 0
-        MEAN = 1
-        NONE = 2
+        SUM = BagPoolingMode.KSum    # 0
+        MEAN = BagPoolingMode.KMean  # 1
+        NONE = BagPoolingMode.KNone  # 2
     ```
 
 **Weighted SUM pooling (training only)** — `SUM` pooling supports optional per-position float32 weights: `out[b] = Σ wᵢ · embᵢ`. Supported only in

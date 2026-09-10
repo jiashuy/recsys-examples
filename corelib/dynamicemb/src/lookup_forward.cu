@@ -44,7 +44,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   }
   HOST_DEVICE_INLINE int get_average_pooling_factor(int i) {
     int pooling_factor = static_cast<int>(offset_ptr[i + 1] - offset_ptr[i]);
-    return combiner == 1 ? pooling_factor : 1;
+    return pooling_mode == PoolingMode::kMean ? pooling_factor : 1;
   }
   HOST_DEVICE_INLINE float get_weight(int i) {
     // nullptr => unweighted pooling (identical to the old path).
@@ -64,7 +64,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   }
 
   int num_vec_;
-  int combiner;
+  PoolingMode pooling_mode;
   int ev_size; // uniform: embedding dim; multi-dim: max_D (copy width per row)
   int src_stride; // source row stride (may differ from ev_size when optimizer
                   // states are appended)
@@ -80,7 +80,7 @@ struct ForwardMultiToOneFMLayoutDesc {
 };
 
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
-                     void *inverse_idx_ptr, int combiner, int total_D,
+                     void *inverse_idx_ptr, PoolingMode pooling_mode, int total_D,
                      int accum_D, int ev_size, int src_stride, int num_vec,
                      int batch_size, DataType src_type, DataType dst_type,
                      DataType offset_type, cudaStream_t stream,
@@ -91,7 +91,7 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
       DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         using CopyDesc = ForwardMultiToOneFMLayoutDesc<src_t, dst_t, offset_t>;
         CopyDesc multi_to_one_desc{num_vec,
-                                   combiner,
+                                   pooling_mode,
                                    ev_size,
                                    src_stride,
                                    D_offsets_ptr,

@@ -961,7 +961,6 @@ def dynamicemb_eval_forward(
             cache=cache,
         )
 
-        combiner = 0 if pooling_mode == DynamicEmbPoolingMode.SUM else 1
         output_embs = torch.empty(
             batch_size,
             total_D,
@@ -973,7 +972,7 @@ def dynamicemb_eval_forward(
             output_embs,
             reverse_indices,
             offsets,
-            combiner,
+            pooling_mode,
             total_D,
             batch_size,
             D_offsets,
@@ -1193,7 +1192,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             device = prefetch_state.unique_keys.device
             if is_pooling:
-                combiner = 0 if pooling_mode == DynamicEmbPoolingMode.SUM else 1
                 output_embs = torch.empty(
                     batch_size,
                     total_D,
@@ -1206,7 +1204,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         output_embs,
                         prefetch_state.reverse_indices,
                         offsets,
-                        combiner,
+                        pooling_mode,
                         total_D,
                         batch_size,
                         D_offsets,
@@ -1214,7 +1212,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         pooling_weights,
                     )
             else:
-                combiner = -1
                 output_embs = torch.empty(
                     prefetch_state.reverse_indices.shape[0],
                     emb_dim,
@@ -1238,7 +1235,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
             ctx.pooling_mode = pooling_mode
-            ctx.combiner = combiner
             ctx.offsets = offsets
             ctx.batch_size = batch_size
             ctx.total_D = total_D
@@ -1291,7 +1287,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         out_dim,
                         ctx.offsets,
                         ctx.D_offsets,
-                        ctx.combiner,
+                        ctx.pooling_mode,
                         ctx.total_D,
                         ctx.pooling_weights,
                     )

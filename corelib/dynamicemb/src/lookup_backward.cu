@@ -28,7 +28,7 @@ namespace {
 // max_vec_length]. kMultiDim=true:  multi-dim   — source is in_grads[b*total_D
 // + D_offsets[f]],
 //   vec_length = D_f.  Writes use max_vec_length stride.
-// MEAN scaling (1/pool_size) is fused for both modes when combiner==1.
+// MEAN scaling (1/pool_size) is fused for both modes when pooling_mode is kMean.
 template <typename io_t, typename accum_t, typename id_t, int kWarpSize = 32,
           bool kMultiDim = false, typename offset_t = int64_t>
 __global__ void multi_to_one_reduce_kernel1_no_vec(
@@ -37,7 +37,7 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
     const id_t *__restrict__ unique_ids, accum_t *__restrict__ partial_buffer,
     id_t *__restrict__ partial_unique_ids, const int *__restrict__ D_offsets,
     int total_D, int F, const offset_t *__restrict__ offsets, int B,
-    int combiner, const float *__restrict__ weights) {
+    PoolingMode pooling_mode, const float *__restrict__ weights) {
 
   const int block_id = blockIdx.x;
   int local_sample_num = kWarpSize;
@@ -63,7 +63,7 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
       int b = static_cast<int>(gather_id) / F;
       vec_length = D_offsets[f + 1] - D_offsets[f];
       tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
-      if (combiner == 1) {
+      if (pooling_mode == PoolingMode::kMean) {
         int slot = f * B + b;
         offset_t pool_size = offsets[slot + 1] - offsets[slot];
         if (pool_size > 0)
@@ -72,7 +72,7 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
     } else {
       tmp_src = in_grads + gather_id * max_vec_length;
       vec_length = max_vec_length;
-      if (combiner == 1) {
+      if (pooling_mode == PoolingMode::kMean) {
         int f = static_cast<int>(gather_id) % F;
         int b = static_cast<int>(gather_id) / F;
         int slot = f * B + b;
@@ -176,7 +176,7 @@ __global__ void multi_to_one_reduce_kernel2_no_vec(
 // max_vec_length]. kMultiDim=true:  multi-dim   — source is in_grads[b*total_D
 // + D_offsets[f]],
 //   vec_length = D_f.  Writes use max_vec_length stride.
-// MEAN scaling (1/pool_size) is fused for both modes when combiner==1.
+// MEAN scaling (1/pool_size) is fused for both modes when pooling_mode is kMean.
 template <typename io_t, typename accum_t, typename id_t, int kMaxElemPerThread,
           int kWarpSize = 32, bool kMultiDim = false,
           typename offset_t = int64_t>
@@ -186,7 +186,7 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
     const id_t *__restrict__ unique_ids, accum_t *__restrict__ partial_buffer,
     id_t *__restrict__ partial_unique_ids, const int *__restrict__ D_offsets,
     int total_D, int F, const offset_t *__restrict__ offsets, int B,
-    int combiner, const float *__restrict__ weights) {
+    PoolingMode pooling_mode, const float *__restrict__ weights) {
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -215,7 +215,7 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
       int b = static_cast<int>(gather_id) / F;
       vec_length = D_offsets[f + 1] - D_offsets[f];
       tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
-      if (combiner == 1) {
+      if (pooling_mode == PoolingMode::kMean) {
         int slot = f * B + b;
         offset_t pool_size = offsets[slot + 1] - offsets[slot];
         if (pool_size > 0)
@@ -224,7 +224,7 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
     } else {
       tmp_src = in_grads + gather_id * max_vec_length;
       vec_length = max_vec_length;
-      if (combiner == 1) {
+      if (pooling_mode == PoolingMode::kMean) {
         int f = static_cast<int>(gather_id) % F;
         int b = static_cast<int>(gather_id) / F;
         int slot = f * B + b;
@@ -409,7 +409,7 @@ inline void get_kernel_config_use_warp(
 // addressing (source is grads[B, total_D], per-feature offsets via D_offsets).
 // Otherwise kMultiDim=false (uniform-dim).
 // MEAN scaling (1/pool_size) is fused in stage-1 for both modes when
-// combiner==1 and d_offsets is provided.
+// pooling_mode is kMean and d_offsets is provided.
 // Stage 2 is identical for both modes.
 template <typename io_t, typename accum_t, typename id_t,
           typename offset_t = int64_t, int kWarpSize = 32>
@@ -421,7 +421,8 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                          at::Tensor &partial_unique_ids, cudaStream_t &stream,
                          const int *d_D_offsets = nullptr, int total_D = 0,
                          int F = 0, const offset_t *d_offsets = nullptr,
-                         int B = 0, int combiner = 0,
+                         int B = 0,
+                         PoolingMode pooling_mode = PoolingMode::kNone,
 			 const float *d_weights = nullptr) {
   const bool multi_dim = (d_D_offsets != nullptr);
   auto &device_prop = DeviceProp::getDeviceProp(in_grads.device().index());
@@ -463,13 +464,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                          true, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 1, kWarpSize,
                                          false, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
       }
       // Stage 2
       int second_grid_size =
@@ -492,13 +493,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                          true, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 2, kWarpSize,
                                          false, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
       }
       // Stage 2
       int second_grid_size =
@@ -530,13 +531,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                            offset_t>
             <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_no_vec<io_t, accum_t, id_t, kWarpSize,
                                            false, offset_t>
             <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner, d_weights);
+                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
       }
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -588,7 +589,7 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
                                cudaStream_t &stream,
                                const std::optional<at::Tensor> &D_offsets,
                                const std::optional<at::Tensor> &offsets, int B,
-                               int F, int total_D, int combiner,
+                               int F, int total_D, PoolingMode pooling_mode,
                                const std::optional<at::Tensor> &weights) {
   if (num_key_ == 0)
     return;
@@ -633,7 +634,7 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
                 unique_key_ids, partial_buffer, partial_unique_ids, stream,
                 d_D_ptr, total_D, F,
                 reinterpret_cast<const offset_t *>(offsets.value().data_ptr()),
-                B, combiner, d_w);
+                B, pooling_mode, d_w);
           });
         } else {
           multi_to_one_reduce<grad_t, accum_t, id_t, int64_t, WarpSize>(
