@@ -282,6 +282,20 @@ def test_weighted_sum_unaligned_mixed_D_matches_torchrec(current_device):
     _run_against_reference(dims=[9, 6], feature_num=2, dev=dev, seed=3)
 
 
+def test_weighted_sum_misaligned_feature_start_matches_torchrec(current_device):
+    """A feature that is 4 wide but does not start on a 4-column boundary.
+
+    max_D (4) and total_D (8) are both multiples of 4, so the coarse checks let
+    this reach the vec4 kernels, but D_offsets is [0, 2, 6, 8]: feature 1
+    occupies columns 2..5. Its width being exactly 4 means Vec4T takes its
+    n == 4 path -- a real 16-byte access -- at dst_ptr + b*8 + 2, which is 8
+    bytes off a 16-byte boundary. Only every feature dim being a multiple of 4
+    rules that out, which is what layout.feature_dims_vec4 reports.
+    """
+    dev = torch.device(f"cuda:{current_device}")
+    _run_against_reference(dims=[2, 4, 2], feature_num=3, dev=dev, seed=4)
+
+
 def test_weighted_errors(current_device):
     device = torch.cuda.current_device()
     indices = torch.tensor([5, 12], dtype=torch.int64, device=device)

@@ -21,91 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-// Unified pooled-gather descriptor.
-// When D_offsets_ptr is non-null (multi-dim), each feature f has dim
-// D_offsets_ptr[f+1]-D_offsets_ptr[f] and the destination column start is
-// D_offsets_ptr[f].  Source rows use src_stride as the row stride.
-// When D_offsets_ptr is null (uniform-dim), every feature has dim ev_size and
-// the destination column start is f * ev_size.
-template <typename SrcType, typename DstType, typename offset_t>
-struct ForwardMultiToOneFMLayoutDesc {
-  using SrcT = SrcType;
-  using DstT = DstType;
-
-  HOST_DEVICE_INLINE int get_offset(int i) { return offset_ptr[i]; }
-  HOST_DEVICE_INLINE int get_vec_length(int i) {
-    if (D_offsets_ptr) {
-      int f = i / batch_size;
-      return D_offsets_ptr[f + 1] - D_offsets_ptr[f];
-    }
-    return ev_size;
-  }
-  HOST_DEVICE_INLINE int get_average_pooling_factor(int i) {
-    int pooling_factor = static_cast<int>(offset_ptr[i + 1] - offset_ptr[i]);
-    return pooling_mode == PoolingMode::kMean ? pooling_factor : 1;
-  }
-  HOST_DEVICE_INLINE float get_weight(int i) {
-    // nullptr => unweighted pooling (identical to the old path).
-    return weights_ptr ? weights_ptr[i] : 1.0f;
-  }
-  HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    int idx = reverse_idx_ptr[i];
-    return src_ptr + (int64_t)src_stride * idx;
-  }
-  HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
-    int b = i % batch_size;
-    int f = i / batch_size;
-    if (D_offsets_ptr) {
-      return dst_ptr + b * total_D + D_offsets_ptr[f];
-    }
-    return dst_ptr + b * total_D + f * ev_size;
-  }
-
-  int num_vec_;
-  PoolingMode pooling_mode;
-  int ev_size; // uniform: embedding dim; multi-dim: max_D (copy width per row)
-  int src_stride; // source row stride (may differ from ev_size when optimizer
-                  // states are appended)
-  const int *__restrict__ D_offsets_ptr; // nullptr → uniform, [F+1] → multi-dim
-  const offset_t *__restrict__ offset_ptr;
-  const offset_t *__restrict__ reverse_idx_ptr;
-  const SrcType *__restrict__ src_ptr;
-  DstType *dst_ptr;
-  int batch_size;
-  int total_D;
-  const float *__restrict__ weights_ptr; // nullptr -> unweighted
-};
-
-void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
-                     void *inverse_idx_ptr, PoolingMode pooling_mode, int total_D,
-                     int ev_size, int src_stride, int num_vec,
-                     int batch_size, DataType src_type, DataType dst_type,
-                     DataType offset_type, cudaStream_t stream,
-                     const int *D_offsets_ptr, const float *weights_ptr) {
-
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
-        using CopyDesc = ForwardMultiToOneFMLayoutDesc<src_t, dst_t, offset_t>;
-        CopyDesc multi_to_one_desc{num_vec,
-                                   pooling_mode,
-                                   ev_size,
-                                   src_stride,
-                                   D_offsets_ptr,
-                                   (offset_t *)offset_ptr,
-                                   (offset_t *)inverse_idx_ptr,
-                                   (src_t *)src_ptr,
-                                   (dst_t *)dst_ptr,
-                                   batch_size,
-                                   total_D,
-                                   weights_ptr};
-        copy_multi_to_one(multi_to_one_desc, ev_size, stream);
-      });
-    });
-  });
-}
-
-template <typename SrcType, typename DstType, typename offset_t>
+template <typename SrcType, typename DstType, typename IndexType>
 struct ForwardSequenceFusedCopyDesc {
 
   using SrcT = SrcType;
@@ -115,7 +31,7 @@ struct ForwardSequenceFusedCopyDesc {
     return ev_size;
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    offset_t idx = reverse_idx_ptr[i];
+    IndexType idx = reverse_idx_ptr[i];
     return src_ptr + idx * src_stride;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
@@ -125,7 +41,7 @@ struct ForwardSequenceFusedCopyDesc {
   int num_vec_;
   int ev_size;
   int src_stride;
-  const offset_t *__restrict__ reverse_idx_ptr;
+  const IndexType *__restrict__ reverse_idx_ptr;
   const SrcType *__restrict__ src_ptr;
   DstType *dst_ptr;
 };

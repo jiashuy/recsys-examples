@@ -863,7 +863,7 @@ __global__ void multi_to_one_cta_per_ev_kernel(CopyDesc copy_desc) {
   using vec_length_type = int;
   int i_ev = blockIdx.x;
 
-  if (i_ev < copy_desc.num_vec_) {
+  if (i_ev < copy_desc.layout.num_bags()) {
     vec_length_type vec_length = copy_desc.get_vec_length(i_ev);
     int average_pooling_factor = copy_desc.get_average_pooling_factor(i_ev);
     dst_type *dst_ev = copy_desc.get_dst_ptr(i_ev);
@@ -910,7 +910,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
   int lane_id = threadIdx.x;
   int warp_id = threadIdx.y;
   int i_ev = blockIdx.x * blockDim.y + warp_id;
-  if (i_ev < copy_desc.num_vec_) {
+  if (i_ev < copy_desc.layout.num_bags()) {
     vec_length_type vec_length = copy_desc.get_vec_length(i_ev);
     int average_pooling_factor = copy_desc.get_average_pooling_factor(i_ev);
 
@@ -963,14 +963,28 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
   }
 }
 
+// ``feature_dims_vec4`` says every feature's dim is a multiple of 4, and hence
+// so is every D_offsets entry.  It cannot be derived here: D_offsets lives on
+// the device.  It only matters under mixed dims -- with a uniform dim a
+// feature starts at f*max_D, which max_D % 4 already covers.
 template <typename CopyDesc>
-void copy_multi_to_one(CopyDesc &copy_desc, int ev_size, cudaStream_t stream) {
-  if (copy_desc.num_vec_ == 0)
+void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
+                       cudaStream_t stream) {
+  const int num_bags = copy_desc.layout.num_bags();
+  if (num_bags == 0)
     return;
-  if (ev_size % 4 != 0 || copy_desc.total_D % 4 != 0) {
+  // The per-row copy width. Uniform dims make it every feature's width; mixed
+  // dims make it the widest, and a narrower feature just stops early.
+  const int ev_size = copy_desc.layout.max_D;
+  // Vec4T does a 16-byte load, so every address it touches -- dst_ptr +
+  // b*total_D + col_begin(f) -- has to be 4-element aligned.
+  const bool vec4_aligned = ev_size % 4 == 0 &&
+                            copy_desc.layout.total_D % 4 == 0 &&
+                            (!copy_desc.layout.mixed_D() || feature_dims_vec4);
+  if (!vec4_aligned) {
     //  need to optimize for small ev_size
     constexpr int MAX_THREADS_PER_BLOCK = 1024;
-    int grid_dim = copy_desc.num_vec_;
+    int grid_dim = num_bags;
     int block_dim =
         ev_size < MAX_THREADS_PER_BLOCK ? ev_size : MAX_THREADS_PER_BLOCK;
 
@@ -978,18 +992,18 @@ void copy_multi_to_one(CopyDesc &copy_desc, int ev_size, cudaStream_t stream) {
         <<<grid_dim, block_dim, 0, stream>>>(copy_desc);
   } else {
     if (ev_size <= 128) {
-      int grid_size = (copy_desc.num_vec_ - 1) / 2 + 1;
+      int grid_size = (num_bags - 1) / 2 + 1;
       dim3 block_size{32, 2};
       multi_to_one_warp_per_ev_vec4_kernel<CopyDesc, 1>
           <<<grid_size, block_size, 0, stream>>>(copy_desc);
     } else if (ev_size <= 256) {
-      int grid_size = (copy_desc.num_vec_ - 1) / 2 + 1;
+      int grid_size = (num_bags - 1) / 2 + 1;
       dim3 block_size{32, 2};
       multi_to_one_warp_per_ev_vec4_kernel<CopyDesc, 2>
           <<<grid_size, block_size, 0, stream>>>(copy_desc);
     } else if (ev_size <= 1024) {
       multi_to_one_cta_per_ev_kernel<CopyDesc, 1>
-          <<<copy_desc.num_vec_, ev_size, 0, stream>>>(copy_desc);
+          <<<num_bags, ev_size, 0, stream>>>(copy_desc);
     } else {
       throw std::runtime_error(
           "dyn emb does not support emb vector size > 1024");

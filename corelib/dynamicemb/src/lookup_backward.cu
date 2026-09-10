@@ -35,9 +35,9 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
     int64_t num_vec, int64_t max_vec_length, const io_t *__restrict__ in_grads,
     io_t *__restrict__ out_grads, const id_t *__restrict__ original_ids,
     const id_t *__restrict__ unique_ids, accum_t *__restrict__ partial_buffer,
-    id_t *__restrict__ partial_unique_ids, const int *__restrict__ D_offsets,
-    int total_D, int F, const offset_t *__restrict__ offsets, int B,
-    PoolingMode pooling_mode, const float *__restrict__ weights) {
+    id_t *__restrict__ partial_unique_ids, PooledLayout layout,
+    const offset_t *__restrict__ offsets, PoolingMode pooling_mode,
+    const float *__restrict__ weights) {
 
   const int block_id = blockIdx.x;
   int local_sample_num = kWarpSize;
@@ -58,14 +58,21 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
 
     const io_t *tmp_src;
     float scale = 1.0f;
+    // gather_id numbers the bag in the output's order; offsets numbers it in
+    // the input's, hence the conversion before every pool-size lookup.
+    //
+    // Deliberately not hoisted out of the branches: a sequence reduce arrives
+    // with an empty layout, so feature_num is 0 and decoding gather_id would
+    // divide by it.  It only ever takes the uniform branch with kNone, which is
+    // why nothing here runs for it.
     if constexpr (kMultiDim) {
-      int f = static_cast<int>(gather_id) % F;
-      int b = static_cast<int>(gather_id) / F;
-      vec_length = D_offsets[f + 1] - D_offsets[f];
-      tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
+      const int f = layout.feature_of_output(static_cast<int>(gather_id));
+      const int b = layout.sample_of_output(static_cast<int>(gather_id));
+      vec_length = layout.col_width(f);
+      tmp_src = in_grads + (int64_t)b * layout.total_D + layout.col_begin(f);
       if (pooling_mode == PoolingMode::kMean) {
-        int slot = f * B + b;
-        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        const int bag = layout.input_index(f, b);
+        offset_t pool_size = offsets[bag + 1] - offsets[bag];
         if (pool_size > 0)
           scale = 1.0f / (float)pool_size;
       }
@@ -73,10 +80,10 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
       tmp_src = in_grads + gather_id * max_vec_length;
       vec_length = max_vec_length;
       if (pooling_mode == PoolingMode::kMean) {
-        int f = static_cast<int>(gather_id) % F;
-        int b = static_cast<int>(gather_id) / F;
-        int slot = f * B + b;
-        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        const int f = layout.feature_of_output(static_cast<int>(gather_id));
+        const int b = layout.sample_of_output(static_cast<int>(gather_id));
+        const int bag = layout.input_index(f, b);
+        offset_t pool_size = offsets[bag + 1] - offsets[bag];
         if (pool_size > 0)
           scale = 1.0f / (float)pool_size;
       }
@@ -184,9 +191,9 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
     int64_t num_vec, int64_t max_vec_length, const io_t *__restrict__ in_grads,
     io_t *__restrict__ out_grads, const id_t *__restrict__ original_ids,
     const id_t *__restrict__ unique_ids, accum_t *__restrict__ partial_buffer,
-    id_t *__restrict__ partial_unique_ids, const int *__restrict__ D_offsets,
-    int total_D, int F, const offset_t *__restrict__ offsets, int B,
-    PoolingMode pooling_mode, const float *__restrict__ weights) {
+    id_t *__restrict__ partial_unique_ids, PooledLayout layout,
+    const offset_t *__restrict__ offsets, PoolingMode pooling_mode,
+    const float *__restrict__ weights) {
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -210,14 +217,21 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
 
     const io_t *tmp_src;
     float scale = 1.0f;
+    // gather_id numbers the bag in the output's order; offsets numbers it in
+    // the input's, hence the conversion before every pool-size lookup.
+    //
+    // Deliberately not hoisted out of the branches: a sequence reduce arrives
+    // with an empty layout, so feature_num is 0 and decoding gather_id would
+    // divide by it.  It only ever takes the uniform branch with kNone, which is
+    // why nothing here runs for it.
     if constexpr (kMultiDim) {
-      int f = static_cast<int>(gather_id) % F;
-      int b = static_cast<int>(gather_id) / F;
-      vec_length = D_offsets[f + 1] - D_offsets[f];
-      tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
+      const int f = layout.feature_of_output(static_cast<int>(gather_id));
+      const int b = layout.sample_of_output(static_cast<int>(gather_id));
+      vec_length = layout.col_width(f);
+      tmp_src = in_grads + (int64_t)b * layout.total_D + layout.col_begin(f);
       if (pooling_mode == PoolingMode::kMean) {
-        int slot = f * B + b;
-        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        const int bag = layout.input_index(f, b);
+        offset_t pool_size = offsets[bag + 1] - offsets[bag];
         if (pool_size > 0)
           scale = 1.0f / (float)pool_size;
       }
@@ -225,10 +239,10 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
       tmp_src = in_grads + gather_id * max_vec_length;
       vec_length = max_vec_length;
       if (pooling_mode == PoolingMode::kMean) {
-        int f = static_cast<int>(gather_id) % F;
-        int b = static_cast<int>(gather_id) / F;
-        int slot = f * B + b;
-        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        const int f = layout.feature_of_output(static_cast<int>(gather_id));
+        const int b = layout.sample_of_output(static_cast<int>(gather_id));
+        const int bag = layout.input_index(f, b);
+        offset_t pool_size = offsets[bag + 1] - offsets[bag];
         if (pool_size > 0)
           scale = 1.0f / (float)pool_size;
       }
@@ -405,7 +419,7 @@ inline void get_kernel_config_use_warp(
   return;
 }
 
-// Unified dispatch: when d_D_offsets is non-null, stage-1 uses kMultiDim=true
+// Unified dispatch: when layout.mixed_D(), stage-1 uses kMultiDim=true
 // addressing (source is grads[B, total_D], per-feature offsets via D_offsets).
 // Otherwise kMultiDim=false (uniform-dim).
 // MEAN scaling (1/pool_size) is fused in stage-1 for both modes when
@@ -419,12 +433,12 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                          const at::Tensor &unique_key_ids,
                          at::Tensor &partial_buffer,
                          at::Tensor &partial_unique_ids, cudaStream_t &stream,
-                         const int *d_D_offsets = nullptr, int total_D = 0,
-                         int F = 0, const offset_t *d_offsets = nullptr,
-                         int B = 0,
+                         PooledLayout layout = {0, 0, 0, 0, nullptr},
+                         bool feature_dims_vec4 = false,
+                         const offset_t *d_offsets = nullptr,
                          PoolingMode pooling_mode = PoolingMode::kNone,
 			 const float *d_weights = nullptr) {
-  const bool multi_dim = (d_D_offsets != nullptr);
+  const bool multi_dim = layout.mixed_D();
   auto &device_prop = DeviceProp::getDeviceProp(in_grads.device().index());
   const uint64_t first_stage_key_num = n;
   const uint64_t second_stage_key_num = (n - 1) / kWarpSize + 1;
@@ -432,7 +446,12 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
 
   int grid_size = (first_stage_key_num - 1) / WGRAD_REDUCE_BLOCK_SIZE + 1;
   int block_size = WGRAD_REDUCE_BLOCK_SIZE;
-  bool aligned = len_vec % 4 == 0;
+  // Same 16-byte alignment requirement as the forward: in_grads + b*total_D +
+  // col_begin(f) must be 4-element aligned, and under mixed dims col_begin
+  // comes from D_offsets, which only feature_dims_vec4 can vouch for.
+  const bool vec4_aligned =
+      len_vec % 4 == 0 &&
+      (!multi_dim || (layout.total_D % 4 == 0 && feature_dims_vec4));
   bool small_than_256 = len_vec <= 256;
 
   // Tensors cast to the same pointer type must have matching dtypes.
@@ -449,14 +468,14 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
       sorted_key_ids.dtype(), " vs ", partial_unique_ids.dtype());
 
   // Common kernel args (same for both multi_dim and uniform).
-  auto *p_in = reinterpret_cast<const io_t *>(in_grads.data_ptr());
-  auto *p_out = reinterpret_cast<io_t *>(out_grads.data_ptr());
-  auto *p_sorted = reinterpret_cast<const id_t *>(sorted_key_ids.data_ptr());
-  auto *p_unique = reinterpret_cast<const id_t *>(unique_key_ids.data_ptr());
-  auto *p_partial = reinterpret_cast<accum_t *>(partial_buffer.data_ptr());
-  auto *p_partial_ids = reinterpret_cast<id_t *>(partial_unique_ids.data_ptr());
+  auto *p_in = get_pointer<const io_t>(in_grads);
+  auto *p_out = get_pointer<io_t>(out_grads);
+  auto *p_sorted = get_pointer<const id_t>(sorted_key_ids);
+  auto *p_unique = get_pointer<const id_t>(unique_key_ids);
+  auto *p_partial = get_pointer<accum_t>(partial_buffer);
+  auto *p_partial_ids = get_pointer<id_t>(partial_unique_ids);
 
-  if (aligned && small_than_256) {
+  if (vec4_aligned && small_than_256) {
     if (len_vec <= 128) {
       // Stage 1
       if (multi_dim) {
@@ -464,13 +483,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                          true, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 1, kWarpSize,
                                          false, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       }
       // Stage 2
       int second_grid_size =
@@ -493,13 +512,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                          true, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 2, kWarpSize,
                                          false, offset_t>
             <<<grid_size, block_size, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       }
       // Stage 2
       int second_grid_size =
@@ -531,13 +550,13 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
                                            offset_t>
             <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       } else {
         multi_to_one_reduce_kernel1_no_vec<io_t, accum_t, id_t, kWarpSize,
                                            false, offset_t>
             <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
                 n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
-                p_partial_ids, nullptr, 0, F, d_offsets, B, pooling_mode, d_weights);
+                p_partial_ids, layout, d_offsets, pooling_mode, d_weights);
       }
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -586,55 +605,40 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
                                at::Tensor &out_grads,
                                const at::Tensor &sorted_key_ids,
                                const at::Tensor &unique_key_ids,
-                               cudaStream_t &stream,
-                               const std::optional<at::Tensor> &D_offsets,
-                               const std::optional<at::Tensor> &offsets, int B,
-                               int F, int total_D, PoolingMode pooling_mode,
+                               cudaStream_t &stream, const PooledLayout &layout,
+                               bool feature_dims_vec4,
+                               const std::optional<at::Tensor> &offsets,
+                               PoolingMode pooling_mode,
                                const std::optional<at::Tensor> &weights) {
   if (num_key_ == 0)
     return;
-  auto scalar_type = out_grads.dtype().toScalarType();
-  auto tmp_type = in_grads.dtype().toScalarType();
-  if (scalar_type != tmp_type) {
+  if (out_grads.scalar_type() != in_grads.scalar_type()) {
     throw std::runtime_error(
         "Input grad's dtype mismatches with output grad's.");
   }
-  auto grad_type = scalartype_to_datatype(scalar_type);
+  const auto grad_type = get_data_type(out_grads);
 
-  const float *d_w = nullptr;
   if (weights.has_value()) {
     TORCH_CHECK(weights.value().scalar_type() == at::kFloat,
                 "weights must be float32, got ", weights.value().scalar_type());
     TORCH_CHECK(weights.value().numel() == num_key_,
                 "weights.numel() (", weights.value().numel(),
                 ") must equal num_key_ (", num_key_, ")");
-    d_w = reinterpret_cast<const float *>(weights.value().data_ptr());
   }
+  const float *d_w = get_pointer<const float>(weights);
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, grad_t, [&] {
     DISPATCH_FLOAT_ACCUM_TYPE_FUNC(accum_type_, accum_t, [&] {
       DISPATCH_INTEGER_DATATYPE_FUNCTION(id_type_, id_t, [&] {
         if (offsets.has_value()) {
-          auto offset_type =
-              scalartype_to_datatype(offsets.value().dtype().toScalarType());
-          const int *d_D_ptr = nullptr;
-          if (D_offsets.has_value()) {
-            TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
-                        "D_offsets must be int32, got ",
-                        D_offsets.value().scalar_type());
-            TORCH_CHECK(D_offsets.value().numel() == F + 1,
-                        "D_offsets.numel() (", D_offsets.value().numel(),
-                        ") must equal F + 1 (", F + 1, ")");
-            d_D_ptr =
-                reinterpret_cast<const int *>(D_offsets.value().data_ptr());
-          }
+          const auto offset_type = get_data_type(offsets.value());
           DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
             multi_to_one_reduce<grad_t, accum_t, id_t, offset_t, WarpSize>(
                 num_key_, len_vec_, in_grads, out_grads, sorted_key_ids,
                 unique_key_ids, partial_buffer, partial_unique_ids, stream,
-                d_D_ptr, total_D, F,
-                reinterpret_cast<const offset_t *>(offsets.value().data_ptr()),
-                B, pooling_mode, d_w);
+                layout, feature_dims_vec4,
+                get_pointer<const offset_t>(offsets.value()),
+                pooling_mode, d_w);
           });
         } else {
           multi_to_one_reduce<grad_t, accum_t, id_t, int64_t, WarpSize>(

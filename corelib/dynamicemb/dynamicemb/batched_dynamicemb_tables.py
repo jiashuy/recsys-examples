@@ -54,6 +54,7 @@ from dynamicemb.key_value_table import (
     Storage,
     flush_cache,
 )
+from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
@@ -659,6 +660,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         D_offsets = [0] + list(accumulate(feature_dims))
         self.total_D: int = D_offsets[-1]
         self.max_D: int = max(self.dims)
+        # The shared dim, or None when the tables differ. Mirrors the condition
+        # the D_offsets buffer below is registered on.
+        self.common_D: Optional[int] = (
+            self.dims[0] if self.max_D == min(self.dims) else None
+        )
+        # Whether the pooled kernels may use their vectorized path; see
+        # EmbeddingLayout.feature_dims_vec4.  Every table has at least one
+        # feature, so checking the table dims covers the feature dims.
+        self.feature_dims_vec4: bool = all(d % 4 == 0 for d in self.dims)
 
         # Per-feature cumulative dimension offsets, registered on GPU for use
         # by multi-dim pooling kernels.  Only needed when tables have mixed
@@ -1126,6 +1136,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size = (
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
+        # Built per call because batch_size comes from the input; see
+        # dynamicemb/lookup_layout.py for what the fields mean.
+        layout = EmbeddingLayout(
+            pooling_mode=self.pooling_mode,
+            batch_size=batch_size,
+            feature_num=self.feature_num,
+            num_keys=indices.numel(),
+            total_D=self.total_D,
+            max_D=self.max_D,
+            common_D=self.common_D,
+            D_offsets=self.D_offsets_t,
+            feature_dims_vec4=self.feature_dims_vec4,
+        )
         if pooling_weights is not None:
             if frequency_counters is not None:
                 # Both are fed from the single KJT weights channel: the
@@ -1170,14 +1193,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.feature_offsets,
                 self.output_dtype,
                 self._eval_initializers,
+                layout,
                 self._evict_strategy,
                 frequency_counters,
-                self.pooling_mode,
-                self.total_D,
-                batch_size,
-                self.dims,
-                self.max_D,
-                self.D_offsets_t,
                 pooling_weights,
             )
 
@@ -1198,15 +1216,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.output_dtype,
             self._initializers,
             self._optimizer,
+            layout,
             self._admit_strategy,
             self._evict_strategy,
             self._admission_counter,
-            self.pooling_mode,
-            self.total_D,
-            batch_size,
-            self.dims,
-            self.max_D,
-            self.D_offsets_t,
             pooling_weights,
             self._empty_tensor,
         )
