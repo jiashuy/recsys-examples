@@ -1965,6 +1965,19 @@ def _load_key_values(
     if opt_states is not None and not opt_states.is_cuda:
         raise RuntimeError("Opt states must be on GPU")
 
+    # Normalize both inputs to the table's precision up front, with the other
+    # argument checks. A checkpoint may carry a different precision than the
+    # table (load converts -- see _validate_load_meta), and everything below
+    # this point -- padding, the cat, the store -- reads better for not having
+    # to ask which dtype a tensor is at that line. Casting opt_states *before*
+    # pad_optimizer_states_from_checkpoint also converts the narrow checkpoint
+    # block rather than the widened runtime one, and covers that function's one
+    # path that returns its input uncast. Both casts are no-ops when the dtypes
+    # already agree.
+    embeddings = embeddings.to(state.emb_dtype)
+    if opt_states is not None:
+        opt_states = opt_states.to(state.emb_dtype)
+
     if opt_states is None and runtime_optstate_dim > 0:
         opt_states = (
             torch.ones(
@@ -1985,6 +1998,8 @@ def _load_key_values(
             embeddings.device,
         )
 
+    # Both halves are already state.emb_dtype (normalized above), so this cat
+    # cannot silently widen the row via type promotion.
     values = (
         torch.cat(
             [embeddings.view(-1, dim), opt_states.view(-1, runtime_optstate_dim)],

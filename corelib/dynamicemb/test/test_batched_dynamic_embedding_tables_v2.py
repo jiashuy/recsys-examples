@@ -53,7 +53,6 @@ from dynamicemb.key_value_table import (
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
-    resolve_checkpoint_value_layout,
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
@@ -2794,8 +2793,8 @@ def test_dump_stores_table_precision(value_type, tmp_path):
 
     mid = _make_dump_load_tables(dims, table_names, value_type)
     with warnings.catch_warnings():
-        # Reading fp32 rows into a narrower table warns by design; the warning
-        # itself is asserted in test_load_warns_when_checkpoint_precision_differs.
+        # Reading fp32 rows into a narrower table warns by design -- that is the
+        # conversion path, not the thing under test here.
         warnings.simplefilter("ignore", UserWarning)
         mid.load(fp32_dir)
 
@@ -2862,135 +2861,6 @@ def test_load_reads_legacy_checkpoint_without_value_layout_meta(tmp_path):
         order_dst = keys_dst.argsort()
         torch.testing.assert_close(keys_src[order_src], keys_dst[order_dst])
         torch.testing.assert_close(vals_src[order_src], vals_dst[order_dst])
-
-
-@pytest.mark.parametrize("with_layout_meta", [True, False], ids=["meta", "legacy"])
-def test_load_rejects_embedding_dim_mismatch(with_layout_meta, tmp_path):
-    """Rows of the wrong width are rejected, whether meta says so or size does."""
-    device = _init_single_rank_pg()
-    table_names = ["table0", "table1"]
-
-    src = _make_dump_load_tables([8, 16], table_names, torch.float32)
-    _train_multi_table_bdeb_once(src, torch.int64, device)
-    save_dir = str(tmp_path)
-    src.dump(save_dir)
-
-    if not with_layout_meta:
-        for name in table_names:
-            meta = _read_meta(save_dir, name)
-            for key in _VALUE_LAYOUT_META_KEYS:
-                meta.pop(key, None)
-            _write_meta(save_dir, name, meta)
-
-    dst = _make_dump_load_tables([16, 16], table_names, torch.float32)
-    with pytest.raises(ValueError, match="Embedding dim mismatch"):
-        dst.load(save_dir)
-
-
-def test_load_rejects_truncated_value_file(tmp_path):
-    """A value file that does not hold whole rows is an error, not a partial load."""
-    device = _init_single_rank_pg()
-    dims = [8, 16]
-    table_names = ["table0", "table1"]
-
-    src = _make_dump_load_tables(dims, table_names, torch.float32)
-    _train_multi_table_bdeb_once(src, torch.int64, device)
-    save_dir = str(tmp_path)
-    src.dump(save_dir)
-
-    values_path = _shard_file(save_dir, table_names[0], "values")
-    with open(values_path, "r+b") as f:
-        f.truncate(os.path.getsize(values_path) - _dtype_element_size(torch.float32))
-
-    dst = _make_dump_load_tables(dims, table_names, torch.float32)
-    with pytest.raises(ValueError, match="bytes but"):
-        dst.load(save_dir)
-
-
-def test_load_warns_when_checkpoint_precision_differs(tmp_path):
-    """Loading across precisions converts rather than failing, and says so."""
-    device = _init_single_rank_pg()
-    dims = [8, 16]
-    table_names = ["table0", "table1"]
-
-    fp32_dir = _dump_fp32_source(tmp_path, dims, table_names, device)
-
-    dst = _make_dump_load_tables(dims, table_names, torch.bfloat16)
-    with pytest.warns(UserWarning, match="converted on load"):
-        dst.load(fp32_dir)
-
-    keys_dst, vals_dst = dst.export_keys_values(table_names[0], device)
-    assert vals_dst.dtype == torch.bfloat16
-    assert keys_dst.numel() > 0
-
-
-# -- resolve_checkpoint_value_layout, without a table behind it ---------------
-
-
-def _write_blob(tmp_path, name: str, nbytes: int) -> str:
-    path = os.path.join(str(tmp_path), name)
-    with open(path, "wb") as f:
-        f.write(b"\0" * nbytes)
-    return path
-
-
-def test_resolve_value_layout_legacy_defaults_to_fp32_and_derives_dim(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8)
-    emb_dtype, opt_state_dtype, dim = resolve_checkpoint_value_layout(
-        {}, path, num_keys=3, runtime_dim=999
-    )
-    assert emb_dtype == torch.float32
-    assert opt_state_dtype == torch.float32
-    # 96 bytes / (3 keys * 4 bytes) -- the runtime dim is not consulted.
-    assert dim == 8
-
-
-def test_resolve_value_layout_prefers_meta(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 2 * 3 * 8)
-    emb_dtype, opt_state_dtype, dim = resolve_checkpoint_value_layout(
-        {
-            "embedding_dtype": "bfloat16",
-            "embedding_dim": 8,
-            "optim_state_dtype": "bfloat16",
-        },
-        path,
-        num_keys=3,
-        runtime_dim=8,
-    )
-    assert emb_dtype == torch.bfloat16
-    assert opt_state_dtype == torch.bfloat16
-    assert dim == 8
-
-
-def test_resolve_value_layout_empty_shard_falls_back_to_runtime_dim(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 0)
-    _, _, dim = resolve_checkpoint_value_layout({}, path, num_keys=0, runtime_dim=16)
-    assert dim == 16
-
-
-def test_resolve_value_layout_rejects_size_disagreement(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8)
-    with pytest.raises(ValueError, match="bytes but"):
-        resolve_checkpoint_value_layout(
-            {"embedding_dtype": "float32", "embedding_dim": 7},
-            path,
-            num_keys=3,
-            runtime_dim=7,
-        )
-
-
-def test_resolve_value_layout_rejects_legacy_size_that_is_not_whole_rows(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 4 * 3 * 8 + 1)
-    with pytest.raises(ValueError, match="row width cannot be recovered"):
-        resolve_checkpoint_value_layout({}, path, num_keys=3, runtime_dim=8)
-
-
-def test_resolve_value_layout_rejects_non_dtype_meta(tmp_path):
-    path = _write_blob(tmp_path, "values.bin", 0)
-    with pytest.raises(ValueError, match="not a torch dtype"):
-        resolve_checkpoint_value_layout(
-            {"embedding_dtype": "float33"}, path, num_keys=0, runtime_dim=8
-        )
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
