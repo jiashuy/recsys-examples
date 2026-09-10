@@ -3,7 +3,7 @@
 # Overview
 NVIDIA RecSys Examples is a collection of optimized recommender models and components. 
 
-The project is organized into two parts:
+The project is organized into three parts:
 
 ## Examples
 - [HSTU recommender examples](./examples/hstu/README.md) for large-scale ranking and retrieval training, with [TorchRec](https://github.com/pytorch/torchrec), [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core), DynamicEmb, training benchmarks, and optimized HSTU attention through `fbgemm_gpu_hstu`
@@ -16,7 +16,11 @@ The project is organized into two parts:
 - [RecSys KVCache Manager](./corelib/recsys_kvcache_manager/README.md) for user-ID-based KV-cache reuse in generative recommender inference, with paged GPU KV tables, asynchronous onboarding/offloading, native pinned-host storage, FlexKV-backed lower-tier storage, and FlexKV CPU breakdown analysis
 - [Beam search decode attention](./corelib/gr_decode_atten/README.md) kernels for SID-GR KV-cache generation, with fused and 3-kernel paths across SM8x, SM90, SM100, and SM120 GPUs
 
+## Agentic Performance Optimization
+- [Talos](./corelib/talos/README.md) for end-to-end automated optimization of a PyTorch model: it profiles the real workload, rewrites the hotspots it finds, verifies every change for numerical correctness and measured speedup, and iterates until the gains run out — driven entirely by a coding agent (Claude Code, Codex and others), with no human in the loop
+
 # What's New
+- **[2026/9/8]** Adds [Talos](./corelib/talos/README.md), an agent-driven optimization toolkit that profiles a PyTorch training workload, dispatches one hotspot per round to an isolated optimizer subagent, and keeps a change only after an independent judge confirms both numerical parity and a profiler-off step-time gain. Measured 2.22×–3.29× end-to-end speedups on DIN, DIEN, HSTU, and OneRec.
 - **[2026/8/10]** 🎉v26.07 released!
   - Adds a `torch.export`-compatible RecSys KVCache backend and an end-to-end [HSTU AOTInductor inference workflow](./examples/hstu/inference_aoti/README.md) with packaged models, native C++ replay, a FlexKV-backed runtime, and Triton Server deployment; also publishes refreshed [AOTI and KV-cache benchmarks](./examples/hstu/inference_aoti/benchmark/README.md).
   - Improves [SID-GR inference](./examples/sid-gr-inference/README.md) with shared decode CUDA-graph memory pools and logits buffers, and adds opt-in, SGLang-compatible weight hot updates from disk or colocated CUDA IPC for slime-style RL workflows. See the [weight hot-update guide](./examples/sid-gr-inference/docs/weight_hot_update.md).

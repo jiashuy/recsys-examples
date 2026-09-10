@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Persistent third branch generated into the target repository by Optimization.
+#
+# Production dispatch:
+#   origin   -> _forward_origin(...)
+#   optimize -> _forward_optimize(..., params=live_params)
+#   compare  -> _forward_compare(...) using CompareBranch below
+#
+# Compare returns origin values to the real training path. The optimize branch
+# runs on clones; both branches start from the same buffers and RNG state.
+
+class CompareBranch:
+    def __init__(self):
+        self.stash = None
+
+    def forward(self, target, args, kwargs, params):
+        args_p, kwargs_p = clone_inputs(args, kwargs)
+        params_p = [p.detach().clone().requires_grad_(p.requires_grad) for p in params]
+        buffers_before = snapshot_buffers(target)
+        rng_before = get_rng_state()
+        y_origin = target._forward_origin(*args, **kwargs)
+        buffers_after_origin = snapshot_buffers(target)
+        rng_after_origin = get_rng_state()
+
+        restore_buffers(target, buffers_before)
+        set_rng_state(rng_before)
+        try:
+            y_optimize = target._forward_optimize(
+                *args_p, params=params_p, **kwargs_p
+            )
+        finally:
+            restore_buffers(target, buffers_after_origin)
+            set_rng_state(rng_after_origin)
+
+        if not finite_and_shape_match(y_origin, y_optimize):
+            self.stash = {"skipped": "non-finite / shape-mismatch"}
+            return y_origin
+
+        self.stash = {
+            "forward": max_abs_rel(y_origin, y_optimize),
+            "origin_params": list(params),
+            "optimize_params": params_p,
+        }
+        return straight_through(y_origin, y_optimize)
+
+    def read_vjp(self):
+        if not self.stash or "skipped" in self.stash:
+            return self.stash or {"skipped": "compare branch did not run"}
+        return {
+            "vjp": max_abs_rel(
+                [p.grad for p in self.stash["origin_params"]],
+                [p.grad for p in self.stash["optimize_params"]],
+            )
+        }
+
+# Implement these project-specific helpers in the generated target-repo file.
+def clone_inputs(args, kwargs): ...
+def snapshot_buffers(target): ...
+def restore_buffers(target, snapshot): ...
+def get_rng_state(): ...
+def set_rng_state(state): ...
+def finite_and_shape_match(origin, optimize): ...
+def max_abs_rel(origin, optimize): ...
+def straight_through(origin, optimize): ...

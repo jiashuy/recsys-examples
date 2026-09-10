@@ -1,0 +1,54 @@
+# Report
+
+<!--
+Writing bar: this report should read as one clear, logically coherent line
+of reasoning end to end — not a disconnected pile of facts or numbers. A
+reader who wasn't here should come away knowing what you tried, why you
+tried it, and what effect it had, without having to piece it together
+themselves.
+
+Fill this as you go, not at a final wrap-up — your turn can be cut off by a
+timeout, and whatever is on disk then is your round. A template left unfilled
+is a lost round.
+-->
+
+## 1. Summary
+
+<The bottom-line outcome of this round, up front: was the hotspot fixed, by how much (or not at all), and your honest read of this attempt. Someone should be able to read only this section and know the outcome. Present it as evidence and your read — the actual verdict is the Judge's, not yours to stamp here.>
+
+## 2. Root Cause
+
+<Your own independent analysis of why this hotspot occurs — investigated and concluded by you, not a restatement of the Main Loop Agent's `loop_baseline_analysis.md`. Go verify it yourself and write your own conclusion, with your own evidence. If your analysis confirms the Main Loop Agent's original reasoning, say so explicitly and note what you did to confirm it; if your conclusion differs, say how and why.>
+
+## 3. Attempts & Changes
+
+<One subsection per attempt or experiment this round, told from the code's perspective. Full blow-by-blow detail belongs in `worklog.md`; this is the distilled version.>
+
+### Attempt 1 — <short name>
+
+**Change.** <What you actually changed in the code — file:line, the mechanism of the change, not just a label like "batched the loop." Someone should be able to picture the diff from this description alone.>
+
+**Effect.** <What effect it had — kept / reverted / no measurable effect — with the actual before → after numbers, and *why* it had that effect (the mechanism behind the result).>
+
+**Evidence (nsys).** <Paste real nsys-based evidence backing the effect above — the specific numbers/citations (e.g. `util.json` / `source_attribution.json` values, timeline bucket indices, kernel counts) or raw `veloq` output — not a paraphrase of them.>
+
+### Attempt 2 — <short name>
+
+<Same three-part structure — Change, Effect, Evidence (nsys). Continue with Attempt 3, 4, ... for every attempt made this round.>
+
+## 4. Testing
+
+### 4.1 Local check (your scratch iterate signal)
+
+<Paste the local accuracy assert and the local / region-level performance signal you iterated on (profiler evidence, region timing). This is only your iterate signal, not the accepted result.>
+
+### 4.2 Verification result (authoritative)
+
+<Paste the actual numbers from the verification record `round_<k>/verification.json` (its `real` + `e2e`) so this report is self-contained: forward parity `max_abs` / `max_rel`; for training, VJP (or optimizer/gradient update) parity `max_abs` / `max_rel`; and end-to-end `baseline.avg_step_ms` → `candidate.avg_step_ms` with `pct` and `meets_min_gain`. State the run's step-to-step noise too (`noise_ms`, `gain_exceeds_noise`) so the Judge can see whether the margin is comfortably above it. `round_<k>/verification.json` stays the machine record of these numbers. If it shows no or negative end-to-end gain, say so plainly.>
+
+## 5. Keep case (only if local win but no end-to-end gain)
+
+<If the verification record (§4.2) shows no/negative end-to-end gain but the change is still worth keeping, make the case here so the Judge can weigh it — do not decide keep/revert yourself. Cover:
+- **Coverage** — which input shapes / dtypes this profiling run exercised, and which it did not.
+- **Other-shape rationale** — the mechanism-level argument, with evidence, for why the change helps on the shapes/dtypes this run didn't hit (or a unit-test-level win that stands on its own).
+Leave this section out entirely when the record shows a real end-to-end gain, or when there is no such case.>

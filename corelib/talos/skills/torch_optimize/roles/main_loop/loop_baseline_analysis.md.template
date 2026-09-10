@@ -1,0 +1,69 @@
+# Loop Baseline Analysis — loop_<n>
+
+- **workload:** <one line — model / config being profiled>
+- **baseline step time (profiled reference):** <typical_step.full_duration_ms from basics.json, and how it was picked, e.g. "step 34, median of steps 30–40"> — this is a profiler-on, single-capture reference for locating hotspots, **not** the authoritative gain baseline. Authoritative baseline → optimized latency is measured profiler-off by verification `e2e` (see `optimization/verification/verification.md`) and recorded in each round's `verification.json`.
+
+> **Output contract — locate only.** This document describes *what / where / why* + evidence. It does **not** choose or name the fix: no technique (compile / fusion / C++ lowering / batching / sync-removal, etc.), no library / API / op, no flag, no implementation approach. Selecting and applying the fix is the Optimizer's job — it runs the dispatch table on your analysis. Your job is to hand it an accurate, technique-agnostic picture of the problem.
+
+## 1. Files produced this loop
+
+<Everything captured or written directly under this `loop_<n>/` folder, so anyone opening this doc later knows what evidence exists and where. Add/remove rows to match what this run actually produced.>
+
+| file / folder | what it is |
+|---|---|
+| `loop_baseline.nsys-rep` | raw nsys trace for this loop's baseline capture |
+| `basics.json` | trace meta, hardware, step structure, the picked typical step |
+| `stream_<id>/` | per-CUDA-stream `timeline_bucket.json` / `util.json` / `source_attribution.json` (one folder per stream) |
+| `cpu_thread_<i>/` | per-CPU-thread `torch_function_util.json` |
+| `memcpy.json` / `sync.json` / `idle.json` | data movement, host-sync stalls, idle gaps — by source (self-time) |
+| `exposed_idle.json` | hotspots ranked by step-time impact: how much GPU idle each region / source line is responsible for, split into host-sync vs launch-bound, plus the busy-side `fusible_ms` |
+| `gpu_util.json` | **device-level** utilization: union across ALL streams, bucketed + per-stream means — confirms whether a compute-stream gap is truly dead or filled by another stream |
+| `fusion_candidates.json` | source lines ranked by fusible GPU time — secondary (busy-side) view, for after the idle windows are gone |
+
+## 2. Hotspot Analysis
+
+**This is the most important section in this document.** Before starting a round, the Optimizer reads this section to understand not just which hotspot was picked, but how you reasoned about the whole performance picture — so it can sanity-check your call, notice if you missed something, and pick up context fast without re-deriving it from the raw trace. A thin or table-only write-up here hands the Optimizer a worse understanding than you actually have. Write at whatever length that requires: a few hundred words per hotspot is normal, and a few thousand across all of them is fine — there is no length ceiling here. Do not compress this into a checklist.
+
+**Work on the utilization timeline: a hotspot is a low-utilization window.** The method, in order:
+
+1. **Walk the compute stream's `stream_<id>/util.json`** (the stream with the highest `busy_ms`) bucket by bucket, and mark every contiguous stretch of low-util buckets (e.g. util < 0.5 across several consecutive buckets).
+2. **Cross-check the same buckets in `gpu_util.json`** (device level, union across ALL streams). A compute-stream gap that another stream fills is overlap, not waste — only windows that are low at the **device** level count as true dead time.
+3. **Quantify each true window** — bucket range, duration, idle ms, % of step — then open those buckets in `timeline_bucket.json` (`by_source`, kernel counts, average kernel size, `kernel_ms` vs `memcpy_ms`) and read the code to explain **why** the GPU is starved there.
+4. **Rank windows by idle mass.** Beware self-time numbers: a big `sync.json` row whose host wait overlaps GPU-busy work costs the step nothing — the timeline, not an op's own duration, decides what matters.
+
+A short table for orientation (a supplement to the narrative below, not a replacement for it):
+
+| rank | window (buckets) | idle | device-level util | suspected cause |
+|---|---|---|---|---|
+| 1 | <e.g. 31–45 (15 buckets)> | <e.g. 132 ms, 13% of step> | <e.g. 0.03–0.31> | <one line> |
+| 2 | ... | ... | ... | ... |
+
+Then, **for every window, in rank order, a full narrative subsection covering all three of what / why / evidence** — don't skip "why": a description of a window without its root cause is only half the analysis. List each distinct cause you can see here; §3 groups the same-cause ones into clusters and §4 picks one.
+
+### Hotspot 1 — <short name>
+
+**What it is.** Describe the behavior/pattern observed — where in the step it falls, which stream or thread, what kind of cost it is (compute, sync, launch, memory traffic). Write enough that someone who hasn't looked at the trace yet can picture it. Example: "During backward, the compute stream goes idle for roughly 22% of the step, from bucket 40 through bucket 55 of `stream_0/timeline_bucket.json`. The gap sits between the embedding-gradient scatter and the dense-optimizer step, and it recurs identically on every one of the profiled steps."
+
+**Why it happens.** This is usually the part worth the most words. Don't stop at "there's a sync here" — explain *why* the code produces it: an algorithmic reason (e.g. a data-dependent shape forces a host read), a framework behavior (e.g. a `.item()` call inside a Python loop, or an implicit `cudaStreamSynchronize` from a CPU-side conditional on a GPU value), an architectural one (e.g. per-expert dispatch with no batching, or a collective that can't overlap with this particular compute shape). This is what tells the Optimizer whether there's a real fix available or only a surface symptom of something deeper. State the root cause itself (the code / behavior reason); **do not name a technique, op, API, or flag to use, and do not describe the remedy** — that is the Optimizer's call. Example: "`comm/model.py:118` reads `num_active.item()` to size a subsequent gather, which forces a host round-trip on every step. This exists because the number of active experts is only known after the router runs, so the original implementation blocks on it."
+
+**Evidence.** Specific citations, not impressions — file:line, the workspace file and field, timeline bucket index, ms figures, percentage of step, kernel counts. Example: "`sync.json`: `comm/model.py:118` accounts for 4.8ms/step (22% of the 21.8ms typical step). `stream_0/util.json` shows buckets 40–55 idle (util < 0.05) over the identical window. `veloq slices` over that window shows a `cudaStreamSynchronize` immediately preceded by the `.item()` call, with no overlapping work issued on the comm or copy streams in the same range."
+
+### Hotspot 2 — <short name>
+
+<Same three-part structure as Hotspot 1 — what it is, why it happens, evidence. Continue with Hotspot 3, 4, ... for every hotspot found, in rank order.>
+
+## 3. Aggregate by cause
+
+Merge the §2 hotspots that share the **same root cause** — the same op + helper/symbol, i.e. one fix would address them all — into a single cluster, even when they sit on different source lines or NVTX modules. Sum each cluster's impact. Group by *cause* (same fix), **not** by NVTX region (one region holds several distinct causes); never fold a blocked residual into a live cluster.
+
+| cluster (cause) | member hotspots (from §2) | summed impact |
+|---|---|---|
+| <e.g. expr scalar/shape tensor construction> | `expr.py:105` (ft.90/.138), `expr.py:171` (ft.316) | <sum ms / % of step> |
+| ... | ... | ... |
+
+The trace only shows currently-visible rows; a same-cause sibling can be masked by a bigger one and surface only after it is removed. So when a cluster is chosen, the Optimizer fixes **every** occurrence of the cause in the code (all callsites of the helper), not just the rows listed here — see `roles/optimizer/instructions.md`.
+
+## 4. Chosen hotspot
+
+- **chosen cluster:** <one aggregated cluster from §3 — the Optimizer works on the *whole* cluster (all its members), not a single row>
+- **reason:** <why this cluster now, over the others in §3 — weigh summed impact, confidence, and cost. State only why it is the top pick; do **not** say how to fix it, and do **not** name a technique, flag, or approach — technique selection is the Optimizer's job.>

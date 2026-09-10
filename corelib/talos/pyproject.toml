@@ -1,0 +1,112 @@
+[project]
+name = "talos"
+version = "0.1.0"
+description = "Talos — Torch Acceleration through a Loop-Driven Optimization Skill: a Claude Code / Cursor skill collection for PyTorch performance work (torch-optimize, torch-perf-analysis, ...)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# pyarrow is a hard runtime dep: torch_perf_analysis/python/correlate.py
+# imports pyarrow.parquet at module scope to read the parquet sidecars veloq
+# exports. Everything else the skills need (PyTorch, Triton, ...) is assumed
+# to already live in the user's environment — we don't force-install those.
+dependencies = [
+    "pyarrow>=14",
+]
+
+[project.scripts]
+# The package's own entry points are modules, not console scripts, so they
+# work without the pip scripts dir on PATH:
+#   python -m talos.install_skills <agent>
+#   python -m talos.compile_observer
+#
+# `veloq` is the exception: it is a native binary bundled in the wheel at
+# talos/bin/veloq, so it cannot be run with `python -m`. This shim exec()s
+# it. The skills invoke `veloq` bare in hundreds of places.
+veloq = "talos:_veloq_main"
+
+[build-system]
+requires = [
+    # >=77 for PEP 639 SPDX license expressions.
+    "setuptools>=77",
+    "wheel",
+    # tomllib is stdlib on Python ≥ 3.11; tomli is the build-only fallback
+    # for older interpreters used to read [tool.talos] from setup.py.
+    "tomli>=1.1.0; python_version < '3.11'",
+]
+build-backend = "setuptools.build_meta"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bundled veloq pin. setup.py's BuildWithVeloq command reads this section
+# and downloads the matching binary + skill tarball from veloq's public
+# GitHub Releases at wheel-build time. Bump in lockstep with veloq releases.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tool.talos]
+veloq-version = "v0.4.1"
+# sha256 of every asset pulled at wheel-build time. The build refuses to
+# package anything that does not match, so a replaced or tampered release
+# asset fails the build instead of shipping inside the wheel. Regenerate
+# these whenever veloq-version moves.
+[tool.talos.sha256]
+"veloq-x86_64-linux"  = "9139769065b3035e4a906a5364f040d9723796a9af79e6959467dc54ff57b4d7"
+"veloq-aarch64-linux" = "802fc3b36532ae02a84d846ca55d8ecf0de2599ac3829f886298ac7ae8e37cac"
+"veloq-x86_64-macos"  = "3bda39f875e4cbc5d9ea4f239364ba247f356dca4ba9578338b044ce0ba13479"
+"veloq-aarch64-macos" = "136f759b86bdf4dc819fdcdaa12df800c4f2243dfab3bf402ff21bd0054f4c79"
+"veloq-skills.tar.gz" = "02e9fcda68174d919f43407db47b9694ba3b5f9e0914b12bcd91aa4ffd918174"
+# Optional override; default is the public GitHub Releases download URL
+# (https://github.com/lucifer1004/veloq/releases/download).
+# veloq-base-url = "..."
+
+# The skills/ directory IS the talos package. Subdirectories
+# (torch_optimize/, torch_perf_analysis/, nsys_profile_analysis/,
+# ncu_profile_analysis/) become talos.<name> subpackages.
+[tool.setuptools]
+package-dir = {"talos" = "skills"}
+packages = [
+    "talos",
+    "talos.torch_optimize",
+    "talos.torch_optimize.python",
+    "talos.torch_perf_analysis",
+    "talos.torch_perf_analysis.python",
+    # Bundled veloq skills. The directories exist in source (with empty
+    # __init__.py); their SKILL.md + references/ get filled by setup.py
+    # at build time.
+    "talos.nsys_profile_analysis",
+    "talos.ncu_profile_analysis",
+]
+
+[tool.setuptools.package-data]
+# Bundled veloq native binary. setup.py downloads exactly one of these
+# per platform-tagged wheel. The .exe entry is a no-op on Unix wheels
+# and lets a future Windows wheel reuse the same package_data spec.
+"talos" = [
+    "bin/veloq",
+    "bin/veloq.exe",
+]
+"talos.torch_optimize" = [
+    "SKILL.md",
+    "workspace_layout.md",
+    "roles/**/*",
+    "optimization/**/*",
+    "verification/**/*",
+]
+"talos.torch_perf_analysis" = [
+    "SKILL.md",
+]
+"talos.torch_perf_analysis.python" = [
+    # C++ observer source. Not compiled at wheel-build
+    # time ON PURPOSE: profiler.py JIT-compiles it in the *target* env via
+    # torch.utils.cpp_extension.load(), so the build always matches that
+    # env's exact Python (incl. free-threaded) and torch ABI. First use
+    # compiles (~1 min, cached in ~/.cache/torch_extensions); later runs
+    # just re-verify.
+    "talos_observer.cpp",
+]
+"talos.nsys_profile_analysis" = [
+    "SKILL.md",
+    "references/**/*",
+]
+"talos.ncu_profile_analysis" = [
+    "SKILL.md",
+    "references/**/*",
+]

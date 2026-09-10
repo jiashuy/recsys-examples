@@ -1,0 +1,2 @@
+# keep skills/bin/ in the source tree so package_data globs resolve at
+# wheel-build time. setup.py fills bin/veloq during the build.

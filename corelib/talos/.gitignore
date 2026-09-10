@@ -1,0 +1,49 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+.talos/
+.talos_env
+.venv/
+.env
+*.log
+generated/
+.vscode/
+.claude/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+talos.json
+*.run
+*.deb
+*.nsys-rep
+tmp/*
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bundled veloq artifacts. Downloaded by setup.py at wheel-build time from
+# GitHub Releases; never commit them. The directory skeleton
+# (__init__.py / .gitkeep) is committed so package_data globs and the
+# SKILLS registry resolve correctly on a fresh checkout.
+# ─────────────────────────────────────────────────────────────────────────────
+skills/bin/veloq
+skills/bin/veloq.exe
+skills/nsys_profile_analysis/SKILL.md
+skills/nsys_profile_analysis/references/
+skills/ncu_profile_analysis/SKILL.md
+skills/ncu_profile_analysis/references/
+skills/pytorch_profile_analysis
+
+
+examples/hstu/data
+examples/onerec/data
+**/.torch_optimize/
+**/.torch_optimize_backup_*/
+**/.torch_perf_analysis/
+
+# Internal dev-box docker_tool config; not part of the public repo.
+docker_tool.env

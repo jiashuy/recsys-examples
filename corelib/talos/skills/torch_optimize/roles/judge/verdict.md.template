@@ -1,0 +1,72 @@
+# Verdict
+
+<!--
+Written for an agent to act on, not for a human to enjoy reading: be
+precise and evidence-backed, not literary.
+
+Every verdict needs a reasonable "why" — cite what you actually found
+investigating, don't just assert a conclusion. This matters most when the
+verdict is ITERATE: this document becomes the next Optimizer's starting
+point, so it must contain reasons and evidence clear enough that a fresh
+agent, who was not here, understands exactly what was wrong with this
+round's conclusion or approach — not merely that something was wrong.
+
+On PASS, `code disposition` needs the same standard of reasoning: `revert`
+is not the automatic default just because end-to-end showed no gain —
+`keep` is legitimate when there's real evidence the code is worth having
+anyway (a unit-test-level win, a sound case for other input shapes). Say
+which it is and why in Reasoning below.
+
+The "helps other input shapes" case is the Optimizer's to make, not yours
+to invent: assess the keep case it argued in `report.md` §5 (coverage +
+other-shape rationale) and decide whether it holds. Do NOT manufacture a
+rescue reason of your own to keep a change the Optimizer never justified —
+if you suspect a real keep case it failed to argue, that is grounds for
+ITERATE (send it back to substantiate), not a `keep` you author yourself.
+-->
+
+- **verdict:** ITERATE | PASS(target_reached | diminishing_returns | blocked)
+- **confidence:** high | medium | low
+- **code disposition (PASS only):** keep | revert-to-loop-baseline
+
+## Reasoning
+
+<The core of this document: why you reached this verdict. Walk through what you found investigating — what held up, what didn't, and how that led to ITERATE vs PASS. This is your own account of your investigation and conclusion, not a summary of the Optimizer's report.>
+
+## Claim check
+
+<Every claim from `report.md` you checked, and what you actually found — a real finding in each cell, not a bare yes/no.>
+
+| claim (from report.md) | verified? | how you checked | what you found |
+|---|---|---|---|
+
+## Semantic audit
+
+<Any risk found — the change, the input class it affects, the effect — or "none found," stated as something you verified, not assumed.>
+
+## Keep / revert (within this round)
+
+<Per-commit recommendations from *this round* — distinct from the whole-loop `code disposition` above, which governs everything accumulated across every round of this loop.>
+
+| commit / change | recommendation | why |
+|---|---|---|
+
+## Directives (ITERATE only, ranked by expected value)
+
+<One subsection per directive. Each must let the next Optimizer understand exactly what was wrong and what to try instead — not "explore more" or "try harder.">
+
+### Directive 1 — <short name>
+
+**What was wrong.** <The specific problem with this round's approach or conclusion — be concrete about it.>
+
+**Evidence.** <What backs that — file:line, profiling numbers, what you re-checked and what you found.>
+
+**What to try instead.** <A concrete next step, not vague guidance.>
+
+**Expected gain / cost.** <Your estimate, and why.>
+
+### Directive 2 — ...
+
+## Notes
+
+<Anything else the Main Loop Agent should know that doesn't fit above.>
