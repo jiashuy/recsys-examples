@@ -51,9 +51,10 @@ enum class EvictStrategy : uint32_t {
   kCustomized = 4,
 };
 
-// How a bag of embeddings is combined into one output row.  The values match
-// dynamicemb.DynamicEmbPoolingMode on the Python side, so a pooling mode can be
-// handed straight to the kernels with no translation.
+// How a bag of embeddings is combined into one output row.  This is the single
+// source of truth for the numbering: dynamicemb.DynamicEmbPoolingMode takes its
+// values from the bound enum, so a pooling mode reaches the kernels with no
+// translation on the way.
 enum class PoolingMode : int32_t {
   kSum = 0,
   kMean = 1,

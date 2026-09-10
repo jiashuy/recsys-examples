@@ -481,6 +481,11 @@ eval mode, only for `SUM` (no weighted-MEAN variant), and works with mixed-D tab
 - **Through TorchRec's `EmbeddingBagCollection`**: build the collection with
   `is_weighted=True` and attach the weights to the features KJT (`KeyedJaggedTensor(keys=..., values=indices, weights=weights, lengths=...)`);
   call `model(features)` as usual. The weights ride the KJT through the all2all distribution and reach the DynamicEmb lookup as pooling weights.
+
+  **`is_weighted=True` is required, not merely conventional.** DynamicEmb only reads the KJT weights as pooling weights when the collection
+  declares itself weighted; on an `is_weighted=False` collection the weights are ignored and the result is a plain unweighted sum, with no
+  error raised. The weights channel of a `KeyedJaggedTensor` is shared — TorchRec also uses it to carry per-feature scores for virtual-table
+  eviction, and the sequence (`EmbeddingCollection`) path reads it as LFU frequency counters — so the flag is what disambiguates them.
 - **Through `BatchedDynamicEmbeddingTablesV2.forward` directly**:
   `module(indices, offsets, pooling_weights=w)` where `w` is a float32 tensor aligned with `indices` (`w.numel() == indices.numel()`).
 
@@ -1208,9 +1213,9 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 
 ## Weighted EmbeddingBagCollection
 
-Weighted-sum pooling for `EmbeddingBagCollection` tables backed by DynamicEmb is supported in training (see
+Weighted-sum pooling for `EmbeddingBagCollection` tables backed by DynamicEmb is supported in training and eval (see
 [DynamicEmbPoolingMode](#dynamicembpoolingmode)). Gradients are scaled per-position: `grad_embᵢ = wᵢ · grad_pooled`, verified against an exact SGD
-oracle in `test/unit_tests/test_weighted_pooled_embedding_v2.py` and end-to-end through TorchRec's `is_weighted` path in `test/unit_tests/test_weighted_pooled_embedding_fw.py` (1-GPU and multi-GPU).
+reference in `test/unit_tests/test_weighted_pooled_embedding_v2.py` and end-to-end, sharded, forward and backward, against a twin TorchRec model in `test/unit_tests/test_twin_module.py` (`is_weighted=True`).
 
 ### Breaking API change: `per_sample_weights` split
 

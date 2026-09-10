@@ -370,10 +370,19 @@ class BatchedDynamicEmbeddingBag(
         self._emb_module.reset_cache_states()
 
     def forward(self, features) -> torch.Tensor:
+        # Only take the KJT weights as pooling weights when the collection was
+        # actually declared weighted. The weights channel is shared: TorchRec
+        # also uses it to carry per-feature scores for virtual-table eviction,
+        # and the sequence path reads it as LFU frequency counters. Keying off
+        # is_weighted keeps an unweighted collection unweighted no matter what
+        # else ends up riding that channel.
+        pooling_weights = (
+            features.weights_or_none() if self._config.is_weighted else None
+        )
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
-            pooling_weights=features.weights_or_none(),
+            pooling_weights=pooling_weights,
         )
 
 

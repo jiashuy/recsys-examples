@@ -1119,9 +1119,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             emb_dtype = storage.embedding_dtype()
 
             # pooling_weights is validated by the sole caller,
-            # BatchedDynamicEmbeddingTablesV2.forward (pooling mode, training
-            # mode, dtype, numel), and again by TORCH_CHECK in
-            # gather_embedding_pooled / reduce_grads.
+            # BatchedDynamicEmbeddingTablesV2.forward (pooling mode, dtype,
+            # numel, and exclusivity with frequency_counters), and again by
+            # TORCH_CHECK in gather_embedding_pooled / reduce_grads.
             is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
             mixed_D = is_pooling and dims is not None and max_D > min(dims)
             out_dim = max_D if mixed_D else emb_dim
