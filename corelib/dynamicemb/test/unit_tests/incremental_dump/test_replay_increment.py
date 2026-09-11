@@ -400,13 +400,18 @@ def test_replay_rejects_score_strategy_mismatch(current_device):
     assert dump_all(dst).keys[0].numel() == 0, "rejection must be total"
 
 
-def test_replay_accepts_swapped_score_order(current_device):
-    """Same two score words, opposite configured order, must still replay.
+def test_replay_rejects_swapped_score_order(current_device):
+    """Same two score words, opposite configured order, must be rejected.
 
-    The tuple order is only ever the checkpoint column order: ``(TIMESTAMP, LFU)``
-    and ``(LFU, TIMESTAMP)`` are the same physical layout, so a source slot means
-    the same thing in both. With no scores in flight there is nothing left for
-    the order to break, and rejecting the pair would be over-strict.
+    The two agree physically -- ``(TIMESTAMP, LFU)`` and ``(LFU, TIMESTAMP)``
+    both store the timestamp at word 0 -- so a source slot does mean the same
+    thing in both, and matching on physical layout alone lets the pair through.
+    The score block does not survive it: a dump emits its columns in the source's
+    configured order, and replay decides which columns are ages to rebase and how
+    to permute them by position in the *target's* order. Swapped, that rebases
+    the frequency as though it were a timestamp and puts each word in the other's
+    slot -- and since the embeddings still land correctly, nothing downstream
+    would show it.
     """
     device = torch.device(f"cuda:{current_device}")
     src = make_model(
@@ -423,16 +428,12 @@ def test_replay_accepts_swapped_score_order(current_device):
             DynamicEmbScoreStrategy.TIMESTAMP,
         ),
     )
-    keys = list(range(1001, 1051))
-    touch(src, keys, device)
+    touch(src, list(range(1001, 1051)), device)
     delta = dump_all(src)
 
-    dst.replay_increment(delta)
-    src_keys, src_vals = sorted_view(delta.keys[0], delta.values[0])
-    out = dump_all(dst)
-    dst_keys, dst_vals = sorted_view(out.keys[0], out.values[0])
-    assert torch.equal(src_keys, dst_keys)
-    torch.testing.assert_close(src_vals, dst_vals)
+    with pytest.raises(ValueError, match="score_strategy mismatch"):
+        dst.replay_increment(delta)
+    assert dump_all(dst).keys[0].numel() == 0, "rejection must be total"
 
 
 def _two_table_model(current_device, capacities):

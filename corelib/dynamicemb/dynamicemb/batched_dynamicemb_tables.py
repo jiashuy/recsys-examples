@@ -40,7 +40,6 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
-    get_physical_score_order,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -1761,12 +1760,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         only meaningful when the target's capacity and bucket layout match the
         source's. Everything compared here comes from the delta's ``meta``.
 
-        ``score_strategy`` is compared by its **physical** word order, not the
-        configured tuple: what a slot write depends on is how the score words are
-        laid out on device, and ``(TIMESTAMP, LFU)`` and ``(LFU, TIMESTAMP)`` are
-        the same layout -- the tuple order only ever decided checkpoint column
-        order. Two genuinely different strategies still differ physically and are
-        still rejected.
+        ``score_strategy`` is compared **as configured**, tuple order included.
+        A compound strategy's physical layout is fixed -- ``(TIMESTAMP, LFU)``
+        and ``(LFU, TIMESTAMP)`` both store the timestamp at word 0 -- so the two
+        agree on where a slot write lands. They do not agree on the delta: the
+        configured order is the column order of the score block a dump emits,
+        and replay reads that block with the *target's* order, deciding which
+        columns are ages to rebase (:func:`_timestamp_score_columns`) and how to
+        permute them (:func:`score_load_permutation`) by logical position. Two
+        tables matching physically and differing logically would rebase the
+        frequency as though it were a timestamp and write each word into the
+        other's slot, with nothing to signal it. Requiring the configured order
+        to match is what keeps that from being expressible.
         """
         storage = self._storage
         option = self._dynamicemb_options[table_id]
@@ -1792,11 +1797,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
             ("world_size", meta.get("world_size"), self._shard_world_size),
-            # Compared by physical layout -- see the note above.
+            # Configured order, not physical layout -- see the note above.
             (
                 "score_strategy",
-                get_physical_score_order(src_options.score_strategy),
-                get_physical_score_order(option.score_strategy),
+                src_options.score_strategy,
+                option.score_strategy,
             ),
             ("dim", src_options.dim, option.dim),
             ("dist_type", src_options.dist_type, option.dist_type),
