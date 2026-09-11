@@ -216,11 +216,20 @@ rank its share; `pg=None` leaves each rank holding only its own keys, so that
 delta belongs on the rank that produced it (elsewhere the filter drops all of it,
 reported as `skipped` rather than as an error).
 
-Because ownership is recomputed with the *target's* `world_size`, a globally
-gathered delta reshards for free — an 8-rank dump can be replayed into a 4-rank
-replica. `world_size == 1` skips filtering entirely. `meta["world_size"]` is
-compared only to decide whether the table may be replayed at all, never to route
-keys.
+**The world size must match.** `meta["world_size"]` is compared with the
+target's and a difference is rejected, so replay never reshards. It cannot: a
+`slot_index` names a position inside *one rank's* table and carries no rank of
+its own, and the delta is all-gathered, so it holds every source rank's keys
+each with its own rank-local slot. Shrink 8 ranks to 4 and target rank 0 takes
+both source rank 0's and source rank 4's keys — two independent slot spaces of
+the same size, collapsed onto one table where a pair that shared a slot number
+now shares a slot, one silently overwriting the other. (The `current_capacity`
+check forbids growing the target to compensate, and would not fix the collision
+anyway.) Reshard by loading a full checkpoint instead.
+
+Within a fixed world, ownership is still recomputed from the key rather than
+read off the delta's ordering, which is what lets one globally gathered delta be
+handed to every rank unchanged. `world_size == 1` skips filtering entirely.
 
 **Removals.** A key leaves a table two ways, and the two go to **separate
 retained buffers**:

@@ -147,8 +147,13 @@ def owned_key_mask(
 
     ``incremental_dump`` all-gathers within its process group, so every rank holds
     the whole delta; replay keeps only its own shard. Ownership is recomputed from
-    the key with the **target's** fan-out, which is what lets a globally gathered
-    delta be replayed into a differently sized world.
+    the key rather than read off the delta, so a globally gathered delta can be
+    handed to every rank unchanged.
+
+    *world_size* is the target's, but replay only ever runs with the source's
+    equal to it (``_replay_compatibility`` rejects otherwise), so this does not
+    reshard: a slot names a position inside one rank's table and carries no rank,
+    so two source ranks folded onto one target rank would collide on it.
 
     Returns ``None`` when no filtering is needed (single rank), so callers can
     skip the mask entirely.
@@ -1841,12 +1846,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         evicted one's slot is in the delta. A table retaining evictions for some
         other consumer therefore costs a replay nothing.
 
-        Only the keys this rank owns are replayed, with ownership recomputed
-        from the key using *this* model's world size. A delta gathered over a
-        process group therefore fans out correctly when handed to every rank; a
-        per-rank delta (``incremental_dump`` with ``pg=None``) should be replayed
-        on the rank that produced it, or the filter drops all of it -- visible as
-        ``ReplayStats.skipped``.
+        The target must be sharded across the same number of ranks as the
+        source; a differing ``world_size`` is rejected, because a slot names a
+        position inside one rank's table and two source ranks folded onto one
+        target rank would collide on it. Within that fixed world, only the keys
+        this rank owns are replayed, with ownership recomputed from the key. A
+        delta gathered over a process group therefore fans out correctly when
+        handed to every rank; a per-rank delta (``incremental_dump`` with
+        ``pg=None``) should be replayed on the rank that produced it, or the
+        filter drops all of it -- visible as ``ReplayStats.skipped``.
 
         Args:
             delta: one collection's :class:`DeltaDumpResult`. Tables not present

@@ -495,9 +495,17 @@ def replay_increment(
     (NO_EVICTION is unaffected either way: its score word is a value row, not a
     score, and is restored exactly.)
 
-    **Sharding.** Replay always keeps only the keys this rank owns, recomputing
-    ownership from the key with *this* model's world size. What that filter does
-    depends on how the delta was produced:
+    **Sharding.** The target must be sharded across the same number of ranks as
+    the source: ``meta["world_size"]`` is compared with this model's, and a
+    difference raises. Replay is by slot, and a slot names a position inside one
+    rank's table -- it carries no rank of its own -- so folding two source ranks
+    onto one target rank would land two keys that each held that slot on the same
+    slot here, and one would silently overwrite the other. Resharding a delta is
+    not something this can do; reshard by loading a full checkpoint.
+
+    Within that fixed world, replay keeps only the keys this rank owns,
+    recomputing ownership from the key rather than trusting the delta's order.
+    What that filter does depends on how the delta was produced:
 
     - ``incremental_dump(..., pg)`` all-gathers, so every rank holds the whole
       group's keys; hand the same delta to every rank and each takes its share.
