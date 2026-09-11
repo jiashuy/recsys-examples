@@ -474,8 +474,20 @@ def replay_increment(
     -- are held by separate modules, and those are replayed one after another, so
     a rejection in a later module does not undo the modules already applied. Read
     a ``ValueError`` as "this delta did not go in", not as "the model is
-    unchanged"; recover by rebuilding from a full checkpoint, or by fixing the
-    target and replaying the same delta again, which is idempotent.
+    unchanged".
+
+    Recover by rebuilding from a full checkpoint, or by fixing the target and
+    replaying the same delta again. Replaying it twice restores the same keys,
+    the same embeddings and the same optimizer states, and carries LFU
+    frequencies, ``STEP``, ``CUSTOMIZED`` and ``NO_EVICTION`` row numbers through
+    unchanged. What does not repeat is a **timestamp** column: the delta stores
+    it as an age, and each replay turns that back into a score against the clock
+    it reads when it runs (see :class:`ReplayContent`). So a module that was
+    already applied comes out of the second pass looking more recently used than
+    it did -- by however long elapsed between the two attempts. Its keys keep
+    their order relative to each other, having all moved by the same amount, but
+    move ahead of the keys in that table the delta never touched, which changes
+    what evicts first and what the next time-based ``incremental_dump`` selects.
 
     Writing at the source's slot **overwrites whatever occupies it** -- that is
     what makes a replica converge (the source evicted that occupant to make
