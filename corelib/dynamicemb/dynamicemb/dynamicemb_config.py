@@ -33,6 +33,10 @@ from dynamicemb.types import (
     Storage,
 )
 from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
+
+# fbgemm exports its own PoolingMode, so the bound C++ enum is aliased here to
+# keep the two apart wherever both are in scope.
+from dynamicemb_extensions import PoolingMode as BagPoolingMode
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
@@ -95,10 +99,15 @@ class DynamicEmbCheckMode(enum.IntEnum):
     IGNORE = 2
 
 
+# Values come from dyn_emb::PoolingMode (src/utils.h) so the C++ enum stays
+# the single source of truth.  Unlike DynamicEmbEvictStrategy this is an IntEnum,
+# because the pooling mode is handed straight to the kernels and compared as an
+# integer rather than only being used as a tag.
+@enum.unique
 class DynamicEmbPoolingMode(enum.IntEnum):
-    SUM = 0
-    MEAN = 1
-    NONE = 2
+    SUM = BagPoolingMode.KSum
+    MEAN = BagPoolingMode.KMean
+    NONE = BagPoolingMode.KNone
 
 
 @enum.unique

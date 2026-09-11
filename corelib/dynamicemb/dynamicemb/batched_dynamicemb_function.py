@@ -18,7 +18,7 @@ from enum import Enum, auto
 from typing import List, Optional, Tuple
 
 import torch
-from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, EvictedItemMode
+from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
@@ -33,6 +33,7 @@ from dynamicemb.key_value_table import (
     load_from_flat,
     store_to_flat,
 )
+from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import AdmissionStrategy, CopyMode, Counter
 from dynamicemb_extensions import (
@@ -174,8 +175,6 @@ class PrefetchState:
     unique_table_ids: torch.Tensor
     lfu_accumulated_frequency: torch.Tensor
     table_num: int
-    emb_dim: int
-    value_dim: int
     emb_dtype: torch.dtype
     storage_mode: StorageMode
     slot_indices: Optional[torch.Tensor]
@@ -219,7 +218,7 @@ def _apply_admission(
     missing_table_ids: torch.Tensor,
     missing_scores: Optional[torch.Tensor],
     values: torch.Tensor,
-    emb_dim: int,
+    max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
     admit_strategy: Optional[AdmissionStrategy],
     admission_counter: Optional[Counter],
@@ -272,7 +271,7 @@ def _apply_admission(
         if non_admitted_indices.numel() > 0:
             initialized_non_admitted = (
                 admit_strategy.initialize_non_admitted_embeddings(
-                    values[:, :emb_dim],
+                    values[:, :max_emb_dim],
                     non_admitted_indices,
                 )
             )
@@ -310,8 +309,8 @@ def _prefetch_cache_path(
     storage: Storage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    emb_dim: int,
-    val_dim: int,
+    max_emb_dim: int,
+    max_val_dim: int,
     emb_dtype: torch.dtype,
     initializer: BaseDynamicEmbInitializer,
     evict_strategy: Optional[EvictStrategy],
@@ -468,17 +467,17 @@ def _prefetch_cache_path(
         if _bool_item(is_new_in_insert.any()):
             n_new_admitted = int(_scalar_item(is_new_in_insert.sum()))
             init_vals = torch.empty(
-                n_new_admitted, val_dim, dtype=emb_dtype, device=device
+                n_new_admitted, max_val_dim, dtype=emb_dtype, device=device
             )
             init_indices = torch.arange(
                 n_new_admitted, dtype=torch.int64, device=device
             )
             new_admitted_keys = insert_keys[is_new_in_insert]
             with torch.cuda.nvtx.range("op:initializer"):
-                initializer(init_vals[:, :emb_dim], init_indices, new_admitted_keys)
+                initializer(init_vals[:, :max_emb_dim], init_indices, new_admitted_keys)
 
-            if val_dim != emb_dim:
-                init_vals[:, emb_dim:] = storage.init_optimizer_state()
+            if max_val_dim != max_emb_dim:
+                init_vals[:, max_emb_dim:] = storage.init_optimizer_state()
 
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(
@@ -565,8 +564,8 @@ def _prefetch_hbm_direct_path(
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    emb_dim: int,
-    val_dim: int,
+    max_emb_dim: int,
+    max_val_dim: int,
     initializer: BaseDynamicEmbInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
@@ -674,14 +673,14 @@ def _prefetch_hbm_direct_path(
         if admitted_keys.numel() > 0:
             n_admitted = admitted_keys.numel()
             init_values = torch.empty(
-                n_admitted, val_dim, dtype=state.emb_dtype, device=device
+                n_admitted, max_val_dim, dtype=state.emb_dtype, device=device
             )
             init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
             with torch.cuda.nvtx.range("op:initializer"):
-                initializer(init_values[:, :emb_dim], init_idx, admitted_keys)
+                initializer(init_values[:, :max_emb_dim], init_idx, admitted_keys)
 
-            if val_dim != emb_dim:
-                init_values[:, emb_dim:] = state.initial_optim_state
+            if max_val_dim != max_emb_dim:
+                init_values[:, max_emb_dim:] = state.initial_optim_state
 
             score_arg = get_insert_score_arg(
                 state, n_admitted, device, admitted_scores, table_ids=admitted_tids
@@ -766,8 +765,8 @@ def dynamicemb_prefetch(
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
         emb_dtype = storage.embedding_dtype()
-        emb_dim = storage.max_embedding_dim()
-        val_dim = storage.max_value_dim()
+        max_emb_dim = storage.max_embedding_dim()
+        max_val_dim = storage.max_value_dim()
         caching = cache is not None
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
@@ -834,8 +833,8 @@ def dynamicemb_prefetch(
                 storage,
                 unique_keys,
                 unique_table_ids,
-                emb_dim,
-                val_dim,
+                max_emb_dim,
+                max_val_dim,
                 emb_dtype,
                 initializers[0],
                 evict_strat,
@@ -856,8 +855,8 @@ def dynamicemb_prefetch(
                 storage,
                 unique_keys,
                 unique_table_ids,
-                emb_dim,
-                val_dim,
+                max_emb_dim,
+                max_val_dim,
                 initializers[0],
                 evict_strat,
                 lfu_accumulated_frequency,
@@ -871,8 +870,6 @@ def dynamicemb_prefetch(
             unique_table_ids=unique_table_ids,
             lfu_accumulated_frequency=lfu_accumulated_frequency,
             table_num=table_num,
-            emb_dim=emb_dim,
-            value_dim=val_dim,
             emb_dtype=emb_dtype,
             slot_indices=slot_indices,
             storage_mode=storage_mode,
@@ -891,14 +888,10 @@ def dynamicemb_eval_forward(
     feature_offsets: torch.Tensor,
     output_dtype: torch.dtype,
     initializers: List[BaseDynamicEmbInitializer],
+    layout: EmbeddingLayout,
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
-    pooling_mode: DynamicEmbPoolingMode = DynamicEmbPoolingMode.NONE,
-    total_D: int = 0,
-    batch_size: int = 0,
-    dims: Optional[List[int]] = None,
-    max_D: int = 0,
-    D_offsets: Optional[torch.Tensor] = None,
+    pooling_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only forward for all storage configurations (no autograd)."""
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
@@ -906,7 +899,7 @@ def dynamicemb_eval_forward(
         assert table_num != 0
         emb_dtype = storage.embedding_dtype()
 
-        is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
+        is_pooling = layout.is_pooling
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
 
@@ -961,10 +954,8 @@ def dynamicemb_eval_forward(
             cache=cache,
         )
 
-        combiner = 0 if pooling_mode == DynamicEmbPoolingMode.SUM else 1
         output_embs = torch.empty(
-            batch_size,
-            total_D,
+            *layout.pooled_shape(),
             dtype=output_dtype,
             device=indices.device,
         )
@@ -973,11 +964,13 @@ def dynamicemb_eval_forward(
             output_embs,
             reverse_indices,
             offsets,
-            combiner,
-            total_D,
-            batch_size,
-            D_offsets,
-            max_D,
+            layout.pooling_mode,
+            layout.total_D,
+            layout.batch_size,
+            layout.D_offsets,
+            layout.max_D,
+            pooling_weights,
+            layout.feature_dims_vec4,
         )
         return output_embs
 
@@ -986,8 +979,8 @@ def _generic_forward_path(
     storage: Storage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    emb_dim: int,
-    val_dim: int,
+    max_emb_dim: int,
+    max_val_dim: int,
     emb_dtype: torch.dtype,
     initializer: BaseDynamicEmbInitializer,
     evict_strategy: Optional[EvictStrategy],
@@ -1058,7 +1051,7 @@ def _generic_forward_path(
             missing_table_ids,
             missing_scores,
             unique_values,
-            emb_dim,
+            max_emb_dim,
             freq_for_admission,
             admit_strategy,
             admission_counter,
@@ -1067,10 +1060,14 @@ def _generic_forward_path(
 
         if indices_to_init.numel() > 0:
             with torch.cuda.nvtx.range("op:initializer"):
-                initializer(unique_values[:, :emb_dim], indices_to_init, unique_keys)
+                initializer(
+                    unique_values[:, :max_emb_dim], indices_to_init, unique_keys
+                )
 
-        if val_dim != emb_dim:
-            unique_values[missing_indices, emb_dim:] = storage.init_optimizer_state()
+        if max_val_dim != max_emb_dim:
+            unique_values[
+                missing_indices, max_emb_dim:
+            ] = storage.init_optimizer_state()
 
         values_to_insert = unique_values[positions_in_unique]
 
@@ -1100,25 +1097,23 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         output_dtype: torch.dtype,
         initializers: List[BaseDynamicEmbInitializer],
         optimizer: BaseDynamicEmbeddingOptimizer,
+        layout: EmbeddingLayout,
         admit_strategy=None,
         evict_strategy=None,
         admission_counter: Optional[Counter] = None,
-        pooling_mode: DynamicEmbPoolingMode = DynamicEmbPoolingMode.NONE,
-        total_D: int = 0,
-        batch_size: int = 0,
-        dims: Optional[List[int]] = None,
-        max_D: int = 0,
-        D_offsets: Optional[torch.Tensor] = None,
+        pooling_weights: Optional[torch.Tensor] = None,
         *args,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
-            emb_dim = storage.max_embedding_dim()
-            val_dim = storage.max_value_dim()
+            max_emb_dim = storage.max_embedding_dim()
+            max_val_dim = storage.max_value_dim()
             emb_dtype = storage.embedding_dtype()
 
-            is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
-            mixed_D = is_pooling and dims is not None and max_D > min(dims)
-            out_dim = max_D if mixed_D else emb_dim
+            # pooling_weights is validated by the sole caller,
+            # BatchedDynamicEmbeddingTablesV2.forward (pooling mode, dtype,
+            # numel, and exclusivity with frequency_counters), and again by
+            # TORCH_CHECK in gather_embedding_pooled / reduce_grads.
+            is_pooling = layout.is_pooling
 
             use_counter = prefetch_state.slot_indices is not None
             if use_counter:
@@ -1136,14 +1131,11 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         prefetch_state.unique_table_ids,
                         copy_mode=CopyMode.EMBEDDING,
                     )
-                if out_dim != emb_dim:
-                    unique_embs = unique_embs[:, :out_dim]
-
                 if prefetch_state.non_admitted_positions is not None:
                     na = prefetch_state.non_admitted_positions
                     with torch.cuda.nvtx.range("op:initializer"):
                         initializers[0](
-                            unique_embs[:, :emb_dim],
+                            unique_embs[:, :max_emb_dim],
                             na,
                             prefetch_state.unique_keys,
                         )
@@ -1158,8 +1150,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     storage,
                     prefetch_state.unique_keys,
                     prefetch_state.unique_table_ids,
-                    emb_dim,
-                    val_dim,
+                    max_emb_dim,
+                    max_val_dim,
                     emb_dtype,
                     initializers[0],
                     evict_strat,
@@ -1167,14 +1159,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     admit_strategy,
                     admission_counter,
                 )
-                unique_embs = unique_values[:, :out_dim]
+                # find() was asked for CopyMode.VALUE, so a row here is
+                # embedding ++ optimizer state; keep only the embedding.
+                unique_embs = unique_values[:, :max_emb_dim]
 
             device = prefetch_state.unique_keys.device
             if is_pooling:
-                combiner = 0 if pooling_mode == DynamicEmbPoolingMode.SUM else 1
                 output_embs = torch.empty(
-                    batch_size,
-                    total_D,
+                    *layout.pooled_shape(),
                     dtype=output_dtype,
                     device=device,
                 )
@@ -1184,17 +1176,17 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         output_embs,
                         prefetch_state.reverse_indices,
                         offsets,
-                        combiner,
-                        total_D,
-                        batch_size,
-                        D_offsets,
-                        max_D,
+                        layout.pooling_mode,
+                        layout.total_D,
+                        layout.batch_size,
+                        layout.D_offsets,
+                        layout.max_D,
+                        pooling_weights,
+                        layout.feature_dims_vec4,
                     )
             else:
-                combiner = -1
                 output_embs = torch.empty(
-                    prefetch_state.reverse_indices.shape[0],
-                    emb_dim,
+                    *layout.sequence_shape(),
                     dtype=output_dtype,
                     device=device,
                 )
@@ -1214,21 +1206,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.update_value_rows = prefetch_state.value_row_indices
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
-            ctx.pooling_mode = pooling_mode
-            ctx.combiner = combiner
+            ctx.layout = layout
             ctx.offsets = offsets
-            ctx.batch_size = batch_size
-            ctx.total_D = total_D
-            ctx.emb_dim = emb_dim
-            ctx.value_dim = val_dim
+            ctx.max_emb_dim = max_emb_dim
+            ctx.max_val_dim = max_val_dim
             ctx.emb_dtype = emb_dtype
-            ctx.mixed_D = mixed_D
-            ctx.dims = dims
-            ctx.max_D = max_D
-            ctx.D_offsets = D_offsets
-            ctx.num_features = (
-                (offsets.shape[0] - 1) // batch_size if batch_size > 0 else 0
-            )
+            ctx.pooling_weights = pooling_weights
             ctx.use_counter = use_counter
             ctx.unique_values = unique_values
             ctx.persisted_unique_indices = persisted_unique_indices
@@ -1255,20 +1238,21 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             if optimizer.need_gradient_clipping():
                 optimizer.clip_gradient(grads)
 
-            is_pooling = ctx.pooling_mode != DynamicEmbPoolingMode.NONE
-            if is_pooling:
-                out_dim = ctx.max_D if ctx.mixed_D else ctx.emb_dim
+            layout = ctx.layout
+            if layout.is_pooling:
                 with torch.cuda.nvtx.range("op:reduce_grads"):
                     unique_grads = reduce_grads(
                         ctx.reverse_indices,
                         grads,
                         ctx.unique_keys.numel(),
-                        ctx.batch_size,
-                        out_dim,
+                        layout.batch_size,
+                        ctx.max_emb_dim,
                         ctx.offsets,
-                        ctx.D_offsets,
-                        ctx.combiner,
-                        ctx.total_D,
+                        layout.D_offsets,
+                        layout.pooling_mode,
+                        layout.total_D,
+                        ctx.pooling_weights,
+                        layout.feature_dims_vec4,
                     )
             else:
                 with torch.cuda.nvtx.range("op:reduce_grads"):
@@ -1276,8 +1260,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ctx.reverse_indices,
                         grads,
                         ctx.unique_keys.numel(),
-                        ctx.batch_size,
-                        ctx.emb_dim,
+                        layout.batch_size,
+                        ctx.max_emb_dim,
                     )
 
             optimizer.step()
@@ -1331,8 +1315,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             ctx.unique_values,
                             unique_table_ids,
                             table_emb_dims,
-                            ctx.emb_dim,
-                            ctx.value_dim,
+                            ctx.max_emb_dim,
+                            ctx.max_val_dim,
                             all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
@@ -1353,4 +1337,4 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                                 preserve_existing=True,
                             )
 
-            return (None,) * 17
+            return (None,) * 18

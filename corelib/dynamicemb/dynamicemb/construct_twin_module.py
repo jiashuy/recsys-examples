@@ -58,7 +58,7 @@ def _init_fn(x: torch.Tensor):
 
 
 def generate_sparse_feature(
-    feature_names, num_embeddings_list, local_batch_size, lookup_iter=0
+    feature_names, num_embeddings_list, local_batch_size, lookup_iter=0, weighted=False
 ):
     """
     Generate a KeyedJaggedTensor for one lookup iteration across all embedding tables.
@@ -67,9 +67,11 @@ def generate_sparse_feature(
     - feature_names: List of N embedding table names
     - num_embeddings_list: List of N embedding table sizes
     - local_batch_size: Batch size per rank
-    - world_size: Total number of ranks
-    - rank: Current rank ID
     - lookup_iter: Current lookup iteration (0, 1, 2, ...)
+    - weighted: Attach all-ones per-sample weights. A weighted collection
+      unconditionally reads features.weights(), which raises on a KJT that has
+      none; all-ones leaves a SUM pooling result equal to the row itself, which
+      is what this sweep relies on to read values back out.
 
     Returns:
     - A KeyedJaggedTensor for the current lookup iteration
@@ -100,6 +102,11 @@ def generate_sparse_feature(
             keys=feature_names,
             values=torch.tensor(indices, dtype=torch.int64).cuda(),
             lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
+            weights=(
+                torch.ones(len(indices), dtype=torch.float32).cuda()
+                if weighted
+                else None
+            ),
         ),
         torch.tensor(indices, dtype=torch.int64).cuda(),
     )
@@ -209,6 +216,7 @@ class ConstructTwinModule:
         bwd_a2a_precision: CommType = CommType.FP32,
         optimizer_kwargs: Dict[str, Any] = None,
         use_index_dedup: bool = False,
+        is_weighted: bool = False,
         init_fn: Optional[Callable[[torch.Tensor], Optional[torch.Tensor]]] = _init_fn,
         rank: int = 0,
         world_size: int = 1,
@@ -229,6 +237,9 @@ class ConstructTwinModule:
         self._bwd_a2a_precision = bwd_a2a_precision
         self._optimizer_kwargs = optimizer_kwargs
         self._use_index_dedup = use_index_dedup
+        # Weighted pooling is SUM-only, and only EmbeddingBagCollection has it.
+        assert not is_weighted or is_pooled, "is_weighted requires a pooled collection"
+        self._is_weighted = is_weighted
         self._rank = rank
         self._world_size = world_size
         self._scale_factor = scale_factor
@@ -254,6 +265,7 @@ class ConstructTwinModule:
             collection = torchrec.EmbeddingBagCollection(
                 device=torch.device("meta"),
                 tables=configs,
+                is_weighted=self._is_weighted,
             )
         else:
             configs = [
@@ -350,6 +362,7 @@ class ConstructTwinModule:
             collection = torchrec.EmbeddingBagCollection(
                 device=torch.device("meta"),
                 tables=configs,
+                is_weighted=self._is_weighted,
             )
         else:
             configs = [
@@ -463,7 +476,11 @@ class ConstructTwinModule:
         for iter_idx in range(total_iterations):
             # Generate sparse feature for current iteration
             sparse_feature, sparse_indices = generate_sparse_feature(
-                self._feature_names, self._num_embeddings, self._batch_size, iter_idx
+                self._feature_names,
+                self._num_embeddings,
+                self._batch_size,
+                iter_idx,
+                weighted=self._is_weighted,
             )
 
             # Forward pass through model

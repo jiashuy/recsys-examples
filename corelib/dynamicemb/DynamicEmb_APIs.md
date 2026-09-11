@@ -445,9 +445,17 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
     from dynamicemb import DynamicEmbPoolingMode
 
     #API arguments
+    @enum.unique
     class DynamicEmbPoolingMode(enum.IntEnum):
         """
         Enumeration for pooling modes in dynamic embedding lookup.
+
+        The values are taken from the bound C++ enum ``dyn_emb::PoolingMode``
+        (``src/utils.h``), which is the single source of truth, in the same way
+        ``DynamicEmbEvictStrategy`` takes its values from ``EvictStrategy``. It
+        is an ``IntEnum`` because a pooling mode is handed straight to the
+        kernels and compared as an integer, so it stays usable wherever a plain
+        ``int`` was before (``SUM == 0``, dict keys, JSON).
 
         Attributes
         ----------
@@ -462,10 +470,32 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
             No pooling (sequence mode). Each index produces its own embedding row.
             Output shape: (total_indices, D).
         """
-        SUM = 0
-        MEAN = 1
-        NONE = 2
+        SUM = BagPoolingMode.KSum    # 0
+        MEAN = BagPoolingMode.KMean  # 1
+        NONE = BagPoolingMode.KNone  # 2
     ```
+
+**Weighted SUM pooling** — `SUM` pooling supports optional per-position float32 weights: `out[b] = Σ wᵢ · embᵢ`. Supported in both training and
+eval mode, only for `SUM` (no weighted-MEAN variant), and works with mixed-D tables. Two ways to use it:
+
+- **Through TorchRec's `EmbeddingBagCollection`**: build the collection with
+  `is_weighted=True` and attach the weights to the features KJT (`KeyedJaggedTensor(keys=..., values=indices, weights=weights, lengths=...)`);
+  call `model(features)` as usual. The weights ride the KJT through the all2all distribution and reach the DynamicEmb lookup as pooling weights.
+
+  **`is_weighted=True` is required, not merely conventional.** DynamicEmb only reads the KJT weights as pooling weights when the collection
+  declares itself weighted; on an `is_weighted=False` collection the weights are ignored and the result is a plain unweighted sum, with no
+  error raised. The weights channel of a `KeyedJaggedTensor` is shared — TorchRec also uses it to carry per-feature scores for virtual-table
+  eviction, and the sequence (`EmbeddingCollection`) path reads it as LFU frequency counters — so the flag is what disambiguates them.
+- **Through `BatchedDynamicEmbeddingTablesV2.forward` directly**:
+  `module(indices, offsets, pooling_weights=w)` where `w` is a float32 tensor aligned with `indices` (`w.numel() == indices.numel()`).
+
+**The weights are not differentiable.** No gradient is computed for them, so learned per-position weights are not supported: passing a tensor with
+`requires_grad=True` while grad mode is enabled raises `ValueError` rather than letting the producing module train against a gradient that is
+silently zero. Weights that carry `requires_grad` are still accepted under `torch.no_grad()`, which is what keeps eval working.
+
+Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights are not float32, `weights.numel() != indices.numel()`, the weights
+require grad while grad mode is enabled, or `frequency_counters` is passed alongside them (both are carried by the single KJT weights channel, so
+a caller has to pick one).
 
 ## DynamicEmbTableOptions
 
@@ -1186,6 +1216,23 @@ Once the model containing `EmbeddingCollection` is built and initialized through
 The switching between training and evaluation modes should be consistent with `nn.Module`, while `training` in [DynamicEmbTableOptions](./dynamicemb/dynamicemb_config.py) is used to guide whether to allocate memory to optimizer states when builds the table.
 
 Due to limited resources, the dynamic embedding table does not pre allocate memory for all keys. If a key appears for the first time during training, it will be initialized immediately during the training process. Please see `initializer_args` and `eval_initializer_args` in `DynamicEmbTableOptions` for more information.
+
+## Weighted EmbeddingBagCollection
+
+Weighted-sum pooling for `EmbeddingBagCollection` tables backed by DynamicEmb is supported in training and eval (see
+[DynamicEmbPoolingMode](#dynamicembpoolingmode)). Gradients are scaled per-position: `grad_embᵢ = wᵢ · grad_pooled`, verified against an exact SGD
+reference in `test/unit_tests/test_weighted_pooled_embedding_v2.py` and end-to-end, sharded, forward and backward, against a twin TorchRec model in `test/unit_tests/test_twin_module.py` (`is_weighted=True`).
+
+### Breaking API change: `per_sample_weights` split
+
+`BatchedDynamicEmbeddingTablesV2.forward` previously took `per_sample_weights`, which was consumed as **LFU frequency counters**. That parameter is now split:
+
+- `frequency_counters: Optional[Tensor]` — per-position LFU frequency counters (the old `per_sample_weights` semantics).
+- `pooling_weights: Optional[Tensor]` — per-position float32 weights for weighted-SUM pooling (new; SUM only). The two are mutually exclusive.
+
+Callers that passed `per_sample_weights=...` for LFU counting must pass `frequency_counters=...` instead.
+
+`InferenceEmbeddingTable`'s `per_sample_weights` (inference/export path) is a separate API and is unchanged.
 
 ## Automatic eviction
 

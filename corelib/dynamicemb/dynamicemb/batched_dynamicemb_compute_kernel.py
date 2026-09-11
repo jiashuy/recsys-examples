@@ -369,6 +369,22 @@ class BatchedDynamicEmbeddingBag(
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
+    def forward(self, features) -> torch.Tensor:
+        # Only take the KJT weights as pooling weights when the collection was
+        # actually declared weighted. The weights channel is shared: TorchRec
+        # also uses it to carry per-feature scores for virtual-table eviction,
+        # and the sequence path reads it as LFU frequency counters. Keying off
+        # is_weighted keeps an unweighted collection unweighted no matter what
+        # else ends up riding that channel.
+        pooling_weights = (
+            features.weights_or_none() if self._config.is_weighted else None
+        )
+        return self._emb_module(
+            indices=features.values().long(),
+            offsets=features.offsets().long(),
+            pooling_weights=pooling_weights,
+        )
+
 
 class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     # FusedOptimizerModule):
@@ -484,5 +500,5 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
-            per_sample_weights=features.weights_or_none(),
+            frequency_counters=features.weights_or_none(),
         )

@@ -54,6 +54,7 @@ from dynamicemb.key_value_table import (
     Storage,
     flush_cache,
 )
+from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
@@ -659,6 +660,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         D_offsets = [0] + list(accumulate(feature_dims))
         self.total_D: int = D_offsets[-1]
         self.max_D: int = max(self.dims)
+        # The shared dim, or None when the tables differ. Mirrors the condition
+        # the D_offsets buffer below is registered on.
+        self.common_D: Optional[int] = (
+            self.dims[0] if self.max_D == min(self.dims) else None
+        )
+        # Whether the pooled kernels may use their vectorized path; see
+        # EmbeddingLayout.feature_dims_vec4.  Every table has at least one
+        # feature, so checking the table dims covers the feature dims.
+        self.feature_dims_vec4: bool = all(d % 4 == 0 for d in self.dims)
 
         # Per-feature cumulative dimension offsets, registered on GPU for use
         # by multi-dim pooling kernels.  Only needed when tables have mixed
@@ -1101,7 +1111,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         indices: Tensor,
         offsets: Tensor,
-        per_sample_weights: Optional[Tensor] = None,
+        frequency_counters: Optional[Tensor] = None,
+        pooling_weights: Optional[Tensor] = None,
         feature_requires_grad: Optional[Tensor] = None,
         # 2D tensor of batch size for each rank and feature.
         # Shape (number of features, number of ranks)
@@ -1125,6 +1136,58 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size = (
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
+        # Built per call because batch_size comes from the input; see
+        # dynamicemb/lookup_layout.py for what the fields mean.
+        layout = EmbeddingLayout(
+            pooling_mode=self.pooling_mode,
+            batch_size=batch_size,
+            feature_num=self.feature_num,
+            num_keys=indices.numel(),
+            total_D=self.total_D,
+            max_D=self.max_D,
+            common_D=self.common_D,
+            D_offsets=self.D_offsets_t,
+            feature_dims_vec4=self.feature_dims_vec4,
+        )
+        if pooling_weights is not None:
+            if frequency_counters is not None:
+                # Both are fed from the single KJT weights channel: the
+                # sequence path reads it as LFU frequency counters, the
+                # weighted-pooling path as per-sample weights. One KJT cannot
+                # mean both, so receiving both signals a misrouted caller.
+                raise ValueError(
+                    "pooling_weights and frequency_counters are mutually "
+                    "exclusive (both are derived from KeyedJaggedTensor "
+                    "weights); got both."
+                )
+            if self.pooling_mode != DynamicEmbPoolingMode.SUM:
+                raise ValueError(
+                    "pooling_weights requires pooling_mode=SUM (weighted pooling "
+                    f"is only supported for SUM, got {self.pooling_mode})."
+                )
+            if pooling_weights.dtype != torch.float32:
+                raise ValueError(
+                    f"pooling_weights must be float32, got {pooling_weights.dtype}."
+                )
+            if pooling_weights.numel() != indices.numel():
+                raise ValueError(
+                    "pooling_weights.numel() "
+                    f"({pooling_weights.numel()}) must equal indices.numel() "
+                    f"({indices.numel()})."
+                )
+            # The backward returns no gradient for the weights, so autograd
+            # would treat theirs as zero and a module producing learned weights
+            # would train as if it were detached -- silently, since a None
+            # gradient is not an error. Reject that outright rather than let it
+            # look like it works. Guarded on grad mode so eval under no_grad()
+            # accepts weights that merely happen to carry requires_grad.
+            if torch.is_grad_enabled() and pooling_weights.requires_grad:
+                raise ValueError(
+                    "pooling_weights with requires_grad=True is not supported: "
+                    "no gradient is computed for them, so learned per-position "
+                    "weights cannot train. Pass detached weights, or compute "
+                    "the weight gradient outside this module."
+                )
 
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
@@ -1143,14 +1206,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.feature_offsets,
                 self.output_dtype,
                 self._eval_initializers,
+                layout,
                 self._evict_strategy,
-                per_sample_weights,
-                self.pooling_mode,
-                self.total_D,
-                batch_size,
-                self.dims,
-                self.max_D,
-                self.D_offsets_t,
+                frequency_counters,
+                pooling_weights,
             )
 
         if any([not o.training for o in self._dynamicemb_options]):
@@ -1159,7 +1218,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         if not self._prefetch_states:
-            self.prefetch(indices, offsets, frequency_counters=per_sample_weights)
+            self.prefetch(indices, offsets, frequency_counters=frequency_counters)
         prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
@@ -1170,15 +1229,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.output_dtype,
             self._initializers,
             self._optimizer,
+            layout,
             self._admit_strategy,
             self._evict_strategy,
             self._admission_counter,
-            self.pooling_mode,
-            self.total_D,
-            batch_size,
-            self.dims,
-            self.max_D,
-            self.D_offsets_t,
+            pooling_weights,
             self._empty_tensor,
         )
         if isinstance(self._cache, DynamicEmbCache):

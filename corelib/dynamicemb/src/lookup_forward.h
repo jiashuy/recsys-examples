@@ -17,20 +17,74 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #ifndef LOOKUP_FORWARD_H
 #define LOOKUP_FORWARD_H
+#include "lookup_kernel.cuh"
+#include "pooled_layout.cuh"
 #include "utils.h"
 
 namespace dyn_emb {
 
-// Unified pooled gather (scatter-combine).
-// When D_offsets_ptr is non-null, multi-dim mode: ev_size is max_D (source row
-// stride), per-feature dims from D_offsets_ptr, accum_D ignored (pass 0).
-// When D_offsets_ptr is null, uniform-dim mode: ev_size is the embedding dim.
-void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
-                     void *inverse_idx_ptr, int combiner, int total_D,
-                     int accum_D, int ev_size, int src_stride, int num_vec,
-                     int batch_size, DataType src_type, DataType dst_type,
-                     DataType offset_type, cudaStream_t stream,
-                     const int *D_offsets_ptr = nullptr);
+// Unified pooled-gather descriptor.  One CTA/warp per bag, indexed in the
+// input's order; ``layout`` maps that to the output's columns.  Source rows use
+// src_stride, which exceeds the copy width when optimizer state follows the
+// embedding in a row.
+template <typename SrcType, typename DstType, typename IndexType>
+struct ForwardMultiToOneFMLayoutDesc {
+  using SrcT = SrcType;
+  using DstT = DstType;
+
+  HOST_DEVICE_INLINE int get_offset(int i) { return offset_ptr[i]; }
+  HOST_DEVICE_INLINE int get_vec_length(int i) {
+    return layout.col_width(layout.feature_of_input(i));
+  }
+  HOST_DEVICE_INLINE int get_average_pooling_factor(int i) {
+    int pooling_factor = static_cast<int>(offset_ptr[i + 1] - offset_ptr[i]);
+    return pooling_mode == PoolingMode::kMean ? pooling_factor : 1;
+  }
+  HOST_DEVICE_INLINE float get_weight(int i) {
+    // nullptr => unweighted pooling (identical to the old path).
+    return weights_ptr ? weights_ptr[i] : 1.0f;
+  }
+  HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
+    int idx = inverse_idx_ptr[i];
+    return src_ptr + (int64_t)src_stride * idx;
+  }
+  HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
+    const int f = layout.feature_of_input(i);
+    const int b = layout.sample_of_input(i);
+    return dst_ptr + b * layout.total_D + layout.col_begin(f);
+  }
+
+  PoolingMode pooling_mode;
+  PooledLayout layout;
+  int src_stride; // source row stride; exceeds layout.max_D when optimizer
+                  // states are appended to each row
+  const IndexType *__restrict__ offset_ptr;
+  // torch.unique's inverse mapping: for input position i, the row of the
+  // deduplicated table that position reads.  Most of the codebase still spells
+  // this "reverse"; it is the same array.
+  const IndexType *__restrict__ inverse_idx_ptr;
+  const SrcType *__restrict__ src_ptr;
+  DstType *dst_ptr;
+  const float *__restrict__ weights_ptr; // nullptr -> unweighted
+};
+
+// Unified pooled gather (scatter-combine).  ``layout`` carries the shapes, the
+// bag numbering and the copy width; see pooled_layout.cuh.  ``src_stride`` is
+// the source row stride, which exceeds the copy width when optimizer state is
+// appended to each row.  ``IndexType`` is shared by the offsets and the inverse
+// indices, which the descriptor requires to have the same width.
+template <typename SrcType, typename DstType, typename IndexType>
+void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
+                     const IndexType *offset_ptr,
+                     const IndexType *inverse_idx_ptr, PoolingMode pooling_mode,
+                     const PooledLayout &layout, int src_stride,
+                     bool feature_dims_vec4, cudaStream_t stream,
+                     const float *weights_ptr = nullptr) {
+  ForwardMultiToOneFMLayoutDesc<SrcType, DstType, IndexType> desc{
+      pooling_mode, layout,  src_stride,  offset_ptr, inverse_idx_ptr,
+      src_ptr,      dst_ptr, weights_ptr};
+  copy_multi_to_one(desc, feature_dims_vec4, stream);
+}
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    int num_emb, int ev_size, int src_stride, DataType src_type,
