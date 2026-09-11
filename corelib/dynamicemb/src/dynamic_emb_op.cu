@@ -129,6 +129,13 @@ void gather_embedding_pooled(
 
   const auto src_type = get_data_type(input);
   const auto dst_type = get_data_type(output);
+  // One index type serves both: the descriptor reads the offsets and the
+  // inverse indices through the same pointer type, so a mismatch here would
+  // reinterpret one of them rather than convert it.  reduce_grads converts
+  // instead; the forward has no reason to allocate, so it refuses.
+  TORCH_CHECK(inverse_index.scalar_type() == offsets.scalar_type(),
+              "inverse_index and offsets must have the same dtype, got ",
+              inverse_index.scalar_type(), " vs ", offsets.scalar_type());
   const auto offset_type = get_data_type(offsets);
 
   int dim = D_offsets.has_value() ? max_D : static_cast<int>(input.size(1));
