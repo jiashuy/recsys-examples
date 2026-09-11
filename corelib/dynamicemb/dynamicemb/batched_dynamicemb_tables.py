@@ -1822,9 +1822,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         Replay is exact in *layout*: every key is written at the slot and value
         row it held in the source table, so the target ends up layout-identical
-        to it. A table whose layout does not match the source's is rejected with
-        a ``ValueError`` rather than written some other way -- see
-        :meth:`_replay_compatibility`.
+        to it. Only a table that matches the delta's metadata is replayed; one
+        that does not is rejected with a ``ValueError`` rather than written some
+        other way -- see :meth:`_replay_compatibility`.
 
         The key and its embedding always travel; *content* selects what comes
         along, and defaults to both, i.e. the replica ends up holding what the
@@ -1857,9 +1857,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             per table.
 
         Raises:
-            ValueError: a table's layout does not match the source's, or the
+            ValueError: a table's metadata does not match the source's, or the
                 delta is missing the per-key data replay needs. Raised before
-                anything is written.
+                this module writes anything.
             TypeError: this module's storage is neither ``DynamicEmbStorage`` nor
                 ``HybridStorage``.
             NotImplementedError: a table is sharded with
@@ -1899,7 +1899,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """Resolve and check every table in *delta*, writing nothing.
 
         Raises on the first table that cannot be replayed, so a caller that sees
-        an exception knows the collection is untouched.
+        an exception knows *this module* is untouched. Not the collection: a
+        collection whose tables do not all group together is several modules, and
+        ``dynamicemb.replay_increment`` applies them one at a time.
         """
         plan: List[_ReplayJob] = []
         for i, table_name in enumerate(delta.table_names):

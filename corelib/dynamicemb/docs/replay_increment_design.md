@@ -38,7 +38,7 @@ Everything replay needs is already there; §3 records what deliberately is *not*
 | `evicted_keys` | **Never replayed.** Overwriting a slot already reproduces an eviction, so this list exists only for other consumers of the dump |
 | `erased_keys` | A separate buffer and a separate list, applied whenever non-empty, **erase before upsert** — nothing takes over an erased key's slot, so no write reproduces it |
 | What replay writes | The key and its embedding always; `ReplayContent` chooses what comes along (optimizer state / score), default both |
-| Rejection | Every table validated -- metadata *and* column shapes -- before any is written, so a delta applies whole or not at all |
+| Rejection | Only a table matching the delta's metadata is replayed; a mismatch raises. A module validates all of its tables -- metadata *and* column shapes -- before writing any of them, so a rejection leaves that module whole. A collection split across several modules is applied a module at a time, so a later rejection does not undo an earlier module |
 | `dist_type` | `roundrobin` / `hash_roundrobin` only — same restriction the dump side already enforces; `continuous` raises |
 
 ---
@@ -342,11 +342,11 @@ class ReplayStats:
 | `test_replay_spans_multiple_batches` | with `threads_in_wave` shrunk so the chunking actually runs, every column is cut along dimension 0 — 1-D `keys` / `slot_index` and 2-D `values` / `optimizer_states` / `scores` stay paired |
 | `test_replay_rejects_layout_mismatch` | capacity mismatch raises **and leaves the target untouched** (no partial write) |
 | `test_replay_rejects_score_strategy_mismatch` | a genuinely different score layout raises |
-| `test_replay_accepts_swapped_score_order` | `(TIMESTAMP, LFU)` vs `(LFU, TIMESTAMP)` is the *same* physical layout, so it must replay rather than be rejected |
+| `test_replay_rejects_swapped_score_order` | `(TIMESTAMP, LFU)` vs `(LFU, TIMESTAMP)` is the same *physical* layout but the opposite delta column order, so replay would rebase and permute the words into each other's slots -- rejected |
 | `test_replay_rejects_missing_table_options` | a delta from an older version raises instead of writing blind |
 | `test_replay_applies_erasures_and_ignores_evictions` | `erased_keys` is applied, erase before upsert, an erased-then-readmitted key survives; a non-empty `evicted_keys` changes nothing |
 | `test_replay_content_restores_optimizer_state` | with `OPTIMIZER_STATE` the source's state lands even on a row the key is taking over, where the default would have initialised it |
-| `test_replay_rejects_a_multi_table_delta_without_writing_any` | a layout mismatch on the *second* table leaves the first unwritten |
+| `test_replay_rejects_a_multi_table_delta_without_writing_any` | a layout mismatch on the *second* table of a module leaves the first unwritten |
 | `test_replay_rejects_a_malformed_column_before_writing_any_table` | the same, for a bad column rather than bad metadata: a wrong score width, a wrong optimizer-state width, a short `slot_index` |
 | `test_erased_and_evicted_use_separate_buffers`¹ | an erase and an eviction land in different buffers, neither leaks into the other, both are read-and-clear |
 | `test_erase_retention_is_per_call_not_per_table`¹ | the same table records one erase and not the next; a table that discards evictions still reports its erases |
