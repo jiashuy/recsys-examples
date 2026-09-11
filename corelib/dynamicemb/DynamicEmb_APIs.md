@@ -489,7 +489,13 @@ eval mode, only for `SUM` (no weighted-MEAN variant), and works with mixed-D tab
 - **Through `BatchedDynamicEmbeddingTablesV2.forward` directly**:
   `module(indices, offsets, pooling_weights=w)` where `w` is a float32 tensor aligned with `indices` (`w.numel() == indices.numel()`).
 
-Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights are not float32, `weights.numel() != indices.numel()`, or `frequency_counters` is passed alongside them (both are carried by the single KJT weights channel, so a caller has to pick one).
+**The weights are not differentiable.** No gradient is computed for them, so learned per-position weights are not supported: passing a tensor with
+`requires_grad=True` while grad mode is enabled raises `ValueError` rather than letting the producing module train against a gradient that is
+silently zero. Weights that carry `requires_grad` are still accepted under `torch.no_grad()`, which is what keeps eval working.
+
+Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights are not float32, `weights.numel() != indices.numel()`, the weights
+require grad while grad mode is enabled, or `frequency_counters` is passed alongside them (both are carried by the single KJT weights channel, so
+a caller has to pick one).
 
 ## DynamicEmbTableOptions
 

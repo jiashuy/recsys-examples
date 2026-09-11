@@ -1175,6 +1175,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     f"({pooling_weights.numel()}) must equal indices.numel() "
                     f"({indices.numel()})."
                 )
+            # The backward returns no gradient for the weights, so autograd
+            # would treat theirs as zero and a module producing learned weights
+            # would train as if it were detached -- silently, since a None
+            # gradient is not an error. Reject that outright rather than let it
+            # look like it works. Guarded on grad mode so eval under no_grad()
+            # accepts weights that merely happen to carry requires_grad.
+            if torch.is_grad_enabled() and pooling_weights.requires_grad:
+                raise ValueError(
+                    "pooling_weights with requires_grad=True is not supported: "
+                    "no gradient is computed for them, so learned per-position "
+                    "weights cannot train. Pass detached weights, or compute "
+                    "the weight gradient outside this module."
+                )
 
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]

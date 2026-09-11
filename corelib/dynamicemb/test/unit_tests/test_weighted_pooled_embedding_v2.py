@@ -321,3 +321,14 @@ def test_weighted_errors(current_device):
     counters = torch.tensor([1.0, 2.0], dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="mutually exclusive"):
         mod(indices, offsets, frequency_counters=counters, pooling_weights=weights)
+
+    # differentiable weights -> ValueError. The backward returns no gradient for
+    # them, so accepting these would leave the producing module training against
+    # a silent zero.
+    with pytest.raises(ValueError, match="requires_grad"):
+        mod(indices, offsets, pooling_weights=weights.clone().requires_grad_())
+
+    # ... but with grad mode off there is no backward to lose a gradient to, so
+    # the same tensor is accepted. This is what keeps eval usable.
+    with torch.no_grad():
+        mod(indices, offsets, pooling_weights=weights.clone().requires_grad_())
