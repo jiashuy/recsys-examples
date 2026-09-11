@@ -29,33 +29,50 @@ namespace dyn_emb {
 // and the scale to apply to that row.
 //
 // The two travel together because the reduce needs the keys grouped by unique
-// row, and getting them there means sorting.  Carrying the weight as part of
-// the sort's value is free: the value used to be a bare gather id typed like
-// the inverse indices, which segmented_unique emits as int64, so it was 8
-// bytes already.  Sorting a separate float array by the same keys, in
-// contrast, is an entire second radix sort.  Unweighted lookups store 1.0f,
-// and multiplying by it is exact in fp32, so they take the identical path at
-// the identical cost and need no separate kernel instantiation.
+// row, and getting them there means sorting.  Carrying the weight as the
+// sort's value rather than sorting a separate float array by the same keys
+// saves an entire second radix sort.  Unweighted lookups store 1.0f, and
+// multiplying by it is exact in fp32, so they take the identical path and need
+// no separate kernel instantiation.
 //
-// grad_index is int32: reduce_grads checks up front that both the key count
-// and the bag count fit in it.
+// grad_index is IndexType -- the same type as the inverse indices and the
+// offsets -- so no row can be truncated on its way through the sort.
 //
-// POD by design, and 8-byte aligned so cub's radix sort handles it exactly
-// like a uint64_t value.
-struct alignas(8) GradInfo {
-  int32_t grad_index;
+// Packed to 4, not padded: IndexType is 64-bit throughout this codebase
+// (DISPATCH_INTEGER_DATATYPE_FUNCTION covers only Int64/UInt64), so the
+// natural layout would waste 4 bytes per key on tail padding.  12 bytes at
+// alignment 4 means cub moves three 32-bit words per item instead of two
+// 64-bit ones; pack(1) is deliberately avoided, as it would degrade the
+// shared-memory exchange to byte granularity.
+#pragma pack(push, 4)
+template <typename IndexType> struct GradInfo {
+  IndexType grad_index;
   float weight;
 };
-static_assert(sizeof(GradInfo) == 8, "GradInfo must stay 8 bytes");
-static_assert(alignof(GradInfo) == 8, "GradInfo must stay 8-byte aligned");
+#pragma pack(pop)
+static_assert(sizeof(GradInfo<int64_t>) == 12, "GradInfo must stay packed");
+static_assert(alignof(GradInfo<int64_t>) == 4, "GradInfo must stay 4-aligned");
 
-class LocalReduce {
+// IndexType -> the DataType its tensors are allocated with.  Only the two
+// types DISPATCH_INTEGER_DATATYPE_FUNCTION can produce are instantiated.
+template <typename T> struct IndexDataType;
+template <> struct IndexDataType<int64_t> {
+  static constexpr DataType value = DataType::Int64;
+};
+template <> struct IndexDataType<uint64_t> {
+  static constexpr DataType value = DataType::UInt64;
+};
+
+// Templated on the index type so the offsets, the inverse indices and
+// GradInfo::grad_index are the same type by construction rather than by
+// convention.  reduce_grads converts the offsets when they disagree.
+// Explicitly instantiated in lookup_backward.cu for both index types, which
+// keeps the reduce kernels out of every translation unit that includes this.
+template <typename IndexType> class LocalReduce {
 private:
   c10::Device device_;
   int64_t num_key_;
   int64_t len_vec_;
-  DataType key_type_;
-  DataType id_type_;
   DataType accum_type_;
 
   at::Tensor partial_buffer;
@@ -65,7 +82,7 @@ private:
 
 public:
   LocalReduce(c10::Device &device, int64_t num_key, int64_t len_vec,
-              DataType id_type, DataType accum_type);
+              DataType accum_type);
 
   // Unified reduce.  Under mixed dims the source is grads[B, total_D] and a
   // feature's columns come from layout.col_begin/col_width; otherwise the
@@ -74,11 +91,11 @@ public:
   // reduce is the degenerate case -- every key its own bag -- so it passes no
   // offsets and the layout goes unread.
   //
-  // sorted_grad_infos holds one GradInfo per key, already sorted by
+  // sorted_grad_infos holds one GradInfo<IndexType> per key, already sorted by
   // unique_key_ids; pooling weights ride in on it, so there is no separate
-  // weights argument.  It is an int32 tensor of 2*num_key elements reading as
-  // GradInfo[num_key] -- an int32 pair rather than an opaque byte blob so it
-  // stays inspectable from the Python side.
+  // weights argument.  Packing makes it a byte tensor of
+  // num_key * sizeof(GradInfo<IndexType>) elements; reduce_grads owns its
+  // validity, so nothing is re-checked here.
   void local_reduce(const at::Tensor &in_grads, at::Tensor &out_grads,
                     const at::Tensor &sorted_grad_infos,
                     const at::Tensor &unique_key_ids, cudaStream_t &stream,
