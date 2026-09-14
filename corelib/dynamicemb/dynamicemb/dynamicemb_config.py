@@ -419,7 +419,11 @@ class DynamicEmbTableOptions:
     Parameters
     ----------
     embedding_dtype : Optional[torch.dtype], optional
-        Data (weight) type of dynamic embedding table.
+        Data (weight) type of dynamic embedding table. Also the precision a checkpoint stores:
+        ``DynamicEmbDump`` writes value files at this dtype and records it in the table's meta JSON as
+        ``embedding_dtype`` (alongside ``embedding_dim`` / ``optim_state_dtype``), which is how
+        ``DynamicEmbLoad`` reads them back. Loading a checkpoint whose precision differs converts the
+        values and warns; a differing dim is an error.
     dim : Optional[int], optional
         Value vector dimension. With ``DynamicEmbeddingShardingPlanner``, ``_prepare_dynemb_table_options``
         sets it from ``BaseEmbeddingConfig.embedding_dim``. The embedding kernel only warns if it

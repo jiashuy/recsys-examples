@@ -40,7 +40,6 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
-    get_physical_score_order,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -148,8 +147,13 @@ def owned_key_mask(
 
     ``incremental_dump`` all-gathers within its process group, so every rank holds
     the whole delta; replay keeps only its own shard. Ownership is recomputed from
-    the key with the **target's** fan-out, which is what lets a globally gathered
-    delta be replayed into a differently sized world.
+    the key rather than read off the delta, so a globally gathered delta can be
+    handed to every rank unchanged.
+
+    *world_size* is the target's, but replay only ever runs with the source's
+    equal to it (``_replay_compatibility`` rejects otherwise), so this does not
+    reshard: a slot names a position inside one rank's table and carries no rank,
+    so two source ranks folded onto one target rank would collide on it.
 
     Returns ``None`` when no filtering is needed (single rank), so callers can
     skip the mask entirely.
@@ -1567,6 +1571,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return this rank's (keys, embeddings) for one table.
+
+        Embeddings come back at the table's own precision, the same as they are
+        checkpointed and the same as ``incremental_dump`` reports them.
+        """
         self.flush()
 
         table_id = self._table_names.index(table_name)
@@ -1581,7 +1590,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if len(keys_list) == 0:
             return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
-                0, 0, device=device
+                0, 0, dtype=self._storage.embedding_dtype(), device=device
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
@@ -1756,12 +1765,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         only meaningful when the target's capacity and bucket layout match the
         source's. Everything compared here comes from the delta's ``meta``.
 
-        ``score_strategy`` is compared by its **physical** word order, not the
-        configured tuple: what a slot write depends on is how the score words are
-        laid out on device, and ``(TIMESTAMP, LFU)`` and ``(LFU, TIMESTAMP)`` are
-        the same layout -- the tuple order only ever decided checkpoint column
-        order. Two genuinely different strategies still differ physically and are
-        still rejected.
+        ``score_strategy`` is compared **as configured**, tuple order included.
+        A compound strategy's physical layout is fixed -- ``(TIMESTAMP, LFU)``
+        and ``(LFU, TIMESTAMP)`` both store the timestamp at word 0 -- so the two
+        agree on where a slot write lands. They do not agree on the delta: the
+        configured order is the column order of the score block a dump emits,
+        and replay reads that block with the *target's* order, deciding which
+        columns are ages to rebase (:func:`_timestamp_score_columns`) and how to
+        permute them (:func:`score_load_permutation`) by logical position. Two
+        tables matching physically and differing logically would rebase the
+        frequency as though it were a timestamp and write each word into the
+        other's slot, with nothing to signal it. Requiring the configured order
+        to match is what keeps that from being expressible.
         """
         storage = self._storage
         option = self._dynamicemb_options[table_id]
@@ -1787,11 +1802,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
             ("world_size", meta.get("world_size"), self._shard_world_size),
-            # Compared by physical layout -- see the note above.
+            # Configured order, not physical layout -- see the note above.
             (
                 "score_strategy",
-                get_physical_score_order(src_options.score_strategy),
-                get_physical_score_order(option.score_strategy),
+                src_options.score_strategy,
+                option.score_strategy,
             ),
             ("dim", src_options.dim, option.dim),
             ("dist_type", src_options.dist_type, option.dist_type),
@@ -1812,9 +1827,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         Replay is exact in *layout*: every key is written at the slot and value
         row it held in the source table, so the target ends up layout-identical
-        to it. A table whose layout does not match the source's is rejected with
-        a ``ValueError`` rather than written some other way -- see
-        :meth:`_replay_compatibility`.
+        to it. Only a table that matches the delta's metadata is replayed; one
+        that does not is rejected with a ``ValueError`` rather than written some
+        other way -- see :meth:`_replay_compatibility`.
 
         The key and its embedding always travel; *content* selects what comes
         along, and defaults to both, i.e. the replica ends up holding what the
@@ -1831,12 +1846,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         evicted one's slot is in the delta. A table retaining evictions for some
         other consumer therefore costs a replay nothing.
 
-        Only the keys this rank owns are replayed, with ownership recomputed
-        from the key using *this* model's world size. A delta gathered over a
-        process group therefore fans out correctly when handed to every rank; a
-        per-rank delta (``incremental_dump`` with ``pg=None``) should be replayed
-        on the rank that produced it, or the filter drops all of it -- visible as
-        ``ReplayStats.skipped``.
+        The target must be sharded across the same number of ranks as the
+        source; a differing ``world_size`` is rejected, because a slot names a
+        position inside one rank's table and two source ranks folded onto one
+        target rank would collide on it. Within that fixed world, only the keys
+        this rank owns are replayed, with ownership recomputed from the key. A
+        delta gathered over a process group therefore fans out correctly when
+        handed to every rank; a per-rank delta (``incremental_dump`` with
+        ``pg=None``) should be replayed on the rank that produced it, or the
+        filter drops all of it -- visible as ``ReplayStats.skipped``.
 
         Args:
             delta: one collection's :class:`DeltaDumpResult`. Tables not present
@@ -1847,9 +1865,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             per table.
 
         Raises:
-            ValueError: a table's layout does not match the source's, or the
+            ValueError: a table's metadata does not match the source's, or the
                 delta is missing the per-key data replay needs. Raised before
-                anything is written.
+                this module writes anything.
             TypeError: this module's storage is neither ``DynamicEmbStorage`` nor
                 ``HybridStorage``.
             NotImplementedError: a table is sharded with
@@ -1889,7 +1907,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """Resolve and check every table in *delta*, writing nothing.
 
         Raises on the first table that cannot be replayed, so a caller that sees
-        an exception knows the collection is untouched.
+        an exception knows *this module* is untouched. Not the collection: a
+        collection whose tables do not all group together is several modules, and
+        ``dynamicemb.replay_increment`` applies them one at a time.
         """
         plan: List[_ReplayJob] = []
         for i, table_name in enumerate(delta.table_names):

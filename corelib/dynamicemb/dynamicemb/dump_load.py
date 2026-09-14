@@ -115,7 +115,13 @@ def DynamicEmbDump(
     The name of the collection is the path of the torch module within the model, with the input module defined as str of model.
 
     Each dynamic embedding table will be stored as a key binary file and a value binary file, where the dtype of the key is int64_t,
-    and the dtype of the value is float. Each optimizer state is also treated as a dynamic embedding table.
+    and the dtype of the value is the table's own ``embedding_dtype`` (float32, float16 or bfloat16) -- values are stored at the
+    precision the table holds them at, not widened to float32. Each optimizer state is also treated as a dynamic embedding table
+    and shares that precision.
+
+    The value files carry no header, so the per-table meta JSON records ``embedding_dtype``, ``embedding_dim`` and
+    ``optim_state_dtype``; :func:`DynamicEmbLoad` reads the files by them. A checkpoint written before those keys existed is read
+    as float32 with the row width recovered from the value file's size.
 
     Parameters
     ----------
@@ -220,7 +226,13 @@ def DynamicEmbLoad(
     Load the distributed weights and corresponding optimizer states of dynamic embedding tables from the filesystem into the model.
 
     Each dynamic embedding table will be stored as a key binary file and a value binary file, where the dtype of the key is int64_t,
-    and the dtype of the value is float. Each optimizer state is also treated as a dynamic embedding table.
+    and the dtype of the value is the table's own ``embedding_dtype``. Each optimizer state is also treated as a dynamic embedding
+    table and shares that precision.
+
+    The value files are read at the precision and row width the per-table meta JSON records (``embedding_dtype`` /
+    ``embedding_dim`` / ``optim_state_dtype``). A checkpoint written before those keys existed is read as float32 with the row
+    width recovered from the value file's size. A dim that disagrees with the runtime table is an error; a differing precision is
+    converted on load, with a warning.
 
     Parameters
     ----------

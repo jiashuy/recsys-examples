@@ -461,10 +461,33 @@ def replay_increment(
 
     **Write-back is by slot.** Every key is written at the slot and value row it
     occupied in the source table, leaving the target layout-identical to it. That
-    is only meaningful when the two tables share a layout, so the target is
-    checked against the delta's ``meta`` (capacity, bucket capacity, score
-    layout, dim, dist_type, world size) and a mismatch raises
-    :class:`ValueError` before anything is written.
+    is only meaningful when the two tables share a layout, so a table is replayed
+    only once it has matched the delta's ``meta`` (capacity, bucket capacity,
+    score layout, dim, dist_type, world size). A table whose metadata does not
+    match is never written: it raises :class:`ValueError` instead.
+
+    That check covers every table a module holds before the module writes any of
+    them, so a rejection leaves the module as it was. It does not span a
+    collection. Tables whose options differ -- score strategy, caching,
+    dist_type, and the rest of
+    :meth:`~dynamicemb.dynamicemb_config.DynamicEmbTableOptions.get_grouped_key`
+    -- are held by separate modules, and those are replayed one after another, so
+    a rejection in a later module does not undo the modules already applied. Read
+    a ``ValueError`` as "this delta did not go in", not as "the model is
+    unchanged".
+
+    Recover by rebuilding from a full checkpoint, or by fixing the target and
+    replaying the same delta again. Replaying it twice restores the same keys,
+    the same embeddings and the same optimizer states, and carries LFU
+    frequencies, ``STEP``, ``CUSTOMIZED`` and ``NO_EVICTION`` row numbers through
+    unchanged. What does not repeat is a **timestamp** column: the delta stores
+    it as an age, and each replay turns that back into a score against the clock
+    it reads when it runs (see :class:`ReplayContent`). So a module that was
+    already applied comes out of the second pass looking more recently used than
+    it did -- by however long elapsed between the two attempts. Its keys keep
+    their order relative to each other, having all moved by the same amount, but
+    move ahead of the keys in that table the delta never touched, which changes
+    what evicts first and what the next time-based ``incremental_dump`` selects.
 
     Writing at the source's slot **overwrites whatever occupies it** -- that is
     what makes a replica converge (the source evicted that occupant to make
@@ -484,9 +507,17 @@ def replay_increment(
     (NO_EVICTION is unaffected either way: its score word is a value row, not a
     score, and is restored exactly.)
 
-    **Sharding.** Replay always keeps only the keys this rank owns, recomputing
-    ownership from the key with *this* model's world size. What that filter does
-    depends on how the delta was produced:
+    **Sharding.** The target must be sharded across the same number of ranks as
+    the source: ``meta["world_size"]`` is compared with this model's, and a
+    difference raises. Replay is by slot, and a slot names a position inside one
+    rank's table -- it carries no rank of its own -- so folding two source ranks
+    onto one target rank would land two keys that each held that slot on the same
+    slot here, and one would silently overwrite the other. Resharding a delta is
+    not something this can do; reshard by loading a full checkpoint.
+
+    Within that fixed world, replay keeps only the keys this rank owns,
+    recomputing ownership from the key rather than trusting the delta's order.
+    What that filter does depends on how the delta was produced:
 
     - ``incremental_dump(..., pg)`` all-gathers, so every rank holds the whole
       group's keys; hand the same delta to every rank and each takes its share.
@@ -523,9 +554,10 @@ def replay_increment(
             dynamic embedding tables.
 
     Raises:
-        ValueError: a target table's layout does not match the source's, or a
-            delta is missing the per-key data replay needs. Raised before
-            anything is written.
+        ValueError: a target table's metadata does not match the source's, or a
+            delta is missing the per-key data replay needs. The rejected table is
+            not written, nor is any other table of its module; see above for what
+            a multi-module collection may already have applied.
         TypeError: a module's storage is neither ``DynamicEmbStorage`` nor
             ``HybridStorage``.
         NotImplementedError: a table is sharded with ``dist_type="continuous"``
