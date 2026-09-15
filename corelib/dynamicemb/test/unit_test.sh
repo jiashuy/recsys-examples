@@ -15,6 +15,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/test_padded_buffer_optimizer.py"
+    "test/unit_tests/test_ftrl_optimizer.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
 )
 
