@@ -239,13 +239,14 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
   });
 }
 
-// A learning_rate_power of -0.5 is the paper's own choice and by far the
-// common one; test for it here so the kernel can take the sqrt path instead of
-// a general pow.
+// The accumulator is raised to -learning_rate_power, so -0.5 asks for a square
+// root -- the exponent the paper fixes, and by far the common choice. Test for
+// it here so the kernel can call sqrtf instead of a general powf. Exact
+// comparison is right: -0.5 is representable, and a value merely near it is a
+// different exponent the caller meant to ask for.
 namespace {
-constexpr float kFtrlSqrtLrPower = -0.5f;
-inline bool ftrl_lr_power_is_half(float learning_rate_power) {
-  return fabsf(learning_rate_power - kFtrlSqrtLrPower) < 1e-6f;
+inline bool ftrl_uses_sqrt(float learning_rate_power) {
+  return learning_rate_power == -0.5f;
 }
 } // namespace
 
@@ -266,8 +267,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
-  const bool lr_power_is_half = ftrl_lr_power_is_half(learning_rate_power);
-  const float neg_lr_power = -learning_rate_power;
+  const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
 
   auto grad_type = get_data_type(grads);
   auto val_type = static_cast<DataType>(table_dtype);
@@ -284,8 +284,9 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
 
-        FtrlVecOptimizer<g_t, w_t> opt{lr,   neg_lr_power, lr_power_is_half,
-                                       beta, l1_reg,       l2_reg};
+        FtrlVecOptimizer<g_t, w_t> opt{lr,   learning_rate_power,
+                                       use_sqrt, beta,
+                                       l1_reg, l2_reg};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
@@ -484,8 +485,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
-  const bool lr_power_is_half = ftrl_lr_power_is_half(learning_rate_power);
-  const float neg_lr_power = -learning_rate_power;
+  const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
@@ -493,8 +493,9 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      FtrlVecOptimizer<g_t, w_t> opt{lr,   neg_lr_power, lr_power_is_half,
-                                     beta, l1_reg,       l2_reg};
+      FtrlVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
+                                     use_sqrt, beta,
+                                     l1_reg, l2_reg};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,

@@ -417,11 +417,11 @@ template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
 struct FtrlVecOptimizer {
   // alpha in the paper.
   const float lr;
-  // -learning_rate_power, i.e. the exponent applied to accum. The paper fixes
-  // this at a square root; -0.5 recovers that and is worth a dedicated path,
-  // which `lr_power_is_half` selects.
-  const float neg_lr_power;
-  const bool lr_power_is_half;
+  // The accumulator is raised to -learning_rate_power. The paper fixes that
+  // exponent at a square root, which -0.5 recovers and `use_sqrt` selects; the
+  // host decides, since the predicate is the same for every row.
+  const float learning_rate_power;
+  const bool use_sqrt;
   // beta, which keeps the per-coordinate learning rate finite while accum is
   // still small.
   const float beta;
@@ -430,7 +430,7 @@ struct FtrlVecOptimizer {
   const float l2_reg;
 
   DEVICE_INLINE float accum_pow(const float accum) const {
-    return lr_power_is_half ? sqrtf(accum) : powf(accum, neg_lr_power);
+    return use_sqrt ? sqrtf(accum) : powf(accum, -learning_rate_power);
   }
 
   DEVICE_INLINE void update_one(float &weight, float &linear, float &accum,
