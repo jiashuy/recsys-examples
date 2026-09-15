@@ -22,7 +22,7 @@ from math import sqrt
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
-from dynamicemb.optimizer import get_optimizer_state_dim
+from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
 from dynamicemb.types import (
     BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
@@ -818,7 +818,7 @@ def get_constraint_capacity(
     memory_bytes,
     dtype,
     dim,
-    optimizer_type: EmbOptimType,
+    optimizer_type: OptimType,
     bucket_capacity,
 ) -> int:
     byte_consume_per_vector = (
@@ -923,7 +923,7 @@ def get_sharded_table_capacity(
 
 def get_table_value_bytes(
     embedding_config: BaseEmbeddingConfig,
-    optimizer_type: EmbOptimType,
+    optimizer_type: OptimType,
     world_size: int,
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY,
 ) -> int:
@@ -939,7 +939,8 @@ def get_table_value_bytes(
     embedding_config
         Table shape and dtype from TorchREC (``num_embeddings``, ``embedding_dim``, ``data_type``).
     optimizer_type
-        FBGEMM ``EmbOptimType``; see :func:`dynamicemb.optimizer.get_optimizer_state_dim`.
+        FBGEMM ``EmbOptimType`` or dynamicemb's ``DynamicEmbOptimType``; see
+        :func:`dynamicemb.optimizer.get_optimizer_state_dim`.
     world_size
         Number of ranks, as in distributed planning.
     bucket_capacity

@@ -477,7 +477,10 @@ def _prefetch_cache_path(
                 initializer(init_vals[:, :max_emb_dim], init_indices, new_admitted_keys)
 
             if max_val_dim != max_emb_dim:
-                state.optimizer.reset_optimizer_states(init_vals[:, max_emb_dim:])
+                state.optimizer.reset_optimizer_states(
+                    init_vals[:, max_emb_dim:],
+                    emb_dims=state.table_emb_dims[insert_tids[is_new_in_insert]],
+                )
 
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(
@@ -680,7 +683,10 @@ def _prefetch_hbm_direct_path(
                 initializer(init_values[:, :max_emb_dim], init_idx, admitted_keys)
 
             if max_val_dim != max_emb_dim:
-                state.optimizer.reset_optimizer_states(init_values[:, max_emb_dim:])
+                state.optimizer.reset_optimizer_states(
+                    init_values[:, max_emb_dim:],
+                    emb_dims=state.table_emb_dims[admitted_tids],
+                )
 
             score_arg = get_insert_score_arg(
                 state, n_admitted, device, admitted_scores, table_ids=admitted_tids
@@ -1067,7 +1073,9 @@ def _generic_forward_path(
 
         if max_val_dim != max_emb_dim:
             optimizer.reset_optimizer_states(
-                unique_values[:, max_emb_dim:], indices=missing_indices
+                unique_values[:, max_emb_dim:],
+                indices=missing_indices,
+                emb_dims=storage.embedding_dims(on_device=True)[missing_table_ids],
             )
 
         values_to_insert = unique_values[positions_in_unique]

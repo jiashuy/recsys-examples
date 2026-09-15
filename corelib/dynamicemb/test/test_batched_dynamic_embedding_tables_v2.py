@@ -18,7 +18,7 @@ import os
 import random
 import time
 import warnings
-from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import pytest
@@ -56,6 +56,7 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
+    DynamicEmbOptimType,
     get_optimizer_ckpt_state_dim,
     pad_optimizer_states_from_checkpoint,
     truncate_optimizer_states_for_checkpoint,
@@ -1236,7 +1237,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                         n, value_dim, dtype=torch.float32, device=self.device
                     )
                     values[:, :dim] = embeddings
-                    self.optimizer.reset_optimizer_states(values[:, dim:])
+                    self.optimizer.reset_optimizer_states(
+                        values[:, dim:], emb_dims=dim
+                    )
                 else:
                     values = embeddings
 
@@ -1371,7 +1374,8 @@ def init_embedding_tables(stbe, bdet):
             values[:, :emb_dim] = split
             if opt_state_dim > 0:
                 optimizer.reset_optimizer_states(
-                    values[:, max_emb_dim : max_emb_dim + opt_state_dim]
+                    values[:, max_emb_dim : max_emb_dim + opt_state_dim],
+                    emb_dims=emb_dim,
                 )
             storage.set_score(1)
             storage.insert(indices, table_ids, values)
@@ -1382,7 +1386,9 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if val_dim > emb_dim:
-                optimizer.reset_optimizer_states(values[:, emb_dim:])
+                optimizer.reset_optimizer_states(
+                    values[:, emb_dim:], emb_dims=emb_dim
+                )
             pydict.insert(indices, table_ids, values)
         else:
             raise ValueError("Not support table type")
@@ -2922,6 +2928,8 @@ def _assert_opt_values_ckpt_row_width(
         assert ckpt_elems == emb_dim
     elif opt_type == EmbOptimType.ADAM:
         assert ckpt_elems == emb_dim * 2
+    elif opt_type == DynamicEmbOptimType.FTRL:
+        assert ckpt_elems == emb_dim * 2
     elif opt_type == EmbOptimType.SGD:
         assert ckpt_elems == 0
     else:
@@ -2964,9 +2972,21 @@ def _assert_opt_values_ckpt_row_width(
                 "weight_decay": 0.0,
             },
         ),
+        (
+            DynamicEmbOptimType.FTRL,
+            {
+                "learning_rate": 0.01,
+                "learning_rate_power": -0.5,
+                # FTRL re-solves the weight from its state, so both halves have
+                # to start at zero or the first update discards the initializer.
+                "initial_accumulator_value": 0.0,
+                "l1_reg": 0.0,
+                "l2_reg": 0.0,
+            },
+        ),
         (EmbOptimType.SGD, {"learning_rate": 0.01}),
     ],
-    ids=["rowwise_adagrad", "adagrad", "adam", "sgd"],
+    ids=["rowwise_adagrad", "adagrad", "adam", "ftrl", "sgd"],
 )
 def test_dump_optimizer_states_ckpt_width(
     tmp_path,

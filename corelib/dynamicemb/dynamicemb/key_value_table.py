@@ -1983,7 +1983,7 @@ def _load_key_values(
             dtype=state.emb_dtype,
             device=embeddings.device,
         )
-        state.optimizer.reset_optimizer_states(opt_states)
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
     elif opt_states is not None and runtime_optstate_dim > 0:
         opt_states = pad_optimizer_states_from_checkpoint(
             state.optimizer,
@@ -2156,7 +2156,7 @@ def _replay_write_values(
             dtype=state.emb_dtype,
             device=fresh_emb.device,
         )
-        state.optimizer.reset_optimizer_states(opt_states)
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
         store_to_flat_single_table(
             state,
             rows[fresh],
@@ -3772,7 +3772,10 @@ class HybridStorage(Storage):
                     dtype=self._hbm.emb_dtype,
                     device=device,
                 )
-                self._hbm.optimizer.reset_optimizer_states(opt_states)
+                self._hbm.optimizer.reset_optimizer_states(
+                    opt_states,
+                    emb_dims=self._hbm.table_emb_dims_cpu[table_id],
+                )
             elif opt_states is not None and params.runtime_optstate_dim > 0:
                 opt_states = pad_optimizer_states_from_checkpoint(
                     self._hbm.optimizer,

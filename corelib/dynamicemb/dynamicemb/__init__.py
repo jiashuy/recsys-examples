@@ -39,7 +39,7 @@ from .incremental_dump import (
     pop_evicted_keys,
     replay_increment,
 )
-from .optimizer import EmbOptimType, OptimizerArgs
+from .optimizer import DynamicEmbOptimType, EmbOptimType, OptimizerArgs
 from .types import (
     BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
@@ -86,6 +86,7 @@ __all__ = [
     "pop_erased_keys",
     "pop_evicted_keys",
     "replay_increment",
+    "DynamicEmbOptimType",
     "EmbOptimType",
     "OptimizerArgs",
 ]

@@ -141,7 +141,8 @@ def _seed_dynamicemb_from_reference(module, ref):
         values[:, :emb_dim] = w
         if opt_state_dim > 0:
             optimizer.reset_optimizer_states(
-                values[:, max_emb_dim : max_emb_dim + opt_state_dim]
+                values[:, max_emb_dim : max_emb_dim + opt_state_dim],
+                emb_dims=emb_dim,
             )
 
         indices = torch.arange(num_emb, device=w.device, dtype=torch.int64)

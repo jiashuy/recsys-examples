@@ -568,9 +568,18 @@ class ConstructTwinModule:
             table_id = table_name_map_table_id[tmp_table_name]
             max_emb_dim = cur_hkv_table.max_embedding_dim()
             max_value_dim = cur_hkv_table.max_value_dim()
-            optstate_dim = cur_hkv_table.value_dim(
-                table_id
-            ) - cur_hkv_table.embedding_dim(table_id)
+            # The value row's layout is the table's to describe, so take every
+            # width from it rather than mixing in the twin's own `dim` -- the
+            # two are the same table's width and disagreeing would corrupt the
+            # row silently.
+            emb_dim = cur_hkv_table.embedding_dim(table_id)
+            optstate_dim = cur_hkv_table.value_dim(table_id) - emb_dim
+            if emb_dim != dim:
+                raise ValueError(
+                    f"table '{tmp_table_name}' is {emb_dim}-wide in dynamicemb "
+                    f"but {dim}-wide in the twin model; the feature-to-table "
+                    "mapping and the configured dims disagree."
+                )
 
             padded_values = torch.zeros(
                 unique_values.size(0),
@@ -578,10 +587,11 @@ class ConstructTwinModule:
                 dtype=unique_values.dtype,
                 device=unique_values.device,
             )
-            padded_values[:, :dim] = unique_values
+            padded_values[:, :emb_dim] = unique_values
             if optstate_dim > 0:
                 table_name_map_optimizer[tmp_table_name].reset_optimizer_states(
-                    padded_values[:, max_emb_dim : max_emb_dim + optstate_dim]
+                    padded_values[:, max_emb_dim : max_emb_dim + optstate_dim],
+                    emb_dims=emb_dim,
                 )
 
             table_ids = torch.full(
