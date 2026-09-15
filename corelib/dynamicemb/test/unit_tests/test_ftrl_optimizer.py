@@ -382,3 +382,24 @@ def test_non_positive_learning_rate_is_rejected():
     # FTRL divides by the learning rate; a zero would be a silent inf/nan.
     with pytest.raises(ValueError, match="must be positive"):
         _make_optimizer(learning_rate=0.0)
+
+
+def test_positive_learning_rate_power_is_rejected():
+    """The accumulator is raised to -learning_rate_power, so a positive value
+    puts it in the denominator and the learning rate grows without bound."""
+    with pytest.raises(ValueError, match="must be <= 0"):
+        _make_optimizer(learning_rate_power=0.5)
+
+
+def test_zero_learning_rate_power_is_allowed():
+    # accum**0 == 1, i.e. a fixed learning rate -- degenerate but meaningful.
+    assert _make_optimizer(learning_rate_power=0.0) is not None
+
+
+def test_checkpoint_args_are_held_to_the_same_bounds():
+    """``set_opt_args`` takes a checkpoint's meta, which nothing else vets."""
+    optimizer = _make_optimizer()
+    meta = dict(optimizer.get_opt_args())
+    meta["learning_rate_power"] = 0.5
+    with pytest.raises(ValueError, match="must be <= 0"):
+        optimizer.set_opt_args(meta)

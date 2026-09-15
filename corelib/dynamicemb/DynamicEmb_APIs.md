@@ -533,7 +533,7 @@ accum     = new_accum
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `learning_rate` | `0.01` | α. Must be positive -- FTRL divides by it. |
-| `learning_rate_power` | `-0.5` | Exponent on the accumulator. `-0.5` is the paper's own choice and takes a faster kernel path; other values follow TensorFlow's generalization. |
+| `learning_rate_power` | `-0.5` | Exponent on the accumulator **in the learning rate**, so it must be `<= 0`: negative decays the rate, `0` holds it fixed, and a positive value would make it grow without bound (rejected). `-0.5` is the paper's own choice and takes a faster kernel path; other values follow TensorFlow's generalization. |
 | `ftrl_beta` | `0.0` | β. Keeps the per-coordinate learning rate finite while `accum` is still small -- the paper's way of bounding the first steps. |
 | `initial_accumulator_value` | `0.0` | Seeds `accum`; `linear` always starts at 0. Read the note below before setting it non-zero. |
 | `l1_reg` | `0.0` | λ1. |

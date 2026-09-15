@@ -713,10 +713,26 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
     ) -> None:
         super().__init__(opt_args)
-        if opt_args.learning_rate <= 0.0:
+        self._validate(opt_args.learning_rate, opt_args.learning_rate_power)
+
+    @staticmethod
+    def _validate(learning_rate: float, learning_rate_power: float) -> None:
+        if learning_rate <= 0.0:
             raise ValueError(
                 "FTRL divides by the learning rate, so it must be positive; got "
-                f"{opt_args.learning_rate}."
+                f"{learning_rate}."
+            )
+        if learning_rate_power > 0.0:
+            # The accumulator is raised to -learning_rate_power, so a positive
+            # value puts it in the denominator: the learning rate would then
+            # grow as the gradients accumulate, which diverges. Zero is fine and
+            # means a fixed learning rate.
+            raise ValueError(
+                "FTRL's learning_rate_power must be <= 0 -- it is the exponent "
+                "on the accumulator in the learning rate, so a negative value "
+                "decays it and zero holds it fixed. Got "
+                f"{learning_rate_power}, which would make the learning rate "
+                "grow without bound."
             )
 
     def update_for_padded_buffer(
@@ -786,10 +802,13 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
-        self._opt_args.learning_rate = get_required_arg(args, "lr")
-        self._opt_args.learning_rate_power = get_required_arg(
-            args, "learning_rate_power"
-        )
+        learning_rate = get_required_arg(args, "lr")
+        learning_rate_power = get_required_arg(args, "learning_rate_power")
+        # A checkpoint's meta reaches here unchecked, so hold it to the same
+        # bounds the constructor does.
+        self._validate(learning_rate, learning_rate_power)
+        self._opt_args.learning_rate = learning_rate
+        self._opt_args.learning_rate_power = learning_rate_power
         self._opt_args.ftrl_beta = get_required_arg(args, "ftrl_beta")
         initial_value = get_required_arg(args, "initial_accumulator_value")
         self._opt_args.initial_accumulator_value = initial_value
