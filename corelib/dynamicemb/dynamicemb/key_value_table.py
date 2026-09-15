@@ -41,8 +41,6 @@ from dynamicemb.extendable_tensor import (
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
-    pad_optimizer_states_from_checkpoint,
-    truncate_optimizer_states_for_checkpoint,
 )
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -1099,10 +1097,10 @@ def _split_value_row(
     width is not all payload: rowwise Adagrad reserves a fixed 16 bytes per row
     in the fused FBGEMM layout but only ever fills one accumulator scalar. The
     dumped block is therefore narrowed to the width the file checkpoint uses --
-    the same :func:`truncate_optimizer_states_for_checkpoint` ``_dump_table``
+    the same ``optimizer.states_for_checkpoint`` ``_dump_table``
     applies -- so a delta and a checkpoint describe a row identically, and the
     padding is not paid for on every dump. Replay expands it back with
-    :func:`pad_optimizer_states_from_checkpoint`.
+    ``optimizer.states_from_checkpoint``.
 
     Tables whose optimizer keeps no per-row state (e.g. plain SGD) get ``None``
     rather than a zero-width tensor, matching :func:`export_keys_values_iter`.
@@ -1115,9 +1113,7 @@ def _split_value_row(
     opt = values[:, -optim_state_dim:]
     return (
         emb,
-        truncate_optimizer_states_for_checkpoint(
-            state.optimizer, emb_dim, opt
-        ).contiguous(),
+        state.optimizer.states_for_checkpoint(opt, emb_dim).contiguous(),
     )
 
 
@@ -1695,10 +1691,9 @@ def _dump_table(
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
-            to_write = truncate_optimizer_states_for_checkpoint(
-                state.optimizer,
-                state.table_emb_dims_cpu[table_id],
+            to_write = state.optimizer.states_for_checkpoint(
                 opt_states_batch,
+                state.table_emb_dims_cpu[table_id],
             )
             fopt_states.write(_raw_bytes(to_write))
 
@@ -1968,7 +1963,7 @@ def _load_key_values(
     # table (load converts -- see _validate_load_meta), and everything below
     # this point -- padding, the cat, the store -- reads better for not having
     # to ask which dtype a tensor is at that line. Casting opt_states *before*
-    # pad_optimizer_states_from_checkpoint also converts the narrow checkpoint
+    # optimizer.states_from_checkpoint also converts the narrow checkpoint
     # block rather than the widened runtime one, and covers that function's one
     # path that returns its input uncast. Both casts are no-ops when the dtypes
     # already agree.
@@ -1985,11 +1980,9 @@ def _load_key_values(
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
     elif opt_states is not None and runtime_optstate_dim > 0:
-        opt_states = pad_optimizer_states_from_checkpoint(
-            state.optimizer,
-            emb_dim_cfg,
+        opt_states = state.optimizer.states_from_checkpoint(
             opt_states,
-            state.optimizer.get_initial_optimizer_state(),
+            emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
         )
@@ -2132,11 +2125,9 @@ def _replay_write_values(
                 f"block of shape {tuple(optimizer_states.shape)}."
             )
         # Back to the runtime width the fused value row expects.
-        opt = pad_optimizer_states_from_checkpoint(
-            state.optimizer,
-            emb_dim_cfg,
+        opt = state.optimizer.states_from_checkpoint(
             optimizer_states.to(device=embeddings.device),
-            state.optimizer.get_initial_optimizer_state(),
+            emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
         )
@@ -3777,11 +3768,9 @@ class HybridStorage(Storage):
                     emb_dims=self._hbm.table_emb_dims_cpu[table_id],
                 )
             elif opt_states is not None and params.runtime_optstate_dim > 0:
-                opt_states = pad_optimizer_states_from_checkpoint(
-                    self._hbm.optimizer,
-                    self._hbm.table_emb_dims_cpu[table_id],
+                opt_states = self._hbm.optimizer.states_from_checkpoint(
                     opt_states,
-                    self._hbm.optimizer.get_initial_optimizer_state(),
+                    self._hbm.table_emb_dims_cpu[table_id],
                     self._hbm.emb_dtype,
                     device,
                 )

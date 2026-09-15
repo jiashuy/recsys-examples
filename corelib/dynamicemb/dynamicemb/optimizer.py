@@ -255,6 +255,61 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
             optim_states[indices] = fill
 
 
+    def _check_state_width(
+        self,
+        optim_states: torch.Tensor,
+        expected: int,
+        which: str,
+    ) -> None:
+        """Reject a state block that is not the width this optimizer keeps.
+
+        Both directions have exactly one legal width, so anything else is a
+        checkpoint that does not belong to this table -- worth saying so
+        rather than quietly reshaping it into something that loads.
+        """
+        n = optim_states.size(1)
+        if n != expected:
+            raise ValueError(
+                f"{type(self).__name__} keeps {expected} {which} "
+                f"optimizer-state column(s) per row, but was handed {n}."
+            )
+
+    def states_for_checkpoint(
+        self,
+        optim_states: torch.Tensor,
+        emb_dim: int,
+    ) -> torch.Tensor:
+        """What a checkpoint should store for these rows' optimizer state.
+
+        The runtime state is what a checkpoint holds, so this hands it back
+        unchanged. Override when the two widths differ -- see
+        :meth:`get_ckpt_state_dim`.
+        """
+        runtime_dim = self.get_state_dim(emb_dim)
+        if runtime_dim == 0:
+            return optim_states
+        self._check_state_width(optim_states, runtime_dim, "runtime")
+        return optim_states
+
+    def states_from_checkpoint(
+        self,
+        optim_states: torch.Tensor,
+        emb_dim: int,
+        values_dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Runtime optimizer state for what a checkpoint stored.
+
+        The inverse of :meth:`states_for_checkpoint`; by default only the
+        precision changes, since the file holds the runtime width already.
+        """
+        if self.get_state_dim(emb_dim) == 0:
+            return optim_states
+        self._check_state_width(
+            optim_states, self.get_ckpt_state_dim(emb_dim), "checkpoint"
+        )
+        return optim_states.to(dtype=values_dtype)
+
     def step(self) -> None:
         pass
 
@@ -600,6 +655,41 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
         )
 
+    def states_for_checkpoint(
+        self,
+        optim_states: torch.Tensor,
+        emb_dim: int,
+    ) -> torch.Tensor:
+        """Keep only the accumulator.
+
+        The runtime region is widened to a fixed 16 bytes for alignment in the
+        fused value row, but just its first element is ever written, so the
+        rest is slack a checkpoint should not carry.
+        """
+        self._check_state_width(optim_states, self.get_state_dim(emb_dim), "runtime")
+        return optim_states[:, : self.get_ckpt_state_dim(emb_dim)].contiguous()
+
+    def states_from_checkpoint(
+        self,
+        optim_states: torch.Tensor,
+        emb_dim: int,
+        values_dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Widen the accumulator back out to the aligned runtime region."""
+        ckpt_dim = self.get_ckpt_state_dim(emb_dim)
+        self._check_state_width(optim_states, ckpt_dim, "checkpoint")
+        out = torch.empty(
+            (optim_states.size(0), self.get_state_dim(emb_dim)),
+            dtype=values_dtype,
+            device=device,
+        )
+        # The slack the file does not cover is not read by the kernel, but seed
+        # it the way a fresh row would be rather than leaving it uninitialized.
+        self.reset_optimizer_states(out, emb_dims=emb_dim)
+        out[:, :ckpt_dim] = optim_states.to(dtype=values_dtype)
+        return out
+
 
 class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     """FTRL-Proximal, Algorithm 1 of McMahan et al. 2013.
@@ -756,49 +846,3 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             optim_states.copy_(rows)
         else:
             optim_states[indices] = rows
-
-
-def truncate_optimizer_states_for_checkpoint(
-    optimizer: BaseDynamicEmbeddingOptimizer,
-    emb_dim: int,
-    opt_states_runtime: torch.Tensor,
-) -> torch.Tensor:
-    """Slice runtime optimizer states to the width written in checkpoint files."""
-    ckpt_dim = optimizer.get_ckpt_state_dim(emb_dim)
-    if ckpt_dim == 0:
-        return opt_states_runtime
-    n = opt_states_runtime.size(1)
-    if n == ckpt_dim:
-        return opt_states_runtime
-    if n < ckpt_dim:
-        raise ValueError(
-            f"Runtime optimizer state width {n} is less than checkpoint width {ckpt_dim}."
-        )
-    return opt_states_runtime[:, :ckpt_dim].contiguous()
-
-
-def pad_optimizer_states_from_checkpoint(
-    optimizer: BaseDynamicEmbeddingOptimizer,
-    emb_dim: int,
-    opt_states_from_file: torch.Tensor,
-    initial_accumulator_value: float,
-    values_dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Expand checkpoint optimizer states to the runtime fused value width."""
-    runtime_dim = optimizer.get_state_dim(emb_dim)
-    file_dim = opt_states_from_file.size(1)
-    if runtime_dim == 0:
-        return opt_states_from_file
-    if file_dim == runtime_dim:
-        return opt_states_from_file.to(dtype=values_dtype)
-    if file_dim > runtime_dim:
-        return opt_states_from_file[:, :runtime_dim].contiguous().to(dtype=values_dtype)
-    out = torch.full(
-        (opt_states_from_file.size(0), runtime_dim),
-        initial_accumulator_value,
-        dtype=values_dtype,
-        device=device,
-    )
-    out[:, :file_dim] = opt_states_from_file.to(dtype=values_dtype)
-    return out

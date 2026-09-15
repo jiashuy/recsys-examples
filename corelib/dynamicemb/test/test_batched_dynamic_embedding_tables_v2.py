@@ -58,8 +58,6 @@ from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     DynamicEmbOptimType,
     get_optimizer_ckpt_state_dim,
-    pad_optimizer_states_from_checkpoint,
-    truncate_optimizer_states_for_checkpoint,
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -1097,10 +1095,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 fscore.write(scores_out.cpu().numpy().tobytes())
             fembedding.write(embeddings.cpu().numpy().tobytes())
             if fopt_states is not None and opt_states is not None:
-                to_write = truncate_optimizer_states_for_checkpoint(
-                    self.optimizer,
-                    self._emb_dims[table_id],
+                to_write = self.optimizer.states_for_checkpoint(
                     opt_states,
+                    self._emb_dims[table_id],
                 )
                 fopt_states.write(to_write.cpu().numpy().tobytes())
 
@@ -1210,11 +1207,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                     dtype=torch.float32,
                     device=self.device,
                 ).view(-1, file_opt_dim)
-                opt_states = pad_optimizer_states_from_checkpoint(
-                    self.optimizer,
-                    dim,
+                opt_states = self.optimizer.states_from_checkpoint(
                     opt_states,
-                    self.optimizer.get_initial_optimizer_state(),
+                    dim,
                     torch.float32,
                     self.device,
                 )
