@@ -105,7 +105,7 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
 
-        SgdVecOptimizer<g_t, w_t> opt{lr};
+        SGDVecOptimizer<g_t, w_t> opt{lr};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
@@ -284,7 +284,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
 
-        FtrlVecOptimizer<g_t, w_t> opt{lr,   learning_rate_power,
+        FTRLVecOptimizer<g_t, w_t> opt{lr,   learning_rate_power,
                                        use_sqrt, beta,
                                        l1_reg, l2_reg};
 
@@ -357,7 +357,7 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      SgdVecOptimizer<g_t, w_t> opt{lr};
+      SGDVecOptimizer<g_t, w_t> opt{lr};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
@@ -493,7 +493,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      FtrlVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
+      FTRLVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
                                      use_sqrt, beta,
                                      l1_reg, l2_reg};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(

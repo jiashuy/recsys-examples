@@ -39,7 +39,7 @@ template <typename wgrad_t, typename weight_t> struct OptimizierInput {
 };
 
 template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
-struct SgdVecOptimizer {
+struct SGDVecOptimizer {
   const float lr;
 
   DEVICE_INLINE void update4(const OptimizierInput<wgrad_t, weight_t> &input) {
@@ -414,7 +414,7 @@ struct RowWiseAdaGradVecOptimizer {
 // of being nudged from its previous value, which is what makes the L1 term
 // produce exact zeros rather than merely small weights.
 template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
-struct FtrlVecOptimizer {
+struct FTRLVecOptimizer {
   // alpha in the paper.
   const float lr;
   // The accumulator is raised to -learning_rate_power. The paper fixes that
