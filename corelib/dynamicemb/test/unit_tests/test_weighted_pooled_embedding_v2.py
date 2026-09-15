@@ -140,9 +140,9 @@ def _seed_dynamicemb_from_reference(module, ref):
         values = torch.zeros(num_emb, max_value_dim, dtype=w.dtype, device=w.device)
         values[:, :emb_dim] = w
         if opt_state_dim > 0:
-            values[
-                :, max_emb_dim : max_emb_dim + opt_state_dim
-            ] = storage.init_optimizer_state()
+            optimizer.reset_optimizer_states(
+                values[:, max_emb_dim : max_emb_dim + opt_state_dim]
+            )
 
         indices = torch.arange(num_emb, device=w.device, dtype=torch.int64)
         table_ids = torch.full(

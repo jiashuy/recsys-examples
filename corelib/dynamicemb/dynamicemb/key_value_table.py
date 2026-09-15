@@ -419,7 +419,6 @@ class DynamicEmbTableState:
     emb_dtype: torch.dtype
     all_dims_vec4: bool
     optimizer: BaseDynamicEmbeddingOptimizer
-    initial_optim_state: float
     threads_in_wave: int
     score: Optional[int] = None
     training: bool = False
@@ -604,7 +603,6 @@ def create_table_state(
         emb_dtype=emb_dtype,
         all_dims_vec4=all_dims_vec4,
         optimizer=optimizer,
-        initial_optim_state=optimizer.get_initial_optim_states(),
         threads_in_wave=threads_in_wave,
         score=None,
         training=False,
@@ -1979,21 +1977,19 @@ def _load_key_values(
         opt_states = opt_states.to(state.emb_dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
-        opt_states = (
-            torch.ones(
-                keys.numel(),
-                runtime_optstate_dim,
-                dtype=state.emb_dtype,
-                device=embeddings.device,
-            )
-            * state.initial_optim_state
+        opt_states = torch.empty(
+            keys.numel(),
+            runtime_optstate_dim,
+            dtype=state.emb_dtype,
+            device=embeddings.device,
         )
+        state.optimizer.reset_optimizer_states(opt_states)
     elif opt_states is not None and runtime_optstate_dim > 0:
         opt_states = pad_optimizer_states_from_checkpoint(
             state.optimizer,
             emb_dim_cfg,
             opt_states,
-            state.initial_optim_state,
+            state.optimizer.get_initial_optimizer_state(),
             state.emb_dtype,
             embeddings.device,
         )
@@ -2107,7 +2103,7 @@ def _replay_write_values(
     - **Without it**, rows that already belonged to this same key keep their
       state, because writing just the embedding columns leaves the tail
       untouched. Every other row is new to this key, so its tail still holds the
-      previous occupant's moments and has to be reset to ``initial_optim_state``.
+      previous occupant's moments and has to be reset by the optimizer.
     """
     if rows.numel() == 0:
         return
@@ -2140,7 +2136,7 @@ def _replay_write_values(
             state.optimizer,
             emb_dim_cfg,
             optimizer_states.to(device=embeddings.device),
-            state.initial_optim_state,
+            state.optimizer.get_initial_optimizer_state(),
             state.emb_dtype,
             embeddings.device,
         )
@@ -2155,12 +2151,12 @@ def _replay_write_values(
     fresh = torch.logical_not(keep)
     if bool(fresh.any()):
         fresh_emb = embeddings[fresh]
-        opt_states = torch.full(
+        opt_states = torch.empty(
             (fresh_emb.size(0), optstate_dim),
-            state.initial_optim_state,
             dtype=state.emb_dtype,
             device=fresh_emb.device,
         )
+        state.optimizer.reset_optimizer_states(opt_states)
         store_to_flat_single_table(
             state,
             rows[fresh],
@@ -2432,7 +2428,7 @@ class DynamicEmbCache(Cache):
         return self._state.value_dim
 
     def init_optimizer_state(self) -> float:
-        return self._state.initial_optim_state
+        return self._state.optimizer.get_initial_optimizer_state()
 
     def evict_strategy(self) -> EvictStrategy:
         return self._state.evict_strategy
@@ -3044,7 +3040,7 @@ class DynamicEmbStorage(Storage):
         return self._state.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
-        return self._state.initial_optim_state
+        return self._state.optimizer.get_initial_optimizer_state()
 
     # -- Score management --
 
@@ -3153,7 +3149,7 @@ class HybridStorage(Storage):
         return self._hbm.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
-        return self._hbm.initial_optim_state
+        return self._hbm.optimizer.get_initial_optimizer_state()
 
     @property
     def num_tables(self) -> int:
@@ -3770,21 +3766,19 @@ class HybridStorage(Storage):
                 continue
 
             if opt_states is None and params.runtime_optstate_dim > 0:
-                opt_states = (
-                    torch.ones(
-                        keys.numel(),
-                        params.runtime_optstate_dim,
-                        dtype=self._hbm.emb_dtype,
-                        device=device,
-                    )
-                    * self._hbm.initial_optim_state
+                opt_states = torch.empty(
+                    keys.numel(),
+                    params.runtime_optstate_dim,
+                    dtype=self._hbm.emb_dtype,
+                    device=device,
                 )
+                self._hbm.optimizer.reset_optimizer_states(opt_states)
             elif opt_states is not None and params.runtime_optstate_dim > 0:
                 opt_states = pad_optimizer_states_from_checkpoint(
                     self._hbm.optimizer,
                     self._hbm.table_emb_dims_cpu[table_id],
                     opt_states,
-                    self._hbm.initial_optim_state,
+                    self._hbm.optimizer.get_initial_optimizer_state(),
                     self._hbm.emb_dtype,
                     device,
                 )

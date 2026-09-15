@@ -464,13 +464,18 @@ class ConstructTwinModule:
         tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
         table_name_map_hkv_table = {}
         table_name_map_table_id = {}
+        # Seeding a row's optimizer state is the optimizer's call, not the
+        # storage's, so keep a handle on it alongside the storage.
+        table_name_map_optimizer = {}
         for dynamic_emb_module in tmp_dynamic_emb_module_list:
             tmp_table_names = dynamic_emb_module.table_names
             tmp_storage = dynamic_emb_module.tables
+            tmp_optimizer = dynamic_emb_module.optimizer
 
             for i, tmp_table_name in enumerate(tmp_table_names):
                 table_name_map_hkv_table[tmp_table_name] = tmp_storage
                 table_name_map_table_id[tmp_table_name] = i
+                table_name_map_optimizer[tmp_table_name] = tmp_optimizer
 
         # Perform all lookup iterations
         for iter_idx in range(total_iterations):
@@ -566,7 +571,6 @@ class ConstructTwinModule:
             optstate_dim = cur_hkv_table.value_dim(
                 table_id
             ) - cur_hkv_table.embedding_dim(table_id)
-            initial_accumulator = cur_hkv_table.init_optimizer_state()
 
             padded_values = torch.zeros(
                 unique_values.size(0),
@@ -576,9 +580,9 @@ class ConstructTwinModule:
             )
             padded_values[:, :dim] = unique_values
             if optstate_dim > 0:
-                padded_values[
-                    :, max_emb_dim : max_emb_dim + optstate_dim
-                ] = initial_accumulator
+                table_name_map_optimizer[tmp_table_name].reset_optimizer_states(
+                    padded_values[:, max_emb_dim : max_emb_dim + optstate_dim]
+                )
 
             table_ids = torch.full(
                 (unique_indices.numel(),),

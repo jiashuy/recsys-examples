@@ -877,7 +877,6 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         self._max_emb_dim = max(self._emb_dims)
         self._max_value_dim = max(self._value_dims)
         self._max_optstate_dim = max(self._optstate_dims)
-        self._initial_optim_state = optimizer.get_initial_optim_states()
 
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
@@ -1214,7 +1213,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                     self.optimizer,
                     dim,
                     opt_states,
-                    self._initial_optim_state,
+                    self.optimizer.get_initial_optimizer_state(),
                     torch.float32,
                     self.device,
                 )
@@ -1237,7 +1236,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                         n, value_dim, dtype=torch.float32, device=self.device
                     )
                     values[:, :dim] = embeddings
-                    values[:, dim:] = self._initial_optim_state
+                    self.optimizer.reset_optimizer_states(values[:, dim:])
                 else:
                     values = embeddings
 
@@ -1313,7 +1312,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def init_optimizer_state(
         self,
     ) -> float:
-        return self._initial_optim_state
+        return self.optimizer.get_initial_optimizer_state()
 
 
 def create_split_table_batched_embedding(
@@ -1371,9 +1370,9 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if opt_state_dim > 0:
-                values[
-                    :, max_emb_dim : max_emb_dim + opt_state_dim
-                ] = storage.init_optimizer_state()
+                optimizer.reset_optimizer_states(
+                    values[:, max_emb_dim : max_emb_dim + opt_state_dim]
+                )
             storage.set_score(1)
             storage.insert(indices, table_ids, values)
         elif isinstance(storage, PyDictStorage):
@@ -1383,7 +1382,7 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if val_dim > emb_dim:
-                values[:, emb_dim:] = pydict.init_optimizer_state()
+                optimizer.reset_optimizer_states(values[:, emb_dim:])
             pydict.insert(indices, table_ids, values)
         else:
             raise ValueError("Not support table type")

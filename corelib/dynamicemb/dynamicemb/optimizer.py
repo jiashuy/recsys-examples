@@ -15,6 +15,7 @@
 
 import abc
 import copy
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -173,12 +174,39 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         self._opt_args.learning_rate = new_lr
         return
 
-    def get_initial_optim_states(self) -> float:
+    def get_initial_optimizer_state(self) -> float:
         return self._opt_args.initial_accumulator_value
 
-    def set_initial_optim_states(self, value: float) -> None:
+    def set_initial_optimizer_state(self, value: float) -> None:
         self._opt_args.initial_accumulator_value = value
         return
+
+    def reset_optimizer_states(
+        self,
+        optim_states: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Reset a batch of rows' optimizer state to its initial value, in place.
+
+        ``optim_states`` is the state region only -- ``(rows, state_width)`` --
+        never the embedding, so an optimizer cannot reach outside what it owns.
+        ``indices`` selects which rows to write; ``None`` means all of them.
+
+        Callers that hold a fused value buffer should slice the state region off
+        first and pass ``indices`` rather than indexing rows first: basic
+        slicing (``values[:, max_emb_dim:]``) yields a writable view, while
+        advanced indexing (``values[rows, max_emb_dim:]``) yields a copy that a
+        write would be lost to.
+
+        The default fills every element with the same scalar, which is what
+        every optimizer whose state regions all start at the same value wants.
+        Override when they do not.
+        """
+        fill = self.get_initial_optimizer_state()
+        if indices is None:
+            optim_states.fill_(fill)
+        else:
+            optim_states[indices] = fill
 
     def step(self) -> None:
         pass
@@ -267,6 +295,21 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ) -> None:
         super().__init__(opt_args)
         self._iterations: int = 0
+        if opt_args.initial_accumulator_value != 0.0:
+            warnings.warn(
+                "initial_accumulator_value is an Adagrad-family option and is "
+                "ignored by Adam, whose first and second moments must both "
+                "start at zero for the bias correction 1/(1-beta^t) to hold. "
+                f"Got {opt_args.initial_accumulator_value}; using 0 instead.",
+                UserWarning,
+            )
+
+    def get_initial_optimizer_state(self) -> float:
+        # Both m and v start at zero regardless of initial_accumulator_value:
+        # the bias correction assumes it, and a non-zero first moment would
+        # steer the first steps by a phantom momentum rather than the gradient.
+        # Neither torch.optim.Adam nor FBGEMM's TBE exposes a way to seed them.
+        return 0.0
 
     def step(self):
         self._iterations += 1
