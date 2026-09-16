@@ -82,8 +82,13 @@ class DynamicEmbInitializerArgs:
     value: float = 0.0
 
     def __eq__(self, other):
+        # Only the fields the mode actually reads take part: a CONSTANT's mean
+        # or a NORMAL's bounds are never used, so two args that differ there
+        # still initialize identically.
         if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
+            return NotImplemented
+        if self.mode != other.mode:
+            return False
         if self.mode == DynamicEmbInitializerMode.NORMAL:
             return self.mean == other.mean and self.std_dev == other.std_dev
         elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
@@ -97,12 +102,8 @@ class DynamicEmbInitializerArgs:
             return self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.CONSTANT:
             return self.value == other.value
+        # DEBUG takes no parameters, so same mode is all there is to compare.
         return True
-
-    def __ne__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        return not (self == other)
 
 
 KEY_TYPE = torch.int64
