@@ -60,6 +60,7 @@ from dynamicemb.optimizer import (
     get_optimizer_ckpt_state_dim,
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
+from optimizer_reference import ftrl_step
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -3528,4 +3529,105 @@ def test_fill_tables(
         assert size_i == expected, (
             f"fill_tables({score_strategy.name}, {load_factor} -> effective {effective_lf}): "
             f"size={size_i} expected={expected} capacity={cap0}"
+        )
+
+
+@pytest.mark.parametrize("emb_dim", [8, 6], ids=["vec4", "unaligned"])
+@pytest.mark.parametrize(
+    "opt_params",
+    [
+        {"learning_rate": 0.1},
+        {"learning_rate": 0.1, "ftrl_beta": 1.0, "l2_reg": 0.05},
+        {"learning_rate": 0.1, "l1_reg": 0.02},
+        {"learning_rate": 0.1, "learning_rate_power": -0.25},
+        {"learning_rate": 0.1, "initial_accumulator_value": 0.1},
+    ],
+    ids=["plain", "beta_l2", "l1", "power", "seeded_accum"],
+)
+def test_ftrl_backward_matches_reference(emb_dim, opt_params):
+    """FTRL has no FBGEMM twin, so check it against a transcription of the paper.
+
+    A second dynamicemb storage would be no use here: it shares the optimizer
+    under test, so a wrong formula would come out wrong on both sides.
+    ``optimizer_reference.ftrl_step`` is independent and runs in float64.
+
+    Sequence pooling with one unique key per bag keeps the bookkeeping honest --
+    every row is touched exactly once per iteration and ``loss = embs.sum()``
+    hands each of its elements a gradient of exactly 1.
+    """
+    assert torch.cuda.is_available()
+    device_id = 0
+    device = torch.device(f"cuda:{device_id}")
+    key_type = torch.int64
+    value_type = torch.float32
+    num_keys = 16
+
+    options = DynamicEmbTableOptions(
+        dim=emb_dim,
+        max_capacity=2048,
+        index_type=key_type,
+        embedding_dtype=value_type,
+        device_id=device_id,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=False,
+        local_hbm_for_values=1024**3,
+    )
+    bdeb = BatchedDynamicEmbeddingTablesV2(
+        table_names=["table0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=DynamicEmbOptimType.FTRL,
+        **opt_params,
+    )
+    optimizer = bdeb.optimizer
+    storage = bdeb.tables
+    state_dim = optimizer.get_state_dim(emb_dim)
+    max_emb_dim = storage.max_embedding_dim()
+    max_value_dim = storage.max_value_dim()
+
+    # Seed both sides from the same weights, and let the optimizer lay down its
+    # own initial state so the reference starts where the table does.
+    generator = torch.Generator(device="cpu").manual_seed(17)
+    weights = torch.rand(num_keys, emb_dim, generator=generator).to(device)
+    values = torch.zeros(num_keys, max_value_dim, dtype=value_type, device=device)
+    values[:, :emb_dim] = weights
+    optimizer.reset_optimizer_states(
+        values[:, max_emb_dim : max_emb_dim + state_dim], emb_dims=emb_dim
+    )
+    keys = torch.arange(num_keys, device=device, dtype=key_type)
+    storage.set_score(1)
+    storage.insert(keys, torch.zeros_like(keys), values)
+
+    ref_weight = weights.double()
+    ref_linear = values[:, max_emb_dim : max_emb_dim + emb_dim].double().clone()
+    ref_accum = (
+        values[:, max_emb_dim + emb_dim : max_emb_dim + 2 * emb_dim].double().clone()
+    )
+
+    offsets = torch.arange(num_keys + 1, device=device).to(key_type)
+    for _ in range(4):
+        embs = bdeb(keys, offsets)
+        embs.sum().backward()
+        torch.cuda.synchronize()
+        # d(sum)/d(emb_ij) == 1 for every looked-up element.
+        grad = torch.ones_like(ref_weight)
+        ref_weight, ref_linear, ref_accum = ftrl_step(
+            ref_weight, ref_linear, ref_accum, grad, **opt_params
+        )
+
+    for out_keys, out_emb, out_opt, _ in export_keys_values_iter(
+        storage._state, device, table_id=0
+    ):
+        order = torch.argsort(out_keys)
+        got_weight = out_emb.view(-1, emb_dim)[order].double()
+        got_state = out_opt.view(-1, state_dim)[order].double()
+        torch.testing.assert_close(
+            got_weight, ref_weight, rtol=1e-4, atol=1e-5, msg="weight"
+        )
+        torch.testing.assert_close(
+            got_state[:, :emb_dim], ref_linear, rtol=1e-4, atol=1e-4, msg="linear"
+        )
+        torch.testing.assert_close(
+            got_state[:, emb_dim:], ref_accum, rtol=1e-5, atol=1e-6, msg="accum"
         )

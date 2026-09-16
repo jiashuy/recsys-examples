@@ -46,6 +46,7 @@ otherwise.
 
 import pytest
 import torch
+from dynamicemb.optimizer import FTRLDynamicEmbeddingOptimizer, OptimizerArgs
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 
@@ -306,6 +307,101 @@ def test_ftrl_padded_buffer_mixed_dims_accum(dims, dtype):
             before[row, tail],
             msg=f"padding past the state was written for table {row}",
         )
+
+
+def _ftrl_optimizer(**overrides):
+    """An FTRL optimizer with the paper's defaults unless overridden."""
+    args = dict(
+        learning_rate=0.1, learning_rate_power=-0.5, initial_accumulator_value=0.0
+    )
+    args.update(overrides)
+    return FTRLDynamicEmbeddingOptimizer(OptimizerArgs(**args))
+
+
+def _fresh_ftrl_values(
+    num_rows, emb_dim, row_width, state_offset, accum_seed, device, seed=0
+):
+    """A value buffer with random embeddings, linear at 0 and accum seeded."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    values = torch.zeros(num_rows, row_width, dtype=torch.float32)
+    values[:, :emb_dim] = torch.rand(
+        num_rows, emb_dim, generator=generator, dtype=torch.float32
+    )
+    values[:, state_offset : state_offset + emb_dim] = 0.0
+    values[:, state_offset + emb_dim : state_offset + 2 * emb_dim] = accum_seed
+    return values.to(device)
+
+
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
+def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
+    """The two kernels differ only in how they find a row, not in the update."""
+    device = torch.device("cuda")
+    num_rows = 32
+    row_width = 3 * emb_dim
+    accum_seed = 0.1
+    optimizer = _ftrl_optimizer()
+
+    padded = _fresh_ftrl_values(
+        num_rows, emb_dim, row_width, emb_dim, accum_seed, device, seed=3
+    )
+    flat = padded.clone()
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    grads = torch.randn(
+        num_rows, emb_dim, generator=generator, dtype=torch.float32
+    ).to(device)
+
+    table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
+    table_value_dims = torch.tensor([row_width], dtype=torch.int64, device=device)
+
+    optimizer.update_for_padded_buffer(
+        grads, padded, table_ids, table_emb_dims, emb_dim, row_width, all_dims_vec4
+    )
+
+    optimizer.fused_update_for_flat_table(
+        grads,
+        torch.arange(num_rows, dtype=torch.int64, device=device),
+        torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
+        table_ids,
+        table_value_dims,
+        table_emb_dims,
+        emb_dim,
+        all_dims_vec4,
+        torch.float32,
+    )
+
+    torch.testing.assert_close(flat, padded, rtol=0, atol=0)
+
+
+@cuda
+def test_ftrl_skipped_rows_are_untouched():
+    """-1 marks a key that failed to insert; its row must not be written."""
+    device = torch.device("cuda")
+    emb_dim = 4
+    row_width = 3 * emb_dim
+    optimizer = _ftrl_optimizer()
+
+    values = _fresh_ftrl_values(8, emb_dim, row_width, emb_dim, 0.1, device, seed=9)
+    before = values.clone()
+    indices = torch.full((8,), -1, dtype=torch.int64, device=device)
+    indices[3] = 3
+    grads = torch.ones(8, emb_dim, dtype=torch.float32, device=device)
+
+    optimizer.fused_update_for_flat_table(
+        grads,
+        indices,
+        torch.tensor([values.data_ptr()], dtype=torch.int64, device=device),
+        torch.zeros(8, dtype=torch.int64, device=device),
+        torch.tensor([row_width], dtype=torch.int64, device=device),
+        torch.tensor([emb_dim], dtype=torch.int64, device=device),
+        emb_dim,
+        True,
+        torch.float32,
+    )
+
+    untouched = [r for r in range(8) if r != 3]
+    torch.testing.assert_close(values[untouched], before[untouched], rtol=0, atol=0)
+    assert not bool(torch.equal(values[3], before[3]))
 
 
 if __name__ == "__main__":
