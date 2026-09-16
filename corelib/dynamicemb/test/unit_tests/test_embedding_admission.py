@@ -12,10 +12,11 @@ import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
-from dynamicemb.types import DynamicEmbInitializerArgs
+from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
+    TABLE_INITIALIZER_VALUE,
     assert_batched_dynamicemb_storage_class,
     create_model,
     get_optimizer_kwargs,
@@ -218,6 +219,40 @@ def validate_admission_keys(
         )
 
 
+def validate_non_admitted_embedding_values(
+    output: torch.Tensor,
+    expected_value: float,
+    iteration: int,
+):
+    """
+    Validate the embedding values a rejected key is looked up with.
+
+    Under a threshold no key can reach, admission rejects every key, so the
+    whole forward output comes from whichever initializer owns non-admitted
+    rows -- the strategy's when it has one, the table's otherwise. Any other
+    value means those rows were left uninitialized or the wrong initializer
+    wrote them.
+
+    Args:
+        output: Forward output, one row per looked-up key.
+        expected_value: The constant the owning initializer writes.
+        iteration: Iteration index, for the failure message.
+    """
+    expected = torch.full_like(output, expected_value)
+    if torch.allclose(output, expected, rtol=0, atol=1e-6):
+        return
+
+    mismatched = ~torch.isclose(output, expected, rtol=0, atol=1e-6)
+    num_mismatched = int(mismatched.sum())
+    sample = output[mismatched][:8].tolist()
+    raise AssertionError(
+        f"Iteration {iteration}: {num_mismatched} of {output.numel()} values "
+        f"of rejected keys are not {expected_value} "
+        f"(range [{float(output.min())}, {float(output.max())}], "
+        f"first mismatches {sample})"
+    )
+
+
 @click.command()
 @click.option("--num-embedding-collections", type=int, default=1)
 @click.option("--num-embeddings", type=str, default="1000")
@@ -254,6 +289,28 @@ def validate_admission_keys(
         "DEFAULT (_generic_forward_path), not HBM_DIRECT."
     ),
 )
+@click.option(
+    "--non-admitted-init-value",
+    type=float,
+    default=0.0,
+    help="Constant the admission strategy initializes non-admitted embeddings with.",
+)
+@click.option(
+    "--no-strategy-initializer",
+    is_flag=True,
+    help=(
+        "Give the admission strategy no initializer of its own, so non-admitted "
+        "rows fall back to the table's initializer."
+    ),
+)
+@click.option(
+    "--expect-all-rejected",
+    is_flag=True,
+    help=(
+        "Assert no key is admitted and every forward value equals the initializer "
+        "constant that owns non-admitted rows. Pass a threshold no key can reach."
+    ),
+)
 def test_admission_strategy_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -267,6 +324,9 @@ def test_admission_strategy_validation(
     cache_capacity_ratio: float,
     score_strategy: str,
     global_hbm_budget_scale: float,
+    non_admitted_init_value: float,
+    no_strategy_initializer: bool,
+    expect_all_rejected: bool,
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
@@ -309,12 +369,23 @@ def test_admission_strategy_validation(
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
 
-    # Create admission strategy
+    # Create admission strategy. Without an initializer of its own, a rejected
+    # key's row is left to the table initializer.
+    if no_strategy_initializer:
+        non_admitted_initializer_args = None
+        expected_non_admitted_value = TABLE_INITIALIZER_VALUE
+    else:
+        non_admitted_initializer_args = DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT,
+            value=non_admitted_init_value,
+        )
+        expected_non_admitted_value = non_admitted_init_value
+    if expect_all_rejected:
+        print(f"  - Expecting every key rejected, value {expected_non_admitted_value}")
+
     admission_strategy = FrequencyAdmissionStrategy(
         threshold=threshold,
-        initializer_args=DynamicEmbInitializerArgs(
-            value=0.0,
-        ),
+        initializer_args=non_admitted_initializer_args,
     )
 
     # Create model with admission strategy
@@ -369,6 +440,10 @@ def test_admission_strategy_validation(
     for iteration, kjt in enumerate(kjts):
         ret = model(kjt)
         torch.cuda.synchronize()
+        if expect_all_rejected:
+            validate_non_admitted_embedding_values(
+                ret, expected_non_admitted_value, iteration
+            )
         loss = ret.sum() * dist.get_world_size()
         loss.backward()
         torch.cuda.synchronize()
@@ -381,6 +456,18 @@ def test_admission_strategy_validation(
     # Validate admission logic
     print(f"\nValidating admission with threshold={threshold}...")
     validate_admission_keys(expected_frequencies, actual_keys, threshold)
+
+    if expect_all_rejected:
+        for table_name, keys in actual_keys.items():
+            if keys:
+                raise AssertionError(
+                    f"Table {table_name}: {len(keys)} keys admitted under "
+                    f"threshold={threshold}, expected none"
+                )
+        print(
+            f"✓ No key admitted; every looked-up value was "
+            f"{expected_non_admitted_value}"
+        )
 
     print(f"\n✓ Admission strategy test passed!")
 

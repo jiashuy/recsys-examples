@@ -55,6 +55,10 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+# Constant value every table in these tests initializes its embeddings with.
+# Tests that assert on embedding values compare against it.
+TABLE_INITIALIZER_VALUE = 1e-1
+
 
 def idx_to_name(embedding_collection_idx: int, embedding_idx: int) -> Tuple[str, str]:
     return (
@@ -318,7 +322,7 @@ def apply_dmp(
             dist_type=dist_type,
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.CONSTANT,
-                value=1e-1,
+                value=TABLE_INITIALIZER_VALUE,
             ),
             bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
