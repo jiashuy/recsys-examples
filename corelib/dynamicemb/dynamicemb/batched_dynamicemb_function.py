@@ -1142,11 +1142,22 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 if prefetch_state.non_admitted_positions is not None:
                     na = prefetch_state.non_admitted_positions
                     with torch.cuda.nvtx.range("op:initializer"):
-                        initializers[0](
-                            unique_embs[:, :max_emb_dim],
-                            na,
-                            prefetch_state.unique_keys,
+                        # Same contract as _apply_admission on the generic
+                        # path: the strategy gets first refusal on its own
+                        # rows, the table initializer covers what it declines.
+                        wrote_non_admitted = (
+                            admit_strategy is not None
+                            and admit_strategy.initialize_non_admitted_embeddings(
+                                unique_embs[:, :max_emb_dim],
+                                na,
+                            )
                         )
+                        if not wrote_non_admitted:
+                            initializers[0](
+                                unique_embs[:, :max_emb_dim],
+                                na,
+                                prefetch_state.unique_keys,
+                            )
                 unique_values = None
                 persisted_unique_indices = None
             else:
