@@ -18,7 +18,7 @@ import copy
 import enum
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch  # usort:skip
 from dynamicemb.utils import DTYPE_NUM_BYTES, torch_to_dyn_emb

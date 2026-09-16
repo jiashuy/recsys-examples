@@ -736,6 +736,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             weight_decay_mode,
             counter_based_regularization,
             cowclip_regularization,
+            learning_rate_power,
+            ftrl_beta,
+            l1_reg,
+            l2_reg,
         )
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
@@ -955,6 +959,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         weight_decay_mode: WeightDecayMode,
         counter_based_regularization: Optional[CounterBasedRegularizationDefinition],
         cowclip_regularization: Optional[CowClipDefinition],
+        learning_rate_power: float,
+        ftrl_beta: float,
+        l1_reg: float,
+        l2_reg: float,
     ) -> BaseDynamicEmbeddingOptimizer:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
