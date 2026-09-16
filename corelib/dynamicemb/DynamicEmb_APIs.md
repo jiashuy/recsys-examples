@@ -527,8 +527,8 @@ weight    = 0                                                          if |linea
 accum     = new_accum
 ```
 
-`lr`, `ftrl_beta`, `l1_reg` and `l2_reg` are the paper's α, β, λ1 and λ2; `p = 0.5` recovers its
-`α / (β + √n)` learning rate exactly. Pass them through `fused_params` alongside `optimizer`:
+`lr`, `ftrl_beta`, `l1_reg` and `l2_reg` are the paper's α, β, λ1 and λ2; `p = -0.5` makes `n^(−p)` a
+square root and so recovers its `α / (β + √n)` learning rate exactly. Pass them through `fused_params` alongside `optimizer`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -546,20 +546,29 @@ Two behaviours worth knowing before choosing FTRL:
 - **The weight is re-solved from `(linear, accum)` each step** rather than nudged from its previous value.
   That is what lets `l1_reg` drive a weight to exactly zero instead of merely shrinking it.
 
-  It is also why `initial_accumulator_value` deserves care here. FTRL was written for linear regression,
-  whose weights start at zero; there, seeding `accum` with `n0` costs nothing. An embedding's weights do
-  not start at zero, and a state of `linear = 0, accum = n0` is inconsistent with the weight already
-  sitting in the row. The first update reconciles them by shrinking the weight by `sqrt(n0 / (n0 + g²))`:
+  It is also why seeding the state deserves care here. FTRL was written for linear regression, whose
+  weights start at zero; an embedding's do not, and a state of `linear = 0` is inconsistent with the
+  weight already sitting in the row. The first update reconciles them, keeping a fraction
 
-  | `n0` | `g = 1.0` | `g = 0.01` | `g = 0.0001` |
-  | --- | --- | --- | --- |
-  | `0.1` | keeps 70% | keeps 0.05% | keeps 0.0005% |
-  | `0.0` | keeps 100% | keeps 100% | keeps 100% |
+  ```
+  (√n₁ − √n₀) / (ftrl_beta + √n₁)        n₀ = initial_accumulator_value,  n₁ = n₀ + g²
+  ```
 
-  For the small gradients typical of embeddings a non-zero seed therefore discards almost all of the
-  initializer on a row's first update. Leave it at `0.0` and use **`ftrl_beta`** to bound the early steps
-  instead -- β sits outside the accumulator, so it damps the first updates without contradicting the
-  weight the row already holds.
+  of the initializer. **Both** knobs that bound the early steps cost retention, and for the small
+  gradients typical of embeddings they cost nearly all of it:
+
+  | `n0` | `ftrl_beta` | `g = 1.0` | `g = 0.01` | `g = 0.0001` |
+  | --- | --- | --- | --- | --- |
+  | `0.0` | `0.0` | 100% | 100% | 100% |
+  | `0.1` | `0.0` | 69.8% | 0.05% | 0.000005% |
+  | `0.0` | `1.0` | 50% | 0.99% | 0.01% |
+  | `0.1` | `1.0` | 35.8% | 0.012% | 0.0000012% |
+
+  Only `initial_accumulator_value = 0` together with `ftrl_beta = 0` keeps the initializer whole. That
+  combination has its own cost: with `n₀ = 0` the first step is `w − α·sign(g)`, a full α-sized move
+  however small the gradient. Which matters more is a modelling choice -- if the initializer is doing
+  real work, keep both at 0 and pick α accordingly; if the early steps need damping, expect the
+  initializer to be mostly overwritten and size it as if rows started near zero.
 
 Unlike the `EmbOptimType` optimizers, FTRL has no FBGEMM counterpart, so `construct_twin_module` cannot
 build a TorchRec twin for a model that uses it.

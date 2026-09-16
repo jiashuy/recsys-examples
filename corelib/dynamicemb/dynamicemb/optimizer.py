@@ -700,12 +700,18 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ``l1_reg`` drive weights to exactly zero.
 
     ``linear`` starts at zero and ``accum`` at ``initial_accumulator_value``.
-    Note that a non-zero seed is not free here the way it is in the linear
-    regression FTRL was written for: the weight is a function of the state, so
-    seeding ``accum`` alone leaves the state inconsistent with the weight
-    already in the row, and the first update reconciles them by shrinking the
-    weight by ``sqrt(n0 / (n0 + g^2))``. Prefer ``ftrl_beta`` to bound the early
-    steps, which is what the paper introduces it for.
+    Seeding the state is not free here the way it is in the linear regression
+    FTRL was written for, whose weights start at zero: an embedding's do not,
+    so ``linear = 0`` is inconsistent with the weight already in the row and the
+    first update reconciles them, keeping only
+
+        (sqrt(n1) - sqrt(n0)) / (ftrl_beta + sqrt(n1))    n1 = n0 + g^2
+
+    of it. Both knobs that bound the early steps -- ``initial_accumulator_value``
+    and ``ftrl_beta`` -- shrink that fraction, and for the small gradients
+    typical of embeddings they shrink it to almost nothing; only leaving both at
+    zero keeps the initializer whole, at the cost of a first step of
+    ``w - lr * sign(g)`` however small the gradient. See DynamicEmb_APIs.md.
     """
 
     def __init__(
