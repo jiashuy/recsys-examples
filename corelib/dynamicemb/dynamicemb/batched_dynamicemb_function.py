@@ -235,7 +235,9 @@ def _apply_admission(
     Returns (keys_to_insert, scores_to_insert, table_ids_to_insert,
              positions_in_unique, indices_to_init) where indices_to_init are
     the positions in values that the caller should initialize with its
-    embeddings initializer.
+    embeddings initializer. Every missing row is covered exactly once: the
+    non-admitted ones drop out of indices_to_init only when the strategy
+    reports it already initialized them.
     """
     with torch.cuda.nvtx.range("_apply_admission"):
         if admit_strategy is None or missing_keys.numel() == 0:
@@ -290,8 +292,14 @@ def _apply_admission(
                 admit_mask,
                 [missing_keys, missing_indices, missing_table_ids, missing_scores],
             )
+        # The strategy owns the non-admitted rows once it reports it wrote
+        # them, so the caller's table initializer only has to cover the
+        # admitted ones. When it does not write them, the table initializer
+        # has to cover every miss -- otherwise the non-admitted rows reach the
+        # forward as whatever ``storage.find`` left in its ``torch.empty``
+        # value buffer.
         indices_to_init = (
-            missing_indices if initialized_non_admitted else positions_in_unique
+            positions_in_unique if initialized_non_admitted else missing_indices
         )
         admission_counter.erase(keys_to_insert, table_ids_to_insert)
 

@@ -453,7 +453,18 @@ class AdmissionStrategy(abc.ABC):
         self,
         buffer: torch.Tensor,
         indices: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """
         Initialize the embeddings for the keys that are not admitted.
+
+        A non-admitted key still takes part in the forward, so its row must be
+        written by somebody. Returning False hands that duty back to the caller,
+        which then falls back to the table's own initializer.
+
+        Args:
+            buffer (torch.Tensor): The embedding value buffer to write into.
+            indices (torch.Tensor): The rows of `buffer` that hold non-admitted keys.
+
+        Returns:
+            bool: True if this strategy wrote the rows, False otherwise.
         """
