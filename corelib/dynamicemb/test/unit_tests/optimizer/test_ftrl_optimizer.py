@@ -274,21 +274,37 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
             ref_weight, ref_linear, ref_accum, grad, **opt_params
         )
 
-    for out_keys, out_emb, out_opt, _ in export_keys_values_iter(
+    # Keys are 0..num_keys-1 and the reference is indexed the same way, so each
+    # batch can be looked up directly -- no need to care what order the export
+    # walks the table in, or how it splits the rows into batches.
+    seen = 0
+    for keys_b, emb_b, opt_b, _ in export_keys_values_iter(
         storage._state, device, table_id=0
     ):
-        order = torch.argsort(out_keys)
-        got_weight = out_emb.view(-1, emb_dim)[order].double()
-        got_state = out_opt.view(-1, state_dim)[order].double()
+        if keys_b.numel() == 0:
+            continue
+        assert (
+            opt_b is not None
+        ), "FTRL keeps per-row state, so the export must carry it"
+        seen += keys_b.numel()
         torch.testing.assert_close(
-            got_weight, ref_weight, rtol=1e-4, atol=1e-5, msg="weight"
+            emb_b.double(), ref_weight[keys_b], rtol=1e-4, atol=1e-5, msg="weight"
         )
         torch.testing.assert_close(
-            got_state[:, :emb_dim], ref_linear, rtol=1e-4, atol=1e-4, msg="linear"
+            opt_b[:, :emb_dim].double(),
+            ref_linear[keys_b],
+            rtol=1e-4,
+            atol=1e-4,
+            msg="linear",
         )
         torch.testing.assert_close(
-            got_state[:, emb_dim:], ref_accum, rtol=1e-5, atol=1e-6, msg="accum"
+            opt_b[:, emb_dim:].double(),
+            ref_accum[keys_b],
+            rtol=1e-5,
+            atol=1e-6,
+            msg="accum",
         )
+    assert seen == num_keys, f"exported {seen} of {num_keys} rows"
 
 
 if __name__ == "__main__":
