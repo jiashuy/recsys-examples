@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import math
 import warnings
 from typing import List, Optional
 
@@ -273,6 +274,127 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
 
     def state(self) -> Optional[Counter]:
         return self._counter
+
+    @property
+    def non_admitted_initializer(self) -> Optional[MultiTableInitializer]:
+        return self._non_admitted_initializer
+
+
+class ProbabilisticAdmissionStrategy(AdmissionStrategy):
+    """Admits a key by a coin toss, once per appearance, until it gets in.
+
+    Admission is only consulted for a key that is missing, so a key gets a
+    fresh toss every time it turns up and is not yet in the table: it takes
+    ``1 / probability`` appearances on average to be admitted. That filters by
+    frequency without counting anything, which is why this keeps no state --
+    ``state()`` stays None and no counter is ever built for it.
+
+    Parameters
+    ----------
+    probability : float
+        Chance in [0, 1] that one appearance of a missing key admits it.
+    initializer_args : Optional[DynamicEmbInitializerArgs]
+        How to initialize the rows this strategy rejects. None -- the default --
+        leaves them to the table's own initializer, which is also the only way
+        to get bounds derived from a table's row count.
+
+    Notes
+    -----
+    The draws come from ``torch.rand``, so they follow ``torch.manual_seed``
+    and survive CUDA graph capture. A seeded run repeats, but the draws are
+    consumed in the order keys go missing, so changing the batch size or the
+    data order changes which keys get in.
+    """
+
+    def __init__(
+        self,
+        probability: float,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    ):
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"probability must be in [0, 1], got {probability}")
+        if initializer_args is not None:
+            if not isinstance(initializer_args, DynamicEmbInitializerArgs):
+                raise TypeError(
+                    "initializer_args must be a DynamicEmbInitializerArgs, got "
+                    f"{type(initializer_args).__name__}"
+                )
+            if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM and (
+                initializer_args.lower is None or initializer_args.upper is None
+            ):
+                warnings.warn(
+                    "A UNIFORM initializer for non-admitted rows cannot take its "
+                    "bounds from a table's row count, so it falls back to "
+                    f"[{DEFAULT_UNIFORM_LOWER}, {DEFAULT_UNIFORM_UPPER}]. Give "
+                    "lower and upper to choose them, or drop initializer_args to "
+                    "let those rows use the table's own initializer.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        self.probability = probability
+        self.initializer_args = initializer_args
+
+        # log(1 - probability), for compounding a batch's repeats below. Only
+        # meaningful strictly inside (0, 1): log1p(-1) has no value, and at
+        # either end the answer needs no arithmetic.
+        self._log_miss = (
+            math.log1p(-probability) if 0.0 < probability < 1.0 else None
+        )
+
+        self._non_admitted_initializer: Optional[MultiTableInitializer] = None
+
+    def get_grouped_key(self):
+        return (
+            type(self).__name__,
+            self.probability,
+            group_key_of(self.initializer_args),
+        )
+
+    @classmethod
+    def materialize_for_tables(cls, table_strategies, device):
+        keys = {strategy.get_grouped_key() for strategy in table_strategies}
+        if len(keys) != 1:
+            raise ValueError(
+                f"Tables of one module must agree on their admission strategy, "
+                f"got {len(keys)} different ones: {keys}"
+            )
+        first = table_strategies[0]
+        # A new instance rather than one of these: the configurations belong to
+        # the caller and stay as they were written, and one of them is commonly
+        # shared by tables that end up in different modules.
+        materialized = cls(first.probability, first.initializer_args)
+        if first.initializer_args is not None:
+            materialized._non_admitted_initializer = MultiTableInitializer.create(
+                [strategy.initializer_args for strategy in table_strategies], device
+            )
+        return materialized
+
+    def admit(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_keys = keys.shape[0]
+        if self.probability <= 0.0:
+            return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)
+        if self.probability >= 1.0:
+            return torch.ones(num_keys, dtype=torch.bool, device=keys.device)
+
+        # torch.rand draws from [0, 1), so the comparison is strict: nothing
+        # passes at probability 0 and everything does at 1. (curand_uniform,
+        # which the initializers use, is (0, 1] and wants the opposite.)
+        draws = torch.rand(num_keys, device=keys.device)
+        if frequencies is None:
+            return draws < self.probability
+
+        # A key the batch holds k times deserves k tosses. Tossing k times and
+        # taking any success is exactly one toss against 1 - (1 - p)^k, so that
+        # is what this compares to -- through log1p/expm1, because float32
+        # loses a small p outright in 1 - p (at p = 1e-8 it rounds to 1).
+        occurrences = frequencies.to(torch.float32).clamp(min=1.0)
+        return draws < -torch.expm1(occurrences * self._log_miss)
 
     @property
     def non_admitted_initializer(self) -> Optional[MultiTableInitializer]:

@@ -345,6 +345,44 @@ first is what would make it rot.
 `DebugInitializer` overrides `__call__` outright — it is the only mode that
 reads `keys`, and doing so keeps that argument out of every other mode.
 
+### 3.7 Probabilistic admission, the first strategy built on this shape
+
+`ProbabilisticAdmissionStrategy` admits a missing key with a fixed chance, and
+needed no framework change at all: `state()` stays None so no counter is ever
+built for it, `materialize_for_tables` only has the rejected-row initializer to
+open, and `admit` is a comparison.
+
+```python
+draws = torch.rand(num_keys, device=keys.device)
+return draws < self.probability
+```
+
+Admission is consulted only for a key that is *missing*, so a key gets a fresh
+toss every time it turns up and is not yet in the table: it takes `1 / p`
+appearances on average to get in. That is frequency filtering with no counter
+and no state. Deciding by `hash(key)` instead would be reproducible and
+rank-stable, but it would settle each key's fate forever — at `p = 0.1`, nine
+keys in ten could never get in however hot they are. Rank stability buys
+nothing here anyway: row-wise sharding already gives a key to exactly one rank.
+
+**Repeats within a batch.** A batch holding a key `k` times deserves `k` tosses.
+Tossing `k` times and taking any success is exactly one toss against
+`1 - (1 - p)^k`, so that is what it compares to — one draw per key, no ragged
+loop. `frequencies` is where `k` comes from, and is 1 when the module is not
+counting.
+
+Three details that are easy to get backwards:
+
+- **`<`, not `<=`.** `torch.rand` draws from `[0, 1)`, so a strict comparison
+  admits nothing at `p = 0` and everything at `p = 1`. The initializers'
+  `curand_uniform` is `(0, 1]` and wants the opposite; the two conventions sit
+  in one codebase and should not be "unified".
+- **`log1p(-1)` has no value**, so `p = 0` and `p = 1` short-circuit before any
+  arithmetic.
+- **`1 - p` loses a small `p` outright in float32** — at `p = 1e-8` it rounds to
+  1, and `1 - (1 - p)^k` becomes 0, admitting nothing ever. The threshold is
+  computed as `-expm1(k · log1p(-p))`, which is exact at both ends of the range.
+
 ## 4. Changes by area
 
 All of the following is implemented in the working tree. **Nothing has been
@@ -449,6 +487,12 @@ Commit 4 is a prerequisite: `create` compares resolved parameters, and
 
 1-3, 6 and 8 are new files; 4 and 7 extend `test_embedding_admission.sh`.
 
+`test/unit_tests/test_probabilistic_admission.py` covers §3.7 and is written:
+the rate, both ends of the range, repeats compounding to `1 - (1 - p)^k`, a
+seeded run repeating, and a probability small enough that computing
+`(1 - p)^k` directly would admit nothing — which separates the two forms
+without needing a large sample.
+
 ## 8. Commit plan
 
 Continuing from the four already on the branch:
@@ -468,9 +512,6 @@ carries the deprecation.
 - **Per-table thresholds.** `admit` receives `table_ids`, so a strategy could
   hold a threshold per table and drop `threshold` from its grouping key. That is
   a feature, not a fix.
-- **Probabilistic admission.** The point of the shape above: it needs no
-  framework change, only a strategy whose `state()` is None and whose `admit`
-  is `torch.rand(n, device=...) <= p`.
 - **`initializers[0]` elsewhere.** Only the initializer family is addressed here.
 - **`evict_strategy` taking element 0** — it is in the grouping key, so a
   module's tables agree on it by construction, and one physical table has one

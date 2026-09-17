@@ -32,7 +32,11 @@ from .dynamicemb_config import (
     get_table_value_bytes,
     string_to_evict_strategy,
 )
-from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
+from .embedding_admission import (
+    FrequencyAdmissionStrategy,
+    KVCounter,
+    ProbabilisticAdmissionStrategy,
+)
 from .incremental_dump import (
     DeltaDumpResult,
     pop_erased_keys,
@@ -63,6 +67,7 @@ __all__ = [
     "FrequencyAdmissionStrategy",
     "Counter",
     "KVCounter",
+    "ProbabilisticAdmissionStrategy",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",
     "DynamicEmbInitializerMode",
