@@ -59,6 +59,10 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # Tests that assert on embedding values compare against it.
 TABLE_INITIALIZER_VALUE = 1e-1
 
+# Per-rank room for keys an admission strategy is still counting. They are
+# erased on admission, so this only has to hold the ones still waiting.
+ADMISSION_COUNTER_CAPACITY = 1024 * 1024
+
 
 def idx_to_name(embedding_collection_idx: int, embedding_idx: int) -> Tuple[str, str]:
     return (
@@ -313,9 +317,6 @@ def apply_dmp(
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        admission_counter = KVCounter(
-            max(1024 * 1024, eb_config.num_embeddings // (4 * world_size))
-        )
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
@@ -327,7 +328,6 @@ def apply_dmp(
             bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
-            admission_counter=admission_counter,
         )
     planner = get_planner(
         eb_configs,
@@ -541,6 +541,7 @@ def test_model_load_dump(
         dist_type=dist_type,
         admit_strategy=FrequencyAdmissionStrategy(
             threshold=2 if counter else 1,
+            counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
         ),
     )
 
@@ -585,6 +586,7 @@ def test_model_load_dump(
             dist_type=dist_type,
             admit_strategy=FrequencyAdmissionStrategy(
                 threshold=2 if counter else 1,
+                counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
             ),
         )
 

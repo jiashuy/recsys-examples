@@ -16,7 +16,7 @@
 import abc
 import enum
 from dataclasses import dataclass
-from typing import Generic, Iterator, Optional, Tuple, TypeVar
+from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
@@ -53,6 +53,14 @@ class DynamicEmbInitializerMode(enum.Enum):
     DEBUG = "debug"
 
 
+# What an unbounded UNIFORM falls back to when there is no table to derive
+# bounds from. A table's own resolve to +/-sqrt(1 / num_embeddings) in the
+# planner; everywhere else -- a strategy's initializer, or an args object that
+# never reached the planner -- these are what it gets.
+DEFAULT_UNIFORM_LOWER: float = 0.0
+DEFAULT_UNIFORM_UPPER: float = 1.0
+
+
 @dataclass
 class DynamicEmbInitializerArgs:
     """
@@ -81,6 +89,16 @@ class DynamicEmbInitializerArgs:
     upper: float = None
     value: float = 0.0
 
+    def get_grouped_key(self):
+        """What has to match for two tables to share one initializer.
+
+        Only the mode. The parameters are resolved per table by
+        :class:`~dynamicemb.initializer.MultiTableInitializer`, so tables that
+        differ in them still fuse -- and they differ without being asked to,
+        since an unbounded UNIFORM resolves against each table's row count.
+        """
+        return self.mode
+
     def __eq__(self, other):
         # Only the fields the mode actually reads take part: a CONSTANT's mean
         # or a NORMAL's bounds are never used, so two args that differ there
@@ -104,6 +122,21 @@ class DynamicEmbInitializerArgs:
             return self.value == other.value
         # DEBUG takes no parameters, so same mode is all there is to compare.
         return True
+
+
+def group_key_of(obj: Optional[object]):
+    """Ask an object what has to match for its tables to be fused.
+
+    Objects that answer decide their own granularity, which is how a strategy,
+    a counter or an initializer lets tables differ in whatever it resolves per
+    table. Anything else stands for itself, so two tables group only when
+    handed the very same object -- conservative, and what happened before any
+    of them had a say.
+    """
+    if obj is None:
+        return None
+    get_grouped_key = getattr(obj, "get_grouped_key", None)
+    return get_grouped_key() if callable(get_grouped_key) else obj
 
 
 KEY_TYPE = torch.int64
@@ -439,33 +472,92 @@ class Counter(abc.ABC):
 
 
 class AdmissionStrategy(abc.ABC):
+    """Decides which keys may enter a table, and owns whatever that takes.
+
+    A strategy the caller constructs is pure configuration: it allocates
+    nothing, touches no device, and may be handed to as many tables as one
+    likes. :meth:`materialize_for_tables` turns the per-table configurations of
+    one fused module into the single strategy that module runs, and is where
+    anything on the device comes into being.
+    """
+
+    @classmethod
+    def materialize_for_tables(
+        cls,
+        table_strategies: List["AdmissionStrategy"],
+        device: torch.device,
+    ) -> "AdmissionStrategy":
+        """The strategy these tables share, with its device state allocated.
+
+        The default returns the first one: the tables were grouped on
+        :meth:`get_grouped_key`, so they are already interchangeable. Override
+        it to keep what a table may differ in -- per-table parameters in a
+        tensor the kernel indexes -- and then leave those parameters out of the
+        grouping key so such tables still fuse.
+        """
+        keys = {strategy.get_grouped_key() for strategy in table_strategies}
+        if len(keys) != 1:
+            raise ValueError(
+                f"Tables of one module must agree on their admission strategy, "
+                f"got {len(keys)} different ones: {keys}"
+            )
+        return table_strategies[0]
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused module.
+
+        The tables of a fused module share a single strategy, so this decides
+        which configurations are interchangeable. The default is the instance
+        itself: only the very same object groups, which is how strategies
+        behaved before they had a say. Override it to let equal but separately
+        constructed strategies share a module -- return everything that changes
+        the admission decision, and for anything resolved per table return only
+        what the tables must agree on.
+        """
+        return id(self)
+
+    def state(self) -> Optional[Counter]:
+        """Persistent state the framework has to carry, or None.
+
+        Whatever a strategy accumulates across steps lives on the device, has
+        to be reported in memory accounting, and has to survive a checkpoint.
+        Return it here and the framework does all three; keeping it private
+        would only mean it is none of those.
+        """
+        return None
+
+    @property
+    def non_admitted_initializer(self):
+        """What writes the rows this strategy rejects, or None for the table's.
+
+        A rejected key still takes part in the forward, so its row has to be
+        written by something. Returning a ``MultiTableInitializer`` here hands
+        that job to it; None leaves those rows to the table's own initializer.
+        The module does the calling, so buffer layout stays out of a strategy's
+        business, and which of the two writes them is settled once, here, and
+        not renegotiated on every batch.
+        """
+        return None
+
     @abc.abstractmethod
     def admit(
         self,
         keys: torch.Tensor,
-        frequencies: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Admit keys with frequencies >= threshold.
-        """
-
-    @abc.abstractmethod
-    def initialize_non_admitted_embeddings(
-        self,
-        buffer: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> bool:
-        """
-        Initialize the embeddings for the keys that are not admitted.
-
-        A non-admitted key still takes part in the forward, so its row must be
-        written by somebody. Returning False hands that duty back to the caller,
-        which then falls back to the table's own initializer.
+        """Which of these missing keys may enter the table.
 
         Args:
-            buffer (torch.Tensor): The embedding value buffer to write into.
-            indices (torch.Tensor): The rows of `buffer` that hold non-admitted keys.
+            keys (torch.Tensor): The keys to decide on, deduplicated.
+            table_ids (torch.Tensor): The table each key belongs to. One module
+                spans several, so a decision may be made per table.
+            frequencies (Optional[torch.Tensor]): How often each key occurred in
+                *this batch*, where the module counts occurrences at all; None
+                means treat each key as one occurrence. An increment, not a
+                running total -- any total is the strategy's own to keep.
 
         Returns:
-            bool: True if this strategy wrote the rows, False otherwise.
+            torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
+

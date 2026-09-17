@@ -649,10 +649,13 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             If provided, only keys that meet the strategy's criteria will be inserted into the table.
             Keys that don't meet the criteria will still be initialized and used in the forward pass,
             but won't be stored in the table. Default is None (all keys are admitted).
+            Anything the strategy needs to decide -- a frequency counter, an
+            initializer for the rows it rejects -- is configured on the strategy
+            itself, e.g. ``FrequencyAdmissionStrategy(threshold=...,
+            counter=KVCounter(...))``.
         admission_counter : Optional[Counter], optional
-            Counter for tracking the number of keys that have been admitted to the embedding table.
-            If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
-            Default is None (no counter is used).
+            Deprecated, and warns when set. Pass the counter to the strategy
+            that uses it instead.
         evicted_item_mode : EvictedItemMode, optional
             How the *last-tier* storage handles an item it evicts. ``DISCARD``
             (default) drops evicted keys with zero overhead. ``RETAIN_KEY`` retains
@@ -698,7 +701,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         external_storage: Storage = None
         index_type: Optional[torch.dtype] = None
         admit_strategy: Optional[AdmissionStrategy] = None
-        admission_counter: Optional[Counter] = None
+        admission_counter: Optional[Counter] = None  # deprecated
         evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
 
     ```

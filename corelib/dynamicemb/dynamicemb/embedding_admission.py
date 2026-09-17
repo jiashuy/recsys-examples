@@ -14,10 +14,11 @@
 # limitations under the License.
 
 
+import warnings
 from typing import List, Optional
 
 import torch
-from dynamicemb.initializer import create_initializer_from_args
+from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -25,19 +26,25 @@ from dynamicemb.scored_hashtable import (
     get_scored_table,
 )
 from dynamicemb.types import (
+    DEFAULT_UNIFORM_LOWER,
+    DEFAULT_UNIFORM_UPPER,
     AdmissionStrategy,
     Counter,
     DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
     MemoryType,
+    group_key_of,
 )
+from dynamicemb_extensions import flagged_compact
 
 
 class KVCounter:
     """Per-table counter configuration.
 
-    Users specify one ``KVCounter`` per logical table. At runtime, the
-    framework wraps a list of them into a single ``MultiTableKVCounter``
-    that manages a fused multi-table scored hash table.
+    Sizes one logical table's share of the counter. The strategy that counts
+    carries one of these; when a module materializes that strategy, the shares
+    of its tables become a single ``MultiTableKVCounter`` over one fused scored
+    hash table.
     """
 
     def __init__(
@@ -49,6 +56,16 @@ class KVCounter:
         self.capacity = capacity
         self.bucket_capacity = bucket_capacity
         self.key_type = key_type
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused counter.
+
+        ``capacity`` is left out on purpose: the fused table takes one capacity
+        per logical table, so tables are free to differ there. The bucket
+        layout and the key type describe the single physical table they all
+        share, so tables that disagree on those cannot be fused.
+        """
+        return (type(self).__name__, self.bucket_capacity, self.key_type)
 
 
 class MultiTableKVCounter(Counter):
@@ -105,76 +122,158 @@ class MultiTableKVCounter(Counter):
 
 
 class FrequencyAdmissionStrategy(AdmissionStrategy):
-    """
-    Frequency-based admission strategy.
-    Only admits keys whose frequency (score) meets or exceeds a threshold.
+    """Admits a key once it has been seen often enough.
+
+    As written by the caller this is configuration: it allocates nothing and
+    may be handed to as many tables as one likes.
+    :meth:`materialize_for_tables` returns the one a fused module runs, with
+    the counter it accumulates into opened for that module's tables.
 
     Parameters
     ----------
     threshold : int
-        Minimum frequency threshold for admission. Keys with frequency >= threshold
-        will be admitted into the embedding table.
-    initializer_args: Optional[DynamicEmbInitializerArgs]
-        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
+        Accumulated occurrences a key needs before it may enter the table.
+    counter : Optional[KVCounter]
+        How much room each table this strategy serves gets for counting. A key
+        is erased the moment it is admitted, so size this for the keys still
+        waiting, not for the embedding table. Give tables different room by
+        giving them separately configured strategies: capacity is not part of
+        what they are grouped on, so they still share a module. Optional only
+        so that the deprecated ``DynamicEmbTableOptions.admission_counter`` can
+        still supply it; leaving it unset otherwise fails when a module
+        materializes the strategy.
+    initializer_args : Optional[DynamicEmbInitializerArgs]
+        How to initialize the rows this strategy rejects. None -- the default --
+        leaves them to the table's own initializer, which is also the only way
+        to get bounds derived from a table's row count.
     """
 
     def __init__(
         self,
         threshold: int,
+        counter: Optional[KVCounter] = None,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
     ):
         if threshold < 0:
             raise ValueError(f"Threshold must be non-negative, got {threshold}")
+        if counter is not None and not isinstance(counter, KVCounter):
+            raise TypeError(
+                "Frequency admission counts occurrences, so it needs a "
+                f"KVCounter to count them in, got {type(counter).__name__}"
+            )
+        if initializer_args is not None:
+            if not isinstance(initializer_args, DynamicEmbInitializerArgs):
+                raise TypeError(
+                    "initializer_args must be a DynamicEmbInitializerArgs, got "
+                    f"{type(initializer_args).__name__}"
+                )
+            if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM and (
+                initializer_args.lower is None or initializer_args.upper is None
+            ):
+                # A table's own bounds resolve to +/-sqrt(1 / num_embeddings) in
+                # the planner, which a strategy's cannot: it belongs to no one
+                # table. Say so, since the fallback is a far wider interval than
+                # the row count would have given.
+                warnings.warn(
+                    "A UNIFORM initializer for non-admitted rows cannot take its "
+                    "bounds from a table's row count, so it falls back to "
+                    f"[{DEFAULT_UNIFORM_LOWER}, {DEFAULT_UNIFORM_UPPER}]. Give "
+                    "lower and upper to choose them, or drop initializer_args to "
+                    "let those rows use the table's own initializer.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         self.threshold = threshold
+        self.counter = counter
         self.initializer_args = initializer_args
+
+        # Both opened by materialize_for_tables, and only there: a strategy
+        # still holding None is one nobody has given any tables to run on.
+        self._counter: Optional[Counter] = None
+        self._non_admitted_initializer: Optional[MultiTableInitializer] = None
+
+    def get_grouped_key(self):
+        # The threshold decides for a whole batch at once, so tables sharing a
+        # module share it. Of the initializer only the mode has to match; its
+        # parameters are resolved per table. The counter contributes its own
+        # answer, which leaves out the capacity for the same reason.
+        return (
+            type(self).__name__,
+            self.threshold,
+            group_key_of(self.initializer_args),
+            group_key_of(self.counter),
+        )
+
+    @classmethod
+    def materialize_for_tables(cls, table_strategies, device):
+        keys = {strategy.get_grouped_key() for strategy in table_strategies}
+        if len(keys) != 1:
+            raise ValueError(
+                f"Tables of one module must agree on their admission strategy, "
+                f"got {len(keys)} different ones: {keys}"
+            )
+        first = table_strategies[0]
+        if any(strategy.counter is None for strategy in table_strategies):
+            raise ValueError(
+                "Frequency admission counts occurrences, so it needs a counter "
+                "to count them in: FrequencyAdmissionStrategy(threshold=..., "
+                "counter=KVCounter(capacity=...))."
+            )
+        # A new instance rather than one of these: the configurations belong to
+        # the caller and stay as they were written, and one of them is commonly
+        # shared by tables that end up in different modules.
+        materialized = cls(first.threshold, first.counter, first.initializer_args)
+        materialized._counter = MultiTableKVCounter(
+            [strategy.counter for strategy in table_strategies], device
+        )
+        if first.initializer_args is not None:
+            # Grouping made the modes agree; the parameters may still differ
+            # per table, which is what MultiTableInitializer carries.
+            materialized._non_admitted_initializer = MultiTableInitializer.create(
+                [strategy.initializer_args for strategy in table_strategies], device
+            )
+        return materialized
 
     def admit(
         self,
         keys: torch.Tensor,
-        frequencies: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Admit keys with frequencies >= threshold.
-
-        Parameters
-        ----------
-        keys : torch.Tensor
-            Keys to evaluate (shape: [N])
-        frequencies : torch.Tensor
-            Frequency counts for each key (shape: [N])
-
-        Returns
-        -------
-        torch.Tensor
-            Boolean mask (shape: [N]) where True indicates admission
-        """
-        if keys.shape[0] != frequencies.shape[0]:
+        if self._counter is None:
+            raise RuntimeError(
+                "This strategy has no counter to count in, because it has not "
+                "been materialized for any tables. A fused module calls "
+                "materialize_for_tables at construction."
+            )
+        if frequencies is None:
+            frequencies = torch.ones(
+                keys.shape[0], dtype=torch.int64, device=keys.device
+            )
+        elif frequencies.shape[0] != keys.shape[0]:
             raise ValueError(
-                f"Keys and frequencies must have same length, got {keys.shape[0]} and {frequencies.shape[0]}"
+                "Keys and frequencies must have same length, got "
+                f"{keys.shape[0]} and {frequencies.shape[0]}"
             )
 
-        # Admit keys whose frequency meets or exceeds threshold
-        admit_mask = frequencies >= self.threshold
+        accumulated = self._counter.add(keys, table_ids, frequencies)
+        admit_mask = accumulated >= self.threshold
+
+        # A key that got in is no longer waiting, so it stops taking up room.
+        # This repeats a compaction the caller also makes over the same mask;
+        # one pass over the missing keys is worth keeping the counter's whole
+        # lifecycle in the one place that knows the counter exists.
+        _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
+            admit_mask, [keys, table_ids]
+        )
+        if admitted_keys.numel() > 0:
+            self._counter.erase(admitted_keys, admitted_table_ids)
         return admit_mask
 
-    def initialize_non_admitted_embeddings(
-        self,
-        buffer: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> bool:
-        """
-        Initialize the embeddings for the keys that are not admitted.
+    def state(self) -> Optional[Counter]:
+        return self._counter
 
-        Returns:
-            bool: True if the embeddings are initialized, False otherwise.
-        """
-        if self.initializer_args is None:
-            return False
-        non_admit_initializer = create_initializer_from_args(self.initializer_args)
-        non_admit_initializer(
-            buffer,
-            indices,
-            None,
-        )
-        return True
+    @property
+    def non_admitted_initializer(self) -> Optional[MultiTableInitializer]:
+        return self._non_admitted_initializer

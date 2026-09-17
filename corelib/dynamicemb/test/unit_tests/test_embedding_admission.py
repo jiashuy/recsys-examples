@@ -11,11 +11,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
+from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
+    ADMISSION_COUNTER_CAPACITY,
     TABLE_INITIALIZER_VALUE,
     assert_batched_dynamicemb_storage_class,
     create_model,
@@ -385,6 +386,7 @@ def test_admission_strategy_validation(
 
     admission_strategy = FrequencyAdmissionStrategy(
         threshold=threshold,
+        counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
         initializer_args=non_admitted_initializer_args,
     )
 
