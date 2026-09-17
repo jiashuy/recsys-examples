@@ -263,6 +263,13 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
         values[:, max_emb_dim + emb_dim : max_emb_dim + 2 * emb_dim].double().clone()
     )
 
+    # initial_accumulator_value seeds the state rather than taking part in a
+    # step, and ref_accum already starts from the seeded value the table holds,
+    # so it is not among what ftrl_step is told.
+    step_params = {
+        k: v for k, v in opt_params.items() if k != "initial_accumulator_value"
+    }
+
     offsets = torch.arange(num_keys + 1, device=device).to(key_type)
     for _ in range(4):
         embs = bdeb(keys, offsets)
@@ -271,7 +278,7 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
         # d(sum)/d(emb_ij) == 1 for every looked-up element.
         grad = torch.ones_like(ref_weight)
         ref_weight, ref_linear, ref_accum = ftrl_step(
-            ref_weight, ref_linear, ref_accum, grad, **opt_params
+            ref_weight, ref_linear, ref_accum, grad, **step_params
         )
 
     # Keys are 0..num_keys-1 and the reference is indexed the same way, so each
