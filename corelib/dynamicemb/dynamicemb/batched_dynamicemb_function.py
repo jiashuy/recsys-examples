@@ -35,7 +35,7 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import AdmissionStrategy, CopyMode
+from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -222,7 +222,7 @@ def _apply_admission(
     unique_table_ids: torch.Tensor,
     max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
-    admit_strategy: Optional[AdmissionStrategy],
+    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[
     torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -240,7 +240,7 @@ def _apply_admission(
     has already run the strategy's own initializer over them.
     """
     with torch.cuda.nvtx.range("_apply_admission"):
-        if admit_strategy is None or missing_keys.numel() == 0:
+        if admitter is None or missing_keys.numel() == 0:
             return (
                 missing_keys,
                 missing_scores,
@@ -249,10 +249,10 @@ def _apply_admission(
                 missing_indices,
             )
 
-        admit_mask = admit_strategy.admit(
+        admit_mask = admitter.admit(
             missing_keys, missing_table_ids, freq_for_admission
         )
-        non_admitted_initializer = admit_strategy.non_admitted_initializer
+        non_admitted_initializer = admitter.non_admitted_initializer
 
         non_admitted_mask = ~admit_mask
         with torch.cuda.nvtx.range("op:flagged_compact"):
@@ -316,7 +316,7 @@ def _prefetch_cache_path(
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
-    admit_strategy: Optional[AdmissionStrategy],
+    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Cache prefetch with counter protection and overflow buffer.
 
@@ -389,14 +389,14 @@ def _prefetch_cache_path(
         keys_to_insert_mask = storage_founds.clone()
 
         has_new_in_miss = _bool_item(new_in_miss.any())
-        if has_new_in_miss and admit_strategy is not None:
+        if has_new_in_miss and admitter is not None:
             new_keys_sub = miss_keys[new_in_miss]
             new_tids_sub = miss_tids[new_in_miss]
 
             freq_for_admission = (
                 miss_lfu_freq[new_in_miss] if miss_lfu_freq is not None else None
             )
-            admit_mask = admit_strategy.admit(
+            admit_mask = admitter.admit(
                 new_keys_sub, new_tids_sub, freq_for_admission
             )
 
@@ -567,7 +567,7 @@ def _prefetch_hbm_direct_path(
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
-    admit_strategy: Optional[AdmissionStrategy],
+    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """HBM-direct prefetch with counter protection.
 
@@ -633,13 +633,13 @@ def _prefetch_hbm_direct_path(
         # Determine admission for missing keys
         non_admitted_positions: Optional[torch.Tensor] = None
 
-        if admit_strategy is not None:
+        if admitter is not None:
             freq_for_admission = (
                 accumulated_frequency[missing_indices]
                 if accumulated_frequency is not None
                 else None
             )
-            admit_mask = admit_strategy.admit(
+            admit_mask = admitter.admit(
                 missing_keys, missing_table_ids, freq_for_admission
             )
 
@@ -747,7 +747,7 @@ def dynamicemb_prefetch(
     forward_stream: Optional[torch.cuda.Stream] = None,
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
-    admit_strategy: Optional[AdmissionStrategy] = None,
+    admitter: Optional[MultiTableAdmitter] = None,
     outstanding_keys_ref: Optional[torch.Tensor] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
@@ -833,7 +833,7 @@ def dynamicemb_prefetch(
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admit_strategy,
+                admitter,
             )
             # The cache addresses its own value buffer by cache slot: a cache is
             # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
@@ -853,7 +853,7 @@ def dynamicemb_prefetch(
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admit_strategy,
+                admitter,
             )
 
         return PrefetchState(
@@ -977,7 +977,7 @@ def _generic_forward_path(
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
-    admit_strategy: Optional[AdmissionStrategy],
+    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Standalone forward for generic (DEFAULT) storage mode.
 
@@ -1027,7 +1027,7 @@ def _generic_forward_path(
 
         freq_for_admission = (
             accumulated_frequency[missing_indices]
-            if admit_strategy is not None and accumulated_frequency is not None
+            if admitter is not None and accumulated_frequency is not None
             else None
         )
         (
@@ -1046,7 +1046,7 @@ def _generic_forward_path(
             unique_table_ids,
             max_emb_dim,
             freq_for_admission,
-            admit_strategy,
+            admitter,
         )
 
         if indices_to_init.numel() > 0:
@@ -1092,7 +1092,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         initializer: MultiTableInitializer,
         optimizer: BaseDynamicEmbeddingOptimizer,
         layout: EmbeddingLayout,
-        admit_strategy=None,
+        admitter=None,
         evict_strategy=None,
         pooling_weights: Optional[torch.Tensor] = None,
         *args,
@@ -1127,8 +1127,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 if prefetch_state.non_admitted_positions is not None:
                     na = prefetch_state.non_admitted_positions
                     non_admitted_initializer = (
-                        admit_strategy.non_admitted_initializer
-                        if admit_strategy is not None
+                        admitter.non_admitted_initializer
+                        if admitter is not None
                         else None
                     )
                     with torch.cuda.nvtx.range("op:initializer"):
@@ -1157,7 +1157,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     initializer,
                     evict_strat,
                     prefetch_state.lfu_accumulated_frequency,
-                    admit_strategy,
+                    admitter,
                 )
                 # find() was asked for CopyMode.VALUE, so a row here is
                 # embedding ++ optimizer state; keep only the embedding.

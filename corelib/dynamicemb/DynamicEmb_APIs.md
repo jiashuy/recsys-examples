@@ -23,7 +23,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [get_score](#get_score)
 - [set_score](#set_score)
 - [Counter](#counter)
-- [AdmissionStrategy](#admissionstrategy)
+- [AdmissionStrategy and MultiTableAdmitter](#admissionstrategy-and-multitableadmitter)
 
 ## DynamicEmbParameterConstraints
 
@@ -649,10 +649,11 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             If provided, only keys that meet the strategy's criteria will be inserted into the table.
             Keys that don't meet the criteria will still be initialized and used in the forward pass,
             but won't be stored in the table. Default is None (all keys are admitted).
-            Anything the strategy needs to decide -- a frequency counter, an
-            initializer for the rows it rejects -- is configured on the strategy
-            itself, e.g. ``FrequencyAdmissionStrategy(threshold=...,
-            counter=KVCounter(...))``.
+            Anything deciding takes -- a frequency counter, an initializer for
+            the rows it rejects -- is configured on the strategy itself, e.g.
+            ``FrequencyAdmissionStrategy(threshold=..., counter=KVCounter(...))``.
+            The module turns the strategies of the tables it fuses into one
+            ``MultiTableAdmitter``, which is what actually decides.
         admission_counter : Optional[Counter], optional
             Deprecated, and warns when set. Pass the counter to the strategy
             that uses it instead.
@@ -1145,33 +1146,55 @@ class KVCounter:
     )
 ```
 
-## AdmissionStrategy
+## AdmissionStrategy and MultiTableAdmitter
 
-**AdmissionStrategy** decides which keys missing from the table may enter it,
-and owns whatever deciding takes. A strategy as written is configuration: it
-allocates nothing, touches no device, and may be given to as many tables as you
-like. A fused module turns the per-table configurations into the one strategy it
-runs by calling `materialize_for_tables`, which is where anything device-side
-comes into being.
+Admission is two classes: what a table is configured with, and what a module
+runs.
 
-Only `admit` has to be implemented. Everything else has a default, so a strategy
-that merely decides is one method.
+`AdmissionStrategy` is the configuration. It is inert -- it allocates nothing,
+touches no device, and may be given to as many tables as you like -- and it
+decides nothing. A fused module turns the configurations of the tables it fuses
+into the one thing that decides by calling `create_admitter`, which is where
+anything device-side comes into being.
 
 ```python
 class AdmissionStrategy(abc.ABC):
     @classmethod
-    def materialize_for_tables(
+    @abc.abstractmethod
+    def create_admitter(
         cls,
         table_strategies: List["AdmissionStrategy"],
         device: torch.device,
-    ) -> "AdmissionStrategy":
-        """The strategy these tables share, with its device state allocated.
+    ) -> "MultiTableAdmitter":
+        """The admitter these tables share, with its device state allocated.
 
-        The default returns the first: tables are grouped on get_grouped_key,
-        so a module's strategies are already interchangeable. Override it to
-        keep what a table may differ in, and to allocate.
+        Called once, by the module, with one configuration per table it fuses.
         """
 
+    @classmethod
+    def one_configuration(cls, table_strategies) -> "AdmissionStrategy":
+        """The single configuration these tables agree on.
+
+        They were grouped on get_grouped_key, so they are already
+        interchangeable and the first stands for all.
+        """
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused module.
+
+        The default is the instance itself, so only the same object groups.
+        Override it to let equal but separately constructed configurations
+        share a module, returning everything that changes the decision and, for
+        what is resolved per table, only what the tables must agree on.
+        """
+```
+
+`MultiTableAdmitter` is what the module runs, and holds everything deciding
+takes. Only `admit` has to be implemented; the other two have defaults, so an
+admitter that merely decides is one method.
+
+```python
+class MultiTableAdmitter(abc.ABC):
     @abc.abstractmethod
     def admit(
         self,
@@ -1183,42 +1206,33 @@ class AdmissionStrategy(abc.ABC):
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
-        It is an increment, not a running total -- any total is the strategy's
+        It is an increment, not a running total -- any total is the admitter's
         own to keep.
         """
 
     def state(self) -> Optional[Counter]:
         """Persistent state the framework has to carry, or None.
 
-        Whatever a strategy accumulates across steps has to be reported in
+        Whatever an admitter accumulates across steps has to be reported in
         memory accounting and survive a checkpoint. Return it here and the
         framework does both.
         """
 
     @property
     def non_admitted_initializer(self):
-        """What writes the rows this strategy rejects, or None for the table's.
+        """What writes the rows this admitter rejects, or None for the table's.
 
         A rejected key still takes part in the forward, so its row has to be
         written by something. Return a ``MultiTableInitializer`` to take that
         on; the module does the calling.
         """
-
-    def get_grouped_key(self):
-        """What has to match for two tables to share one fused module.
-
-        The default is the instance itself, so only the same object groups.
-        Override it to let equal but separately constructed strategies share a
-        module, returning everything that changes the decision and, for what is
-        resolved per table, only what the tables must agree on.
-        """
 ```
 
-**dynamicemb** provides two built-in strategies.
+**dynamicemb** provides two pairs.
 
-`FrequencyAdmissionStrategy` admits a key once it has been seen often enough.
-It carries the counter it accumulates into, so admission is configured in one
-place; a key is erased from that counter the moment it is admitted.
+`FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
+and carries the counter it accumulates into, so admission is configured in one
+place. Its admitter erases a key from that counter the moment it is admitted.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
@@ -1228,12 +1242,13 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         counter: Optional[KVCounter] = None,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
     )
+    # create_admitter -> MultiTableFrequencyAdmitter
 ```
 
-`ProbabilisticAdmissionStrategy` admits a key by a coin toss instead, and keeps
-no state at all -- its `state()` is None and no counter is built for it.
-Admission is consulted only for a key that is missing, so a key gets a fresh
-toss every time it turns up and is not yet in the table: it takes
+`ProbabilisticAdmissionStrategy` admits a key by a coin toss instead, and its
+admitter keeps no state at all -- `state()` is None and no counter is built for
+it. Admission is consulted only for a key that is missing, so a key gets a
+fresh toss every time it turns up and is not yet in the table: it takes
 `1 / probability` appearances on average to get in. A batch holding a key `k`
 times counts as `k` tosses.
 
@@ -1244,9 +1259,10 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         probability: float,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
     )
+    # create_admitter -> MultiTableProbabilisticAdmitter
 ```
 
-For both, `initializer_args` says how to initialize the rows the strategy
+For both, `initializer_args` says how to initialize the rows the admitter
 rejects; None leaves them to the table's own initializer, which is also the only
 way to get UNIFORM bounds derived from a table's row count.
 

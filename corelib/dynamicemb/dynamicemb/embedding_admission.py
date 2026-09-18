@@ -31,6 +31,7 @@ from dynamicemb.types import (
     DEFAULT_UNIFORM_UPPER,
     AdmissionStrategy,
     Counter,
+    MultiTableAdmitter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     MemoryType,
@@ -122,31 +123,68 @@ class MultiTableKVCounter(Counter):
         self.table_.dump(key_file, {self.score_name_: counter_file}, table_id=table_id)
 
 
-class FrequencyAdmissionStrategy(AdmissionStrategy):
-    """Admits a key once it has been seen often enough.
+def _check_non_admitted_initializer_args(initializer_args):
+    """The initializer for rejected rows is optional, but not free-form."""
+    if initializer_args is None:
+        return
+    if not isinstance(initializer_args, DynamicEmbInitializerArgs):
+        raise TypeError(
+            "initializer_args must be a DynamicEmbInitializerArgs, got "
+            f"{type(initializer_args).__name__}"
+        )
+    if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM and (
+        initializer_args.lower is None or initializer_args.upper is None
+    ):
+        # A table's own bounds resolve to +/-sqrt(1 / num_embeddings) in the
+        # planner, which these cannot: they belong to no one table. Say so,
+        # since the fallback is a far wider interval than a row count gives.
+        warnings.warn(
+            "A UNIFORM initializer for non-admitted rows cannot take its bounds "
+            "from a table's row count, so it falls back to "
+            f"[{DEFAULT_UNIFORM_LOWER}, {DEFAULT_UNIFORM_UPPER}]. Give lower "
+            "and upper to choose them, or drop initializer_args to let those "
+            "rows use the table's own initializer.",
+            UserWarning,
+            stacklevel=3,
+        )
 
-    As written by the caller this is configuration: it allocates nothing and
-    may be handed to as many tables as one likes.
-    :meth:`materialize_for_tables` returns the one a fused module runs, with
-    the counter it accumulates into opened for that module's tables.
+
+def _non_admitted_initializer(table_strategies, device):
+    """What writes the rows these tables reject, or None for the tables' own.
+
+    Grouping made the modes agree; the parameters may still differ per table,
+    which is what MultiTableInitializer carries.
+    """
+    if table_strategies[0].initializer_args is None:
+        return None
+    return MultiTableInitializer.create(
+        [strategy.initializer_args for strategy in table_strategies], device
+    )
+
+
+class FrequencyAdmissionStrategy(AdmissionStrategy):
+    """Admit a key once it has been seen often enough.
+
+    Configuration only. The counter that does the seeing is opened by
+    :meth:`create_admitter`, once per fused module, so one of these can be
+    built before CUDA is up and handed to as many tables as one likes.
 
     Parameters
     ----------
     threshold : int
         Accumulated occurrences a key needs before it may enter the table.
     counter : Optional[KVCounter]
-        How much room each table this strategy serves gets for counting. A key
-        is erased the moment it is admitted, so size this for the keys still
-        waiting, not for the embedding table. Give tables different room by
-        giving them separately configured strategies: capacity is not part of
-        what they are grouped on, so they still share a module. Optional only
-        so that the deprecated ``DynamicEmbTableOptions.admission_counter`` can
-        still supply it; leaving it unset otherwise fails when a module
-        materializes the strategy.
+        How much room each table this serves gets for counting. A key is erased
+        the moment it is admitted, so size this for the keys still waiting, not
+        for the embedding table. Give tables different room by giving them
+        separately configured strategies: capacity is not part of what they are
+        grouped on, so they still share a module. Optional only so that the
+        deprecated ``DynamicEmbTableOptions.admission_counter`` can still
+        supply it; leaving it unset otherwise fails when the admitter is built.
     initializer_args : Optional[DynamicEmbInitializerArgs]
-        How to initialize the rows this strategy rejects. None -- the default --
-        leaves them to the table's own initializer, which is also the only way
-        to get bounds derived from a table's row count.
+        How to initialize the rows this rejects. None -- the default -- leaves
+        them to the table's own initializer, which is also the only way to get
+        bounds derived from a table's row count.
     """
 
     def __init__(
@@ -162,43 +200,17 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
                 "Frequency admission counts occurrences, so it needs a "
                 f"KVCounter to count them in, got {type(counter).__name__}"
             )
-        if initializer_args is not None:
-            if not isinstance(initializer_args, DynamicEmbInitializerArgs):
-                raise TypeError(
-                    "initializer_args must be a DynamicEmbInitializerArgs, got "
-                    f"{type(initializer_args).__name__}"
-                )
-            if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM and (
-                initializer_args.lower is None or initializer_args.upper is None
-            ):
-                # A table's own bounds resolve to +/-sqrt(1 / num_embeddings) in
-                # the planner, which a strategy's cannot: it belongs to no one
-                # table. Say so, since the fallback is a far wider interval than
-                # the row count would have given.
-                warnings.warn(
-                    "A UNIFORM initializer for non-admitted rows cannot take its "
-                    "bounds from a table's row count, so it falls back to "
-                    f"[{DEFAULT_UNIFORM_LOWER}, {DEFAULT_UNIFORM_UPPER}]. Give "
-                    "lower and upper to choose them, or drop initializer_args to "
-                    "let those rows use the table's own initializer.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        _check_non_admitted_initializer_args(initializer_args)
 
         self.threshold = threshold
         self.counter = counter
         self.initializer_args = initializer_args
 
-        # Both opened by materialize_for_tables, and only there: a strategy
-        # still holding None is one nobody has given any tables to run on.
-        self._counter: Optional[Counter] = None
-        self._non_admitted_initializer: Optional[MultiTableInitializer] = None
-
     def get_grouped_key(self):
         # The threshold decides for a whole batch at once, so tables sharing a
-        # module share it. Of the initializer only the mode has to match; its
-        # parameters are resolved per table. The counter contributes its own
-        # answer, which leaves out the capacity for the same reason.
+        # module must share it. Of the initializer only the mode has to match;
+        # its parameters are resolved per table. The counter contributes its
+        # own answer, which leaves out the capacity for the same reason.
         return (
             type(self).__name__,
             self.threshold,
@@ -207,34 +219,37 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         )
 
     @classmethod
-    def materialize_for_tables(cls, table_strategies, device):
-        keys = {strategy.get_grouped_key() for strategy in table_strategies}
-        if len(keys) != 1:
-            raise ValueError(
-                f"Tables of one module must agree on their admission strategy, "
-                f"got {len(keys)} different ones: {keys}"
-            )
-        first = table_strategies[0]
+    def create_admitter(cls, table_strategies, device):
+        first = cls.one_configuration(table_strategies)
         if any(strategy.counter is None for strategy in table_strategies):
             raise ValueError(
                 "Frequency admission counts occurrences, so it needs a counter "
                 "to count them in: FrequencyAdmissionStrategy(threshold=..., "
                 "counter=KVCounter(capacity=...))."
             )
-        # A new instance rather than one of these: the configurations belong to
-        # the caller and stay as they were written, and one of them is commonly
-        # shared by tables that end up in different modules.
-        materialized = cls(first.threshold, first.counter, first.initializer_args)
-        materialized._counter = MultiTableKVCounter(
-            [strategy.counter for strategy in table_strategies], device
+        return MultiTableFrequencyAdmitter(
+            threshold=first.threshold,
+            counter=MultiTableKVCounter(
+                [strategy.counter for strategy in table_strategies], device
+            ),
+            non_admitted_initializer=_non_admitted_initializer(
+                table_strategies, device
+            ),
         )
-        if first.initializer_args is not None:
-            # Grouping made the modes agree; the parameters may still differ
-            # per table, which is what MultiTableInitializer carries.
-            materialized._non_admitted_initializer = MultiTableInitializer.create(
-                [strategy.initializer_args for strategy in table_strategies], device
-            )
-        return materialized
+
+
+class MultiTableFrequencyAdmitter(MultiTableAdmitter):
+    """What :class:`FrequencyAdmissionStrategy` becomes for one fused module."""
+
+    def __init__(
+        self,
+        threshold: int,
+        counter: Counter,
+        non_admitted_initializer=None,
+    ):
+        self._threshold = threshold
+        self._counter = counter
+        self._non_admitted_initializer = non_admitted_initializer
 
     def admit(
         self,
@@ -242,12 +257,6 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self._counter is None:
-            raise RuntimeError(
-                "This strategy has no counter to count in, because it has not "
-                "been materialized for any tables. A fused module calls "
-                "materialize_for_tables at construction."
-            )
         if frequencies is None:
             frequencies = torch.ones(
                 keys.shape[0], dtype=torch.int64, device=keys.device
@@ -259,7 +268,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
             )
 
         accumulated = self._counter.add(keys, table_ids, frequencies)
-        admit_mask = accumulated >= self.threshold
+        admit_mask = accumulated >= self._threshold
 
         # A key that got in is no longer waiting, so it stops taking up room.
         # This repeats a compaction the caller also makes over the same mask;
@@ -276,27 +285,27 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         return self._counter
 
     @property
-    def non_admitted_initializer(self) -> Optional[MultiTableInitializer]:
+    def non_admitted_initializer(self):
         return self._non_admitted_initializer
 
 
 class ProbabilisticAdmissionStrategy(AdmissionStrategy):
-    """Admits a key by a coin toss, once per appearance, until it gets in.
+    """Admit a key by a coin toss, once per appearance, until it gets in.
 
-    Admission is only consulted for a key that is missing, so a key gets a
+    Admission is consulted only for a key that is missing, so a key gets a
     fresh toss every time it turns up and is not yet in the table: it takes
     ``1 / probability`` appearances on average to be admitted. That filters by
-    frequency without counting anything, which is why this keeps no state --
-    ``state()`` stays None and no counter is ever built for it.
+    frequency without counting anything, which is why the admitter this builds
+    keeps no state -- ``state()`` stays None and no counter is built for it.
 
     Parameters
     ----------
     probability : float
         Chance in [0, 1] that one appearance of a missing key admits it.
     initializer_args : Optional[DynamicEmbInitializerArgs]
-        How to initialize the rows this strategy rejects. None -- the default --
-        leaves them to the table's own initializer, which is also the only way
-        to get bounds derived from a table's row count.
+        How to initialize the rows this rejects. None -- the default -- leaves
+        them to the table's own initializer, which is also the only way to get
+        bounds derived from a table's row count.
 
     Notes
     -----
@@ -313,34 +322,10 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
     ):
         if not 0.0 <= probability <= 1.0:
             raise ValueError(f"probability must be in [0, 1], got {probability}")
-        if initializer_args is not None:
-            if not isinstance(initializer_args, DynamicEmbInitializerArgs):
-                raise TypeError(
-                    "initializer_args must be a DynamicEmbInitializerArgs, got "
-                    f"{type(initializer_args).__name__}"
-                )
-            if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM and (
-                initializer_args.lower is None or initializer_args.upper is None
-            ):
-                warnings.warn(
-                    "A UNIFORM initializer for non-admitted rows cannot take its "
-                    "bounds from a table's row count, so it falls back to "
-                    f"[{DEFAULT_UNIFORM_LOWER}, {DEFAULT_UNIFORM_UPPER}]. Give "
-                    "lower and upper to choose them, or drop initializer_args to "
-                    "let those rows use the table's own initializer.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        _check_non_admitted_initializer_args(initializer_args)
 
         self.probability = probability
         self.initializer_args = initializer_args
-
-        # log(1 - probability), for compounding a batch's repeats below. Only
-        # meaningful strictly inside (0, 1): log1p(-1) has no value, and at
-        # either end the answer needs no arithmetic.
-        self._log_miss = math.log1p(-probability) if 0.0 < probability < 1.0 else None
-
-        self._non_admitted_initializer: Optional[MultiTableInitializer] = None
 
     def get_grouped_key(self):
         return (
@@ -350,23 +335,26 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         )
 
     @classmethod
-    def materialize_for_tables(cls, table_strategies, device):
-        keys = {strategy.get_grouped_key() for strategy in table_strategies}
-        if len(keys) != 1:
-            raise ValueError(
-                f"Tables of one module must agree on their admission strategy, "
-                f"got {len(keys)} different ones: {keys}"
-            )
-        first = table_strategies[0]
-        # A new instance rather than one of these: the configurations belong to
-        # the caller and stay as they were written, and one of them is commonly
-        # shared by tables that end up in different modules.
-        materialized = cls(first.probability, first.initializer_args)
-        if first.initializer_args is not None:
-            materialized._non_admitted_initializer = MultiTableInitializer.create(
-                [strategy.initializer_args for strategy in table_strategies], device
-            )
-        return materialized
+    def create_admitter(cls, table_strategies, device):
+        first = cls.one_configuration(table_strategies)
+        return MultiTableProbabilisticAdmitter(
+            probability=first.probability,
+            non_admitted_initializer=_non_admitted_initializer(
+                table_strategies, device
+            ),
+        )
+
+
+class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
+    """What :class:`ProbabilisticAdmissionStrategy` becomes for one module."""
+
+    def __init__(self, probability: float, non_admitted_initializer=None):
+        self._probability = probability
+        # log(1 - probability), for compounding a batch's repeats below. Only
+        # meaningful strictly inside (0, 1): log1p(-1) has no value, and at
+        # either end the answer needs no arithmetic.
+        self._log_miss = math.log1p(-probability) if 0.0 < probability < 1.0 else None
+        self._non_admitted_initializer = non_admitted_initializer
 
     def admit(
         self,
@@ -375,9 +363,9 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_keys = keys.shape[0]
-        if self.probability <= 0.0:
+        if self._probability <= 0.0:
             return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)
-        if self.probability >= 1.0:
+        if self._probability >= 1.0:
             return torch.ones(num_keys, dtype=torch.bool, device=keys.device)
 
         # torch.rand draws from [0, 1), so the comparison is strict: nothing
@@ -385,7 +373,7 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         # which the initializers use, is (0, 1] and wants the opposite.)
         draws = torch.rand(num_keys, device=keys.device)
         if frequencies is None:
-            return draws < self.probability
+            return draws < self._probability
 
         # A key the batch holds k times deserves k tosses. Tossing k times and
         # taking any success is exactly one toss against 1 - (1 - p)^k, so that
@@ -395,5 +383,5 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         return draws < -torch.expm1(occurrences * self._log_miss)
 
     @property
-    def non_admitted_initializer(self) -> Optional[MultiTableInitializer]:
+    def non_admitted_initializer(self):
         return self._non_admitted_initializer

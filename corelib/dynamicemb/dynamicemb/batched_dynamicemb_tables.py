@@ -731,7 +731,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
         self._create_initializers()
-        self._create_admit_strategy()
+        self._create_admitter()
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -918,11 +918,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             device,
         )
 
-    def _create_admit_strategy(self) -> None:
+    def _create_admitter(self) -> None:
         """Turn the tables' admission configurations into the one this runs.
 
         The configurations the caller wrote are inert; this is where the
-        strategy's device state -- a counter's hash table, an initializer's
+        admitter's device state -- a counter's hash table, an initializer's
         per-table parameters -- is allocated. Whatever of it has to be
         checkpointed and accounted for comes back through ``state()``.
         """
@@ -930,7 +930,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.admit_strategy for option in self._dynamicemb_options
         ]
         if all(strategy is None for strategy in table_strategies):
-            self._admit_strategy = None
+            self._admitter = None
             self._admission_counter = None
             return
         if any(strategy is None for strategy in table_strategies):
@@ -940,10 +940,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 "Either every table of a module has an admission strategy or "
                 "none does."
             )
-        self._admit_strategy = type(table_strategies[0]).materialize_for_tables(
+        self._admitter = type(table_strategies[0]).create_admitter(
             table_strategies, torch.device(f"cuda:{self.device_id}")
         )
-        self._admission_counter = self._admit_strategy.state()
+        self._admission_counter = self._admitter.state()
 
     def _create_optimizer(
         self,
@@ -1253,7 +1253,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._initializer,
             self._optimizer,
             layout,
-            self._admit_strategy,
+            self._admitter,
             self._evict_strategy,
             pooling_weights,
             self._empty_tensor,
@@ -1305,7 +1305,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 forward_stream,
                 self._evict_strategy,
                 frequency_counters,
-                self._admit_strategy,
+                self._admitter,
                 outstanding_keys_ref=self._prefetch_outstanding_keys
                 if self._cache is not None
                 else None,

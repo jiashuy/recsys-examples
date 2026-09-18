@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ProbabilisticAdmissionStrategy.admit.
+"""Tests for what ProbabilisticAdmissionStrategy admits.
 
 Admission is consulted only for a key that is missing, so one toss per
 appearance is what makes a key's chance of being in the table rise with how
@@ -40,6 +40,14 @@ NUM_KEYS = 200_000
 # Three would be one in 370, which across a suite run often is more trouble
 # than what it is looking for.
 SIGMAS = 5.0
+
+
+def _admitter(probability, initializer_args=None):
+    """The admitter one table configured this way would run."""
+    strategy = ProbabilisticAdmissionStrategy(probability, initializer_args)
+    return ProbabilisticAdmissionStrategy.create_admitter(
+        [strategy], torch.device("cuda")
+    )
 
 
 def _inputs(num_keys=NUM_KEYS, device="cuda"):
@@ -82,7 +90,7 @@ def _assert_fraction(admitted: torch.Tensor, expected: float):
 def test_admits_at_the_configured_rate():
     probability = 0.3
     keys, table_ids = _inputs()
-    admitted = ProbabilisticAdmissionStrategy(probability).admit(keys, table_ids)
+    admitted = _admitter(probability).admit(keys, table_ids)
     _assert_fraction(admitted, probability)
 
 
@@ -90,13 +98,13 @@ def test_probability_zero_admits_nothing():
     # torch.rand can return exactly 0.0, so this only holds if the comparison
     # is strict. It is also the case log1p(-p) has no value for, at the far end.
     keys, table_ids = _inputs()
-    admitted = ProbabilisticAdmissionStrategy(0.0).admit(keys, table_ids)
+    admitted = _admitter(0.0).admit(keys, table_ids)
     assert not bool(admitted.any())
 
 
 def test_probability_one_admits_everything():
     keys, table_ids = _inputs()
-    admitted = ProbabilisticAdmissionStrategy(1.0).admit(keys, table_ids)
+    admitted = _admitter(1.0).admit(keys, table_ids)
     assert bool(admitted.all())
 
 
@@ -109,7 +117,7 @@ def test_repeats_within_a_batch_count_as_separate_tosses(occurrences):
     probability = 0.1
     keys, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = ProbabilisticAdmissionStrategy(probability).admit(
+    admitted = _admitter(probability).admit(
         keys, table_ids, frequencies
     )
     _assert_fraction(admitted, 1.0 - (1.0 - probability) ** occurrences)
@@ -125,7 +133,7 @@ def test_compounding_survives_a_probability_too_small_for_float32():
     probability, occurrences = 1e-8, 10**9
     keys, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = ProbabilisticAdmissionStrategy(probability).admit(
+    admitted = _admitter(probability).admit(
         keys, table_ids, frequencies
     )
     # Asserted coarsely on purpose. The true rate is 1 - e^-10 = 0.99995, which

@@ -35,6 +35,8 @@ from .dynamicemb_config import (
 from .embedding_admission import (
     FrequencyAdmissionStrategy,
     KVCounter,
+    MultiTableFrequencyAdmitter,
+    MultiTableProbabilisticAdmitter,
     ProbabilisticAdmissionStrategy,
 )
 from .incremental_dump import (
@@ -52,6 +54,7 @@ from .types import (
     Counter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    MultiTableAdmitter,
     ReplayStats,
 )
 from .utils import torch_to_dyn_emb
@@ -67,6 +70,9 @@ __all__ = [
     "FrequencyAdmissionStrategy",
     "Counter",
     "KVCounter",
+    "MultiTableAdmitter",
+    "MultiTableFrequencyAdmitter",
+    "MultiTableProbabilisticAdmitter",
     "ProbabilisticAdmissionStrategy",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",

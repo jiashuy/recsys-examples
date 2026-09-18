@@ -127,16 +127,41 @@ the strategy's interface.
 
 ### 3.1 The admission interface
 
+Two classes, because there are two things: what a table is configured with, and
+what a module runs. One class was both, which left a configuration carrying an
+`admit` that only raised, a `state` that was always None and an initializer that
+was never there -- half an object, right only because nobody called that half.
+
 ```python
 class AdmissionStrategy(abc.ABC):
-    @classmethod
-    def materialize_for_tables(cls, table_strategies, device) -> "AdmissionStrategy":
-        """The strategy these tables share, with its device state allocated.
+    """How a table's admission is configured. Inert, shared, decides nothing."""
 
-        Default: the tables were grouped on get_grouped_key, so they are
-        already interchangeable and the first stands for all. Override to keep
-        what a table may differ in, and to allocate.
+    @classmethod
+    @abc.abstractmethod
+    def create_admitter(cls, table_strategies, device) -> "MultiTableAdmitter":
+        """The admitter these tables share, with its device state allocated.
+
+        Called once, by the module, with one configuration per table it fuses.
+        A classmethod so each configuration picks the admitter it needs, rather
+        than a base class enumerating them.
         """
+
+    @classmethod
+    def one_configuration(cls, table_strategies) -> "AdmissionStrategy":
+        """The single configuration these tables agree on.
+
+        Grouping already made them interchangeable, so the first stands for
+        all; this says so rather than take element zero and leave the reader to
+        wonder.
+        """
+
+    def get_grouped_key(self):
+        """What must match for two tables to share a module."""
+        return id(self)
+
+
+class MultiTableAdmitter(abc.ABC):
+    """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
     def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
@@ -144,7 +169,7 @@ class AdmissionStrategy(abc.ABC):
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
-        An increment, not a running total -- any total is the strategy's own.
+        An increment, not a running total -- any total is the admitter's own.
         """
 
     def state(self) -> Optional[Counter]:
@@ -153,27 +178,18 @@ class AdmissionStrategy(abc.ABC):
 
     @property
     def non_admitted_initializer(self):
-        """What writes the rows this strategy rejects; None for the table's."""
+        """What writes the rows this admitter rejects; None for the table's."""
         return None
-
-    def get_grouped_key(self):
-        """What must match for two tables to share a module."""
-        return id(self)
 ```
 
-One abstract method — the decision. Everything else has a default, so a
-strategy that only decides implements one method, and a probabilistic one needs
-no framework change at all: `state()` stays None and `admit` is one line.
+One abstract method each. Everything else has a default, so an admitter that
+merely decides is one method, and a probabilistic one needs no framework change
+at all: `state()` stays None and `admit` is one line.
 
 `state()` exists because the counter is not private bookkeeping: it is device
 memory the framework sizes, reports through `memory_usage`, and checkpoints.
 `Counter` already is that protocol; it simply gains a second audience —
-`add`/`erase` for the strategy, `memory_usage`/`dump`/`load` for the module.
-
-A strategy as the caller writes it is inert: no allocation, nothing touched on
-the device, safe to hand to as many tables as one likes.
-`materialize_for_tables` is the one place that changes, and it returns a *new*
-instance rather than arming one of the caller's.
+`add`/`erase` for the admitter, `memory_usage`/`dump`/`load` for the module.
 
 ### 3.2 Configuration after the change
 
@@ -188,10 +204,12 @@ FrequencyAdmissionStrategy(
 `DynamicEmbTableOptions.admission_counter` is deprecated (§5). Admission is
 configured in one place, so it cannot be configured inconsistently.
 
-`FrequencyAdmissionStrategy` needs no second class for its materialized form:
-`materialize_for_tables` returns another `FrequencyAdmissionStrategy`, with the
-fused counter and the rejected-row initializer filled in. `admit` on one that
-was never materialized says so.
+Each configuration has an admitter of its own:
+`FrequencyAdmissionStrategy` builds a `MultiTableFrequencyAdmitter`, holding the
+fused counter, and `ProbabilisticAdmissionStrategy` a
+`MultiTableProbabilisticAdmitter`, holding nothing. Four classes where a single
+one would do less, and the reason to prefer them is that none of the eight
+members between them is dead.
 
 ### 3.3 Lifecycle
 
@@ -203,7 +221,7 @@ planner                              resolves table fields only; never writes in
 module construction
         |-- MultiTableInitializer.create(...)          train, from the tables' args
         |-- MultiTableInitializer.create(...)          eval, likewise
-        `-- type(s[0]).materialize_for_tables(...)     admission
+        `-- type(s[0]).create_admitter(...)            admission
                  |-- MultiTableKVCounter               from each strategy's KVCounter
                  `-- MultiTableInitializer.create      for rejected rows
 forward                              admit() decides and keeps its own books
@@ -306,9 +324,9 @@ implementation that does not answer. `group_key_of` lives in `types.py`, the
 lowest layer, because `dynamicemb_config` and `embedding_admission` both need
 it.
 
-`MultiTableInitializer.create` and `materialize_for_tables` both validate their
-inputs by *this* key rather than by hand, so what they check cannot drift from
-what actually decided the tables may be fused.
+`MultiTableInitializer.create` and `AdmissionStrategy.one_configuration` both
+validate their inputs by *this* key rather than by hand, so what they check
+cannot drift from what actually decided the tables may be fused.
 
 One consequence worth stating: tables configured with *equal but separately
 constructed* strategies group together now, where identity comparison kept them
@@ -354,8 +372,8 @@ reads `keys`, and doing so keeps that argument out of every other mode.
 
 `ProbabilisticAdmissionStrategy` admits a missing key with a fixed chance, and
 needed no framework change at all: `state()` stays None so no counter is ever
-built for it, `materialize_for_tables` only has the rejected-row initializer to
-open, and `admit` is a comparison.
+built for it, `create_admitter` only has the rejected-row initializer to open,
+and `admit` is a comparison.
 
 ```python
 draws = torch.rand(num_keys, device=keys.device)
@@ -408,15 +426,18 @@ subclasses as in §3.6; `_with_default_bounds` returning a copy rather than
 filling the caller's args in place. `BaseDynamicEmbInitializer` and
 `create_initializer_from_args` are gone — they had no users outside this file.
 
-**`types.py`** — `AdmissionStrategy` as in §3.1; `group_key_of`;
+**`types.py`** — `AdmissionStrategy` and `MultiTableAdmitter` as in §3.1;
+`group_key_of`;
 `DynamicEmbInitializerArgs.get_grouped_key`; `DEFAULT_UNIFORM_LOWER` /
 `DEFAULT_UNIFORM_UPPER`; the `__eq__` fix (already committed).
 
 **`embedding_admission.py`** — `KVCounter.get_grouped_key`;
 `FrequencyAdmissionStrategy` taking its own counter, implementing
-`materialize_for_tables`, `admit`, `state`, `non_admitted_initializer` and
-`get_grouped_key`, and warning on an unbounded `UNIFORM`. `admit` does the
-counter's `add` and `erase` itself.
+`create_admitter` and `get_grouped_key`, warning on an unbounded `UNIFORM`;
+and their admitters `MultiTableFrequencyAdmitter` and
+`MultiTableProbabilisticAdmitter` implementing `admit`, `state` and
+`non_admitted_initializer`. The frequency admitter does the counter's `add`
+and `erase` itself.
 
 **`dynamicemb_config.py`** — grouping as in §3.5; `complete_initializer_args`
 reading the shared fallback constants; the `admission_counter` deprecation and
@@ -427,8 +448,8 @@ nothing else: `eval_initializer_args` needs no resolution, being `CONSTANT` by
 construction, and a strategy is never touched.
 
 **`batched_dynamicemb_tables.py`** — `_create_initializers` builds the train
-and eval initializers; `_create_admit_strategy` materializes the strategy and
-takes `_admission_counter` from `state()`, which the dump/load paths still read.
+and eval initializers; `_create_admitter` builds the admitter and takes
+`_admission_counter` from its `state()`, which the dump/load paths still read.
 
 **`batched_dynamicemb_function.py`** — six call sites pass `table_ids`; the
 three admission paths lose their counter bookkeeping to `admit()`; rejected
@@ -447,7 +468,8 @@ signature.
 | before | after | migration |
 | --- | --- | --- |
 | `DynamicEmbTableOptions.admission_counter=KVCounter(...)` | `FrequencyAdmissionStrategy(counter=KVCounter(...))` | still works, warns |
-| `AdmissionStrategy.initialize_non_admitted_embeddings` | `non_admitted_initializer` | removed |
+| `AdmissionStrategy.initialize_non_admitted_embeddings` | `MultiTableAdmitter.non_admitted_initializer` | removed |
+| `AdmissionStrategy.admit` | `MultiTableAdmitter.admit` | a configuration no longer decides; `create_admitter` builds what does |
 | `admit(keys, frequencies)` | `admit(keys, table_ids, frequencies=None)` | `frequencies` is now a per-batch increment, not a running total |
 
 `admission_counter` keeps working: `__post_init__` warns, then folds it into a

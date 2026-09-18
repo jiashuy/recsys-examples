@@ -472,28 +472,37 @@ class Counter(abc.ABC):
 
 
 class AdmissionStrategy(abc.ABC):
-    """Decides which keys may enter a table, and owns whatever that takes.
+    """How a table's admission is configured.
 
-    A strategy the caller constructs is pure configuration: it allocates
-    nothing, touches no device, and may be handed to as many tables as one
-    likes. :meth:`materialize_for_tables` turns the per-table configurations of
-    one fused module into the single strategy that module runs, and is where
-    anything on the device comes into being.
+    This is inert: it allocates nothing, touches no device, and may be handed
+    to as many tables as you like. It does not decide anything either -- a
+    module turns the configurations of the tables it fuses into the one thing
+    that does, by calling :meth:`create_admitter`.
     """
 
     @classmethod
-    def materialize_for_tables(
+    @abc.abstractmethod
+    def create_admitter(
         cls,
         table_strategies: List["AdmissionStrategy"],
         device: torch.device,
-    ) -> "AdmissionStrategy":
-        """The strategy these tables share, with its device state allocated.
+    ) -> "MultiTableAdmitter":
+        """The admitter these tables share, with its device state allocated.
 
-        The default returns the first one: the tables were grouped on
-        :meth:`get_grouped_key`, so they are already interchangeable. Override
-        it to keep what a table may differ in -- per-table parameters in a
-        tensor the kernel indexes -- and then leave those parameters out of the
-        grouping key so such tables still fuse.
+        Called once, by the module, with one configuration per table it fuses.
+        This is where anything on the device comes into being: a counter's hash
+        table, an initializer's per-table parameters.
+        """
+
+    @classmethod
+    def one_configuration(
+        cls, table_strategies: List["AdmissionStrategy"]
+    ) -> "AdmissionStrategy":
+        """The single configuration these tables agree on.
+
+        They were grouped on :meth:`get_grouped_key`, so they are already
+        interchangeable and the first stands for all; this says so rather than
+        take element zero and leave the reader to wonder.
         """
         keys = {strategy.get_grouped_key() for strategy in table_strategies}
         if len(keys) != 1:
@@ -506,38 +515,23 @@ class AdmissionStrategy(abc.ABC):
     def get_grouped_key(self):
         """What has to match for two tables to share one fused module.
 
-        The tables of a fused module share a single strategy, so this decides
+        The tables of a fused module share a single admitter, so this decides
         which configurations are interchangeable. The default is the instance
         itself: only the very same object groups, which is how strategies
         behaved before they had a say. Override it to let equal but separately
-        constructed strategies share a module -- return everything that changes
-        the admission decision, and for anything resolved per table return only
+        constructed configurations share a module -- return everything that
+        changes the decision, and for anything resolved per table return only
         what the tables must agree on.
         """
         return id(self)
 
-    def state(self) -> Optional[Counter]:
-        """Persistent state the framework has to carry, or None.
 
-        Whatever a strategy accumulates across steps lives on the device, has
-        to be reported in memory accounting, and has to survive a checkpoint.
-        Return it here and the framework does all three; keeping it private
-        would only mean it is none of those.
-        """
-        return None
+class MultiTableAdmitter(abc.ABC):
+    """What a fused module runs: one admitter over all of its tables.
 
-    @property
-    def non_admitted_initializer(self):
-        """What writes the rows this strategy rejects, or None for the table's.
-
-        A rejected key still takes part in the forward, so its row has to be
-        written by something. Returning a ``MultiTableInitializer`` here hands
-        that job to it; None leaves those rows to the table's own initializer.
-        The module does the calling, so buffer layout stays out of a strategy's
-        business, and which of the two writes them is settled once, here, and
-        not renegotiated on every batch.
-        """
-        return None
+    Built by :meth:`AdmissionStrategy.create_admitter`, and the only half that
+    holds anything -- whatever deciding takes, it owns.
+    """
 
     @abc.abstractmethod
     def admit(
@@ -555,8 +549,31 @@ class AdmissionStrategy(abc.ABC):
             frequencies (Optional[torch.Tensor]): How often each key occurred in
                 *this batch*, where the module counts occurrences at all; None
                 means treat each key as one occurrence. An increment, not a
-                running total -- any total is the strategy's own to keep.
+                running total -- any total is the admitter's own to keep.
 
         Returns:
             torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
+
+    def state(self) -> Optional[Counter]:
+        """Persistent state the framework has to carry, or None.
+
+        Whatever an admitter accumulates across steps lives on the device, has
+        to be reported in memory accounting, and has to survive a checkpoint.
+        Return it here and the framework does all three; keeping it private
+        would only mean it is none of those.
+        """
+        return None
+
+    @property
+    def non_admitted_initializer(self):
+        """What writes the rows this admitter rejects, or None for the table's.
+
+        A rejected key still takes part in the forward, so its row has to be
+        written by something. Returning a ``MultiTableInitializer`` here hands
+        that job to it; None leaves those rows to the table's own initializer.
+        The module does the calling, so buffer layout stays out of an
+        admitter's business, and which of the two writes them is settled once,
+        when the admitter is built, and not renegotiated on every batch.
+        """
+        return None
