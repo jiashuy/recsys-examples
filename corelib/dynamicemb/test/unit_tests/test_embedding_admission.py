@@ -3,6 +3,7 @@
 
 import os
 import random
+import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -305,6 +306,16 @@ def validate_non_admitted_embedding_values(
     ),
 )
 @click.option(
+    "--case",
+    type=str,
+    default=None,
+    help=(
+        "Run one case of the suite. It supplies the options it cares about; "
+        "anything also given on the command line still wins. --list-cases "
+        "prints the names, --list-cases --num-gpus N those worth that many."
+    ),
+)
+@click.option(
     "--expect-all-rejected",
     is_flag=True,
     help=(
@@ -328,6 +339,7 @@ def test_admission_strategy_validation(
     non_admitted_init_value: float,
     no_strategy_initializer: bool,
     expect_all_rejected: bool,
+    case: Optional[str],
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
@@ -474,11 +486,148 @@ def test_admission_strategy_validation(
     print(f"\n✓ Admission strategy test passed!")
 
 
+# The suite as a table rather than as copies of a torchrun line. A case names
+# only the options that differ from the command's defaults, and says which
+# process counts it means anything at. test_embedding_admission.sh asks for the
+# names and runs each one in its own process, so no parameter lives there.
+
+STORAGE_MODES = {
+    # The three ways a lookup reaches admission.
+    "hbm-direct": {},
+    "hybrid": {"global_hbm_budget_scale": 0.25},
+    "cache": {"caching": True, "cache_capacity_ratio": 0.3},
+}
+OPTIMIZERS = ("sgd", "adam", "rowwise_adagrad")
+SCORE_STRATEGIES = ("timestamp", "lfu", "step")
+
+_FOUR_TABLES = {
+    "num_embedding_collections": 2,
+    "num_embeddings": "10000,10000,10000,10000",
+    "multi_hot_sizes": "5,5,5,5",
+    "embedding_dim": 16,
+    "batch_size": 32,
+    "num_iterations": 10,
+    "threshold": 4,
+}
+_ONE_TABLE = {
+    "num_embedding_collections": 1,
+    "embedding_dim": 16,
+    "optimizer_type": "sgd",
+    "threshold": 4,
+}
+
+
+def _build_cases():
+    cases = {}
+
+    # Admission over every storage path, every optimizer and every score
+    # strategy a table can be built with.
+    for storage, storage_options in STORAGE_MODES.items():
+        for optimizer in OPTIMIZERS:
+            for score_strategy in SCORE_STRATEGIES:
+                cases[f"{storage}-{optimizer}-{score_strategy}"] = {
+                    "gpus": (1, 8),
+                    "options": {
+                        **_FOUR_TABLES,
+                        **storage_options,
+                        "optimizer_type": optimizer,
+                        "score_strategy": score_strategy,
+                    },
+                }
+
+    # Long enough for a key to accumulate its way past the threshold.
+    for storage, storage_options in (
+        ("hbm-direct", {}),
+        ("cache", {"caching": True, "cache_capacity_ratio": 0.4}),
+    ):
+        cases[f"high-frequency-{storage}"] = {
+            "gpus": (1,),
+            "options": {
+                **_ONE_TABLE,
+                **storage_options,
+                "num_embeddings": "5000",
+                "multi_hot_sizes": "3",
+                "batch_size": 16,
+                "num_iterations": 50,
+            },
+        }
+
+    # A cache far too small for the keys, so admission runs against eviction.
+    for optimizer in ("sgd", "adam"):
+        cases[f"tiny-cache-{optimizer}"] = {
+            "gpus": (1,),
+            "options": {
+                **_ONE_TABLE,
+                "optimizer_type": optimizer,
+                "num_embeddings": "10000",
+                "multi_hot_sizes": "5",
+                "batch_size": 64,
+                "num_iterations": 25,
+                "caching": True,
+                "cache_capacity_ratio": 0.08,
+            },
+        }
+
+    # A threshold no key can reach, so every value the forward returns comes
+    # from whichever initializer owns the rows admission rejects.
+    for owner, owner_options in (
+        ("strategy", {"non_admitted_init_value": 0.5}),
+        ("table", {"no_strategy_initializer": True}),
+    ):
+        for storage, storage_options in STORAGE_MODES.items():
+            cases[f"reject-all-{owner}-{storage}"] = {
+                "gpus": (1, 8),
+                "options": {
+                    **_FOUR_TABLES,
+                    **storage_options,
+                    **owner_options,
+                    "optimizer_type": "sgd",
+                    "threshold": 10**9,
+                    "expect_all_rejected": True,
+                },
+            }
+
+    return cases
+
+
+CASES = _build_cases()
+
+
+def case_names(num_gpus: Optional[int] = None) -> List[str]:
+    """The cases worth running at this process count, or all of them."""
+    return [
+        name
+        for name, case in CASES.items()
+        if num_gpus is None or num_gpus in case["gpus"]
+    ]
+
+
+def _case_options(argv: List[str]) -> Dict[str, object]:
+    """The options of the --case in argv, for click to take as defaults."""
+    if "--case" not in argv:
+        return {}
+    name = argv[argv.index("--case") + 1]
+    if name not in CASES:
+        raise SystemExit(f"unknown case {name!r}; --list-cases prints them")
+    return CASES[name]["options"]
+
+
 if __name__ == "__main__":
+    # Listing is answered before anything claims a device, so that the shell
+    # driver can ask for the names without a GPU.
+    if "--list-cases" in sys.argv:
+        num_gpus = (
+            int(sys.argv[sys.argv.index("--num-gpus") + 1])
+            if "--num-gpus" in sys.argv
+            else None
+        )
+        print("\n".join(case_names(num_gpus)))
+        sys.exit(0)
+
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(LOCAL_RANK)
 
     dist.init_process_group(backend="nccl")
-    test_admission_strategy_validation()
+    test_admission_strategy_validation(default_map=_case_options(sys.argv))
     dist.barrier()
     dist.destroy_process_group()
