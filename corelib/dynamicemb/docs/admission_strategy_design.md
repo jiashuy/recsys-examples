@@ -487,7 +487,8 @@ Commit 4 is a prerequisite: `create` compares resolved parameters, and
 
 1-3, 6 and 8 are new files; 4 and 7 extend `test_embedding_admission.sh`.
 
-`test/unit_tests/test_probabilistic_admission.py` covers §3.7 and is written:
+`test/unit_tests/admission/test_probabilistic_admission.py` covers §3.7 and is
+written:
 the rate, both ends of the range, repeats compounding to `1 - (1 - p)^k`, a
 seeded run repeating, and a probability small enough that computing
 `(1 - p)^k` directly would admit nothing — which separates the two forms

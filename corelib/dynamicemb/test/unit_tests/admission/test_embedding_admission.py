@@ -15,6 +15,11 @@ from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 
+# test_embedding_dump_load is the fixture module the tests in unit_tests share
+# -- test_lfu_scores and test_hybrid_storage_export import it too -- so it stays
+# a directory up and has to be put on the path from here.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
     ADMISSION_COUNTER_CAPACITY,

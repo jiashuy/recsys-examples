@@ -16,11 +16,11 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/test_padded_buffer_optimizer.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
-    "test/unit_tests/test_probabilistic_admission.py"
+    "test/unit_tests/admission/test_probabilistic_admission.py"
 )
 
 LOAD_DUMP_TEST_FILES=(
-    "test/unit_tests/test_embedding_admission.sh"
+    "test/unit_tests/admission/test_embedding_admission.sh"
     "test/unit_tests/test_embedding_dump_load.sh"
     "test/unit_tests/incremental_dump/test_incremental_dump.sh"
 )

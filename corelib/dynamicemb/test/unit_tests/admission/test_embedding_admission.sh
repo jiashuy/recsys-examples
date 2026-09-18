@@ -4,7 +4,7 @@
 # to be decided out here, because torchrun decides it.
 set -e
 
-TEST=./test/unit_tests/test_embedding_admission.py
+TEST=./test/unit_tests/admission/test_embedding_admission.py
 
 for num_gpus in 1 8; do
   for case_name in $(python3 "$TEST" --list-cases --num-gpus "$num_gpus"); do
