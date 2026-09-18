@@ -1,10 +1,15 @@
 #!/bin/bash
-# The suite itself lives in test_embedding_admission.py, which names its cases
-# and the process counts each is worth running at. Only the process count has
-# to be decided out here, because torchrun decides it.
+# Everything about admission. The strategies that decide on their own, then the
+# end-to-end suite, which lives in test_embedding_admission.py: it names its
+# cases and the process counts each is worth running at, so the only thing left
+# to decide out here is that count, because torchrun decides it.
 set -e
 
-TEST=./test/unit_tests/admission/test_embedding_admission.py
+ADMISSION=./test/unit_tests/admission
+TEST=$ADMISSION/test_embedding_admission.py
+
+# Cheap and needs one GPU, so it runs first and fails before the 70 below.
+pytest -svv $ADMISSION/test_probabilistic_admission.py || exit 1
 
 for num_gpus in 1 8; do
   for case_name in $(python3 "$TEST" --list-cases --num-gpus "$num_gpus"); do
