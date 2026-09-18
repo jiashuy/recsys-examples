@@ -3,11 +3,7 @@ from dataclasses import replace
 from typing import Dict, List, Optional
 
 from dynamicemb.dynamicemb_config import *
-from dynamicemb.types import (
-    DEFAULT_UNIFORM_LOWER,
-    DEFAULT_UNIFORM_UPPER,
-    group_key_of,
-)
+from dynamicemb.types import DEFAULT_UNIFORM_LOWER, DEFAULT_UNIFORM_UPPER, group_key_of
 from dynamicemb_extensions import (
     CurandStateContext,
     const_init,
@@ -83,9 +79,7 @@ class MultiTableInitializer(abc.ABC):
         rows = initializer_class.table_param_rows(args_list)
         table_params = None
         if any(row != rows[0] for row in rows):
-            table_params = torch.tensor(
-                rows, dtype=torch.float32, device=device
-            )
+            table_params = torch.tensor(rows, dtype=torch.float32, device=device)
         return initializer_class(args_list[0], table_params)
 
     def __init__(
@@ -166,9 +160,7 @@ class TruncatedNormalInitializer(MultiTableInitializer):
 
     @staticmethod
     def table_param_rows(args_list):
-        return [
-            [args.mean, args.std_dev, args.lower, args.upper] for args in args_list
-        ]
+        return [[args.mean, args.std_dev, args.lower, args.upper] for args in args_list]
 
     def __call__(self, buffer, keys, table_ids, indices) -> None:
         if self._table_params is None:

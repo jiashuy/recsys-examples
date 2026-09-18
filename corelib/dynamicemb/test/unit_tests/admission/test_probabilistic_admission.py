@@ -74,9 +74,9 @@ def _assert_fraction(admitted: torch.Tensor, expected: float):
     # The floor keeps a rate of exactly 0 or 1 -- no randomness, so no variance
     # -- from collapsing the window to nothing. Nothing here reaches it.
     tolerance = SIGMAS * math.sqrt(max(expected * (1.0 - expected), 1e-12) / num_keys)
-    assert abs(observed - expected) <= tolerance, (
-        f"admitted {observed:.6f}, expected {expected:.6f} +/- {tolerance:.6f}"
-    )
+    assert (
+        abs(observed - expected) <= tolerance
+    ), f"admitted {observed:.6f}, expected {expected:.6f} +/- {tolerance:.6f}"
 
 
 def test_admits_at_the_configured_rate():

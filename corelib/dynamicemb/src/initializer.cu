@@ -167,7 +167,8 @@ static TableParamPtrs check_table_params(const at::Tensor &buffer,
   check_beside_buffer(buffer, table_params, "table_params");
   check_beside_buffer(buffer, table_ids, "table_ids");
   if (table_params.scalar_type() != at::kFloat) {
-    throw std::invalid_argument("Initializer's table_params have to be float32.");
+    throw std::invalid_argument(
+        "Initializer's table_params have to be float32.");
   }
   if (table_params.dim() != 2 || table_params.size(1) != num_params) {
     throw std::invalid_argument(
@@ -189,9 +190,8 @@ static TableParamPtrs check_table_params(const at::Tensor &buffer,
         "Initializer's table_ids have to run alongside the value buffer, one "
         "per row of it -- not alongside the indices selecting rows.");
   }
-  return TableParamPtrs{
-      static_cast<const float *>(table_params.data_ptr()),
-      static_cast<const int64_t *>(table_ids.data_ptr())};
+  return TableParamPtrs{static_cast<const float *>(table_params.data_ptr()),
+                        static_cast<const int64_t *>(table_ids.data_ptr())};
 }
 
 void normal_init(at::Tensor buffer, at::Tensor indices,
@@ -199,21 +199,21 @@ void normal_init(at::Tensor buffer, at::Tensor indices,
                  float std_dev) {
   using GeneratorT = NormalEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{mean, std_dev}};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
 
 void normal_init_table_params(at::Tensor buffer, at::Tensor indices,
-                           CurandStateContext &curand_state_context,
-                           at::Tensor table_params, at::Tensor table_ids) {
+                              CurandStateContext &curand_state_context,
+                              at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = NormalEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
-                                    GeneratorT::kNumParams);
+                                 GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
@@ -223,22 +223,22 @@ void truncated_normal_init(at::Tensor buffer, at::Tensor indices,
                            float std_dev, float lower, float upper) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{mean, std_dev, lower, upper}};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
 
-void truncated_normal_init_table_params(at::Tensor buffer, at::Tensor indices,
-                                     CurandStateContext &curand_state_context,
-                                     at::Tensor table_params,
-                                     at::Tensor table_ids) {
+void truncated_normal_init_table_params(
+    at::Tensor buffer, at::Tensor indices,
+    CurandStateContext &curand_state_context, at::Tensor table_params,
+    at::Tensor table_ids) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
-                                    GeneratorT::kNumParams);
+                                 GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
@@ -248,21 +248,21 @@ void uniform_init(at::Tensor buffer, at::Tensor indices,
                   float upper) {
   using GeneratorT = UniformEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{lower, upper}};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
 
 void uniform_init_table_params(at::Tensor buffer, at::Tensor indices,
-                            CurandStateContext &curand_state_context,
-                            at::Tensor table_params, at::Tensor table_ids) {
+                               CurandStateContext &curand_state_context,
+                               at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = UniformEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
-                                    GeneratorT::kNumParams);
+                                 GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
-  auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
-                                                  params};
+  auto generator_args =
+      typename GeneratorT::Args{curand_state_context.ptr(), params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args,
                                         curand_state_context.num_worker());
 }
@@ -275,10 +275,10 @@ void const_init(at::Tensor buffer, at::Tensor indices, float value) {
 }
 
 void const_init_table_params(at::Tensor buffer, at::Tensor indices,
-                          at::Tensor table_params, at::Tensor table_ids) {
+                             at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = ConstEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
-                                    GeneratorT::kNumParams);
+                                 GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args);

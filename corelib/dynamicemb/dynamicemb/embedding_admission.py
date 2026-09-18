@@ -338,9 +338,7 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
         # log(1 - probability), for compounding a batch's repeats below. Only
         # meaningful strictly inside (0, 1): log1p(-1) has no value, and at
         # either end the answer needs no arithmetic.
-        self._log_miss = (
-            math.log1p(-probability) if 0.0 < probability < 1.0 else None
-        )
+        self._log_miss = math.log1p(-probability) if 0.0 < probability < 1.0 else None
 
         self._non_admitted_initializer: Optional[MultiTableInitializer] = None
 

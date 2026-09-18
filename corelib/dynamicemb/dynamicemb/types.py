@@ -560,4 +560,3 @@ class AdmissionStrategy(abc.ABC):
         Returns:
             torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
-

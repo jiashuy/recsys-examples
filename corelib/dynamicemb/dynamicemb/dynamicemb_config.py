@@ -36,10 +36,10 @@ from dynamicemb.types import (
     Storage,
     group_key_of,
 )
-from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 
-# fbgemm exports its own PoolingMode, so the bound C++ enum is aliased here to
+# fbgemm exports its own PoolingMode, so the bound C++ enum is aliased below to
 # keep the two apart wherever both are in scope.
+from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
