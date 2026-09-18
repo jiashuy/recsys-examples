@@ -29,6 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <curand_kernel.h>
 #include <pybind11/pybind11.h>
 #include <random>
+#include <string>
 
 namespace dyn_emb {
 
@@ -37,12 +38,11 @@ DEVICE_INLINE unsigned int worker_id() {
   return grid.thread_rank();
 }
 
-// The parameters a generator reads. A fused module holds several logical
-// tables in one value buffer, and they need not initialize alike, so a
-// parameter is either shared by all of them or looked up per table. Each
-// kernel is built for exactly one of the two: the shared form keeps its
-// parameters in registers and never reads memory for them, and neither form
-// carries the other's fields.
+// The parameters a generator reads. Both forms serve a fused module's buffer,
+// which holds several logical tables; what differs is the parameters, shared
+// by every table or held one row per table. Each kernel is built for exactly
+// one of the two: the shared form keeps its parameters in registers and never
+// reads memory for them, and neither form carries the other's fields.
 template <bool kPerTable, int kNumParams> struct InitParams;
 
 template <int kNumParams> struct InitParams<false, kNumParams> {
@@ -54,11 +54,11 @@ template <int kNumParams> struct InitParams<false, kNumParams> {
 };
 
 template <int kNumParams> struct InitParams<true, kNumParams> {
-  const float *table_args; // [num_tables, kNumParams], row-major
-  const int64_t *table_ids; // buffer row -> table, the convention keys uses
+  const float *table_params; // [num_tables, kNumParams], row-major
+  const int64_t *table_ids;  // buffer row -> table, the convention keys uses
 
   DEVICE_INLINE float get(int64_t vec_id, int slot) const {
-    return table_args[table_ids[vec_id] * kNumParams + slot];
+    return table_params[table_ids[vec_id] * kNumParams + slot];
   }
 };
 

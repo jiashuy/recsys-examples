@@ -230,9 +230,11 @@ fallback; `complete_initializer_args` and the initializer both read them.
 `MultiTableInitializer.create` decides once, at construction, whether its
 tables agree. They usually do, and then each subclass calls its mode's plain
 kernel with the parameters as scalars — the same call the code made before this
-change. When they do not, it calls that mode's `_per_table` kernel with a
+change. When they do not, it calls that mode's `_table_params` kernel with a
 `[num_tables, num_params]` float32 tensor and the table each buffer row belongs
-to.
+to. Both write the same multi-table buffer; only where the parameters come from
+differs, which is why the second form is named for the parameters and not
+`_multi_table`.
 
 The two are **separate entry points, hence separate kernels**, so the common
 path carries nothing of the other's. In CUDA that is one templated holder:
@@ -246,10 +248,10 @@ template <int N> struct InitParams<false, N> {
 };
 
 template <int N> struct InitParams<true, N> {
-  const float *table_args;   // [num_tables, N], row-major
+  const float *table_params; // [num_tables, N], row-major
   const int64_t *table_ids;  // buffer row -> table
   DEVICE_INLINE float get(int64_t vec_id, int slot) const {
-    return table_args[table_ids[vec_id] * N + slot];
+    return table_params[table_ids[vec_id] * N + slot];
   }
 };
 ```
@@ -259,7 +261,10 @@ reads `params_.get(vec_id, slot)`. The shared instantiation keeps its
 parameters in registers, reads no memory for them, and carries neither pointer;
 there is no runtime branch in either.
 
-`table_ids` is addressed by buffer row, the convention `keys` already uses.
+`keys` and `table_ids` run alongside the value buffer, one entry per row of
+it, and `indices` picks out the rows to write -- which is why it comes last in
+an initializer's signature, and why the launchers check the other two against
+the buffer's row count rather than trust the convention to be remembered.
 Per mode: `UNIFORM`/`NORMAL` 2 parameters, `TRUNCATED_NORMAL` 4, `CONSTANT` 1.
 `DEBUG` derives the value from the key, so it takes no parameters, its tables
 cannot disagree, and it has no per-table form.
@@ -318,25 +323,25 @@ nothing else:
 
 ```python
 class UniformInitializer(MultiTableInitializer):
-    def __init__(self, args, table_parameters=None):
-        super().__init__(args, table_parameters)
+    def __init__(self, args, table_params=None):
+        super().__init__(args, table_params)
         self._curand_state = CurandStateContext()
 
     @staticmethod
-    def table_parameters(args_list):
+    def table_param_rows(args_list):
         return [[args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, indices, keys, table_ids=None):
-        if self._table_parameters is None:
+    def __call__(self, buffer, keys, table_ids, indices):
+        if self._table_params is None:
             uniform_init(buffer, indices, self._curand_state,
                          self._args.lower, self._args.upper)
         else:
-            uniform_init_per_table(buffer, indices, self._curand_state,
-                                   self._table_parameters,
-                                   self._table_ids_for_kernel(table_ids))
+            uniform_init_table_params(buffer, indices, self._curand_state,
+                                      self._table_params,
+                                      self._table_ids_for_kernel(table_ids))
 ```
 
-`table_parameters` is where the tensor's column order is written down, four
+`table_param_rows` is where the column order is written down, four
 lines from the scalar call that has to agree with it and with the slot indices
 the matching generator reads. That adjacency is the whole point: before this
 change the order existed in one place only, and adding a second far from the
@@ -395,7 +400,8 @@ templated on `kPerTable` and reading `params_.get(vec_id, slot)`;
 
 **`src/initializer.cu`** — `check_table_params` validating dtype, shape and
 contiguity; two launchers per parameterized mode; nine bindings, of which the
-five pre-existing ones keep their signatures unchanged.
+five pre-existing ones keep their names and signatures unchanged, the new ones
+being `<mode>_init_table_params`.
 
 **`initializer.py`** — `MultiTableInitializer` as base plus `create`; five
 subclasses as in §3.6; `_with_default_bounds` returning a copy rather than

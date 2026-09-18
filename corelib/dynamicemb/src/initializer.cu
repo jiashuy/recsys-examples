@@ -80,6 +80,22 @@ __global__ void initialize_with_index_addressor_kernel(
   gen.destroy();
 }
 
+// Everything an initializer reads is dereferenced by the kernel, so a tensor
+// left on the host, or on another device, is an illegal access rather than a
+// wrong answer. Say which tensor it was before launching.
+static void check_beside_buffer(const at::Tensor &buffer,
+                                const at::Tensor &tensor, const char *name) {
+  if (!tensor.is_cuda()) {
+    throw std::invalid_argument(std::string("Initializer's ") + name +
+                                " have to be a CUDA tensor.");
+  }
+  if (tensor.device() != buffer.device()) {
+    throw std::invalid_argument(
+        std::string("Initializer's ") + name +
+        " have to be on the same device as the value buffer.");
+  }
+}
+
 template <typename GeneratorT>
 void initialize_with_generator(at::Tensor buffer, at::Tensor indices,
                                typename GeneratorT::Args generator_args,
@@ -92,6 +108,11 @@ void initialize_with_generator(at::Tensor buffer, at::Tensor indices,
     throw std::runtime_error(
         "Initializer'input buffer has to be contiguous at dim1.");
   }
+  if (!buffer.is_cuda()) {
+    throw std::invalid_argument(
+        "Initializer's value buffer have to be a CUDA tensor.");
+  }
+  check_beside_buffer(buffer, indices, "indices");
   int64_t num_total = indices.size(0);
   int64_t dim = buffer.size(1);
   int64_t stride = buffer.stride(0);
@@ -130,27 +151,31 @@ void initialize_with_generator(at::Tensor buffer, at::Tensor indices,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// The pointers a per-table generator reads. ``table_args`` is
-// [num_tables, num_params] and ``table_ids`` maps a row of the value buffer to
-// the table that owns it, the convention ``keys`` already uses.
+// The pointers a per-table generator reads. ``table_params`` is
+// [num_tables, num_params]; ``table_ids`` says which table owns each row of
+// the value buffer, so it runs alongside that buffer, as ``keys`` does, while
+// ``indices`` picks out the rows to write.
 struct TableParamPtrs {
   const float *args;
   const int64_t *ids;
 };
 
-static TableParamPtrs check_table_params(const at::Tensor &table_args,
+static TableParamPtrs check_table_params(const at::Tensor &buffer,
+                                         const at::Tensor &table_params,
                                          const at::Tensor &table_ids,
                                          int64_t num_params) {
-  if (table_args.scalar_type() != at::kFloat) {
-    throw std::invalid_argument("Initializer's table_args have to be float32.");
+  check_beside_buffer(buffer, table_params, "table_params");
+  check_beside_buffer(buffer, table_ids, "table_ids");
+  if (table_params.scalar_type() != at::kFloat) {
+    throw std::invalid_argument("Initializer's table_params have to be float32.");
   }
-  if (table_args.dim() != 2 || table_args.size(1) != num_params) {
+  if (table_params.dim() != 2 || table_params.size(1) != num_params) {
     throw std::invalid_argument(
-        "Initializer's table_args have to be [num_tables, num_params].");
+        "Initializer's table_params have to be [num_tables, num_params].");
   }
-  if (!table_args.is_contiguous()) {
+  if (!table_params.is_contiguous()) {
     throw std::invalid_argument(
-        "Initializer's table_args have to be contiguous.");
+        "Initializer's table_params have to be contiguous.");
   }
   if (table_ids.scalar_type() != at::kLong) {
     throw std::invalid_argument("Initializer's table_ids have to be int64.");
@@ -159,8 +184,13 @@ static TableParamPtrs check_table_params(const at::Tensor &table_args,
     throw std::invalid_argument(
         "Initializer's table_ids have to be contiguous.");
   }
+  if (table_ids.size(0) != buffer.size(0)) {
+    throw std::invalid_argument(
+        "Initializer's table_ids have to run alongside the value buffer, one "
+        "per row of it -- not alongside the indices selecting rows.");
+  }
   return TableParamPtrs{
-      static_cast<const float *>(table_args.data_ptr()),
+      static_cast<const float *>(table_params.data_ptr()),
       static_cast<const int64_t *>(table_ids.data_ptr())};
 }
 
@@ -175,11 +205,12 @@ void normal_init(at::Tensor buffer, at::Tensor indices,
                                         curand_state_context.num_worker());
 }
 
-void normal_init_per_table(at::Tensor buffer, at::Tensor indices,
+void normal_init_table_params(at::Tensor buffer, at::Tensor indices,
                            CurandStateContext &curand_state_context,
-                           at::Tensor table_args, at::Tensor table_ids) {
+                           at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = NormalEmbeddingGenerator<true>;
-  auto ptrs = check_table_params(table_args, table_ids, GeneratorT::kNumParams);
+  auto ptrs = check_table_params(buffer, table_params, table_ids,
+                                    GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
                                                   params};
@@ -198,12 +229,13 @@ void truncated_normal_init(at::Tensor buffer, at::Tensor indices,
                                         curand_state_context.num_worker());
 }
 
-void truncated_normal_init_per_table(at::Tensor buffer, at::Tensor indices,
+void truncated_normal_init_table_params(at::Tensor buffer, at::Tensor indices,
                                      CurandStateContext &curand_state_context,
-                                     at::Tensor table_args,
+                                     at::Tensor table_params,
                                      at::Tensor table_ids) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator<true>;
-  auto ptrs = check_table_params(table_args, table_ids, GeneratorT::kNumParams);
+  auto ptrs = check_table_params(buffer, table_params, table_ids,
+                                    GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
                                                   params};
@@ -222,11 +254,12 @@ void uniform_init(at::Tensor buffer, at::Tensor indices,
                                         curand_state_context.num_worker());
 }
 
-void uniform_init_per_table(at::Tensor buffer, at::Tensor indices,
+void uniform_init_table_params(at::Tensor buffer, at::Tensor indices,
                             CurandStateContext &curand_state_context,
-                            at::Tensor table_args, at::Tensor table_ids) {
+                            at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = UniformEmbeddingGenerator<true>;
-  auto ptrs = check_table_params(table_args, table_ids, GeneratorT::kNumParams);
+  auto ptrs = check_table_params(buffer, table_params, table_ids,
+                                    GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{curand_state_context.ptr(),
                                                   params};
@@ -241,16 +274,23 @@ void const_init(at::Tensor buffer, at::Tensor indices, float value) {
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args);
 }
 
-void const_init_per_table(at::Tensor buffer, at::Tensor indices,
-                          at::Tensor table_args, at::Tensor table_ids) {
+void const_init_table_params(at::Tensor buffer, at::Tensor indices,
+                          at::Tensor table_params, at::Tensor table_ids) {
   using GeneratorT = ConstEmbeddingGenerator<true>;
-  auto ptrs = check_table_params(table_args, table_ids, GeneratorT::kNumParams);
+  auto ptrs = check_table_params(buffer, table_params, table_ids,
+                                    GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{params};
   initialize_with_generator<GeneratorT>(buffer, indices, generator_args);
 }
 
 void debug_init(at::Tensor buffer, at::Tensor indices, at::Tensor keys) {
+  check_beside_buffer(buffer, keys, "keys");
+  if (keys.size(0) != buffer.size(0)) {
+    throw std::invalid_argument(
+        "Initializer's keys have to run alongside the value buffer, one per "
+        "row of it -- not alongside the indices selecting rows.");
+  }
   auto key_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(keys.dtype()));
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
@@ -271,45 +311,46 @@ void bind_initializer_op(py::module &m) {
            py::return_value_policy::reference);
 
   // Each mode comes in two forms. The plain one takes the parameters every
-  // table of a fused module shares; the ``_per_table`` one takes a
+  // table of a fused module shares; the ``_table_params`` one takes a
   // [num_tables, num_params] table of them plus the table each buffer row
-  // belongs to. They are separate entry points, and so separate kernels, so
-  // the shared form carries nothing of the other's.
+  // belongs to. Both serve the same multi-table buffer -- only the parameters
+  // differ. They are separate entry points, and so separate kernels, so the
+  // shared form carries nothing of the other's.
   m.def("normal_init", &dyn_emb::normal_init, "Normal initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
         py::arg("mean"), py::arg("std_dev"));
 
-  m.def("normal_init_per_table", &dyn_emb::normal_init_per_table,
-        "Normal initializer with per-table parameters", py::arg("buffer"),
+  m.def("normal_init_table_params", &dyn_emb::normal_init_table_params,
+        "Normal initializer, parameters one row per table", py::arg("buffer"),
         py::arg("indices"), py::arg("curand_state_context"),
-        py::arg("table_args"), py::arg("table_ids"));
+        py::arg("table_params"), py::arg("table_ids"));
 
   m.def("truncated_normal_init", &dyn_emb::truncated_normal_init,
         "Truncated normal initializer", py::arg("buffer"), py::arg("indices"),
         py::arg("curand_state_context"), py::arg("mean"), py::arg("std_dev"),
         py::arg("lower"), py::arg("upper"));
 
-  m.def("truncated_normal_init_per_table",
-        &dyn_emb::truncated_normal_init_per_table,
-        "Truncated normal initializer with per-table parameters",
+  m.def("truncated_normal_init_table_params",
+        &dyn_emb::truncated_normal_init_table_params,
+        "Truncated normal initializer, parameters one row per table",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
-        py::arg("table_args"), py::arg("table_ids"));
+        py::arg("table_params"), py::arg("table_ids"));
 
   m.def("uniform_init", &dyn_emb::uniform_init, "Uniform initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
         py::arg("lower"), py::arg("upper"));
 
-  m.def("uniform_init_per_table", &dyn_emb::uniform_init_per_table,
-        "Uniform initializer with per-table parameters", py::arg("buffer"),
+  m.def("uniform_init_table_params", &dyn_emb::uniform_init_table_params,
+        "Uniform initializer, parameters one row per table", py::arg("buffer"),
         py::arg("indices"), py::arg("curand_state_context"),
-        py::arg("table_args"), py::arg("table_ids"));
+        py::arg("table_params"), py::arg("table_ids"));
 
   m.def("const_init", &dyn_emb::const_init, "Const initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("value"));
 
-  m.def("const_init_per_table", &dyn_emb::const_init_per_table,
-        "Const initializer with per-table parameters", py::arg("buffer"),
-        py::arg("indices"), py::arg("table_args"), py::arg("table_ids"));
+  m.def("const_init_table_params", &dyn_emb::const_init_table_params,
+        "Const initializer, parameters one row per table", py::arg("buffer"),
+        py::arg("indices"), py::arg("table_params"), py::arg("table_ids"));
 
   m.def("debug_init", &dyn_emb::debug_init, "Debug initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("keys"));

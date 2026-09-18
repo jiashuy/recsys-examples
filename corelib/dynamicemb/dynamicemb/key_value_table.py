@@ -4049,7 +4049,7 @@ def _eval_lookup_storage(
     )
 
     if h_num_missing > 0:
-        initializer(embs, missing_indices, keys, table_ids)
+        initializer(embs, keys, table_ids, missing_indices)
 
     return embs
 
@@ -4092,7 +4092,7 @@ def _eval_lookup_cached(
 
     if h_num_missing_in_storage > 0:
         initializer(
-            storage_embs, missing_indices_in_storage, missing_keys, missing_table_ids
+            storage_embs, missing_keys, missing_table_ids, missing_indices_in_storage
         )
 
     embs[miss_compact_idx, :] = storage_embs

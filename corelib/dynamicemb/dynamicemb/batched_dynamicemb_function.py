@@ -263,11 +263,12 @@ def _apply_admission(
             with torch.cuda.nvtx.range("op:initializer"):
                 non_admitted_initializer(
                     values[:, :max_emb_dim],
-                    non_admitted_indices,
-                    # Both addressed by row of ``values``, which is why these
-                    # are the whole unique vectors and not the missing slice.
+                    # Alongside ``values``, which is why these are the whole
+                    # unique vectors and not the missing slice; the rows to
+                    # write come last.
                     unique_keys,
                     unique_table_ids,
+                    non_admitted_indices,
                 )
 
         with torch.cuda.nvtx.range("op:flagged_compact"):
@@ -468,9 +469,9 @@ def _prefetch_cache_path(
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(
                     init_vals[:, :max_emb_dim],
-                    init_indices,
                     new_admitted_keys,
                     new_admitted_tids,
+                    init_indices,
                 )
 
             if max_val_dim != max_emb_dim:
@@ -668,9 +669,9 @@ def _prefetch_hbm_direct_path(
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(
                     init_values[:, :max_emb_dim],
-                    init_idx,
                     admitted_keys,
                     admitted_tids,
+                    init_idx,
                 )
 
             if max_val_dim != max_emb_dim:
@@ -1052,9 +1053,9 @@ def _generic_forward_path(
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(
                     unique_values[:, :max_emb_dim],
-                    indices_to_init,
                     unique_keys,
                     unique_table_ids,
+                    indices_to_init,
                 )
 
         if max_val_dim != max_emb_dim:
@@ -1135,9 +1136,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         # at construction, so this is one call either way.
                         (non_admitted_initializer or initializer)(
                             unique_embs[:, :max_emb_dim],
-                            na,
                             prefetch_state.unique_keys,
                             prefetch_state.unique_table_ids,
+                            na,
                         )
                 unique_values = None
                 persisted_unique_indices = None
