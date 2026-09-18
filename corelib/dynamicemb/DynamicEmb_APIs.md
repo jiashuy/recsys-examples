@@ -1093,84 +1093,50 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
 
 ## Counter
 
-**dynamicemb** provides an interface to the Counter which will be used in the embedding admission, and the users can customize the counter implementation by inherit the class `Counter`.
-
+A counter maps a key to an accumulated count. A strategy that admits by
+frequency owns one; the framework only carries it, reporting its memory and
+writing it into checkpoints, which is what `AdmissionStrategy.state()` hands
+over. Custom counters inherit `Counter`.
 
 ```python
 class Counter(abc.ABC):
-    """
-    Interface of a counter table which maps a key to a counter.
-    """
+    """Interface of a counter table which maps a key to a counter."""
 
     @abc.abstractmethod
     def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the frequencies will be assigned directly.
-        For existing keys, the frequencies will be accumulated.
-        Args:
-            keys (torch.Tensor): The input keys, should be unique keys.
-            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
-        Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
-        """
-        accumulated_frequencies: torch.Tensor
-        return accumulated_frequencies
+        """Add frequencies to these keys and return their accumulated counts."""
 
     @abc.abstractmethod
-    def erase(self, keys) -> None:
-        """
-        Erase keys form the `Counter`.
-        Args:
-            keys (torch.Tensor): The input keys to be erased.
-        """
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Erase these keys."""
 
     @abc.abstractmethod
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
-        """
-        Get the consumption of a specific memory type.
-        Args:
-            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
-        """
+        """Consumption of one kind of memory."""
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file) -> None:
-        """
-        Load keys and frequencies from input file path.
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
+    def load(self, key_file, counter_file, table_id: int) -> None:
+        """Load one table's keys and counts from these files."""
 
     @abc.abstractmethod
-    def dump(self, key_file, counter_file) -> None:
-        """
-        Dump keys and frequencies to output file path.
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
-        
-    @abc.abstractmethod
-    def create(self, device: torch.device) -> "Counter":
-        """
-        Create the counter table on the specified device.
-        """
+    def dump(self, key_file, counter_file, table_id: int) -> None:
+        """Dump one table's keys and counts to these files."""
 ```
 
-**dynamicemb** also provides a built-in counter implementation named `KVCounter`.
-There is as capacity limit of `KVCounter` which is bucketized, and the key with the smallest frequency will be evicted from the bucket for a new key if the bucket is full. 
+**dynamicemb** provides `KVCounter`, which sizes one table's share of a counter.
+It is configuration, not a `Counter`: the strategy holding it turns the shares
+of the tables it serves into a single fused `MultiTableKVCounter` when a module
+materializes it. The table is bucketized, and a full bucket evicts its
+smallest-frequency key to make room, so size the capacity for the keys still
+waiting to be admitted rather than for the embedding table.
 
 ```python
-
-class KVCounter(Counter):
-    """
-    Interface of a counter table which maps a key to a counter.
-    """
-
+class KVCounter:
     def __init__(
         self,
         capacity: int,
@@ -1181,50 +1147,108 @@ class KVCounter(Counter):
 
 ## AdmissionStrategy
 
-**AdmissionStrategy** is another component for implementing embedding admission.
-The keys not in the dynamic embedding table, will first be passed to the `Counter`, after get the accumulated frequencies among the previous training process, the `AdmissionStrategy` will determine which keys will be admitted into the dynamic embedding table.
+**AdmissionStrategy** decides which keys missing from the table may enter it,
+and owns whatever deciding takes. A strategy as written is configuration: it
+allocates nothing, touches no device, and may be given to as many tables as you
+like. A fused module turns the per-table configurations into the one strategy it
+runs by calling `materialize_for_tables`, which is where anything device-side
+comes into being.
+
+Only `admit` has to be implemented. Everything else has a default, so a strategy
+that merely decides is one method.
 
 ```python
 class AdmissionStrategy(abc.ABC):
+    @classmethod
+    def materialize_for_tables(
+        cls,
+        table_strategies: List["AdmissionStrategy"],
+        device: torch.device,
+    ) -> "AdmissionStrategy":
+        """The strategy these tables share, with its device state allocated.
+
+        The default returns the first: tables are grouped on get_grouped_key,
+        so a module's strategies are already interchangeable. Override it to
+        keep what a table may differ in, and to allocate.
+        """
+
     @abc.abstractmethod
     def admit(
         self,
         keys: torch.Tensor,
-        frequencies: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Admit keys with frequencies >= threshold.
+        """Which of these missing keys may enter the table.
+
+        ``frequencies`` is how often each key occurred in *this batch*, where
+        the module counts occurrences at all; None means treat each key as one.
+        It is an increment, not a running total -- any total is the strategy's
+        own to keep.
         """
 
-    @abc.abstractmethod
-    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+    def state(self) -> Optional[Counter]:
+        """Persistent state the framework has to carry, or None.
+
+        Whatever a strategy accumulates across steps has to be reported in
+        memory accounting and survive a checkpoint. Return it here and the
+        framework does both.
         """
-        Get the initializer args for keys that are not admitted.
+
+    @property
+    def non_admitted_initializer(self):
+        """What writes the rows this strategy rejects, or None for the table's.
+
+        A rejected key still takes part in the forward, so its row has to be
+        written by something. Return a ``MultiTableInitializer`` to take that
+        on; the module does the calling.
+        """
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused module.
+
+        The default is the instance itself, so only the same object groups.
+        Override it to let equal but separately constructed strategies share a
+        module, returning everything that changes the decision and, for what is
+        resolved per table, only what the tables must agree on.
         """
 ```
 
-**dynamicemb** provides built-in `FrequencyAdmissionStrategy`, which will return keys whose frequencies are not less than the threshold.
+**dynamicemb** provides two built-in strategies.
+
+`FrequencyAdmissionStrategy` admits a key once it has been seen often enough.
+It carries the counter it accumulates into, so admission is configured in one
+place; a key is erased from that counter the moment it is admitted.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
-    """
-    Frequency-based admission strategy.
-    Only admits keys whose frequency (score) meets or exceeds a threshold.
-    Parameters
-    ----------
-    threshold : int
-        Minimum frequency threshold for admission. Keys with frequency >= threshold
-        will be admitted into the embedding table.
-    initializer_args: Optional[DynamicEmbInitializerArgs]
-        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
-    """
-
     def __init__(
         self,
         threshold: int,
+        counter: Optional[KVCounter] = None,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
     )
 ```
+
+`ProbabilisticAdmissionStrategy` admits a key by a coin toss instead, and keeps
+no state at all -- its `state()` is None and no counter is built for it.
+Admission is consulted only for a key that is missing, so a key gets a fresh
+toss every time it turns up and is not yet in the table: it takes
+`1 / probability` appearances on average to get in. A batch holding a key `k`
+times counts as `k` tosses.
+
+```python
+class ProbabilisticAdmissionStrategy(AdmissionStrategy):
+    def __init__(
+        self,
+        probability: float,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    )
+```
+
+For both, `initializer_args` says how to initialize the rows the strategy
+rejects; None leaves them to the table's own initializer, which is also the only
+way to get UNIFORM bounds derived from a table's row count.
 
 # Functionality and User interface
 
