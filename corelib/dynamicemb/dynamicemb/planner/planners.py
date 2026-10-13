@@ -134,6 +134,18 @@ class DynamicEmbParameterSharding(ParameterSharding):
             fused_params.pop(name, None)
 
 
+def _pooling_of(config: BaseEmbeddingConfig) -> Optional[object]:
+    """How a table pools, or ``None`` when it does not pool at all.
+
+    ``EmbeddingBagConfig`` carries ``pooling``; ``EmbeddingConfig`` -- a
+    sequence table in an ``EmbeddingCollection`` -- has no such field. TorchRec
+    groups on pooling either way, so the answer only has to be consistent:
+    every sequence table reports ``None`` and so agrees with the others, and
+    differs from any pooled table.
+    """
+    return getattr(config, "pooling", None)
+
+
 def _sharding_type_of(constraint: DynamicEmbParameterConstraints) -> str:
     """The sharding type a DynamicEmb table is declared with.
 
@@ -436,7 +448,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         # Recorded here because `_plan_torchrec` costs the plan later and has
         # only the ParameterShardings, which do not mention pooling.
         self._table_poolings = {
-            name: config.pooling for name, config in configs.items()
+            name: _pooling_of(config) for name, config in configs.items()
         }
         self._planned_dynamicemb = True
 
@@ -491,7 +503,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 ShardingType.ROW_WISE.value,
                 self._constraints[name].dynamicemb_options,
                 optimizers.get(name),
-                configs[name].pooling,
+                _pooling_of(configs[name]),
             )
             row_wise_groups[key].append(member(name))
         for members in row_wise_groups.values():
@@ -508,7 +520,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                     name=name,
                     options=self._constraints[name].dynamicemb_options,
                     optimizer_type=optimizers.get(name),
-                    pooling=configs[name].pooling,
+                    pooling=_pooling_of(configs[name]),
                     pinned=self._constraints[name].dynamicemb_options.host_index,
                 )
                 for name in sorted(trw)
