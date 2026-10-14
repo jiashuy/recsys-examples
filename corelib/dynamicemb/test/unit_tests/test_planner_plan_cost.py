@@ -508,75 +508,71 @@ def _mixed_sharders(pooled_optimizer=None, sequence_optimizer=None):
     ]
 
 
-def test_each_collection_reads_its_own_sharders_optimizer():
-    """The sharders need not agree, and a table follows the one that claims it.
+class TestOptimizerTypes:
+    """Where a table's optimizer comes from, when the model is sharded by more
+    than one sharder and they need not agree."""
 
-    Flattening the list to a single value -- taking the last sharder that names
-    an optimizer -- would hand every table one module's answer, and the one it
-    picked would depend on the order the caller happened to pass them in.
-    """
-    model = _MixedModel()
-    sharders = _mixed_sharders(
-        pooled_optimizer=OptimType.ADAM,
-        sequence_optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
-    )
+    @pytest.fixture
+    def model(self):
+        return _MixedModel()
 
-    assert optimizer_types(model, sharders) == {
-        "p0": OptimType.ADAM,
-        "p1": OptimType.ADAM,
-        "s0": OptimType.EXACT_ROWWISE_ADAGRAD,
-    }
+    def test_each_collection_reads_its_own_sharders_optimizer(self, model):
+        """A table follows the sharder that claims it.
 
-    # and the answer does not depend on the order they were passed in
-    assert optimizer_types(model, list(reversed(sharders))) == optimizer_types(
-        model, sharders
-    )
+        Flattening the list to a single value -- taking the last sharder that
+        names an optimizer -- would hand every table one module's answer, and
+        the one it picked would depend on the order the caller happened to pass
+        them in.
+        """
+        sharders = _mixed_sharders(
+            pooled_optimizer=OptimType.ADAM,
+            sequence_optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
+        )
 
+        assert optimizer_types(model, sharders) == {
+            "p0": OptimType.ADAM,
+            "p1": OptimType.ADAM,
+            "s0": OptimType.EXACT_ROWWISE_ADAGRAD,
+        }
 
-def test_a_sharder_that_names_no_optimizer_leaves_its_tables_unset():
-    """Only the collection without one; the other sharder does not fill it in."""
-    model = _MixedModel()
-    sharders = _mixed_sharders(pooled_optimizer=OptimType.ADAM)
+        # and the answer does not depend on the order they were passed in
+        assert optimizer_types(model, list(reversed(sharders))) == optimizer_types(
+            model, sharders
+        )
 
-    assert optimizer_types(model, sharders) == {
-        "p0": OptimType.ADAM,
-        "p1": OptimType.ADAM,
-        "s0": None,
-    }
+    def test_a_parameter_optimizer_wins_over_its_sharder(self, model):
+        apply_optimizer_in_backward(
+            torch.optim.SGD, model.pooled.parameters(), {"lr": 0.1}
+        )
 
+        assert optimizer_types(
+            model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)
+        ) == {
+            "p0": OptimType.EXACT_SGD,
+            "p1": OptimType.EXACT_SGD,
+            "s0": None,
+        }
 
-def test_a_parameter_optimizer_wins_over_its_sharder():
-    model = _MixedModel()
-    apply_optimizer_in_backward(torch.optim.SGD, model.pooled.parameters(), {"lr": 0.1})
+    def test_an_optimizer_torchrec_cannot_name_falls_back_to_the_sharder(self, model):
+        """DynamicEmb's own FTRL is one of these: applied to the parameter, but
+        with no EmbOptimType to convert to. The sharder's answer is better than
+        none."""
+        apply_optimizer_in_backward(
+            torch.optim.RMSprop, model.pooled.parameters(), {"lr": 0.1}
+        )
 
-    assert optimizer_types(model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)) == {
-        "p0": OptimType.EXACT_SGD,
-        "p1": OptimType.EXACT_SGD,
-        "s0": None,
-    }
+        assert optimizer_types(
+            model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)
+        ) == {
+            "p0": OptimType.ADAM,
+            "p1": OptimType.ADAM,
+            "s0": None,
+        }
 
-
-def test_an_optimizer_torchrec_cannot_name_falls_back_to_the_sharder():
-    """DynamicEmb's own FTRL is one of these: applied to the parameter, but with
-    no EmbOptimType to convert to. The sharder's answer is better than none."""
-    model = _MixedModel()
-    apply_optimizer_in_backward(
-        torch.optim.RMSprop, model.pooled.parameters(), {"lr": 0.1}
-    )
-
-    assert optimizer_types(model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)) == {
-        "p0": OptimType.ADAM,
-        "p1": OptimType.ADAM,
-        "s0": None,
-    }
-
-
-def test_a_table_no_sharder_claims_is_not_reported():
-    """`shardable_parameters` is the same accessor `module_without_tables`
-    prunes by, so what is planned and what is costed are the same set."""
-    model = _MixedModel()
-
-    assert set(optimizer_types(model, [EmbeddingBagCollectionSharder()])) == {
-        "p0",
-        "p1",
-    }
+    def test_a_table_no_sharder_claims_is_not_reported(self, model):
+        """`shardable_parameters` is the same accessor `module_without_tables`
+        prunes by, so what is planned and what is costed are the same set."""
+        assert set(optimizer_types(model, [EmbeddingBagCollectionSharder()])) == {
+            "p0",
+            "p1",
+        }
