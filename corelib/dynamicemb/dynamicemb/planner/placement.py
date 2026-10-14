@@ -69,7 +69,7 @@ class TableToPlace:
         The table's ``PoolingType``. Not DynamicEmb's to know -- it is on the
         TorchRec config -- but TorchRec groups on it, so two tables that differ
         here do not pool their budgets.
-    pinned : Optional[int]
+    pinned_to : Optional[int]
         The node the caller named through ``DynamicEmbTableOptions.node_index``.
         A placer must honour it, and must still check that it fits.
     """
@@ -78,13 +78,14 @@ class TableToPlace:
     options: "DynamicEmbTableOptions"
     optimizer_type: Optional[OptimType] = None
     pooling: object = None
-    pinned: Optional[int] = None
+    pinned_to: Optional[int] = None
 
     @property
-    def fuses_with(self) -> Tuple:
+    def fusion_key(self) -> Tuple:
         """What this table must match for its budget to be pooled with another's.
 
-        :func:`~dynamicemb.planner.plan.fusion_key`, so the placer and
+        The module-level :func:`~dynamicemb.planner.plan.fusion_key` -- not
+        this property, which a method body does not see -- so the placer and
         `per_rank_storage` cannot disagree about which tables share a TBE --
         and a table-row-wise table is always that, since a pin or a placement
         decides only the node.
@@ -97,18 +98,23 @@ class TableToPlace:
         )
 
     @property
-    def member(self) -> Tuple["DynamicEmbTableOptions", Optional[OptimType]]:
-        """The pair :func:`get_group_value_bytes_by_tier` costs."""
+    def group_member(self) -> Tuple["DynamicEmbTableOptions", Optional[OptimType]]:
+        """This table as one of the ``members`` a group is costed from.
+
+        :func:`get_group_value_bytes_by_tier` takes a list of these. The group
+        is whatever shares a :attr:`fusion_key`; this is the one element of it
+        that is this table.
+        """
         return (self.options, self.optimizer_type)
 
-    def alone(self) -> Storage:
+    def cost_alone(self) -> Storage:
         """What this table costs a rank with nothing to pool with.
 
         Only for ordering: the largest-first sort needs a number before any
         placement exists. What a table actually costs a node is the difference
         it makes to that node's grouped total.
         """
-        hbm, ddr = get_group_value_bytes_by_tier([self.member])
+        hbm, ddr = get_group_value_bytes_by_tier([self.group_member])
         return make_storage(hbm=hbm, ddr=ddr)
 
 
@@ -213,13 +219,13 @@ class BalancedNodePlacer(NodePlacer):
             then goes to them.
             """
             before = cost_of(node)
-            held[node][table.fuses_with].append(table.member)
+            held[node][table.fusion_key].append(table.group_member)
             after = cost_of(node)
-            held[node][table.fuses_with].pop()
+            held[node][table.fusion_key].pop()
             return after - before
 
         def give(node: int, table: TableToPlace) -> None:
-            held[node][table.fuses_with].append(table.member)
+            held[node][table.fusion_key].append(table.group_member)
 
         def spare(node: int) -> Storage:
             left = room[node] - cost_of(node)
@@ -230,11 +236,11 @@ class BalancedNodePlacer(NodePlacer):
         # Pinned tables first: they are not choices, and what they take has to
         # be gone from the room before anything is fitted around them.
         for table in tables:
-            if table.pinned is None:
+            if table.pinned_to is None:
                 continue
-            if not 0 <= table.pinned < num_nodes:
+            if not 0 <= table.pinned_to < num_nodes:
                 raise ValueError(
-                    f"Table {table.name!r} is pinned to node {table.pinned}, "
+                    f"Table {table.name!r} is pinned to node {table.pinned_to}, "
                     f"which is outside the {num_nodes} nodes of this topology."
                 )
             # Checked the same as a table this placer chose for. A pin says
@@ -243,23 +249,23 @@ class BalancedNodePlacer(NodePlacer):
             # which TorchRec's own reservation looks for on `devices[0]` alone
             # (`storage_reservations.py:509`), so a pin to any other node would
             # go unnoticed and the plan would be returned.
-            needs, left = added_by(table.pinned, table), spare(table.pinned)
+            needs, left = added_by(table.pinned_to, table), spare(table.pinned_to)
             if not needs.fits_in(left):
                 raise ValueError(
-                    f"Table {table.name!r} is pinned to node {table.pinned}, "
+                    f"Table {table.name!r} is pinned to node {table.pinned_to}, "
                     f"which cannot hold it. It adds {needs} to each of that "
                     f"node's {local_size} ranks, which have {left} left. Pin "
                     "it elsewhere, leave node_index unset and let the placer "
                     "choose, or give it row-wise sharding."
                 )
-            chosen[table.name] = table.pinned
-            give(table.pinned, table)
+            chosen[table.name] = table.pinned_to
+            give(table.pinned_to, table)
 
         # Then the rest, biggest first. "Biggest" is what a table weighs on its
         # own, which is the only size there is before anything is placed.
         unpinned = sorted(
-            (t for t in tables if t.pinned is None),
-            key=lambda t: (-t.alone().hbm, -t.alone().ddr, t.name),
+            (t for t in tables if t.pinned_to is None),
+            key=lambda t: (-t.cost_alone().hbm, -t.cost_alone().ddr, t.name),
         )
         for table in unpinned:
             # Emptiest node that can hold it, measured after what each would

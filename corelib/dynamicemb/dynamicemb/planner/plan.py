@@ -84,7 +84,7 @@ __all__ = [
     "module_without_tables",
     "storage_ssd",
     "table_fanout",
-    "table_layout",
+    "table_ranks",
 ]
 
 
@@ -492,7 +492,7 @@ def table_fanout(sharding_type: str, world_size: int, local_size: int) -> int:
     return local_size
 
 
-def table_layout(
+def table_ranks(
     sharding_type: str,
     node_index: Optional[int],
     world_size: int,

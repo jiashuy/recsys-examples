@@ -47,7 +47,7 @@ from .plan import (
     optimizer_types,
     per_rank_storage,
     table_fanout,
-    table_layout,
+    table_ranks,
     topology_minus,
 )
 from ..dynamicemb_config import (
@@ -416,7 +416,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 # every rank writes the same thing.
                 #
                 # Only here. A row-wise table keeps whatever the caller set, so
-                # that `table_layout` can refuse a node_index on one -- writing
+                # that `table_ranks` can refuse a node_index on one -- writing
                 # None over it first would turn a refusal into a silent
                 # correction, which is the opposite of what that check is for.
                 opts.node_index = nodes[name]
@@ -424,7 +424,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             # Row-wise is every rank; table-row-wise is one node's ranks. The
             # shard metadata follows, so there are `local_size` entries for a
             # TRW table rather than `world_size` (§4.1).
-            ranks = table_layout(sharding_type, opts.node_index, world_size, local_size)
+            ranks = table_ranks(sharding_type, opts.node_index, world_size, local_size)
 
             self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
                 sharding_spec=EnumerableShardingSpec(
@@ -463,7 +463,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         """Which node each table-row-wise table lands on.
 
         Row-wise tables get ``None``: they are on every rank, so there is no
-        node to name, and `table_layout` refuses one.
+        node to name, and `table_ranks` refuses one.
 
         The work goes to a :class:`~dynamicemb.planner.placement.NodePlacer`,
         which the caller can replace. What this does is prepare its inputs --
@@ -486,7 +486,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         if not trw:
             return {}
 
-        def member(name: str):
+        def group_member(name: str):
             return (self._constraints[name].dynamicemb_options, optimizers.get(name))
 
         # The row-wise tables are on every rank, so they shift no choice between
@@ -505,7 +505,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 optimizers.get(name),
                 _pooling_of(configs[name]),
             )
-            row_wise_groups[key].append(member(name))
+            row_wise_groups[key].append(group_member(name))
         for members in row_wise_groups.values():
             hbm, ddr = get_group_value_bytes_by_tier(members)
             cost = make_storage(hbm=hbm, ddr=ddr)
@@ -521,7 +521,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                     options=self._constraints[name].dynamicemb_options,
                     optimizer_type=optimizers.get(name),
                     pooling=_pooling_of(configs[name]),
-                    pinned=self._constraints[name].dynamicemb_options.node_index,
+                    pinned_to=self._constraints[name].dynamicemb_options.node_index,
                 )
                 for name in sorted(trw)
             ],

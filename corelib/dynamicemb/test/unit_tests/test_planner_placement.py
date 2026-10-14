@@ -50,7 +50,7 @@ def _nothing_spent():
     return [make_storage(hbm=0, ddr=0, ssd=0) for _ in range(WORLD)]
 
 
-def _table(name, size_gb, pinned=None, budget_gb=None):
+def _table(name, size_gb, pinned_to=None, budget_gb=None):
     """A table weighing `size_gb` per rank.
 
     Its HBM budget defaults to its size, so it sits entirely in HBM and
@@ -68,7 +68,7 @@ def _table(name, size_gb, pinned=None, budget_gb=None):
             embedding_dtype=torch.float32,
             local_hbm_for_values=budget * GB,
         ),
-        pinned=pinned,
+        pinned_to=pinned_to,
     )
 
 
@@ -86,7 +86,7 @@ def test_largest_first_onto_the_emptiest_node():
 
 def test_a_pin_is_honoured_and_others_fit_around_it():
     chosen = BalancedNodePlacer().place(
-        [_table("a", 30, pinned=1), _table("b", 20)],
+        [_table("a", 30, pinned_to=1), _table("b", 20)],
         _topology(),
         _nothing_spent(),
     )
@@ -137,7 +137,7 @@ def test_a_table_that_fits_nowhere_says_so():
 def test_a_pin_outside_the_topology_is_an_error():
     with pytest.raises(ValueError, match="outside the 2 nodes"):
         BalancedNodePlacer().place(
-            [_table("a", 1, pinned=5)], _topology(), _nothing_spent()
+            [_table("a", 1, pinned_to=5)], _topology(), _nothing_spent()
         )
 
 
@@ -170,7 +170,7 @@ def test_a_pin_to_a_node_that_cannot_hold_it_is_refused():
     """
     with pytest.raises(ValueError, match="cannot hold it"):
         BalancedNodePlacer().place(
-            [_table("a", 200, pinned=1)], _topology(), _nothing_spent()
+            [_table("a", 200, pinned_to=1)], _topology(), _nothing_spent()
         )
 
 
@@ -178,14 +178,14 @@ def test_a_pin_is_refused_against_room_already_taken():
     """The check is against what is left, not against an empty machine: an
     earlier pin to the same node counts."""
     placer = BalancedNodePlacer()
-    tables = [_table("first", 60, pinned=0), _table("second", 40, pinned=0)]
+    tables = [_table("first", 60, pinned_to=0), _table("second", 40, pinned_to=0)]
     with pytest.raises(ValueError, match="'second'"):
         placer.place(tables, _topology(hbm=80 * GB), _nothing_spent())
 
 
 def test_a_pin_that_fits_is_still_honoured():
     chosen = BalancedNodePlacer().place(
-        [_table("a", 70, pinned=1)], _topology(hbm=80 * GB), _nothing_spent()
+        [_table("a", 70, pinned_to=1)], _topology(hbm=80 * GB), _nothing_spent()
     )
     assert chosen == {"a": 1}
 
@@ -204,8 +204,8 @@ def test_a_groupmate_with_spare_budget_makes_room():
     generous = _table("generous", 4, budget_gb=20)  # 4 GB of a 20 GB budget
     needy = _table("needy", 16, budget_gb=2)  # 16 GB with 2 GB allowed
 
-    assert needy.alone().ddr == 14 * GB, "priced alone it spills 14 GB to host"
-    assert generous.alone().ddr == 0
+    assert needy.cost_alone().ddr == 14 * GB, "priced alone it spills 14 GB to host"
+    assert generous.cost_alone().ddr == 0
 
     chosen = BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
     assert chosen["generous"] == chosen["needy"], (
@@ -247,7 +247,7 @@ def test_a_different_optimizer_is_a_different_group():
         optimizer_type=OptimType.ADAM,  # generous has None
         pooling=needy.pooling,
     )
-    assert generous.fuses_with != needy.fuses_with
+    assert generous.fusion_key != needy.fusion_key
 
     with pytest.raises(ValueError, match="No node can hold"):
         BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
@@ -264,7 +264,7 @@ def test_a_different_pooling_is_a_different_group():
         options=needy.options,
         pooling=PoolingType.SUM,  # generous has None
     )
-    assert generous.fuses_with != needy.fuses_with
+    assert generous.fusion_key != needy.fusion_key
 
     with pytest.raises(ValueError, match="No node can hold"):
         BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
@@ -283,4 +283,4 @@ def test_a_different_dtype_is_a_different_group():
     )
     assert halved == needy.options, "the DynamicEmb key alone does not separate them"
     needy = TableToPlace(name="needy", options=halved)
-    assert generous.fuses_with != needy.fuses_with, "but the fusion key does"
+    assert generous.fusion_key != needy.fusion_key, "but the fusion key does"
