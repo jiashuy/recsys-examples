@@ -21,7 +21,9 @@ be checked without one.
 """
 
 import copy
+from dataclasses import fields
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -37,6 +39,7 @@ from torchrec.distributed.planner.types import PlannerError, Topology
 from dynamicemb.planner.plan import make_storage
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
+    ParameterSharding,
     ShardingType,
     ShardMetadata,
 )
@@ -81,24 +84,51 @@ def _options(rows: int = ROWS, hbm_budget: int = 0) -> DynamicEmbTableOptions:
     )
 
 
-def _sharding(ranks, rows: int = ROWS, hbm_budget: int = 0):
-    """A ParameterSharding placing one shard of `rows` rows on each of `ranks`."""
-    return DynamicEmbParameterSharding(
-        sharding_type=ShardingType.ROW_WISE.value,
-        compute_kernel="customized_kernel",
-        ranks=list(ranks),
-        sharding_spec=EnumerableShardingSpec(
-            [
-                ShardMetadata(
-                    shard_sizes=[rows, DIM],
-                    shard_offsets=[rows * i, 0],
-                    placement=f"rank:{rank}/cuda:{rank % LOCAL_SIZE}",
-                )
-                for i, rank in enumerate(ranks)
-            ]
+class _Planned(NamedTuple):
+    """A table as the planner keeps it: decisions on the plan record, and the
+    options it was planned with beside them rather than on it."""
+
+    sharding: ParameterSharding
+    options: DynamicEmbTableOptions
+
+
+def _sharding(ranks, rows: int = ROWS, hbm_budget: int = 0) -> _Planned:
+    """One shard of `rows` rows on each of `ranks`, and its options."""
+    return _Planned(
+        ParameterSharding(
+            sharding_type=ShardingType.ROW_WISE.value,
+            compute_kernel="customized_kernel",
+            ranks=list(ranks),
+            sharding_spec=EnumerableShardingSpec(
+                [
+                    ShardMetadata(
+                        shard_sizes=[rows, DIM],
+                        shard_offsets=[rows * i, 0],
+                        placement=f"rank:{rank}/cuda:{rank % LOCAL_SIZE}",
+                    )
+                    for i, rank in enumerate(ranks)
+                ]
+            ),
         ),
-        dynamicemb_options=_options(rows, hbm_budget),
+        _options(rows, hbm_budget),
     )
+
+
+def _spent(planned, optimizer_types, world_size: int = WORLD_SIZE, poolings=None):
+    """`per_rank_storage` over a {name: _Planned} mapping.
+
+    The plan and the options go in as two arguments because that is how the
+    planner holds them -- the plan record carries decisions, and the options
+    live with the constraints they came from.
+    """
+    return per_rank_storage(
+        {name: p.sharding for name, p in planned.items()},
+        {name: p.options for name, p in planned.items()},
+        optimizer_types=optimizer_types,
+        world_size=world_size,
+        poolings=poolings,
+    )
+
 
 
 def _topology(hbm: int = 80 * GB, ddr: int = 128 * GB) -> Topology:
@@ -129,11 +159,7 @@ def test_shard_rank_reads_both_placement_forms():
 
 
 def test_row_wise_table_charges_every_rank_equally():
-    per_rank = per_rank_storage(
-        {"t": _sharding(range(WORLD_SIZE))},
-        optimizer_types={"t": None},
-        world_size=WORLD_SIZE,
-    )
+    per_rank = _spent({"t": _sharding(range(WORLD_SIZE))}, optimizer_types={"t": None})
     assert len(per_rank) == WORLD_SIZE
     values = ROWS * DIM * 4  # float32, no optimizer state
     assert all(s == make_storage(hbm=0, ddr=values, ssd=0) for s in per_rank)
@@ -145,10 +171,9 @@ def test_a_table_on_one_node_charges_only_that_node():
     Under TABLE_ROW_WISE a table lives on one node's ranks. Charging every rank
     for it would reserve four nodes' worth of room for one node's table.
     """
-    per_rank = per_rank_storage(
+    per_rank = _spent(
         {"t": _sharding([2, 3])},  # the second node only
         optimizer_types={"t": None},
-        world_size=WORLD_SIZE,
     )
     values = ROWS * DIM * 4
     assert per_rank[0] == make_storage()
@@ -158,10 +183,9 @@ def test_a_table_on_one_node_charges_only_that_node():
 
 
 def test_tables_on_a_rank_add_up():
-    per_rank = per_rank_storage(
+    per_rank = _spent(
         {"a": _sharding(range(WORLD_SIZE)), "b": _sharding([0])},
         optimizer_types={"a": None, "b": None},
-        world_size=WORLD_SIZE,
     )
     values = ROWS * DIM * 4
     assert per_rank[0].ddr == 2 * values
@@ -172,15 +196,13 @@ def test_optimizer_state_lands_entirely_in_ddr():
     """local_hbm_for_values is a fixed budget, so the optimizer's extra bytes
     cannot come out of HBM -- they all spill to the host tier."""
     hbm_budget = ROWS * DIM * 4  # exactly the values, nothing spare
-    without = per_rank_storage(
+    without = _spent(
         {"t": _sharding(range(WORLD_SIZE), hbm_budget=hbm_budget)},
         optimizer_types={"t": None},
-        world_size=WORLD_SIZE,
     )
-    with_adam = per_rank_storage(
+    with_adam = _spent(
         {"t": _sharding(range(WORLD_SIZE), hbm_budget=hbm_budget)},
         optimizer_types={"t": OptimType.ADAM},
-        world_size=WORLD_SIZE,
     )
 
     assert without[0].ddr == 0
@@ -190,11 +212,7 @@ def test_optimizer_state_lands_entirely_in_ddr():
 
 def test_a_shard_outside_the_world_is_an_error():
     with pytest.raises(ValueError, match="outside the world"):
-        per_rank_storage(
-            {"t": _sharding([WORLD_SIZE])},
-            optimizer_types={"t": None},
-            world_size=WORLD_SIZE,
-        )
+        _spent({"t": _sharding([WORLD_SIZE])}, optimizer_types={"t": None})
 
 
 def test_topology_minus_subtracts_per_rank_and_copies():
@@ -308,6 +326,61 @@ def test_an_ssd_overdraft_is_caught():
 def test_topology_minus_rejects_a_length_mismatch():
     with pytest.raises(ValueError, match="entries but the topology has"):
         topology_minus(_topology(), [make_storage()] * (WORLD_SIZE - 1))
+
+
+# --- how a DynamicEmb table reaches the plan --------------------------------
+
+
+def test_the_plan_record_carries_decisions_and_nothing_else():
+    """`_insert_dynamicemb_plan` puts its own record straight into the plan, so
+    the record has to be exactly what the plan carries. Options on it would
+    ride the broadcast, where `external_storage` is a live handle this process
+    opened and `score_function` is a Python callable."""
+    planned = _sharding(range(WORLD_SIZE))
+
+    assert type(planned.sharding) is ParameterSharding
+    assert not hasattr(planned.sharding, "dynamicemb_options")
+
+
+def test_the_options_are_added_on_arrival():
+    """The other half: a rank completes the decisions it was sent with the
+    options it kept. Every inherited field has to survive, which is why
+    `with_options` copies them through `fields(ParameterSharding)` rather than
+    naming them."""
+    planned = _sharding(range(WORLD_SIZE))
+
+    completed = DynamicEmbParameterSharding.with_options(
+        planned.sharding, planned.options
+    )
+
+    assert isinstance(completed, DynamicEmbParameterSharding)
+    assert completed.dynamicemb_options is planned.options
+    for f in fields(ParameterSharding):
+        if f.name == "sharding_spec":
+            continue
+        assert getattr(completed, f.name) == getattr(planned.sharding, f.name), f.name
+
+    # What TorchRec will ask it for, once the kernel is built.
+    assert completed.get_additional_fused_params() == {
+        "dynamicemb_options": planned.options
+    }
+
+
+def test_the_completed_entry_does_not_share_metadata_with_the_record():
+    """DMP rewrites placements in place when its device is `meta`
+    (`embeddingbag.py:995`), and on rank 0 the plan still holds the planner's
+    own record -- a broadcast hands the leader back its own object rather than
+    a round trip (`collective_utils.py:65-67`). Sharing the spec would let the
+    first DMP rewrite what a second `plan` call hands out."""
+    planned = _sharding(range(WORLD_SIZE))
+
+    completed = DynamicEmbParameterSharding.with_options(
+        planned.sharding, planned.options
+    )
+
+    assert completed.sharding_spec is not planned.sharding.sharding_spec
+    completed.sharding_spec.shards[0].placement = "rank:7/cuda:7"
+    assert str(planned.sharding.sharding_spec.shards[0].placement) != "rank:7/cuda:7"
 
 
 # --- where the refusal happens ---------------------------------------------
@@ -482,9 +555,8 @@ def test_a_table_row_wise_table_only_costs_its_own_node():
     """§4.1 and §4.2 meeting §2: the placement decides who pays, and
     per_rank_storage reads it off the shard metadata."""
     ranks = table_ranks(TRW, 1, WORLD, LOCAL)
-    sharding = _sharding(ranks)
-    spent = per_rank_storage(
-        {"t": sharding}, optimizer_types={"t": None}, world_size=WORLD
+    spent = _spent(
+        {"t": _sharding(ranks)}, optimizer_types={"t": None}, world_size=WORLD
     )
     assert all(s == make_storage() for s in spent[:LOCAL])
     assert all(s.ddr > 0 for s in spent[LOCAL:])
@@ -558,7 +630,7 @@ def test_per_rank_storage_groups_what_shares_a_rank():
 
     def sharding(options):
         ranks = list(range(WORLD_SIZE))
-        return DynamicEmbParameterSharding(
+        return ParameterSharding(
             sharding_type=ShardingType.ROW_WISE.value,
             compute_kernel="customized_kernel",
             ranks=ranks,
@@ -572,11 +644,11 @@ def test_per_rank_storage_groups_what_shares_a_rank():
                     for i, r in enumerate(ranks)
                 ]
             ),
-            dynamicemb_options=options,
         )
 
     spent = per_rank_storage(
         {"small": sharding(small), "large": sharding(large)},
+        {"small": small, "large": large},
         optimizer_types={"small": None, "large": None},
         world_size=WORLD_SIZE,
     )

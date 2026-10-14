@@ -102,6 +102,42 @@ class DynamicEmbParameterSharding(ParameterSharding):
     )
 
     @classmethod
+    def with_options(
+        cls,
+        decisions: ParameterSharding,
+        options: DynamicEmbTableOptions,
+    ) -> "DynamicEmbParameterSharding":
+        """This type, built from TorchRec's and one rank's options.
+
+        A DynamicEmb table reaches the plan as a plain ``ParameterSharding``
+        -- decisions are all that crosses the wire -- and becomes a DynamicEmb
+        one here, on the rank that has the options to complete it. It is only
+        ever built this way, whole: :meth:`get_additional_fused_params` reads
+        ``dynamicemb_options``, so an instance carrying ``None`` there would
+        hand TorchRec a ``None`` for the table's whole configuration, and the
+        annotation on that field says it cannot happen.
+
+        The inherited fields are copied by :func:`~dataclasses.fields` rather
+        than named, so a field added upstream travels without an edit here --
+        the same reason :meth:`_additional_field_names` is a set difference.
+
+        The shard metadata is deep-copied rather than shared, because TorchRec
+        writes to it: ``replace_placement_with_meta_device`` rewrites every
+        placement in place when DMP's device is ``meta``
+        (``distributed/embeddingbag.py:995``). On rank 0 the plan still holds
+        the planner's own record at this point -- a broadcast returns the
+        leader its own object, not a round trip
+        (``collective_utils.py:65-67``) -- so sharing it would let the first
+        DMP rewrite what a second `plan` call hands out.
+        """
+        built = cls(
+            **{f.name: getattr(decisions, f.name) for f in fields(ParameterSharding)},
+            dynamicemb_options=options,
+        )
+        built.sharding_spec = copy.deepcopy(decisions.sharding_spec)
+        return built
+
+    @classmethod
     def _additional_field_names(cls) -> Set[str]:
         """The fields this class adds on top of ``ParameterSharding``.
 
@@ -335,7 +371,12 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             ``stats``, ``debug``, and the rest.
         """
         all_constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
-        self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
+        # Decisions only. The options a table was planned with stay on its
+        # constraint, which is where they came from -- a second handle on the
+        # plan record is one more thing that can drift from it, and is what
+        # forced the plan to be stripped before the broadcast and patched
+        # after. See `_attach_options`.
+        self._dyn_emb_plan: Dict[str, ParameterSharding] = {}
         self._planned_dynamicemb = False
         self._table_poolings: Dict[str, object] = {}
         self._reduced_topology: Optional[Topology] = None
@@ -435,7 +476,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             # TRW table rather than `world_size` (§4.1).
             ranks = table_ranks(sharding_type, opts.node_index, world_size, local_size)
 
-            self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
+            self._dyn_emb_plan[name] = ParameterSharding(
                 sharding_spec=EnumerableShardingSpec(
                     [
                         ShardMetadata(
@@ -450,7 +491,6 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 sharding_type=sharding_type,
                 ranks=ranks,
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
-                dynamicemb_options=opts,
             )
 
         # What TorchRec groups on that DynamicEmbTableOptions does not carry.
@@ -471,12 +511,25 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             self._topology,
             per_rank_storage(
                 self._dyn_emb_plan,
+                self._dyn_emb_options,
                 optimizer_types(module, sharders),
                 len(self._topology.devices),
                 self._table_poolings,
             ),
         )
         self._planned_dynamicemb = True
+
+    @property
+    def _dyn_emb_options(self) -> Dict[str, DynamicEmbTableOptions]:
+        """Each planned table's options, from the one place they live.
+
+        The plan record holds decisions; this reads the other half off the
+        constraints the decisions were made from, so the two cannot drift.
+        """
+        return {
+            name: self._constraints[name].dynamicemb_options
+            for name in self._dyn_emb_plan
+        }
 
     def _choose_nodes(
         self,
@@ -590,12 +643,22 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         topology, which nothing checks. Rank 0 deciding makes the question moot.
 
         What crosses the wire is the decisions -- sharding type, ranks, shard
-        sizes and offsets and placements. The ``DynamicEmbTableOptions`` are
-        reattached from this rank's own constraints afterwards, because some of
-        what they hold is rank-local by nature: ``external_storage`` is a live
-        handle to a store this process opened, and ``score_function`` is a
-        Python callable. Sending rank 0's copy of either would be wrong even
-        where pickle allows it.
+        sizes and offsets and placements -- as a plain ``ParameterSharding``,
+        which is the type that holds exactly those and nothing else. The
+        ``DynamicEmbTableOptions`` do not travel, because some of what they
+        hold is rank-local by nature: ``external_storage`` is a live handle to
+        a store this process opened, and ``score_function`` is a Python
+        callable. Sending rank 0's copy of either would be wrong even where
+        pickle allows it.
+
+        That works out because ``_dyn_emb_plan`` records the decisions and
+        nothing else -- the options a table was planned with stay on its
+        constraint -- so :meth:`_insert_dynamicemb_plan` puts its own record
+        straight into the plan and there is nothing to take off it.
+        :meth:`_attach_options` then turns each of those entries into a
+        ``DynamicEmbParameterSharding`` with this rank's options. The plan is
+        built up on arrival rather than stripped before departure, and no
+        instance of that class exists without its options at any point.
 
         Parameters
         ----------
@@ -681,40 +744,27 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         return torchrec_plan
 
     def _attach_options(self, plan: ShardingPlan) -> ShardingPlan:
-        """Put this rank's DynamicEmbTableOptions back on the plan.
+        """Complete each DynamicEmb table's entry with this rank's options.
 
-        See :meth:`collective_plan` for why they were taken off. The plan's own
-        shard metadata is checked against them when the kernel is built
-        (``_get_dynamicemb_options_per_table``), so a rank whose options
-        disagree with the decisions it was sent does not go unnoticed.
+        The entries arrive as plain ``ParameterSharding``s -- decisions only,
+        which is all :meth:`collective_plan` sends -- and leave as
+        ``DynamicEmbParameterSharding``s. The entry is replaced rather than
+        written into, because what is being added is the half of the table the
+        wire cannot carry, not a correction to what it did.
+
+        The plan's own shard metadata is checked against the options when the
+        kernel is built (``_get_dynamicemb_options_per_table``), so a rank
+        whose options disagree with the decisions it was sent does not go
+        unnoticed.
         """
+        options = self._dyn_emb_options
         for module_plan in plan.plan.values():
-            for table_name, parameter_sharding in module_plan.items():
-                settled = self._dyn_emb_plan.get(table_name)
-                if settled is not None:
-                    parameter_sharding.dynamicemb_options = settled.dynamicemb_options
+            for table_name, decisions in list(module_plan.items()):
+                if table_name in options:
+                    module_plan[table_name] = DynamicEmbParameterSharding.with_options(
+                        decisions, options[table_name]
+                    )
         return plan
-
-    @staticmethod
-    def _for_the_plan(
-        settled: DynamicEmbParameterSharding,
-    ) -> DynamicEmbParameterSharding:
-        """A copy of a settled table's ParameterSharding, fit to hand out.
-
-        Two things the original must not be exposed to. The options come off
-        because they are reattached per rank after the broadcast
-        (:meth:`collective_plan`), and stripping the original would empty the
-        planner's own record of the table. The shard metadata is deep-copied
-        because TorchRec writes to it: ``replace_placement_with_meta_device``
-        rewrites every placement in place when DMP's device is ``meta``
-        (``distributed/embeddingbag.py:995``), which would otherwise reach back
-        into the planner and leave a second `plan` call handing out metadata the
-        first DMP had already rewritten.
-        """
-        handed_out = copy.copy(settled)
-        handed_out.sharding_spec = copy.deepcopy(settled.sharding_spec)
-        handed_out.dynamicemb_options = None
-        return handed_out
 
     def _insert_dynamicemb_plan(
         self,
@@ -737,6 +787,11 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         enumerator's descent, in the same order and by the same rule -- a module
         a sharder claims is a leaf, anything else is recursed into -- because
         the paths have to be the ones the planner would have produced.
+
+        The planner's own records go in as they are. They hold the decisions
+        and nothing else, which is exactly what the plan carries and all that
+        crosses the wire; :meth:`_attach_options` completes them with each
+        rank's options, and copies the shard metadata in doing so.
         """
         if not self._dyn_emb_plan:
             return
@@ -760,7 +815,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 module_plan = torchrec_plan.plan.setdefault(
                     path, EmbeddingModuleShardingPlan()
                 )
-                module_plan[table_name] = self._for_the_plan(parameter_sharding)
+                module_plan[table_name] = parameter_sharding
                 placed.add(table_name)
 
         missing = set(self._dyn_emb_plan) - placed
