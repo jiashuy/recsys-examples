@@ -210,6 +210,7 @@ def fusion_key(
 
 def per_rank_storage(
     parameter_shardings: Dict[str, ParameterSharding],
+    options: Dict[str, "DynamicEmbTableOptions"],
     optimizer_types: Dict[str, Optional[OptimType]],
     world_size: int,
     poolings: Optional[Dict[str, object]] = None,
@@ -224,7 +225,9 @@ def per_rank_storage(
     The bytes come from the plan's own shard metadata rather than from the
     constraints the plan was built from, so that what is subtracted here and what
     is handed to the runtime are the same decision read twice, not the same
-    arithmetic done twice.
+    arithmetic done twice. The *options* are passed in beside the plan rather
+    than read off it: a ParameterSharding records decisions, and the options a
+    table was planned with live with the constraints, in one place.
 
     **Tables are costed in groups, because the runtime fuses them.** A group's
     HBM budget is the sum of its members', spent on the sum of their sizes, so a
@@ -268,11 +271,11 @@ def per_rank_storage(
     ]
 
     for name, parameter_sharding in parameter_shardings.items():
-        options = getattr(parameter_sharding, "dynamicemb_options", None)
-        if options is None:
+        table_options = options.get(name)
+        if table_options is None:
             raise ValueError(
-                f"Table {name!r} has no DynamicEmbTableOptions on its "
-                "ParameterSharding, so its footprint cannot be sized."
+                f"Table {name!r} is planned but has no DynamicEmbTableOptions, "
+                "so its footprint cannot be sized."
             )
 
         spec = parameter_sharding.sharding_spec
@@ -285,10 +288,10 @@ def per_rank_storage(
         # Options carry max_capacity and local_hbm_for_values already divided by
         # the table's fan-out, so every shard of a table weighs the same and
         # only the set of ranks differs.
-        member = (options, optimizer_types.get(name))
+        member = (table_options, optimizer_types.get(name))
         key = fusion_key(
             parameter_sharding.sharding_type,
-            options,
+            table_options,
             optimizer_types.get(name),
             (poolings or {}).get(name),
         )
