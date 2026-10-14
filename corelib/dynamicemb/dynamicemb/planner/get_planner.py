@@ -53,7 +53,7 @@ def get_planner(
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
     # Which DynamicEmb tables go on a single node each. Which node is chosen by
-    # the planner's HostPlacer; name one here by setting host_index on the
+    # the planner's NodePlacer; name one here by setting node_index on the
     # table's options, which pins it.
     table_row_wise_embedding_table_names: Optional[Set[str]] = None,
     pipeline_type: str = "none",

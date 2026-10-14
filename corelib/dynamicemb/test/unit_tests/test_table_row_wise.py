@@ -131,7 +131,7 @@ def _constraints(
 ) -> Dict[str, DynamicEmbParameterConstraints]:
     """Every table DynamicEmb's, differing only in sharding type and pooling.
 
-    ``host_index`` is left unset: the planner's HostPlacer picks the node, which
+    ``node_index`` is left unset: the planner's NodePlacer picks the node, which
     is the path a user takes and so the one worth testing.
     """
 
@@ -259,11 +259,11 @@ def check_plan(args, device, rank, world_size) -> None:
 
     # The table-row-wise table is on one node's ranks, contiguously.
     trw_ranks = module_plan[TRW_TABLE].ranks
-    host = trw_ranks[0] // local_size
-    assert 0 <= host < num_nodes, f"host {host} outside {num_nodes} nodes"
+    node = trw_ranks[0] // local_size
+    assert 0 <= node < num_nodes, f"node {node} outside {num_nodes} nodes"
     assert trw_ranks == list(
-        range(host * local_size, (host + 1) * local_size)
-    ), f"table-row-wise ranks {trw_ranks} are not node {host}'s ranks"
+        range(node * local_size, (node + 1) * local_size)
+    ), f"table-row-wise ranks {trw_ranks} are not node {node}'s ranks"
 
     # Capacity follows the fan-out: one node's worth of rows, not the world's.
     trw_rows = module_plan[TRW_TABLE].sharding_spec.shards[0].shard_sizes[0]
@@ -283,7 +283,7 @@ def check_plan(args, device, rank, world_size) -> None:
     # back out of TorchRec rather than trusting the environment.
     if rank == 0:
         print(
-            f"plan ok: {num_nodes} node(s) x {local_size}, trw on node {host} "
+            f"plan ok: {num_nodes} node(s) x {local_size}, trw on node {node} "
             f"({trw_rows} rows/rank), rw on all {world_size} ({rw_rows} rows/rank)"
         )
 

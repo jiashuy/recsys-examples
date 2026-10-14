@@ -554,16 +554,19 @@ class DynamicEmbTableOptions:
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
         ``roundrobin``.
-    host_index : Optional[int], optional
+    node_index : Optional[int], optional
         Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
         unset -- the default -- and the planner's
-        :class:`~dynamicemb.planner.placement.HostPlacer` chooses, packing the
+        :class:`~dynamicemb.planner.placement.NodePlacer` chooses, packing the
         table-row-wise tables across nodes by what they weigh. Set it only to
         override that.
 
         Nodes are numbered ``0 .. world_size // local_world_size - 1``, and the
-        table lands on that node's ``local_world_size`` ranks. Mirrors TorchREC's
-        ``table_row_wise(host_index=...)``.
+        table lands on that node's ``local_world_size`` ranks. TorchREC spells
+        the same thing ``table_row_wise(host_index=...)``; the name differs here
+        because in DynamicEmb *host* already means host memory, the DDR tier a
+        table spills to. TorchREC's own docstring glosses it the same way --
+        "index of host (node) to do row wise".
 
         Meaningless under row-wise sharding, and refused rather than ignored
         there: a row-wise table is on every rank, so there is no node to name.
@@ -613,7 +616,7 @@ class DynamicEmbTableOptions:
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     dist_type: str = "roundrobin"
-    host_index: Optional[int] = None
+    node_index: Optional[int] = None
     admit_strategy: Optional[AdmissionStrategy] = None
 
     admission_counter: Optional[Any] = None

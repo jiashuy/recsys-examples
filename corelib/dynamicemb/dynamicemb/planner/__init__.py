@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
+from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -27,8 +27,8 @@ from .get_planner import get_planner
 
 __all__ = [
     "get_planner",
-    "BalancedHostPlacer",
-    "HostPlacer",
+    "BalancedNodePlacer",
+    "NodePlacer",
     "TableToPlace",
     "DynamicEmbeddingShardingPlanner",
     "DynamicEmbParameterConstraints",

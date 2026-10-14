@@ -28,7 +28,7 @@ from torchrec.modules.embedding_configs import PoolingType
 from dynamicemb.planner.plan import make_storage
 
 from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
-from dynamicemb.planner.placement import BalancedHostPlacer, TableToPlace
+from dynamicemb.planner.placement import BalancedNodePlacer, TableToPlace
 
 GB = 1024**3
 DIM = 16
@@ -73,7 +73,7 @@ def _table(name, size_gb, pinned=None, budget_gb=None):
 
 
 def test_largest_first_onto_the_emptiest_node():
-    chosen = BalancedHostPlacer().place(
+    chosen = BalancedNodePlacer().place(
         [_table("a", 30), _table("b", 20), _table("c", 10)],
         _topology(),
         _nothing_spent(),
@@ -85,7 +85,7 @@ def test_largest_first_onto_the_emptiest_node():
 
 
 def test_a_pin_is_honoured_and_others_fit_around_it():
-    chosen = BalancedHostPlacer().place(
+    chosen = BalancedNodePlacer().place(
         [_table("a", 30, pinned=1), _table("b", 20)],
         _topology(),
         _nothing_spent(),
@@ -98,19 +98,19 @@ def test_row_wise_tables_do_not_shift_the_choice_but_do_take_room():
     """They are on every rank, so they cost each node the same. What they change
     is whether a table-row-wise table still fits."""
     everywhere = [make_storage(hbm=40 * GB, ddr=0, ssd=0) for _ in range(WORLD)]
-    chosen = BalancedHostPlacer().place(
+    chosen = BalancedNodePlacer().place(
         [_table("a", 10), _table("b", 10)], _topology(), everywhere
     )
     assert chosen == {"a": 0, "b": 1}
 
     with pytest.raises(ValueError, match="No node can hold"):
-        BalancedHostPlacer().place([_table("big", 50)], _topology(), everywhere)
+        BalancedNodePlacer().place([_table("big", 50)], _topology(), everywhere)
 
 
 def test_a_node_is_charged_on_every_one_of_its_ranks():
     """Table-row-wise splits rows across the node, so each rank pays the cost --
     it is the tightest rank, not the node total, that has to fit."""
-    placer = BalancedHostPlacer()
+    placer = BalancedNodePlacer()
     chosen = placer.place([_table("a", 60)], _topology(hbm=80 * GB), _nothing_spent())
     assert chosen == {"a": 0}
     # node 0 now has 20GB per rank, so a 30GB table can only go to node 1
@@ -125,18 +125,18 @@ def test_one_crowded_rank_rules_out_its_whole_node():
     uneven = [
         make_storage(hbm=(70 * GB if r == 3 else 0), ddr=0, ssd=0) for r in range(WORLD)
     ]
-    chosen = BalancedHostPlacer().place([_table("a", 20)], _topology(), uneven)
+    chosen = BalancedNodePlacer().place([_table("a", 20)], _topology(), uneven)
     assert chosen == {"a": 1}
 
 
 def test_a_table_that_fits_nowhere_says_so():
     with pytest.raises(ValueError, match="No node can hold"):
-        BalancedHostPlacer().place([_table("a", 200)], _topology(), _nothing_spent())
+        BalancedNodePlacer().place([_table("a", 200)], _topology(), _nothing_spent())
 
 
 def test_a_pin_outside_the_topology_is_an_error():
     with pytest.raises(ValueError, match="outside the 2 nodes"):
-        BalancedHostPlacer().place(
+        BalancedNodePlacer().place(
             [_table("a", 1, pinned=5)], _topology(), _nothing_spent()
         )
 
@@ -145,15 +145,15 @@ def test_the_answer_does_not_depend_on_the_order_it_was_asked():
     """It runs on every rank; two ranks that disagreed would shard one table
     onto two nodes."""
     tables = [_table("a", 30), _table("b", 30), _table("c", 10), _table("d", 10)]
-    first = BalancedHostPlacer().place(tables, _topology(), _nothing_spent())
-    second = BalancedHostPlacer().place(
+    first = BalancedNodePlacer().place(tables, _topology(), _nothing_spent())
+    second = BalancedNodePlacer().place(
         list(reversed(tables)), _topology(), _nothing_spent()
     )
     assert first == second
 
 
 def test_equal_tables_spread_rather_than_stack():
-    chosen = BalancedHostPlacer().place(
+    chosen = BalancedNodePlacer().place(
         [_table("a", 10), _table("b", 10), _table("c", 10), _table("d", 10)],
         _topology(),
         _nothing_spent(),
@@ -169,7 +169,7 @@ def test_a_pin_to_a_node_that_cannot_hold_it_is_refused():
     the first would be returned as a plan.
     """
     with pytest.raises(ValueError, match="cannot hold it"):
-        BalancedHostPlacer().place(
+        BalancedNodePlacer().place(
             [_table("a", 200, pinned=1)], _topology(), _nothing_spent()
         )
 
@@ -177,14 +177,14 @@ def test_a_pin_to_a_node_that_cannot_hold_it_is_refused():
 def test_a_pin_is_refused_against_room_already_taken():
     """The check is against what is left, not against an empty machine: an
     earlier pin to the same node counts."""
-    placer = BalancedHostPlacer()
+    placer = BalancedNodePlacer()
     tables = [_table("first", 60, pinned=0), _table("second", 40, pinned=0)]
     with pytest.raises(ValueError, match="'second'"):
         placer.place(tables, _topology(hbm=80 * GB), _nothing_spent())
 
 
 def test_a_pin_that_fits_is_still_honoured():
-    chosen = BalancedHostPlacer().place(
+    chosen = BalancedNodePlacer().place(
         [_table("a", 70, pinned=1)], _topology(hbm=80 * GB), _nothing_spent()
     )
     assert chosen == {"a": 1}
@@ -207,7 +207,7 @@ def test_a_groupmate_with_spare_budget_makes_room():
     assert needy.alone().ddr == 14 * GB, "priced alone it spills 14 GB to host"
     assert generous.alone().ddr == 0
 
-    chosen = BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+    chosen = BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
     assert chosen["generous"] == chosen["needy"], (
         "they fuse, so together they fit in the pooled 22 GB budget and need no "
         "host memory -- which only shows if the placer prices them together"
@@ -232,7 +232,7 @@ def test_tables_that_do_not_fuse_are_not_pooled():
     assert generous.options != needy.options
 
     with pytest.raises(ValueError, match="No node can hold"):
-        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+        BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
 
 
 def test_a_different_optimizer_is_a_different_group():
@@ -250,7 +250,7 @@ def test_a_different_optimizer_is_a_different_group():
     assert generous.fuses_with != needy.fuses_with
 
     with pytest.raises(ValueError, match="No node can hold"):
-        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+        BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
 
 
 def test_a_different_pooling_is_a_different_group():
@@ -267,7 +267,7 @@ def test_a_different_pooling_is_a_different_group():
     assert generous.fuses_with != needy.fuses_with
 
     with pytest.raises(ValueError, match="No node can hold"):
-        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+        BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
 
 
 def test_a_different_dtype_is_a_different_group():

@@ -329,19 +329,19 @@ def test_the_length_is_the_fanout():
     assert len(table_layout(TRW, 1, WORLD, LOCAL)) == LOCAL
 
 
-def test_host_index_on_a_row_wise_table_is_an_error():
+def test_node_index_on_a_row_wise_table_is_an_error():
     """Not ignored. A row-wise table is on every rank, so naming a node for it
     means the caller expected something the plan will not do."""
     with pytest.raises(ValueError, match="on every rank of every node"):
         table_layout(RW, 0, WORLD, LOCAL)
 
 
-def test_table_row_wise_without_a_host_index_is_an_error():
-    with pytest.raises(ValueError, match="needs a host_index"):
+def test_table_row_wise_without_a_node_index_is_an_error():
+    with pytest.raises(ValueError, match="needs a node_index"):
         table_layout(TRW, None, WORLD, LOCAL)
 
 
-def test_host_index_past_the_last_node_is_an_error():
+def test_node_index_past_the_last_node_is_an_error():
     with pytest.raises(ValueError, match="outside the 2 nodes"):
         table_layout(TRW, 2, WORLD, LOCAL)
 
@@ -378,7 +378,7 @@ def test_a_row_wise_table_is_split_the_same_way_it_always_was():
         assert table_fanout(RW, world, local) == world
 
 
-def test_host_index_on_a_row_wise_table_still_reaches_the_refusal():
+def test_node_index_on_a_row_wise_table_still_reaches_the_refusal():
     """The planner writes the placer's answer back into the options. It must not
     do that for a row-wise table: overwriting with None first would turn the
     refusal below into a silent correction."""

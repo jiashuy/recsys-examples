@@ -43,7 +43,7 @@ from ..dynamicemb_config import (
 
 from .plan import fusion_key, make_storage, storage_ssd
 
-__all__ = ["TableToPlace", "HostPlacer", "BalancedHostPlacer"]
+__all__ = ["TableToPlace", "NodePlacer", "BalancedNodePlacer"]
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class TableToPlace:
         TorchRec config -- but TorchRec groups on it, so two tables that differ
         here do not pool their budgets.
     pinned : Optional[int]
-        The node the caller named through ``DynamicEmbTableOptions.host_index``.
+        The node the caller named through ``DynamicEmbTableOptions.node_index``.
         A placer must honour it, and must still check that it fits.
     """
 
@@ -112,7 +112,7 @@ class TableToPlace:
         return make_storage(hbm=hbm, ddr=ddr)
 
 
-class HostPlacer(abc.ABC):
+class NodePlacer(abc.ABC):
     """Chooses a node for each table-row-wise table."""
 
     @abc.abstractmethod
@@ -122,7 +122,7 @@ class HostPlacer(abc.ABC):
         topology: Topology,
         committed: List[Storage],
     ) -> Dict[str, int]:
-        """Return ``{table name: host index}``, covering every table given.
+        """Return ``{table name: node index}``, covering every table given.
 
         Parameters
         ----------
@@ -142,7 +142,7 @@ class HostPlacer(abc.ABC):
         ...
 
 
-class BalancedHostPlacer(HostPlacer):
+class BalancedNodePlacer(NodePlacer):
     """Largest table first, onto the node with the most room left.
 
     The usual first-fit-decreasing, with "fits" measured against the *tightest*
@@ -249,7 +249,7 @@ class BalancedHostPlacer(HostPlacer):
                     f"Table {table.name!r} is pinned to node {table.pinned}, "
                     f"which cannot hold it. It adds {needs} to each of that "
                     f"node's {local_size} ranks, which have {left} left. Pin "
-                    "it elsewhere, leave host_index unset and let the placer "
+                    "it elsewhere, leave node_index unset and let the placer "
                     "choose, or give it row-wise sharding."
                 )
             chosen[table.name] = table.pinned

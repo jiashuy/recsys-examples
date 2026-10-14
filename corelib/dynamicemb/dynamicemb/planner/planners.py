@@ -39,7 +39,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
-from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
+from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .plan import (
     fusion_key,
     make_storage,
@@ -296,7 +296,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         topology: Optional[Topology] = None,
         constraints: Optional[Dict[str, DynamicEmbParameterConstraints]] = None,
         storage_reservation: Optional[StorageReservation] = None,
-        host_placer: Optional[HostPlacer] = None,
+        node_placer: Optional[NodePlacer] = None,
         **kwargs: Any,
     ):
         """A TorchRec planner that also plans DynamicEmb tables.
@@ -338,7 +338,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._planned_dynamicemb = False
         self._table_poolings: Dict[str, object] = {}
-        self._host_placer: HostPlacer = host_placer or BalancedHostPlacer()
+        self._node_placer: NodePlacer = node_placer or BalancedNodePlacer()
 
         super().__init__(
             topology=topology,
@@ -400,7 +400,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             and self._constraints[config.name].use_dynamicemb
         }
 
-        hosts = self._choose_hosts(configs, module, sharders, world_size, local_size)
+        nodes = self._choose_nodes(configs, module, sharders, world_size, local_size)
         compute_device = self._topology.compute_device
 
         for name, config in configs.items():
@@ -411,20 +411,20 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
 
             if sharding_type != ShardingType.ROW_WISE.value:
                 # Written back rather than only used here: downstream reads the
-                # options, not the plan, so a table the HostPlacer placed would
+                # options, not the plan, so a table the NodePlacer placed would
                 # otherwise look unplaced. Every rank ran the same placement, so
                 # every rank writes the same thing.
                 #
                 # Only here. A row-wise table keeps whatever the caller set, so
-                # that `table_layout` can refuse a host_index on one -- writing
+                # that `table_layout` can refuse a node_index on one -- writing
                 # None over it first would turn a refusal into a silent
                 # correction, which is the opposite of what that check is for.
-                opts.host_index = hosts[name]
+                opts.node_index = nodes[name]
 
             # Row-wise is every rank; table-row-wise is one node's ranks. The
             # shard metadata follows, so there are `local_size` entries for a
             # TRW table rather than `world_size` (§4.1).
-            ranks = table_layout(sharding_type, opts.host_index, world_size, local_size)
+            ranks = table_layout(sharding_type, opts.node_index, world_size, local_size)
 
             self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
                 sharding_spec=EnumerableShardingSpec(
@@ -452,7 +452,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         }
         self._planned_dynamicemb = True
 
-    def _choose_hosts(
+    def _choose_nodes(
         self,
         configs: Dict[str, BaseEmbeddingConfig],
         module: nn.Module,
@@ -465,13 +465,13 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         Row-wise tables get ``None``: they are on every rank, so there is no
         node to name, and `table_layout` refuses one.
 
-        The work goes to a :class:`~dynamicemb.planner.placement.HostPlacer`,
+        The work goes to a :class:`~dynamicemb.planner.placement.NodePlacer`,
         which the caller can replace. What this does is prepare its inputs --
         what each table costs a rank, and what the row-wise tables have already
         taken from every rank, so the placer is fitting into the room that will
         actually be there rather than into an empty machine.
 
-        `host_index` is passed through as a pin rather than acted on here, so a
+        `node_index` is passed through as a pin rather than acted on here, so a
         caller who has named some nodes and left others to the placer gets both,
         and the placer can fit the rest around what it was told.
         """
@@ -514,14 +514,14 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         # The tables are handed over whole rather than priced: what one costs a
         # node depends on which of the others land there with it, and that is
         # the decision the placer is making.
-        return self._host_placer.place(
+        return self._node_placer.place(
             [
                 TableToPlace(
                     name=name,
                     options=self._constraints[name].dynamicemb_options,
                     optimizer_type=optimizers.get(name),
                     pooling=_pooling_of(configs[name]),
-                    pinned=self._constraints[name].dynamicemb_options.host_index,
+                    pinned=self._constraints[name].dynamicemb_options.node_index,
                 )
                 for name in sorted(trw)
             ],
