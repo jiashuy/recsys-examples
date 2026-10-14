@@ -405,9 +405,10 @@ def _collection_without(collection: nn.Module, table_names: Set[str]) -> nn.Modu
             kept[name] = table
 
     reduced = copy.copy(collection)
-    # copy.copy shares __dict__, so _modules is the same dict object until it is
-    # replaced; without this the assignment below would reach into the caller's
-    # module.
+    # `copy.copy` gives the new module its own `__dict__` -- `nn.Module.__getstate__`
+    # returns `self.__dict__.copy()` -- but the values in it are shared, so
+    # `_modules` is the same dict object as the caller's until it is replaced.
+    # Without this line the assignment below would reach into their module.
     reduced._modules = dict(collection._modules)
     setattr(reduced, attribute, kept)
     return reduced
@@ -453,6 +454,7 @@ def module_without_tables(
             return node
 
         copied = copy.copy(node)
+        # Same shared-`_modules` reason as `_collection_without`.
         copied._modules = dict(node._modules)
         for name, child in replacements.items():
             setattr(copied, name, child)
