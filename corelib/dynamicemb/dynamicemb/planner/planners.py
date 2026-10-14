@@ -338,6 +338,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._planned_dynamicemb = False
         self._table_poolings: Dict[str, object] = {}
+        self._reduced_topology: Optional[Topology] = None
         self._node_placer: NodePlacer = node_placer or BalancedNodePlacer()
 
         super().__init__(
@@ -372,8 +373,16 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         :meth:`_plan_torchrec` runs on rank 0 alone. What does need one rank's
         authority is the placement, and that is what the broadcast covers.
 
+        It ends by deducting what these tables cost from the Topology, which is
+        also where overcommitment is refused -- here rather than in
+        :meth:`_plan_torchrec` so that every rank refuses, not just rank 0.
+        See the comment at that line.
+
         Once per planner: the options are filled in place, and a second pass
-        would re-align already aligned capacities and warn about it.
+        would re-align already aligned capacities and warn about it. The
+        reduced Topology is kept for the same reason, and `self._topology`
+        itself is left alone -- it is what the machine has, and every `plan`
+        call has to start from that.
         """
         if self._planned_dynamicemb:
             return
@@ -450,6 +459,23 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._table_poolings = {
             name: _pooling_of(config) for name, config in configs.items()
         }
+
+        # What they take out of this rank's budget, and whether a rank has any
+        # left. Done here rather than in `_plan_torchrec` because that runs on
+        # rank 0 alone, inside the broadcast: a refusal raised there unwinds
+        # rank 0 and leaves every other rank waiting on a broadcast that will
+        # never be sent, so the one place that catches overcommitment would
+        # report it as a hang. Everything it reads is on every rank by now, so
+        # every rank can refuse together.
+        self._reduced_topology = topology_minus(
+            self._topology,
+            per_rank_storage(
+                self._dyn_emb_plan,
+                optimizer_types(module, sharders),
+                len(self._topology.devices),
+                self._table_poolings,
+            ),
+        )
         self._planned_dynamicemb = True
 
     def _choose_nodes(
@@ -600,24 +626,34 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
     ) -> ShardingPlan:
-        """Steps 2 to 4: deduct, plan the rest, assemble.
+        """Steps 2 to 4: take up the reduced budget, plan the rest, assemble.
 
         By the time this runs, :meth:`_plan_dynamicemb` has produced a
-        ParameterSharding for each DynamicEmb table, so:
+        ParameterSharding for each DynamicEmb table and has already taken what
+        they cost out of the Topology, per rank, so:
 
-        2. what they cost is taken out of this planner's Topology, per rank;
+        2. this planner's Topology becomes that reduced one;
         3. TorchRec plans the remaining tables inside what is left, on a copy of
            the module those tables have been taken out of;
         4. both halves are assembled into one ShardingPlan.
 
+        The deduction itself is step 1's, not this method's, because this one
+        runs on rank 0 alone: it can refuse, and a refusal raised in here would
+        reach no other rank. See :meth:`_plan_dynamicemb`.
+
         The Topology is assigned rather than passed, because the enumerator and
-        the estimators were built against ``self._topology`` in ``__init__``.
-        They read it for bandwidths and device type, not for the budget -- the
-        budget is the Topology that ``reserve`` returns, which is derived from
-        this one -- so assigning it reaches the decision that depends on it. It
-        is put back afterwards: the caller's Topology says what the machine has,
-        and a second `plan` call has to start from that again rather than from a
-        machine that already looks spent.
+        the estimators were built against ``self._topology`` in ``__init__`` and
+        keep that object. Assigning still reaches the decision that depends on
+        capacity: ``reserve`` is called with ``self._topology`` at plan time
+        (``planner/planners.py:832``) and what it returns is the budget the
+        partitioner is given. What those components kept, they kept as scalars
+        -- ``compute_device``, ``world_size``, ``intra_group_size`` -- which
+        this deduction does not change, so an in-place edit would reach no
+        further. Design doc §7.3 lists them, and the two it does not reach.
+
+        It is put back afterwards: the caller's Topology says what the machine
+        has, and a second `plan` call has to start from that again rather than
+        from a machine that already looks spent.
 
         Step 4 walks the caller's module, not the reduced one: the reduced one
         no longer admits to having these tables, which is the whole point of it,
@@ -626,16 +662,11 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         The per-table options are left off what goes on the plan; see
         :meth:`collective_plan`.
         """
-        # 2. deduct what the DynamicEmb tables spend from the budget
-        spent = per_rank_storage(
-            self._dyn_emb_plan,
-            optimizer_types(module, sharders),
-            len(self._topology.devices),
-            self._table_poolings,
-        )
+        # 2. the budget with the DynamicEmb tables taken out, from step 1
+        assert self._reduced_topology is not None, "_plan_dynamicemb has not run"
         whole_topology = self._topology
         try:
-            self._topology = topology_minus(whole_topology, spent)
+            self._topology = self._reduced_topology
 
             # 3. TorchRec plans the tables that are left, in the memory that is left
             reduced_module = module_without_tables(

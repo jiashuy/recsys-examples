@@ -309,6 +309,38 @@ def per_rank_storage(
     return totals
 
 
+def _negative_tiers(storage: Storage) -> List[str]:
+    """Which tiers of a Storage have gone below zero, in order.
+
+    ``ssd`` through :func:`storage_ssd`, since the field only exists from
+    TorchRec 1.5.0 and reads as zero -- never negative -- before that.
+    """
+    over = [tier for tier in ("hbm", "ddr") if getattr(storage, tier) < 0]
+    if storage_ssd(storage) < 0:
+        over.append("ssd")
+    return over
+
+
+# What to do about a tier a rank has overdrawn. HBM and host pull against each
+# other -- `global_hbm_for_values` is the line between them, so moving it to
+# fix one tier spends the other -- which is why the advice cannot be one list.
+_TIER_REMEDIES = {
+    "hbm": (
+        "lower global_hbm_for_values, which leaves fewer rows in HBM and "
+        "spills the rest to the host tier"
+    ),
+    "ddr": (
+        "raise global_hbm_for_values, which keeps more rows in HBM instead, "
+        "or state a ddr_cap that matches the host memory a rank really has "
+        "(TorchRec defaults it to 128 GB per rank)"
+    ),
+    "ssd": (
+        "lower the tables' capacity, or state an ssd_cap that matches the "
+        "machine"
+    ),
+}
+
+
 def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
     """``topology`` with each rank's DynamicEmb footprint taken out of it.
 
@@ -330,6 +362,11 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
     ``HeuristicalStorageReservation`` -- a caller who passes a different one
     loses even that. Clamping would be worse: zero reads as "no room, plan
     accordingly" and the plan would come back looking feasible.
+
+    Every tier is checked, not only HBM: ``Storage.__sub__`` subtracts all
+    three, so a guard that read one would pass the others on silently. Nothing
+    charges ``ssd`` today, which is what makes the check cheap to add now and
+    hard to notice missing later.
     """
     if len(per_rank) != len(topology.devices):
         raise ValueError(
@@ -338,17 +375,18 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
         )
 
     reduced = copy.deepcopy(topology)
-    overdrawn: List[Tuple[int, Storage, Storage]] = []
+    overdrawn: List[Tuple[int, Storage, Storage, List[str]]] = []
     for device in reduced.devices:
         spent = per_rank[device.rank]
         before = device.storage
         device.storage = before - spent
-        if device.storage.hbm < 0 or device.storage.ddr < 0:
-            overdrawn.append((device.rank, before, spent))
+        tiers = _negative_tiers(device.storage)
+        if tiers:
+            overdrawn.append((device.rank, before, spent, tiers))
 
     if overdrawn:
         worst = min(overdrawn, key=lambda o: min(o[1].hbm - o[2].hbm, 0))
-        rank, before, spent = worst
+        rank, before, spent, tiers = worst
         raise PlannerError(
             error_type=PlannerErrorType.INSUFFICIENT_STORAGE,
             message=(
@@ -356,10 +394,12 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
                 f"{len(overdrawn)} of {len(reduced.devices)} ranks, leaving "
                 "nothing for TorchRec to plan into. Rank "
                 f"{rank} has {storage_repr_in_gb(before)} and they take "
-                f"{storage_repr_in_gb(spent)}. Lower global_hbm_for_values, "
-                "shard the largest tables row-wise so they spread over every "
-                "rank instead of one node, or state a Topology that matches "
-                "the machine."
+                f"{storage_repr_in_gb(spent)}, which overdraws "
+                f"{' and '.join(tiers)}. To fix it: "
+                + "; ".join(_TIER_REMEDIES[tier] for tier in tiers)
+                + ". Either way you can also shard the largest tables row-wise "
+                "so they spread over every rank instead of one node, or state "
+                "a Topology that matches the machine."
             ),
         )
     return reduced
