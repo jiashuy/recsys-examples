@@ -151,19 +151,19 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 
 **Which node it lands on is chosen for you.** The planner packs the table-row-wise tables across nodes by what they weigh, fitting them into the room the row-wise tables leave behind. You do not have to say.
 
-To override, set **`host_index`** on `DynamicEmbTableOptions` to a node numbered `0 .. world_size // local_world_size - 1`. It is a pin, not a requirement: pinned tables are placed first and the rest are fitted around them, so you can name the nodes you care about and leave the others alone. Setting it on a row-wise table is an error rather than ignored — such a table is on every rank, so there is no node to name.
+To override, set **`node_index`** on `DynamicEmbTableOptions` to a node numbered `0 .. world_size // local_world_size - 1`. It is a pin, not a requirement: pinned tables are placed first and the rest are fitted around them, so you can name the nodes you care about and leave the others alone. Setting it on a row-wise table is an error rather than ignored — such a table is on every rank, so there is no node to name.
 
-To replace the rule, pass a `HostPlacer` to the planner:
+To replace the rule, pass a `NodePlacer` to the planner:
 
-    from dynamicemb.planner import BalancedHostPlacer, HostPlacer, TableToPlace
+    from dynamicemb.planner import BalancedNodePlacer, NodePlacer, TableToPlace
 
-    class MyPlacer(HostPlacer):
+    class MyPlacer(NodePlacer):
         def place(self, tables, topology, committed) -> Dict[str, int]:
-            ...   # {table name: host index}, deterministic on every rank
+            ...   # {table name: node index}, deterministic on every rank
 
-    DynamicEmbeddingShardingPlanner(topology=..., constraints=..., host_placer=MyPlacer())
+    DynamicEmbeddingShardingPlanner(topology=..., constraints=..., node_placer=MyPlacer())
 
-`BalancedHostPlacer` is the default: largest table first onto the emptiest node, measured against the tightest rank of a node rather than the node's total, because a table-row-wise table charges every rank of its node the same.
+`BalancedNodePlacer` is the default: largest table first onto the emptiest node, measured against the tightest rank of a node rather than the node's total, because a table-row-wise table charges every rank of its node the same.
 
 **Not usable yet.** The plan comes out `TABLE_ROW_WISE`-shaped, but nothing consumes it — the sharding runtime still dispatches only `ROW_WISE`.
 
