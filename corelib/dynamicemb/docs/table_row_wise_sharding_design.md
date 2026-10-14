@@ -1172,8 +1172,24 @@ ties among the nodes that can hold it.
 it is where every route to overcommitting converges: a table pinned to a node
 too small for it, a placement the placer accepted on per-table numbers, or
 row-wise tables that simply add up to more than a rank holds. It raises
-`PlannerError(INSUFFICIENT_STORAGE)` naming the worst rank, what it has and what
-the tables take.
+`PlannerError(INSUFFICIENT_STORAGE)` naming one overdrawn rank, what it has and
+what the tables take.
+
+Two limits on how far that check reaches, both known and neither fixed:
+
+- *The rank it names is the worst in HBM, not the worst overall.* The ranking
+  key is `min(before.hbm - spent.hbm, 0)`, which clamps every rank that is not
+  over in HBM to zero -- so a rank one byte over in HBM outranks one 500 GB
+  over in host, and among host-only overdrafts it names whichever comes first.
+  The message prints both tiers for the rank it names, so nothing is hidden;
+  it is just not always the most useful rank to print.
+- *The host half is only as real as the `ddr_cap` it was given.* TorchRec
+  defaults it to 128 GB **per rank** (`planner/constants.py:26`, replicated to
+  every device at `types.py:1038`), so an 8-GPU node with no `ddr_cap` stated
+  is assumed to have a terabyte of host memory and a host overdraft sails
+  through. The TRW tests divide it themselves
+  (`ddr_cap=1024**4 // local_size`); a caller who does not gets an HBM guard
+  and little else.
 
 **It used to pass the negative on**, on the reasoning that TorchRec's
 reservation reports the shortfall. It does not:
@@ -1198,6 +1214,78 @@ One more reason not to rely on anything downstream: a model whose tables are
 *all* DynamicEmb's leaves TorchRec an empty search space, and `plan` returns
 `ShardingPlan({})` (`planners.py:892`) without consulting storage. That is the
 shape the dump/load tests use, so it is not a corner.
+
+**Every tier is checked, not only HBM.** `Storage.__sub__` subtracts hbm, ddr
+and ssd alike, so a guard that read one would hand the planner a negative in
+another without a word. Nothing charges `ssd` today -- `per_rank_storage`
+builds every cost with `make_storage(hbm=..., ddr=...)` -- which is what makes
+the check cheap to add now and hard to notice missing later. `_negative_tiers`
+reads `ssd` through `storage_ssd`, since the field only exists from TorchRec
+1.5.0; on an older one it reads as zero and can never be negative, so the test
+for it skips rather than failing.
+
+**The advice follows the tier that failed.** `global_hbm_for_values` is the
+line between HBM and the host tier, so moving it to fix one spends the other:
+telling an overdrawn host tier to *lower* it -- which the message used to do
+for every tier -- spills more rows to the host and makes it worse. HBM
+overdrawn says lower it, host overdrawn says raise it, and the message names
+which tier it is talking about.
+
+**The refusal happens on every rank, in step 1.** It used to live in
+`_plan_torchrec`, which runs on rank 0 alone inside the broadcast
+(`invoke_on_rank_and_broadcast_result`). A `PlannerError` raised there unwinds
+rank 0 and leaves every other rank waiting on a broadcast that will never be
+sent -- so the one check that catches overcommitment would have surfaced as a
+hang. Everything it reads (`_dyn_emb_plan`, the module, `_table_poolings`, the
+Topology) is already on every rank once `_plan_dynamicemb` has run, so the
+deduction was moved to the end of that, and `_plan_torchrec` takes up the
+Topology it produced. Every rank now refuses together.
+
+#### What the deduction does not reach
+
+The reduced Topology is a new object assigned to `self._topology`, not an
+edit of the caller's. Everything TorchRec built in `__init__` against the
+original keeps the original -- but every one of them extracted scalars at
+construction rather than keeping a live view of `devices[].storage`, so an
+in-place edit would reach exactly as far:
+
+| Holder | Reads |
+|---|---|
+| `EmbeddingEnumerator` | `compute_device`, `world_size`, `intra_group_size` (`enumerators.py:103-105`) |
+| `EmbeddingPerfEstimator`, `EmbeddingStorageEstimator` | the same three (`shard_estimators.py:242-247`) |
+| `NoopPerfModel` | `world_size` (`perf_models.py:31`) |
+| `GreedyPerfPartitioner` | nothing -- *"Don't store the topology since topology cannot be changed"* (`partitioners.py:259`) |
+
+None of those change. The decision that does depend on capacity reads
+`self._topology` at `plan` time -- `storage_reservation.reserve(topology=...)`
+(`planners.py:832`) produces the `storage_constraint` the partitioner is given
+(`planners.py:982`) -- so the assignment reaches it.
+
+Two things it does not reach, and an in-place edit would not either:
+
+- **`EmbeddingEnumerator._device_memory_sizes`** (`enumerators.py:118-125`) is
+  read from `topology._custom_topology_data`, not from `devices[].storage`,
+  and `topology_minus` does not touch it. It is passed to
+  `calculate_shard_sizes_and_offsets` (`enumerators.py:245`), so on a
+  heterogeneous topology -- one built with `custom_topology_data` giving each
+  device its own `hbm_cap` -- shards are sized against the *full* per-device
+  caps, as though DynamicEmb had taken nothing. This affects how big a shard is
+  cut, not whether the plan fits: the partitioner still works from
+  `storage_constraint`, which is derived correctly, so an infeasible plan is
+  still refused. Keeping `_custom_topology_data` in step with the deduction
+  would mean maintaining a private upstream field from here, which is what
+  §4.9 exists to avoid. Left as is, and noted.
+- **`EmbeddingEnumerator._has_ssd`** (`enumerators.py:132`) is a bool frozen at
+  construction from `any(device.storage.ssd > 0)`. It agrees with the reduced
+  Topology only because nothing charges `ssd`; if that ever changes, the
+  enumerator's view and the budget's would diverge and no assignment could fix
+  it.
+
+A smaller consequence: `planners.py:841`, `857` and `1132` read
+`self._topology.devices[].storage` for logs and for the failure message, so
+during our call those report what TorchRec had left rather than what the
+machine has. For the failure message that is the more useful number; a reader
+treating the log as a machine spec would see it low.
 
 ---
 

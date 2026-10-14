@@ -21,6 +21,7 @@ be checked without one.
 """
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -47,7 +48,9 @@ from dynamicemb.dynamicemb_config import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
+from dynamicemb.planner import plan
 from dynamicemb.planner.plan import (
+    _STORAGE_HAS_SSD,
     module_without_tables,
     optimizer_types,
     per_rank_storage,
@@ -56,7 +59,11 @@ from dynamicemb.planner.plan import (
     table_ranks,
     topology_minus,
 )
-from dynamicemb.planner.planners import DynamicEmbParameterSharding
+from dynamicemb.planner.planners import (
+    DynamicEmbeddingShardingPlanner,
+    DynamicEmbParameterConstraints,
+    DynamicEmbParameterSharding,
+)
 
 WORLD_SIZE = 4
 LOCAL_SIZE = 2
@@ -234,21 +241,136 @@ def test_an_exact_fit_is_not_an_overdraft():
     assert reduced.devices[0].storage.ddr == 0
 
 
+def test_a_host_overdraft_is_not_told_to_lower_the_hbm_budget():
+    """`global_hbm_for_values` is the line between the two tiers, so lowering it
+    spills *more* rows to the host -- the opposite of what an overdrawn host
+    tier needs. The advice has to follow the tier that actually failed."""
+    with pytest.raises(PlannerError) as excinfo:
+        topology_minus(
+            _topology(ddr=1 * GB), [make_storage(ddr=4 * GB)] * WORLD_SIZE
+        )
+
+    message = str(excinfo.value)
+    assert "overdraws ddr" in message
+    assert "raise global_hbm_for_values" in message
+    assert "lower global_hbm_for_values" not in message
+
+
+def test_a_rank_over_in_both_tiers_is_told_about_both():
+    with pytest.raises(PlannerError) as excinfo:
+        topology_minus(
+            _topology(hbm=1 * GB, ddr=1 * GB),
+            [make_storage(hbm=2 * GB, ddr=2 * GB)] * WORLD_SIZE,
+        )
+
+    assert "overdraws hbm and ddr" in str(excinfo.value)
+
+
+def test_negative_tiers_reads_ssd_where_the_field_exists(monkeypatch):
+    """The ssd half of the guard, on a TorchRec whose Storage has no ssd.
+
+    `storage_ssd` reads the flag at call time, so forcing it exercises the
+    branch that the container this usually runs in cannot reach. Without this
+    the ssd case would be skipped everywhere and never execute at all."""
+    monkeypatch.setattr(plan, "_STORAGE_HAS_SSD", True)
+
+    assert plan._negative_tiers(SimpleNamespace(hbm=1, ddr=1, ssd=-1)) == ["ssd"]
+    assert plan._negative_tiers(SimpleNamespace(hbm=-1, ddr=1, ssd=-1)) == [
+        "hbm",
+        "ssd",
+    ]
+    assert plan._negative_tiers(SimpleNamespace(hbm=1, ddr=1, ssd=0)) == []
+
+
+@pytest.mark.skipif(
+    not _STORAGE_HAS_SSD, reason="Storage.ssd exists from TorchRec 1.5.0"
+)
+def test_an_ssd_overdraft_is_caught():
+    """`Storage.__sub__` subtracts all three tiers. A guard reading only hbm
+    and ddr would hand the planner a negative ssd without a word.
+
+    `ssd_cap=0` is stated rather than left out: TorchRec defaults it to 2 TB
+    (`planner/constants.py:27`), which no plausible per-rank cost overdraws."""
+    topology = Topology(
+        world_size=WORLD_SIZE,
+        local_world_size=LOCAL_SIZE,
+        compute_device="cuda",
+        hbm_cap=80 * GB,
+        ddr_cap=128 * GB,
+        ssd_cap=0,
+    )
+    assert topology.devices[0].storage.ssd == 0, "nothing to draw on"
+
+    with pytest.raises(PlannerError, match="overdraws ssd"):
+        topology_minus(topology, [make_storage(ssd=1 * GB)] * WORLD_SIZE)
+
+
 def test_topology_minus_rejects_a_length_mismatch():
     with pytest.raises(ValueError, match="entries but the topology has"):
         topology_minus(_topology(), [make_storage()] * (WORLD_SIZE - 1))
 
 
+# --- where the refusal happens ---------------------------------------------
+
+
+def _dynamicemb_planner(topology: Topology, table: str, hbm_budget: int):
+    """A planner whose only table is a DynamicEmb one of the given HBM budget."""
+    return DynamicEmbeddingShardingPlanner(
+        topology=topology,
+        constraints={
+            table: DynamicEmbParameterConstraints(
+                sharding_types=[ShardingType.ROW_WISE.value],
+                use_dynamicemb=True,
+                dynamicemb_options=DynamicEmbTableOptions(
+                    global_hbm_for_values=hbm_budget,
+                ),
+            )
+        },
+    )
+
+
+def test_an_overdraft_is_refused_before_the_broadcast():
+    """`_plan_torchrec` runs on rank 0 alone, inside the broadcast in
+    `collective_plan`. A refusal raised in there unwinds rank 0 and leaves
+    every other rank waiting on a broadcast that will never be sent, so the
+    one check that catches overcommitment would surface as a hang.
+
+    `_plan_dynamicemb` runs on every rank, so that is where it belongs. This
+    asserts it by calling step 1 alone -- `_plan_torchrec` is never reached."""
+    # Row-wise over WORLD_SIZE ranks: 2**26 rows of DIM fp32 each, so 4 GiB a
+    # rank, against a budget that allows it and a rank that has 1 GB.
+    module = _ebc(["big"], rows=2**28)
+    sharders = [EmbeddingBagCollectionSharder()]
+    planner = _dynamicemb_planner(_topology(hbm=1 * GB), "big", 64 * GB)
+
+    with pytest.raises(PlannerError, match="do not fit"):
+        planner._plan_dynamicemb(module, sharders)
+
+
+def test_a_plan_that_fits_leaves_the_caller_topology_whole():
+    """Step 1 deducts into a Topology of its own. `self._topology` still says
+    what the machine has, because a second `plan` call has to start there."""
+    topology = _topology()
+    module = _ebc(["small"])
+    planner = _dynamicemb_planner(topology, "small", 1 * GB)
+
+    planner._plan_dynamicemb(module, [EmbeddingBagCollectionSharder()])
+
+    assert planner._reduced_topology is not None
+    assert planner._topology.devices[0].storage.hbm == 80 * GB
+    assert planner._reduced_topology.devices[0].storage.hbm < 80 * GB
+
+
 # --- module_without_tables -------------------------------------------------
 
 
-def _ebc(names, device=torch.device("meta")):
+def _ebc(names, device=torch.device("meta"), rows: int = ROWS):
     return torchrec.EmbeddingBagCollection(
         tables=[
             EmbeddingBagConfig(
                 name=name,
                 embedding_dim=DIM,
-                num_embeddings=ROWS,
+                num_embeddings=rows,
                 feature_names=[f"f_{name}"],
             )
             for name in names
