@@ -507,7 +507,7 @@ unset and the placer chooses. Pinned tables are charged first, so unpinned ones
 fit around them. This is how a caller who knows their layout for some tables
 gets it without having to name every node.
 
-`table_layout` (`planner/plan.py`) turns a sharding type and a node into the
+`table_ranks` (`planner/plan.py`) turns a sharding type and a node into the
 ranks a table sits on, and `_plan_dynamicemb` writes one `ShardMetadata` per
 rank in that list -- so a TRW table gets `local_size` entries and `ranks` is
 that node's range. It rejects, rather than ignores, a `node_index` on a
@@ -549,7 +549,7 @@ For a TRW table both divisors must be `local_size`. Two problems:
 `table_fanout(sharding_type, world_size, local_size)`: it depends on how big a
 node is, not on *which* node, so capacity is settled before placement and the
 ordering does not invert. That is what lets the placer size a table before
-deciding where to put it. `table_layout` is the same arithmetic carried one step
+deciding where to put it. `table_ranks` is the same arithmetic carried one step
 further, so the number of pieces and the list of ranks cannot disagree.
 `table_fanout` feeds `_sharded_table_bucket_layout` and the
 `local_hbm_for_values` division alike.
@@ -814,7 +814,7 @@ key -> rank rule now lives in `key_ownership.py`.
 |---|---|---|
 | `dynamicemb_config.py` | `node_index` in `DynamicEmbTableOptions`. Done (M2). `_sharded_table_bucket_layout` needed no change -- it already takes the divisor as an argument; what changed is who computes it (`table_fanout`) | S |
 | `planner/planners.py` | TRW branch in `_plan_dynamicemb`; per-table capacity divisor. Done (M2). The ordering worry did not arise -- see §4.2 | M |
-| `planner/plan.py` | **new in M2** -- `table_fanout`, `table_layout`. `per_rank_storage` needed no change: already per rank, and reads the shard metadata `_plan_dynamicemb` writes | S |
+| `planner/plan.py` | **new in M2** -- `table_fanout`, `table_ranks`. `per_rank_storage` needed no change: already per rank, and reads the shard metadata `_plan_dynamicemb` writes | S |
 | `planner/placement.py` | **new in M2** -- `NodePlacer`, `BalancedNodePlacer` | S |
 | `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` and `TwRwSparseFeaturesDist`. Done (M3): 169 lines of code, two overridden methods and one overridden `forward` | S |
 | `shard/embeddingbag.py` | dispatch TRW. Done (M3): one `elif` | S |
@@ -1103,7 +1103,9 @@ Five gigabytes of HBM the old arithmetic did not reserve.
 
 **The grouping used is ours, and is coarser than the real one.** One function,
 `fusion_key`, answers what two tables must agree on, and both the placer and
-`per_rank_storage` bucket by it, so they cannot disagree about what fuses:
+`per_rank_storage` bucket by it, so they cannot disagree about what fuses. The
+placer reaches it through `TableToPlace.fusion_key`, which carries the same
+name because it is the same answer:
 
 | In the key | Why |
 |---|---|
@@ -1312,7 +1314,7 @@ surfaced only because TRW made someone check what `sharding_type` was for.
 |---|---|---|
 | ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
 | ~~**M1**~~ | ~~Measure R1 as a go/no-go~~ **Cancelled.** Customer demand for TWRW is strong enough that it ships regardless of the R1 outcome. The measurement still has value as *sizing* input for §4.2 and for the `node_index` guidance in §10.3 -- it is folded into M5, not a gate. |  |
-| ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `NodePlacer` component, with `node_index` surviving as a pin. Plan is TRW-shaped; nothing consumes it yet -- `shard/embeddingbag.py` still dispatches only ROW_WISE, so a TRW table reaches TorchRec's own TwRw sharding and will not work. M3 is what makes it run. | `table_fanout` / `table_layout` / `BalancedNodePlacer` unit tests; plan inspection still owed |
+| ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `NodePlacer` component, with `node_index` surviving as a pin. Plan is TRW-shaped; nothing consumes it yet -- `shard/embeddingbag.py` still dispatches only ROW_WISE, so a TRW table reaches TorchRec's own TwRw sharding and will not work. M3 is what makes it run. | `table_fanout` / `table_ranks` / `BalancedNodePlacer` unit tests; plan inspection still owed |
 | ~~**M3**~~ | **Done.** `TwRwPooledDynamicEmbeddingSharding` + the input dist (§4.3, §4.4); the staggered shuffle turned out to be inherited. `EmbeddingCollection` refuses TRW outright. Running it found six defects the static reading had missed -- see §8.5. | Numerical parity vs row-wise, reached |
 | ~~**M4**~~ | **Done.** Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7). The kernel reads its shard geometry from the placements TorchRec planned rather than from the global process group, so the four refusals M3 added are gone. | Dump→load round-trip across TRW, reached: a two-node emulation both directions with unequal per-node table counts, and a 2x8 run whose 58 GB checkpoint reloaded onto 8 GPUs with exact key counts and bit-identical values |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
