@@ -26,6 +26,10 @@ import pytest
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 import torchrec
+from torch.distributed.optim import (
+    _apply_optimizer_in_backward as apply_optimizer_in_backward,
+)
+from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.types import PlannerError, Topology
 
@@ -41,10 +45,11 @@ from dynamicemb.dynamicemb_config import (
     get_group_value_bytes_by_tier,
     get_local_value_bytes_by_tier,
 )
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
 from dynamicemb.planner.plan import (
     module_without_tables,
+    optimizer_types,
     per_rank_storage,
     shard_rank,
     table_fanout,
@@ -237,7 +242,7 @@ def test_topology_minus_rejects_a_length_mismatch():
 # --- module_without_tables -------------------------------------------------
 
 
-def _ebc(names):
+def _ebc(names, device=torch.device("meta")):
     return torchrec.EmbeddingBagCollection(
         tables=[
             EmbeddingBagConfig(
@@ -248,7 +253,7 @@ def _ebc(names):
             )
             for name in names
         ],
-        device=torch.device("meta"),
+        device=device,
     )
 
 
@@ -455,3 +460,123 @@ def test_per_rank_storage_groups_what_shares_a_rank():
     )
     grouped = get_group_value_bytes_by_tier([(small, None), (large, None)])
     assert all(s == make_storage(hbm=grouped[0], ddr=grouped[1]) for s in spent)
+
+
+# --- optimizer_types: which optimizer each table trains with ----------------
+
+
+def _ec(names, device=torch.device("meta")):
+    return torchrec.EmbeddingCollection(
+        tables=[
+            EmbeddingConfig(
+                name=name,
+                embedding_dim=DIM,
+                num_embeddings=ROWS,
+                feature_names=[f"f_{name}"],
+            )
+            for name in names
+        ],
+        device=device,
+    )
+
+
+class _MixedModel(torch.nn.Module):
+    """One pooled collection and one sequence collection, as a real model has.
+
+    On CPU rather than meta because `apply_optimizer_in_backward` registers
+    hooks on the parameters.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pooled = _ebc(["p0", "p1"], device=torch.device("cpu"))
+        self.sequence = _ec(["s0"], device=torch.device("cpu"))
+
+
+def _mixed_sharders(pooled_optimizer=None, sequence_optimizer=None):
+    return [
+        EmbeddingBagCollectionSharder(
+            fused_params=None
+            if pooled_optimizer is None
+            else {"optimizer": pooled_optimizer}
+        ),
+        EmbeddingCollectionSharder(
+            fused_params=None
+            if sequence_optimizer is None
+            else {"optimizer": sequence_optimizer}
+        ),
+    ]
+
+
+def test_each_collection_reads_its_own_sharders_optimizer():
+    """The sharders need not agree, and a table follows the one that claims it.
+
+    Flattening the list to a single value -- taking the last sharder that names
+    an optimizer -- would hand every table one module's answer, and the one it
+    picked would depend on the order the caller happened to pass them in.
+    """
+    model = _MixedModel()
+    sharders = _mixed_sharders(
+        pooled_optimizer=OptimType.ADAM,
+        sequence_optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
+    )
+
+    assert optimizer_types(model, sharders) == {
+        "p0": OptimType.ADAM,
+        "p1": OptimType.ADAM,
+        "s0": OptimType.EXACT_ROWWISE_ADAGRAD,
+    }
+
+    # and the answer does not depend on the order they were passed in
+    assert optimizer_types(model, list(reversed(sharders))) == optimizer_types(
+        model, sharders
+    )
+
+
+def test_a_sharder_that_names_no_optimizer_leaves_its_tables_unset():
+    """Only the collection without one; the other sharder does not fill it in."""
+    model = _MixedModel()
+    sharders = _mixed_sharders(pooled_optimizer=OptimType.ADAM)
+
+    assert optimizer_types(model, sharders) == {
+        "p0": OptimType.ADAM,
+        "p1": OptimType.ADAM,
+        "s0": None,
+    }
+
+
+def test_a_parameter_optimizer_wins_over_its_sharder():
+    model = _MixedModel()
+    apply_optimizer_in_backward(torch.optim.SGD, model.pooled.parameters(), {"lr": 0.1})
+
+    assert optimizer_types(model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)) == {
+        "p0": OptimType.EXACT_SGD,
+        "p1": OptimType.EXACT_SGD,
+        "s0": None,
+    }
+
+
+def test_an_optimizer_torchrec_cannot_name_falls_back_to_the_sharder():
+    """DynamicEmb's own FTRL is one of these: applied to the parameter, but with
+    no EmbOptimType to convert to. The sharder's answer is better than none."""
+    model = _MixedModel()
+    apply_optimizer_in_backward(
+        torch.optim.RMSprop, model.pooled.parameters(), {"lr": 0.1}
+    )
+
+    assert optimizer_types(model, _mixed_sharders(pooled_optimizer=OptimType.ADAM)) == {
+        "p0": OptimType.ADAM,
+        "p1": OptimType.ADAM,
+        "s0": None,
+    }
+
+
+def test_a_table_no_sharder_claims_is_not_reported():
+    """`shardable_parameters` is the same accessor `module_without_tables`
+    prunes by, so what is planned and what is costed are the same set."""
+    model = _MixedModel()
+
+    assert set(optimizer_types(model, [EmbeddingBagCollectionSharder()])) == {
+        "p0",
+        "p1",
+    }

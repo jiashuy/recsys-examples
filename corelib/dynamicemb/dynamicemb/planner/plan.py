@@ -104,6 +104,22 @@ def shard_rank(shard: ShardMetadata) -> int:
     return placement.rank()
 
 
+def _parameter_optimizer(param: nn.Parameter) -> Optional[OptimType]:
+    """What `apply_optimizer_in_backward` put on a parameter, if anything.
+
+    ``None`` both when nothing was applied and when what was applied has no
+    ``EmbOptimType`` -- DynamicEmb's own FTRL is one -- so that the caller falls
+    back to what the sharder says rather than to a guess.
+    """
+    optimizer_classes = getattr(param, "_optimizer_classes", None)
+    if not optimizer_classes:
+        return None
+    try:
+        return optimizer_type_to_emb_opt_type(optimizer_classes[0])
+    except ValueError:
+        return None
+
+
 def optimizer_types(
     module: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
@@ -117,35 +133,36 @@ def optimizer_types(
     carries the EmbOptimType directly. The parameter wins where both are present,
     matching `merge_fused_params`.
 
-    A table with neither is reported as ``None``: the caller reserves its rows
-    and nothing for optimizer state, which keeps the reservation a floor rather
-    than a guess.
-    """
-    from_sharders: Optional[OptimType] = None
-    for sharder in sharders:
-        fused_params = getattr(sharder, "fused_params", None) or {}
-        from_sharders = fused_params.get("optimizer", from_sharders)
+    ``fused_params`` is read off the sharder that claims the table's collection,
+    not off the sharder list as a whole. A model may be sharded by several --
+    an EmbeddingBagCollection and an EmbeddingCollection each have their own --
+    and they need not agree on the optimizer, so flattening them to one value
+    would hand some tables another module's answer. TorchRec resolves it the
+    same way, by `module_type_key` (`shard_estimators.py:182`).
 
+    Tables are found through `shardable_parameters`, the same accessor
+    :func:`module_without_tables` prunes by, so a table that is planned is a
+    table that appears here.
+
+    A table with neither convention is reported as ``None``: the caller reserves
+    its rows and nothing for optimizer state, which keeps the reservation a
+    floor rather than a guess.
+    """
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
     per_table: Dict[str, Optional[OptimType]] = {}
-    for param_name, param in module.named_parameters():
-        parts = param_name.split(".")
-        if len(parts) < 2:
-            continue
-        # `embeddings.<table>.weight` for an EC, `embedding_bags.<table>.weight`
-        # for an EBC, either of them arbitrarily nested.
-        table_name = parts[-2]
-        optimizer_classes = getattr(param, "_optimizer_classes", None)
-        if optimizer_classes:
-            try:
-                per_table[table_name] = optimizer_type_to_emb_opt_type(
-                    optimizer_classes[0]
-                )
-                continue
-            except ValueError:
-                # An optimizer TorchRec has no EmbOptimType for -- DynamicEmb's
-                # own FTRL is one -- so fall through to what the sharder says.
-                pass
-        per_table[table_name] = from_sharders
+
+    def visit(node: nn.Module) -> None:
+        sharder = sharder_map.get(sharder_name(type(node)))
+        if sharder is None:
+            for _, child in node.named_children():
+                visit(child)
+            return
+        from_sharder = (getattr(sharder, "fused_params", None) or {}).get("optimizer")
+        for table_name, param in sharder.shardable_parameters(node).items():
+            applied = _parameter_optimizer(param)
+            per_table[table_name] = from_sharder if applied is None else applied
+
+    visit(module)
     return per_table
 
 
