@@ -192,11 +192,26 @@ def fusion_key(
     `_prefetch_and_cached` -- upstream internals that would have to be tracked
     as they change, which §4.9 is about not doing.
 
-    So this stays **coarser** than the truth, and coarser is the direction that
-    errs safely: merging tables the runtime keeps apart moves
-    ``min(sum total, sum budget)`` up, over-stating HBM. A plan can be refused
-    that would have fit; none is accepted that will not. Every attribute added
-    here narrows that gap.
+    So this stays **coarser** than the truth, and coarseness is not safe in both
+    directions. Merging tables the runtime keeps apart moves
+    ``min(sum total, sum budget)`` up, because ``sum min <= min sum``:
+
+    * **HBM is over-stated**, which only ever refuses a layout that would have
+      fit. Nothing is accepted that HBM will not hold.
+    * **The host tier is under-stated** by exactly as much, since it is
+      ``total - hbm`` and ``total`` does not move. That direction *can* accept
+      a layout the runtime will not hold: the planner believes the rows stay in
+      HBM, the runtime keeps the tables apart, and the ones that no longer fit
+      a budget go to a host tier that was never costed for them.
+
+    The same key is what ``per_rank_storage`` deducts the tables with, so the
+    under-statement reaches the Topology handed to TorchRec as well -- the two
+    agree, they are simply both short. Every attribute added here narrows that
+    gap, which is why one is added rather than left out whenever we can know it
+    without reaching into TorchRec's internals. See
+    ``test_tables_that_do_not_fuse_do_not_pool_their_budgets``, which is this
+    paragraph as a test: drop any one attribute and a layout the host tier
+    cannot hold stops being refused.
     """
     return (
         sharding_type,
@@ -235,20 +250,16 @@ def per_rank_storage(
     ``min(sum total, sum budget)`` -- it under-states HBM, and that is the
     direction that lets a plan through which the machine will not hold.
 
-    The grouping used here is the sharding type paired with
-    ``DynamicEmbTableOptions``'s own key
-    (:meth:`~dynamicemb.dynamicemb_config.DynamicEmbTableOptions.get_grouped_key`).
-    The sharding type belongs in it because TorchRec splits tables by it into
-    separate ``EmbeddingSharding``s before ``group_tables`` runs inside each
-    (``embeddingbag.py:267``, ``rw_sharding.py:178``), so a row-wise table never
-    fuses with a table-row-wise one however alike their options.
+    The grouping used here is :func:`fusion_key`, the same function the placer
+    buckets by, so the two cannot disagree about what fuses.
 
-    It is still **coarser** than the runtime's, which also keys on data type,
-    pooling, a dimension bucket and the fused params
-    (``embedding_sharding.py:609``). Reproducing that exactly would mean
-    reimplementing `_get_grouping_fused_params`, the dimension bucketer and
+    It is still **coarser** than the runtime's, which also keys on a dimension
+    bucket and the rest of the fused params (``embedding_sharding.py:609``).
+    Reproducing that exactly would mean reimplementing
+    `_get_grouping_fused_params`, the dimension bucketer and
     `_prefetch_and_cached` here, and then owning them as TorchRec changes them
-    -- the kind of fork §4.9 exists to avoid.
+    -- the kind of fork §4.9 exists to avoid. What that coarseness costs, in
+    both directions, is :func:`fusion_key`'s docstring.
 
     Coarser is the safe inexactness. Merging tables the runtime would keep apart
     only moves ``min(sum total, sum budget)`` up, so this over-states HBM rather

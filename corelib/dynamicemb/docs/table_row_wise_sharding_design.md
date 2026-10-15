@@ -1212,16 +1212,30 @@ upstream internals that would have to be tracked as they change.
 An earlier version of this section lumped all five of those together as
 impractical. Three of them were not: the optimizer was already in hand, the
 data type is on the options, and the pooling only needed passing through. Two
-tables differing in any of them were being pooled, which over-states the
-group's HBM and can refuse a node -- or a plan -- the runtime would have held. Reproducing that here would mean reimplementing
+tables differing in any of them were being pooled. What is left out -- the
+dimension bucket and the rest of the fused params -- would mean reimplementing
 `_get_grouping_fused_params`, the dimension bucketer and `_prefetch_and_cached`,
-and then owning them as TorchRec changes them -- the kind of fork §4.9 exists to
-avoid. So `per_rank_storage` buckets on `DynamicEmbTableOptions.get_grouped_key`
-alone.
+and then owning them as TorchRec changes them, the kind of fork §4.9 exists to
+avoid.
 
-Coarser is the safe inexactness, for the same reason: merging tables the runtime
-would keep apart only moves `min(sum total, sum budget)` up. The estimate can
-exceed the truth and refuse a plan that would have fit; it cannot fall below it.
+**Coarser is not safe in both directions**, which an earlier version of this
+section claimed. Merging tables the runtime would keep apart moves
+`min(sum total, sum budget)` up, because `sum min <= min sum`:
+
+- **HBM is over-stated**, which only refuses a layout that would have fit.
+- **The host tier is under-stated** by the same amount, since it is
+  `total - hbm` and `total` does not move — and that direction *accepts*
+  layouts the runtime will not hold. The planner believes the rows stay in HBM;
+  the runtime keeps the tables apart, and the rows that no longer fit a budget
+  go to a host tier nobody costed for them.
+
+Both the placer and `per_rank_storage` bucket by `fusion_key`, so the
+under-statement reaches the Topology handed to TorchRec as well — the two agree,
+they are simply both short. That is why each attribute that *can* be known is in
+the key rather than left out, and why
+`test_tables_that_do_not_fuse_do_not_pool_their_budgets` has a case per
+attribute: drop any one and a layout the host tier cannot hold stops being
+refused.
 
 **Two things this is not.** `caching` and `external_storage` are *in* the
 grouping key, so a group where one member asks for caching and another does not
