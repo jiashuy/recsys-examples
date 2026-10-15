@@ -337,10 +337,7 @@ _TIER_REMEDIES = {
         "or state a ddr_cap that matches the host memory a rank really has "
         "(TorchRec defaults it to 128 GB per rank)"
     ),
-    "ssd": (
-        "lower the tables' capacity, or state an ssd_cap that matches the "
-        "machine"
-    ),
+    "ssd": "lower the tables' capacity, or state an ssd_cap that matches the machine",
 }
 
 

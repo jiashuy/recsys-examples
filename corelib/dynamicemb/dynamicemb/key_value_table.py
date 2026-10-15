@@ -34,12 +34,12 @@ from dynamicemb.dynamicemb_config import (
     score_dump_permutation,
     score_load_permutation,
 )
-from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.extendable_tensor import (
     DeviceExtendableBuffer,
     ExtendableBuffer,
     HostExtendableBuffer,
 )
+from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
 )
