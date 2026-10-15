@@ -22,10 +22,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from torch import distributed as dist
 from torch import nn
+from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints
 from torchrec.distributed.planner.types import StorageReservation, Topology
-from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import placement
 from torchrec.distributed.types import (
@@ -39,6 +39,14 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
+from ..dynamicemb_config import (
+    DEFAULT_INDEX_TYPE,
+    DynamicEmbTableOptions,
+    _sharded_table_bucket_layout,
+    align_to_table_size,
+    complete_initializer_args,
+    get_group_value_bytes_by_tier,
+)
 from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .plan import (
     fusion_key,
@@ -49,14 +57,6 @@ from .plan import (
     table_fanout,
     table_ranks,
     topology_minus,
-)
-from ..dynamicemb_config import (
-    DEFAULT_INDEX_TYPE,
-    DynamicEmbTableOptions,
-    get_group_value_bytes_by_tier,
-    _sharded_table_bucket_layout,
-    align_to_table_size,
-    complete_initializer_args,
 )
 
 

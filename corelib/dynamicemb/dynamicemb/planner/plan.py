@@ -41,9 +41,7 @@ from torchrec.distributed.planner.types import (
     Storage,
     Topology,
 )
-from torchrec.distributed.planner.utils import storage_repr_in_gb
-from torchrec.distributed.planner.utils import sharder_name
-from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
+from torchrec.distributed.planner.utils import sharder_name, storage_repr_in_gb
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
     ModuleSharder,
@@ -51,6 +49,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
+from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 
 from ..dynamicemb_config import get_group_value_bytes_by_tier
 

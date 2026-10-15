@@ -31,10 +31,10 @@ from dynamicemb.types import (
     DEFAULT_UNIFORM_UPPER,
     AdmissionStrategy,
     Counter,
-    MultiTableAdmitter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     MemoryType,
+    MultiTableAdmitter,
     group_key_of,
 )
 from dynamicemb_extensions import flagged_compact

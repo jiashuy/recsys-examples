@@ -27,33 +27,16 @@ from typing import NamedTuple
 
 import pytest
 import torch
-from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 import torchrec
-from torch.distributed.optim import (
-    _apply_optimizer_in_backward as apply_optimizer_in_backward,
-)
-from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.planner.types import PlannerError, Topology
-
-from dynamicemb.planner.plan import make_storage
-from torchrec.distributed.types import (
-    EnumerableShardingSpec,
-    ParameterSharding,
-    ShardingType,
-    ShardMetadata,
-)
-
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     get_group_value_bytes_by_tier,
     get_local_value_bytes_by_tier,
 )
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
-
 from dynamicemb.planner import plan
 from dynamicemb.planner.plan import (
     _STORAGE_HAS_SSD,
+    make_storage,
     module_without_tables,
     optimizer_types,
     per_rank_storage,
@@ -67,6 +50,20 @@ from dynamicemb.planner.planners import (
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
 )
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from torch.distributed.optim import (
+    _apply_optimizer_in_backward as apply_optimizer_in_backward,
+)
+from torchrec.distributed.embedding import EmbeddingCollectionSharder
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.planner.types import PlannerError, Topology
+from torchrec.distributed.types import (
+    EnumerableShardingSpec,
+    ParameterSharding,
+    ShardingType,
+    ShardMetadata,
+)
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
 WORLD_SIZE = 4
 LOCAL_SIZE = 2

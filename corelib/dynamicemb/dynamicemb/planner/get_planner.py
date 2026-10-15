@@ -24,9 +24,7 @@ from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
 from ..dynamicemb_config import DynamicEmbTableOptions
-from .planners import (
-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
-)
+from .planners import DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner
 from .planners import DynamicEmbParameterConstraints
 
 # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
