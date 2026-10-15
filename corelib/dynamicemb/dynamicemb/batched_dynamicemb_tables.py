@@ -575,7 +575,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._sharding_type = (
             "row_wise" if self._num_shards == world_size else "table_row_wise"
         )
-        # Set by the table-row-wise sharding to its intra-node group; a barrier
+        # Set through set_shard_pg by the table-row-wise sharding; a barrier
         # over the world would deadlock when nodes hold different table counts.
         self._shard_pg: Optional[dist.ProcessGroup] = None
         self._shard_world_size = self._num_shards
@@ -1422,6 +1422,30 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 UserWarning,
             )
         return max(scores)
+
+    def set_shard_pg(self, pg: dist.ProcessGroup) -> None:
+        """Name the group of ranks that hold this kernel's tables.
+
+        Collectives over the kernel -- the checkpoint barrier, the incremental
+        dump's gather -- run over the shards of a table, not over the world. By
+        default that is the world, which is right for row-wise; table-row-wise
+        calls this with the intra-node group, because the other node is busy
+        with its own tables and may have a different count of them.
+
+        The group must be the one the plan described: ``shard_ranks`` decides
+        who owns which key and how the checkpoint is named, and this group
+        decides who waits for whom. They are built by different code -- the
+        planner and the sharding -- and this is the one place they meet, so the
+        sizes are checked against each other here.
+        """
+        size = dist.get_world_size(group=pg)
+        if size != self._shard_world_size:
+            raise ValueError(
+                f"Shard group of {size} ranks does not match the "
+                f"{self._shard_world_size} shards the plan gave tables "
+                f"{self._table_names} (shards on ranks {self._shard_ranks})."
+            )
+        self._shard_pg = pg
 
     def _shard_barrier(self) -> None:
         if not dist.is_initialized():

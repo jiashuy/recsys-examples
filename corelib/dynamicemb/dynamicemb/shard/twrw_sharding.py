@@ -51,6 +51,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from .input_dist import bucketize_kjt_before_all2all, dist_type_codes
 from .rw_sharding import dist_type_per_feature, GroupedPooledEmbeddingsLookup
 
@@ -214,8 +215,12 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             **kwargs,
         )
         # Checkpoint barriers run over the node that holds the table; the other
-        # node is busy with its own tables and may have a different count.
+        # node is busy with its own tables and may have a different count. Only
+        # DynamicEmb's kernels are told: a table sharded table-row-wise but not
+        # on a DynamicEmb kernel is grouped into this same sharding and falls
+        # back to TorchRec's kernel, which owns its own collectives.
         for emb in lookup._emb_modules:
-            if hasattr(emb, "emb_module"):
-                emb.emb_module._shard_pg = self._intra_pg
+            inner = getattr(emb, "emb_module", None)
+            if isinstance(inner, BatchedDynamicEmbeddingTablesV2):
+                inner.set_shard_pg(self._intra_pg)
         return lookup
