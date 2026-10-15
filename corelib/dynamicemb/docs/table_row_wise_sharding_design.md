@@ -694,6 +694,45 @@ sharding hands it. Everything that names a shard derives from those.
   tables — which is the normal case once tables are packed onto nodes, and which
   this section did not anticipate.
 
+The shard group reaches the kernel through `set_shard_pg`, called by the TRW
+sharding once the lookup is built (`twrw_sharding.py:218`). It cannot be a
+constructor argument the way `shard_ranks` is: TorchRec fixes the signature
+`_create_embedding_kernel` is called with, and the `pg` it passes is the global
+one. It is also the only place the plan's `shard_ranks` and the sharding's group
+meet — the planner builds one, the sharding the other, and they must name the
+same ranks — so the sizes are checked against each other there.
+
+Only DynamicEmb's kernels are told. `create_embedding_bag_sharding`
+(`shard/embeddingbag.py:102`) routes **by sharding type alone**, so a table
+sharded table-row-wise on a non-DynamicEmb kernel lands in this same sharding and
+falls back to TorchRec's kernel (`shard/rw_sharding.py:205`), which owns its
+collectives and never reads the field.
+
+`dump` and `load` still take a `pg`, and it is the barrier's fallback: the group
+`set_shard_pg` named wins, `pg` is used when none was named, and `None` means the
+world. That restores upstream's behaviour for row-wise, where a table is on every
+rank and the caller's group is the right one. It cannot be more than a fallback,
+because a caller holds **one** group for a whole model while each kernel's tables
+may sit on a different node — `dump_load.py:197` passes the same `pg` to every
+module.
+
+**Shard identity deliberately does not consult `pg`.** `rank` and `world_size`
+for file naming stay `_shard_index` / `_num_shards`. Unlike the barrier group,
+these are never unknown — `__init__` always computes them — and they are the
+single authority for five things that must agree: the file names
+(`batched_dynamicemb_tables.py:1487`, `:1563`), the `num_shards`/`shard_ranks`
+written into the meta (`:1468`), the check that reads it back (`:1866`), and the
+key-ownership modulus (`:2134`). Letting `pg` into one of them splits it from the
+other four — a dump whose file names are numbered by the caller's group while the
+meta beside them records the plan's shard count.
+
+This is a behaviour change from upstream for one case: upstream named files by
+`dist.get_rank(group=pg)`, so a caller passing a **sub-group** got names numbered
+within it. `DynamicEmbDump` and `DynamicEmbLoad` default to `dist.group.WORLD`
+(`dump_load.py:109`, `:224`), where the two agree; only an explicit sub-group
+differs. Checkpoints still round-trip either way, since dump and load derive the
+names the same way.
+
 ### 4.6 Load / replay / twin-module ownership. Done (M4).
 
 All five sites in §2(b) must move to **one shared function**:
