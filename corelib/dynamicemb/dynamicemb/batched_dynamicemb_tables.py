@@ -1447,13 +1447,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         self._shard_pg = pg
 
-    def _shard_barrier(self) -> None:
+    def _shard_barrier(self, pg: Optional[dist.ProcessGroup] = None) -> None:
+        """Wait for the ranks that hold this kernel's tables.
+
+        The group the sharding named through ``set_shard_pg`` wins over the
+        one the caller offered, because a caller holds a single group for a
+        whole model while each kernel's tables may sit on a different node --
+        under table-row-wise no one group is right for all of them. ``pg`` is
+        what is left to go on when the sharding named nothing: row-wise, where
+        a table is on every rank and the caller's group is the right one.
+        """
         if not dist.is_initialized():
             return
-        if self._shard_pg is not None:
-            dist.barrier(group=self._shard_pg)
-        else:
-            dist.barrier()
+        dist.barrier(group=self._shard_pg if self._shard_pg is not None else pg)
 
     def _write_shard_meta(self, meta_file_path: str) -> None:
         with open(meta_file_path) as meta_file:
@@ -1506,7 +1512,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
             storage = self._storage
-            self._shard_barrier()
+            self._shard_barrier(pg)
             ts = device_timestamp()
             storage.dump(
                 table_id,
@@ -1551,6 +1557,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if table_names is None:
             table_names = self._table_names
 
+        # Files are looked up by the table's own shard, as dump named them:
+        # not by the caller's rank in pg, which pg does not decide either way.
         rank = self._shard_index
         world_size = self._num_shards
 
@@ -1579,7 +1587,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             num_key_files = len(emb_key_files)
-            self._shard_barrier()
+            self._shard_barrier(pg)
             ts = device_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
