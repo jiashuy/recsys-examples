@@ -14,16 +14,13 @@
 # limitations under the License.
 
 
+from .get_planner import get_planner
 from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
 )
-
-
-# Last: it builds the three above, so they have to exist first.
-from .get_planner import get_planner
 
 __all__ = [
     "get_planner",

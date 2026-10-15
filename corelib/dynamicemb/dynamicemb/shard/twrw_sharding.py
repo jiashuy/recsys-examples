@@ -39,8 +39,8 @@ from torchrec.distributed.embedding_types import (
     BaseEmbeddingLookup,
     BaseGroupedFeatureProcessor,
 )
+from torchrec.distributed.sharding.twrw_sharding import TwRwPooledEmbeddingSharding
 from torchrec.distributed.sharding.twrw_sharding import (
-    TwRwPooledEmbeddingSharding,
     TwRwSparseFeaturesDist as _TwRwSparseFeaturesDist,
 )
 from torchrec.distributed.types import (
@@ -53,7 +53,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from .input_dist import bucketize_kjt_before_all2all, dist_type_codes
-from .rw_sharding import dist_type_per_feature, GroupedPooledEmbeddingsLookup
+from .rw_sharding import GroupedPooledEmbeddingsLookup, dist_type_per_feature
 
 
 class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):

@@ -42,12 +42,12 @@ from dynamicemb.dynamicemb_config import (
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
-from dynamicemb.planner import get_planner
 from dynamicemb.key_ownership import murmur3_fmix64
-from dynamicemb.shard.input_dist import dist_type_codes
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
+from dynamicemb.planner import get_planner
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.shard.input_dist import dist_type_codes
 from dynamicemb.types import MAX_BUCKET_CAPACITY, AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType

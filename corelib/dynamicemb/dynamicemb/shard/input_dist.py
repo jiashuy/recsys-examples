@@ -19,9 +19,6 @@ import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
-from torchrec.distributed.sharding.rw_sharding import (
-    RwSparseFeaturesDist as _RwSparseFeaturesDist,
-)
 from torchrec.distributed.embedding_sharding import (
     _fx_wrap_batch_size_per_feature,
     _fx_wrap_gen_list_n_times,
@@ -29,6 +26,9 @@ from torchrec.distributed.embedding_sharding import (
     _fx_wrap_stride,
     _fx_wrap_stride_per_key_per_rank,
     _fx_wrap_tensor_to_device_dtype,
+)
+from torchrec.distributed.sharding.rw_sharding import (
+    RwSparseFeaturesDist as _RwSparseFeaturesDist,
 )
 from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe

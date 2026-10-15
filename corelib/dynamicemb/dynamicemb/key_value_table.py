@@ -40,9 +40,7 @@ from dynamicemb.extendable_tensor import (
     HostExtendableBuffer,
 )
 from dynamicemb.key_ownership import owned_key_mask
-from dynamicemb.optimizer import (
-    BaseDynamicEmbeddingOptimizer,
-)
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,

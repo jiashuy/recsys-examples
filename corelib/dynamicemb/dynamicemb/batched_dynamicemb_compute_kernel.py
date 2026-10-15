@@ -34,9 +34,9 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
 )
 from torchrec.distributed.embedding_kernel import get_state_dict
 from torchrec.distributed.embedding_types import (
-    ShardingType,  # EmbeddingComputeKernel,; GroupedEmbeddingConfig,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
+    ShardingType,
     compute_kernel_to_embedding_location,
 )
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata

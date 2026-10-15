@@ -24,10 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
-from dynamicemb.key_ownership import (
-    murmur3_hash_64bits,
-    owned_key_mask,
-)
+from dynamicemb.key_ownership import murmur3_hash_64bits, owned_key_mask
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
     ScorePolicy,

@@ -28,19 +28,15 @@ filling nodes in order.
 """
 
 import abc
-from dataclasses import dataclass
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, Hashable, List, Optional, Tuple
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torchrec.distributed.planner.types import Storage, Topology
 from torchrec.distributed.types import ShardingType
 
-from ..dynamicemb_config import (
-    DynamicEmbTableOptions,
-    get_group_value_bytes_by_tier,
-)
-
+from ..dynamicemb_config import DynamicEmbTableOptions, get_group_value_bytes_by_tier
 from .plan import fusion_key, make_storage, storage_ssd
 
 __all__ = ["TableToPlace", "NodePlacer", "BalancedNodePlacer"]
@@ -263,17 +259,21 @@ class BalancedNodePlacer(NodePlacer):
 
         # Then the rest, biggest first. "Biggest" is what a table weighs on its
         # own, which is the only size there is before anything is placed.
-        unpinned = sorted(
-            (t for t in tables if t.pinned_to is None),
-            key=lambda t: (-t.cost_alone().hbm, -t.cost_alone().ddr, t.name),
-        )
+        def weight(table: TableToPlace) -> Tuple[int, int, str]:
+            alone = table.cost_alone()
+            return (-alone.hbm, -alone.ddr, table.name)
+
+        unpinned = sorted((t for t in tables if t.pinned_to is None), key=weight)
         for table in unpinned:
             # Emptiest node that can hold it, measured after what each would
             # charge for this table -- so a node holding a groupmate with budget
             # to spare can win on that account, which is what the runtime will
-            # do anyway.
+            # do anyway. Priced once per node and kept, because `added_by`
+            # costs every group on the node twice over to get its answer.
+            priced = {n: (added_by(n, table), spare(n)) for n in range(num_nodes)}
+
             def rank_node(n: int) -> Tuple[bool, int, int, int]:
-                needs, left = added_by(n, table), spare(n)
+                needs, left = priced[n]
                 after = left - needs
                 # Whether it fits comes first. Ranking on room alone compares
                 # the tiers one after another, so a node with headroom in HBM
@@ -282,7 +282,7 @@ class BalancedNodePlacer(NodePlacer):
                 return (needs.fits_in(left), after.hbm, after.ddr, -n)
 
             node = max(range(num_nodes), key=rank_node)
-            needs, left = added_by(node, table), spare(node)
+            needs, left = priced[node]
             if not needs.fits_in(left):
                 raise ValueError(
                     f"No node can hold the table-row-wise table {table.name!r}. "
