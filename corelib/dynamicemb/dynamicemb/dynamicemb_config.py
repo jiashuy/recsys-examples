@@ -24,7 +24,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
-from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb.types import (
     BUCKET_ALIGNMENT,
     DEFAULT_UNIFORM_LOWER,
@@ -37,6 +36,7 @@ from dynamicemb.types import (
     Storage,
     group_key_of,
 )
+from dynamicemb.utils import DTYPE_NUM_BYTES
 
 # fbgemm exports its own PoolingMode, so the bound C++ enum is aliased below to
 # keep the two apart wherever both are in scope.

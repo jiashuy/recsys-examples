@@ -130,7 +130,6 @@ def _spent(planned, optimizer_types, world_size: int = WORLD_SIZE, poolings=None
     )
 
 
-
 def _topology(hbm: int = 80 * GB, ddr: int = 128 * GB) -> Topology:
     return Topology(
         world_size=WORLD_SIZE,
@@ -264,9 +263,7 @@ def test_a_host_overdraft_is_not_told_to_lower_the_hbm_budget():
     spills *more* rows to the host -- the opposite of what an overdrawn host
     tier needs. The advice has to follow the tier that actually failed."""
     with pytest.raises(PlannerError) as excinfo:
-        topology_minus(
-            _topology(ddr=1 * GB), [make_storage(ddr=4 * GB)] * WORLD_SIZE
-        )
+        topology_minus(_topology(ddr=1 * GB), [make_storage(ddr=4 * GB)] * WORLD_SIZE)
 
     message = str(excinfo.value)
     assert "overdraws ddr" in message
