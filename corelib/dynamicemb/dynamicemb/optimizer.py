@@ -133,6 +133,11 @@ class OptimizerArgs:
     l1_reg: float = 0.0
     l2_reg: float = 0.0
     optimizer_state_dtype: Optional[torch.dtype] = None
+    # FTRL group sparsity (G-FTRL, Ni et al., CIKM 2019): a row's
+    # weights are zeroed together when the L2 norm of its L1-thresholded linear
+    # term is at most `group_lasso_reg`. Zero is plain FTRL. Last, so it shifts no
+    # positional construction.
+    group_lasso_reg: float = 0.0
 
 
 def string_to_opt_type(optimizer_str: str) -> OptimType:
@@ -785,6 +790,12 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     previous value but re-solved from the state each step, which is what lets
     ``l1_reg`` drive weights to exactly zero.
 
+    With ``group_lasso_reg > 0`` this is FTRL with group sparsity (G-FTRL, Ni et al., CIKM 2019):
+    a row is one group, and its weights are zeroed together once the L2 norm
+    of its L1-thresholded ``linear`` falls to ``group_lasso_reg``; otherwise they are
+    shrunk by the common factor ``1 - group_lasso_reg / norm``. ``group_lasso_reg = 0`` is
+    plain FTRL.
+
     ``linear`` starts at zero and ``accum`` at ``initial_accumulator_value``.
     Seeding the state is not free here the way it is in the linear regression
     FTRL was written for, whose weights start at zero: an embedding's do not,
@@ -805,10 +816,18 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
     ) -> None:
         super().__init__(opt_args)
-        self._validate(opt_args.learning_rate, opt_args.learning_rate_power)
+        self._validate(
+            opt_args.learning_rate, opt_args.learning_rate_power, opt_args.group_lasso_reg
+        )
 
     @staticmethod
-    def _validate(learning_rate: float, learning_rate_power: float) -> None:
+    def _validate(
+        learning_rate: float, learning_rate_power: float, group_lasso_reg: float = 0.0
+    ) -> None:
+        if group_lasso_reg < 0.0:
+            raise ValueError(
+                f"FTRL's group_lasso_reg is a threshold on a row norm, so it must be >= 0; got {group_lasso_reg}."
+            )
         if learning_rate <= 0.0:
             raise ValueError(
                 "FTRL divides by the learning rate, so it must be positive; got "
@@ -850,6 +869,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.ftrl_beta,
             self._opt_args.l1_reg,
             self._opt_args.l2_reg,
+            self._opt_args.group_lasso_reg,
         )
 
     def fused_update_for_flat_table(
@@ -879,6 +899,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            self._opt_args.group_lasso_reg,
         )
 
     def get_opt_args(self):
@@ -890,6 +911,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             "initial_accumulator_value": self._opt_args.initial_accumulator_value,
             "l1_reg": self._opt_args.l1_reg,
             "l2_reg": self._opt_args.l2_reg,
+            "group_lasso_reg": self._opt_args.group_lasso_reg,
         }
         return ret_args
 
@@ -898,7 +920,11 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         learning_rate_power = get_required_arg(args, "learning_rate_power")
         # A checkpoint's meta reaches here unchecked, so hold it to the same
         # bounds the constructor does.
-        self._validate(learning_rate, learning_rate_power)
+        # Checkpoints written before group sparsity existed carry no group_lasso_reg,
+        # and they were plain FTRL.
+        group_lasso_reg = args.get("group_lasso_reg", 0.0)
+        self._validate(learning_rate, learning_rate_power, group_lasso_reg)
+        self._opt_args.group_lasso_reg = group_lasso_reg
         self._opt_args.learning_rate = learning_rate
         self._opt_args.learning_rate_power = learning_rate_power
         self._opt_args.ftrl_beta = get_required_arg(args, "ftrl_beta")

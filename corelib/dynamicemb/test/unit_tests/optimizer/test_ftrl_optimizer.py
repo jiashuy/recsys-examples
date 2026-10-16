@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FTRL, checked against Algorithm 1 of McMahan et al. 2013.
+"""FTRL, checked against Algorithm 1 of McMahan et al. 2013, and its group-sparse
+variant (G-FTRL, Ni et al. 2019) against a transcription of that.
 
 Every other optimizer here is checked against a
 ``SplitTableBatchedEmbeddingBagsCodegen`` built with the same hyperparameters.
@@ -60,6 +61,7 @@ def ftrl_step(
     ftrl_beta: float = 0.0,
     l1_reg: float = 0.0,
     l2_reg: float = 0.0,
+    group_lasso_reg: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One FTRL-Proximal step, from Algorithm 1 of McMahan et al. 2013.
 
@@ -83,12 +85,27 @@ def ftrl_step(
     linear = (
         linear + grad - (new_accum_pow - accum**exponent) / learning_rate * weight
     )
-    shrunk = (l1_reg * torch.sign(linear) - linear) / (
-        (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
-    )
     # |linear| <= l1_reg pins the weight to exactly zero; that is the whole
     # point of the L1 term and what separates FTRL from a shrinkage update.
-    weight = torch.where(linear.abs() > l1_reg, shrunk, torch.zeros_like(shrunk))
+    thresholded = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
+    if group_lasso_reg > 0.0:
+        # Group sparsity: the last dim is the group (one embedding row). Its
+        # whole thresholded linear term is shrunk by 1 - group_lasso_reg/||.||, or zeroed
+        # outright when the norm does not clear group_lasso_reg.
+        norm = thresholded.norm(dim=-1, keepdim=True)
+        scale = torch.where(
+            norm > group_lasso_reg,
+            1.0 - group_lasso_reg / norm.clamp(min=1e-300),
+            torch.zeros_like(norm),
+        )
+        thresholded = thresholded * scale
+    denom = (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
+    # A coordinate with no gradient and no state has denom == 0 when beta and
+    # l2_reg are zero; its numerator is zero too, and the answer is zero, not
+    # the 0/0 an unguarded division gives.
+    weight = torch.where(
+        thresholded == 0, torch.zeros_like(thresholded), -thresholded / denom
+    )
     return weight, linear, new_accum
 
 
@@ -310,6 +327,322 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
             msg="accum",
         )
     assert seen == num_keys, f"exported {seen} of {num_keys} rows"
+
+
+def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
+    num_rows, row_width = values.shape
+    device = values.device
+    optimizer.update_for_padded_buffer(
+        grads,
+        values,
+        torch.zeros(num_rows, dtype=torch.int64, device=device),
+        torch.tensor([emb_dim], dtype=torch.int64, device=device),
+        emb_dim,
+        row_width,
+        all_dims_vec4,
+    )
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False), (70, False)])
+@pytest.mark.parametrize("l1_reg", [0.0, 0.01], ids=["no_l1", "l1"])
+def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l1_reg):
+    """Rows of very different gradient scale, so some clear the threshold and some do not.
+
+    Checks the weights against the float64 transcription, that the rows below
+    the threshold are *exactly* zero (the point of the group term), and that
+    the others are not -- otherwise a kernel that zeroed everything would pass.
+    """
+    device = torch.device("cuda")
+    num_rows = 64
+    row_width = 3 * emb_dim
+    params = dict(learning_rate=0.1, l1_reg=l1_reg, group_lasso_reg=0.3, l2_reg=0.01)
+    optimizer = _ftrl_optimizer(**params)
+
+    values = _fresh_ftrl_values(
+        num_rows, emb_dim, row_width, emb_dim, 0.0, device, seed=5
+    )
+    generator = torch.Generator(device="cpu").manual_seed(23)
+    row_scale = torch.logspace(-3, 0, num_rows, dtype=torch.float32).unsqueeze(1)
+    grads = (
+        torch.randn(num_rows, emb_dim, generator=generator, dtype=torch.float32)
+        * row_scale
+    ).to(device)
+
+    ref_w, ref_l, ref_a = ftrl_step(
+        values[:, :emb_dim].cpu(),
+        values[:, emb_dim : 2 * emb_dim].cpu(),
+        values[:, 2 * emb_dim :].cpu(),
+        grads.cpu(),
+        **params,
+    )
+    _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4)
+
+    weight = values[:, :emb_dim].cpu()
+    zero_rows = (ref_w == 0).all(dim=1)
+    assert zero_rows.any() and not zero_rows.all(), "test needs both kinds of row"
+    # Exactly zero together, not merely small.
+    assert bool((weight[zero_rows] == 0).all())
+    assert bool((weight[~zero_rows] != 0).any(dim=1).all())
+    torch.testing.assert_close(weight.double(), ref_w, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        values[:, emb_dim : 2 * emb_dim].cpu().double(), ref_l, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        values[:, 2 * emb_dim :].cpu().double(), ref_a, rtol=1e-5, atol=1e-6
+    )
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
+def test_ftrl_group_zero_reg_is_plain_ftrl(emb_dim, all_dims_vec4):
+    """group_lasso_reg = 0 must be bit-identical to FTRL without the group term."""
+    device = torch.device("cuda")
+    row_width = 3 * emb_dim
+    grads = torch.randn(16, emb_dim, device=device)
+    a = _fresh_ftrl_values(16, emb_dim, row_width, emb_dim, 0.1, device, seed=1)
+    b = a.clone()
+    _run_group_step(_ftrl_optimizer(l1_reg=0.01), a, grads, emb_dim, all_dims_vec4)
+    _run_group_step(
+        _ftrl_optimizer(l1_reg=0.01, group_lasso_reg=0.0), b, grads, emb_dim, all_dims_vec4
+    )
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
+def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
+    device = torch.device("cuda")
+    num_rows = 32
+    row_width = 3 * emb_dim
+    optimizer = _ftrl_optimizer(group_lasso_reg=0.2)
+    padded = _fresh_ftrl_values(num_rows, emb_dim, row_width, emb_dim, 0.0, device)
+    flat = padded.clone()
+    grads = torch.randn(num_rows, emb_dim, device=device)
+    table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
+
+    _run_group_step(optimizer, padded, grads, emb_dim, all_dims_vec4)
+    optimizer.fused_update_for_flat_table(
+        grads,
+        torch.arange(num_rows, dtype=torch.int64, device=device),
+        torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
+        table_ids,
+        torch.tensor([row_width], dtype=torch.int64, device=device),
+        table_emb_dims,
+        emb_dim,
+        all_dims_vec4,
+        torch.float32,
+    )
+    torch.testing.assert_close(flat, padded, rtol=0, atol=0)
+
+
+def test_ftrl_group_args_validation_and_ckpt_meta():
+    with pytest.raises(ValueError, match="group_lasso_reg"):
+        _ftrl_optimizer(group_lasso_reg=-0.1)
+    opt = _ftrl_optimizer(group_lasso_reg=0.25)
+    assert opt.get_opt_args()["group_lasso_reg"] == 0.25
+    meta = opt.get_opt_args()
+    fresh = _ftrl_optimizer()
+    fresh.set_opt_args(meta)
+    assert fresh._opt_args.group_lasso_reg == 0.25
+    # A checkpoint from before group sparsity has no group_lasso_reg: plain FTRL.
+    del meta["group_lasso_reg"]
+    fresh.set_opt_args(meta)
+    assert fresh._opt_args.group_lasso_reg == 0.0
+
+
+# Rounding the state through the table dtype is part of what the group-sparse
+# kernel does (it must, so the row norm is of what is stored), and the float64
+# reference does not round, so the narrow dtypes get looser tolerances.
+_NARROW_TOLERANCES = {
+    torch.float32: dict(rtol=1e-4, atol=1e-5),
+    torch.float16: dict(rtol=3e-2, atol=3e-3),
+    torch.bfloat16: dict(rtol=6e-2, atol=1e-2),
+}
+
+
+def _group_case(dims, dtype, rows_per_table=16, seed=31):
+    """Rows that are decisively on one side of the threshold, one set of tables.
+
+    Even rows get tiny gradients and odd rows large ones, so after one step the
+    row norm is far below ``group_lasso_reg`` for the first and far above it for
+    the second. Nothing sits near the threshold, so the narrow dtypes' rounding
+    cannot flip a row between the kernel and the float64 reference. The tiny
+    gradients are kept large enough that their square is not lost in fp16.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    max_dim = max(dims)
+    num_rows = len(dims) * rows_per_table
+    weights = torch.rand(num_rows, max_dim, generator=generator).to(dtype)
+    grads = torch.randn(num_rows, max_dim, generator=generator)
+    mags = torch.where(
+        torch.arange(num_rows) % 2 == 0,
+        torch.full((num_rows,), 5e-3),
+        1.0 + 0.5 * torch.rand(num_rows, generator=generator),
+    ).unsqueeze(1)
+    grads = (grads.sign() * mags * (0.5 + torch.rand_like(grads) * 0.5)).to(dtype)
+    table_of_row = torch.arange(len(dims)).repeat_interleave(rows_per_table)
+    return weights, grads, table_of_row
+
+
+def _check_group_rows(dims, dtype, params, weights, grads, table_of_row, out_of_row):
+    """Compare every row's kernel output with the float64 transcription.
+
+    ``out_of_row(row)`` returns that row's ``(weight, linear, accum)`` as read
+    back from whichever layout the path under test uses.
+    """
+    tol = _NARROW_TOLERANCES[dtype]
+    zero_kernel, zero_ref = [], []
+    for row in range(weights.size(0)):
+        edim = dims[int(table_of_row[row])]
+        w, lin, acc = out_of_row(row)
+        # The kernel reads the table dtype, so the reference starts from the
+        # same rounded values and the same gradient it was handed.
+        ref_w, ref_l, ref_a = ftrl_step(
+            weights[row, :edim].double(),
+            torch.zeros(edim),
+            torch.zeros(edim),
+            grads[row, :edim].double(),
+            **params,
+        )
+        torch.testing.assert_close(
+            w.double(), ref_w, msg=lambda m, r=row: f"weight, row {r}: {m}", **tol
+        )
+        torch.testing.assert_close(
+            lin.double(), ref_l, msg=lambda m, r=row: f"linear, row {r}: {m}", **tol
+        )
+        torch.testing.assert_close(
+            acc.double(), ref_a, msg=lambda m, r=row: f"accum, row {r}: {m}", **tol
+        )
+        zero_kernel.append(bool((w == 0).all()))
+        zero_ref.append(bool((ref_w == 0).all()))
+        if zero_ref[-1]:
+            assert zero_kernel[-1], f"row {row} should be exactly zero"
+    assert zero_kernel == zero_ref, "kernel and reference zero different rows"
+    assert any(zero_ref) and not all(zero_ref), "test needs both kinds of row"
+
+
+_GROUP_DIMS = [[8], [5], [8, 4, 12], [12, 5, 8]]
+_GROUP_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+_GROUP_DIMS_IDS = ["8", "5", "vec4_mixed", "unaligned_mixed"]
+_GROUP_PARAMS = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.01, group_lasso_reg=1.0)
+
+
+@cuda
+@pytest.mark.parametrize("dims", _GROUP_DIMS, ids=_GROUP_DIMS_IDS)
+@pytest.mark.parametrize("dtype", _GROUP_DTYPES, ids=["fp32", "fp16", "bf16"])
+def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
+    """Padded buffer, every table dtype, tables of different widths in one call.
+
+    Each row's own ``edim`` fixes where its states sit and how wide they are,
+    so a kernel that took the buffer's widest row for all of them would put the
+    accum in the wrong place. The slots past a row's live elements are seeded
+    with a sentinel and must come back untouched.
+    """
+    device = torch.device("cuda")
+    max_dim = max(dims)
+    weights, grads, table_of_row = _group_case(dims, dtype)
+    num_rows = weights.size(0)
+    optimizer = _ftrl_optimizer(**_GROUP_PARAMS)
+
+    sentinel = 7.0
+    values = torch.full((num_rows, 3 * max_dim), sentinel, dtype=dtype)
+    for row in range(num_rows):
+        edim = dims[int(table_of_row[row])]
+        values[row, :edim] = weights[row, :edim]
+        values[row, max_dim : max_dim + 2 * edim] = 0.0
+    before = values.clone()
+    values = values.to(device)
+
+    optimizer.update_for_padded_buffer(
+        grads.to(device),
+        values,
+        table_of_row.to(device),
+        torch.tensor(dims, dtype=torch.int64, device=device),
+        max_dim,
+        3 * max_dim,
+        all(d % 4 == 0 for d in dims),
+    )
+    out = values.cpu()
+
+    def out_of_row(row):
+        edim = dims[int(table_of_row[row])]
+        return (
+            out[row, :edim],
+            out[row, max_dim : max_dim + edim],
+            out[row, max_dim + edim : max_dim + 2 * edim],
+        )
+
+    _check_group_rows(
+        dims, dtype, _GROUP_PARAMS, weights, grads, table_of_row, out_of_row
+    )
+    for row in range(num_rows):
+        edim = dims[int(table_of_row[row])]
+        for lo, hi in ((edim, max_dim), (max_dim + 2 * edim, 3 * max_dim)):
+            assert torch.equal(
+                out[row, lo:hi], before[row, lo:hi]
+            ), f"row {row}: padding [{lo}, {hi}) was written"
+
+
+@cuda
+@pytest.mark.parametrize("dims", _GROUP_DIMS, ids=_GROUP_DIMS_IDS)
+@pytest.mark.parametrize("dtype", _GROUP_DTYPES, ids=["fp32", "fp16", "bf16"])
+def test_ftrl_group_flat_table_dtype_and_mixed_dims(dims, dtype):
+    """The flat-table kernel against the same reference, one table per width.
+
+    Unlike the padded buffer, a flat table packs its states right after the
+    embedding, so ``linear`` starts at ``edim`` and ``accum`` at ``2 * edim``.
+    """
+    device = torch.device("cuda")
+    max_dim = max(dims)
+    rows_per_table = 16
+    weights, grads, table_of_row = _group_case(dims, dtype, rows_per_table)
+    optimizer = _ftrl_optimizer(**_GROUP_PARAMS)
+
+    tables = []
+    for t, edim in enumerate(dims):
+        table = torch.zeros(rows_per_table, 3 * edim, dtype=dtype)
+        table[:, :edim] = weights[t * rows_per_table : (t + 1) * rows_per_table, :edim]
+        tables.append(table.to(device))
+
+    optimizer.fused_update_for_flat_table(
+        grads.to(device),
+        torch.arange(rows_per_table, dtype=torch.int64).repeat(len(dims)).to(device),
+        torch.tensor([t.data_ptr() for t in tables], dtype=torch.int64, device=device),
+        table_of_row.to(device),
+        torch.tensor([3 * d for d in dims], dtype=torch.int64, device=device),
+        torch.tensor(dims, dtype=torch.int64, device=device),
+        max_dim,
+        all(d % 4 == 0 for d in dims),
+        dtype,
+    )
+    outs = [t.cpu() for t in tables]
+
+    def out_of_row(row):
+        t = int(table_of_row[row])
+        edim = dims[t]
+        r = row % rows_per_table
+        return (
+            outs[t][r, :edim],
+            outs[t][r, edim : 2 * edim],
+            outs[t][r, 2 * edim : 3 * edim],
+        )
+
+    _check_group_rows(
+        dims, dtype, _GROUP_PARAMS, weights, grads, table_of_row, out_of_row
+    )
+
+
+def test_ftrl_step_reference_is_zero_for_untouched_coordinate():
+    """The reference must agree with the kernels where 0/0 would appear."""
+    zeros = torch.zeros(4)
+    for group_lasso_reg in (0.0, 0.5):
+        weight, linear, accum = ftrl_step(
+            zeros, zeros, zeros, zeros, 0.1, group_lasso_reg=group_lasso_reg
+        )
+        assert not bool(torch.isnan(weight).any())
+        assert bool((weight == 0).all()) and bool((accum == 0).all())
 
 
 if __name__ == "__main__":

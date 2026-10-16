@@ -579,6 +579,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             CowClipDefinition
         ] = None,  # used by Rowwise Adagrad
         shard_ranks: Optional[List[int]] = None,
+        # FTRL only: group-lasso strength, a row is a group. Kept last so it
+        # cannot shift any positional argument; 0 is plain FTRL.
+        group_lasso_reg: float = 0.0,
         # TO align with FBGEMM TBE
         *args,
         **kwargs,
@@ -733,6 +736,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ftrl_beta,
             l1_reg,
             l2_reg,
+            group_lasso_reg,
             table_option.optimizer_state_dtype,
         )
         self._storage_externel = table_option.external_storage is not None
@@ -974,6 +978,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ftrl_beta: float,
         l1_reg: float,
         l2_reg: float,
+        group_lasso_reg: float,
         optimizer_state_dtype: Optional[torch.dtype],
     ) -> BaseDynamicEmbeddingOptimizer:
         self._optimizer_type = optimizer_type
@@ -1059,6 +1064,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ftrl_beta=ftrl_beta,
             l1_reg=l1_reg,
             l2_reg=l2_reg,
+            group_lasso_reg=group_lasso_reg,
             optimizer_state_dtype=optimizer_state_dtype,
         )
         self._optimizer_args = optimizer_args
