@@ -277,6 +277,7 @@ def test_ftrl_padded_buffer_mixed_dims_accum(dims, dtype):
         ftrl_beta,
         l1_reg,
         l2_reg,
+        0.0,  # group_lasso_reg: plain FTRL
     )
 
     for row, edim in enumerate(dims):

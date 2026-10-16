@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FTRL, checked against Algorithm 1 of McMahan et al. 2013.
+"""FTRL, checked against Algorithm 1 of McMahan et al. 2013, and its group-sparse
+variant (Yan et al. 2019) against a transcription of that.
 
 Every other optimizer here is checked against a
 ``SplitTableBatchedEmbeddingBagsCodegen`` built with the same hyperparameters.
@@ -60,6 +61,7 @@ def ftrl_step(
     ftrl_beta: float = 0.0,
     l1_reg: float = 0.0,
     l2_reg: float = 0.0,
+    group_lasso_reg: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One FTRL-Proximal step, from Algorithm 1 of McMahan et al. 2013.
 
@@ -83,12 +85,21 @@ def ftrl_step(
     linear = (
         linear + grad - (new_accum_pow - accum**exponent) / learning_rate * weight
     )
-    shrunk = (l1_reg * torch.sign(linear) - linear) / (
-        (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
-    )
     # |linear| <= l1_reg pins the weight to exactly zero; that is the whole
     # point of the L1 term and what separates FTRL from a shrinkage update.
-    weight = torch.where(linear.abs() > l1_reg, shrunk, torch.zeros_like(shrunk))
+    thresholded = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
+    if group_lasso_reg > 0.0:
+        # Group sparsity: the last dim is the group (one embedding row). Its
+        # whole thresholded linear term is shrunk by 1 - group_lasso_reg/||.||, or zeroed
+        # outright when the norm does not clear group_lasso_reg.
+        norm = thresholded.norm(dim=-1, keepdim=True)
+        scale = torch.where(
+            norm > group_lasso_reg,
+            1.0 - group_lasso_reg / norm.clamp(min=1e-300),
+            torch.zeros_like(norm),
+        )
+        thresholded = thresholded * scale
+    weight = -thresholded / ((ftrl_beta + new_accum_pow) / learning_rate + l2_reg)
     return weight, linear, new_accum
 
 
@@ -310,6 +321,129 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
             msg="accum",
         )
     assert seen == num_keys, f"exported {seen} of {num_keys} rows"
+
+
+def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
+    num_rows, row_width = values.shape
+    device = values.device
+    optimizer.update_for_padded_buffer(
+        grads,
+        values,
+        torch.zeros(num_rows, dtype=torch.int64, device=device),
+        torch.tensor([emb_dim], dtype=torch.int64, device=device),
+        emb_dim,
+        row_width,
+        all_dims_vec4,
+    )
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False), (70, False)])
+@pytest.mark.parametrize("l1_reg", [0.0, 0.01], ids=["no_l1", "l1"])
+def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l1_reg):
+    """Rows of very different gradient scale, so some clear the threshold and some do not.
+
+    Checks the weights against the float64 transcription, that the rows below
+    the threshold are *exactly* zero (the point of the group term), and that
+    the others are not -- otherwise a kernel that zeroed everything would pass.
+    """
+    device = torch.device("cuda")
+    num_rows = 64
+    row_width = 3 * emb_dim
+    params = dict(learning_rate=0.1, l1_reg=l1_reg, group_lasso_reg=0.3, l2_reg=0.01)
+    optimizer = _ftrl_optimizer(**params)
+
+    values = _fresh_ftrl_values(
+        num_rows, emb_dim, row_width, emb_dim, 0.0, device, seed=5
+    )
+    generator = torch.Generator(device="cpu").manual_seed(23)
+    row_scale = torch.logspace(-3, 0, num_rows, dtype=torch.float32).unsqueeze(1)
+    grads = (
+        torch.randn(num_rows, emb_dim, generator=generator, dtype=torch.float32)
+        * row_scale
+    ).to(device)
+
+    ref_w, ref_l, ref_a = ftrl_step(
+        values[:, :emb_dim].cpu(),
+        values[:, emb_dim : 2 * emb_dim].cpu(),
+        values[:, 2 * emb_dim :].cpu(),
+        grads.cpu(),
+        **params,
+    )
+    _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4)
+
+    weight = values[:, :emb_dim].cpu()
+    zero_rows = (ref_w == 0).all(dim=1)
+    assert zero_rows.any() and not zero_rows.all(), "test needs both kinds of row"
+    # Exactly zero together, not merely small.
+    assert bool((weight[zero_rows] == 0).all())
+    assert bool((weight[~zero_rows] != 0).any(dim=1).all())
+    torch.testing.assert_close(weight.double(), ref_w, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        values[:, emb_dim : 2 * emb_dim].cpu().double(), ref_l, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        values[:, 2 * emb_dim :].cpu().double(), ref_a, rtol=1e-5, atol=1e-6
+    )
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
+def test_ftrl_group_zero_reg_is_plain_ftrl(emb_dim, all_dims_vec4):
+    """group_lasso_reg = 0 must be bit-identical to FTRL without the group term."""
+    device = torch.device("cuda")
+    row_width = 3 * emb_dim
+    grads = torch.randn(16, emb_dim, device=device)
+    a = _fresh_ftrl_values(16, emb_dim, row_width, emb_dim, 0.1, device, seed=1)
+    b = a.clone()
+    _run_group_step(_ftrl_optimizer(l1_reg=0.01), a, grads, emb_dim, all_dims_vec4)
+    _run_group_step(
+        _ftrl_optimizer(l1_reg=0.01, group_lasso_reg=0.0), b, grads, emb_dim, all_dims_vec4
+    )
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
+def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
+    device = torch.device("cuda")
+    num_rows = 32
+    row_width = 3 * emb_dim
+    optimizer = _ftrl_optimizer(group_lasso_reg=0.2)
+    padded = _fresh_ftrl_values(num_rows, emb_dim, row_width, emb_dim, 0.0, device)
+    flat = padded.clone()
+    grads = torch.randn(num_rows, emb_dim, device=device)
+    table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
+
+    _run_group_step(optimizer, padded, grads, emb_dim, all_dims_vec4)
+    optimizer.fused_update_for_flat_table(
+        grads,
+        torch.arange(num_rows, dtype=torch.int64, device=device),
+        torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
+        table_ids,
+        torch.tensor([row_width], dtype=torch.int64, device=device),
+        table_emb_dims,
+        emb_dim,
+        all_dims_vec4,
+        torch.float32,
+    )
+    torch.testing.assert_close(flat, padded, rtol=0, atol=0)
+
+
+def test_ftrl_group_args_validation_and_ckpt_meta():
+    with pytest.raises(ValueError, match="group_lasso_reg"):
+        _ftrl_optimizer(group_lasso_reg=-0.1)
+    opt = _ftrl_optimizer(group_lasso_reg=0.25)
+    assert opt.get_opt_args()["group_lasso_reg"] == 0.25
+    meta = opt.get_opt_args()
+    fresh = _ftrl_optimizer()
+    fresh.set_opt_args(meta)
+    assert fresh._opt_args.group_lasso_reg == 0.25
+    # A checkpoint from before group sparsity has no group_lasso_reg: plain FTRL.
+    del meta["group_lasso_reg"]
+    fresh.set_opt_args(meta)
+    assert fresh._opt_args.group_lasso_reg == 0.0
 
 
 if __name__ == "__main__":

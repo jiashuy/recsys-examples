@@ -540,6 +540,7 @@ square root and so recovers its `α / (β + √n)` learning rate exactly. Pass t
 | `initial_accumulator_value` | `0.0` | Seeds `accum`; `linear` always starts at 0. Read the note below before setting it non-zero. |
 | `l1_reg` | `0.0` | λ1. |
 | `l2_reg` | `0.0` | λ2. |
+| `group_lasso_reg` | `0.0` | Group-lasso strength λ_group -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`. |
 
 Two behaviours worth knowing before choosing FTRL:
 
@@ -571,6 +572,23 @@ Two behaviours worth knowing before choosing FTRL:
   however small the gradient. Which matters more is a modelling choice -- if the initializer is doing
   real work, keep both at 0 and pick α accordingly; if the early steps need damping, expect the
   initializer to be mostly overwritten and size it as if rows started near zero.
+
+#### FTRL with group sparsity
+
+Setting `group_lasso_reg > 0` gives FTRL with group sparsity (*Group Sparse FTRL*, Yan et al., CIKM 2019), with
+**one embedding row as the group**. `l1_reg` zeroes individual elements; the group term thresholds the L2 norm of the
+whole row, so a row's weights vanish *together*. With `s = sign(linear)·max(|linear| − l1_reg, 0)` per element:
+
+```
+scale  = max(0, 1 − group_lasso_reg / ‖s‖₂)                      ‖·‖₂ over the row
+weight = −scale · s / ((ftrl_beta + new_accum^(−p)) / lr + l2_reg)
+```
+
+The row is exactly zero whenever `‖s‖₂ ≤ group_lasso_reg`; otherwise every element is shrunk by the same factor. `linear` and
+`accum` are updated exactly as in FTRL, so the state layout, checkpoint width and `initial_accumulator_value` notes
+above all apply unchanged -- only the weight solve differs, and `group_lasso_reg = 0` takes the original single-pass kernel
+path and is bit-identical to it. The solve needs the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes
+over the row. Checkpoints written before this option existed load as `group_lasso_reg = 0`.
 
 Unlike the `EmbOptimType` optimizers, FTRL has no FBGEMM counterpart, so `construct_twin_module` cannot
 build a TorchRec twin for a model that uses it.
