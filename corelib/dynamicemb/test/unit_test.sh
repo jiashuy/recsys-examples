@@ -15,6 +15,10 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
+    # Added by #495 and never registered, so its CUDA checks on the packed
+    # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
+    # precision -- have not run in CI since.
+    "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
     "test/unit_tests/test_expansion_value_capacity.py"
     "test/unit_tests/test_planner_plan_cost.py"
