@@ -520,6 +520,11 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                     dim,
                     0,
                     device,
+                    # Which keys a rank keeps is the rule the table was dumped
+                    # under, and the meta records it. The default is what every
+                    # checkpoint written before it did was dumped with, and what
+                    # this loader assumed for all of them.
+                    dist_type=meta_data.get("dist_type", "roundrobin"),
                     emb_dtype=emb_dtype,
                     opt_state_dtype=opt_state_dtype,
                 ):
