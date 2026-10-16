@@ -51,9 +51,14 @@ Modes:
     The same forward with bags of differing length, empty ones included. Not
     §7 F4: true variable batch needs a KJT carrying ``stride_per_key_per_rank``,
     and F4 stays open.
+``grad``
+    One optimizer step, table-row-wise against row-wise. The only mode that
+    reaches the backward path, where the two divisions §3.3 is about live.
 ``dump`` / ``load``
-    A checkpoint round trip. The sharding is an argument so the driver can dump
-    under one and load under the other.
+    A checkpoint round trip, with a step taken before the write so that a row
+    which was never read back is not holding the value it would have been
+    written with. The sharding is an argument so the driver can dump under one
+    and load under the other.
 """
 
 import argparse
@@ -71,6 +76,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.dump_load import DynamicEmbDump, DynamicEmbLoad
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -350,9 +356,20 @@ def _fit_bags(bags: List[int], total: int) -> List[int]:
 
 
 def check_dump(args, device, rank, world_size) -> None:
+    """Insert the rows, train them one step, then write them.
+
+    The step is what makes :func:`check_load` mean anything. DEBUG writes
+    ``key % DEBUG_EMB_INITIALIZER_MOD`` into every dim, so a row that was never
+    in the checkpoint is created on miss holding exactly what the checkpoint
+    would have held -- and a load that did nothing at all reads the same as one
+    that worked. One optimizer step moves every row off that value, and only a
+    row that came back from the file is still off it.
+    """
     model, _ = _build(device, args.trw_sharding, args.dist_type)
     keys = _rank_keys(rank, world_size)
-    model(_kjt(keys, device))  # insert the rows before writing them
+    # The fused optimizer steps inside backward, so this both inserts the rows
+    # and moves them.
+    model(_kjt(keys, device)).values().sum().backward()
     dist.barrier()
     DynamicEmbDump(args.save_path, model, optim=False)
     dist.barrier()
@@ -373,8 +390,29 @@ def check_load(args, device, rank, world_size) -> None:
 
     keys = _rank_keys(rank, world_size)
     out = model(_kjt(keys, device)).to_dict()
+
+    # Not vacuous: a key the loader dropped is created on miss at
+    # `key % DEBUG_EMB_INITIALIZER_MOD`, which is what every row held before
+    # check_dump took its step. Rows still sitting there did not come from the
+    # file, however quietly.
+    trw_out = out[_feature(TRW_TABLE)]
+    initial = (
+        torch.tensor(
+            [k % DEBUG_EMB_INITIALIZER_MOD for k in keys],
+            dtype=trw_out.dtype,
+            device=trw_out.device,
+        )
+        .unsqueeze(1)
+        .expand_as(trw_out)
+    )
+    assert not torch.allclose(trw_out, initial), (
+        "every row came back at its initial value, so nothing was read from "
+        f"{args.save_path}. check_dump trains one step before writing, so a "
+        "row that was loaded is a step away from where DEBUG put it."
+    )
+
     torch.testing.assert_close(
-        out[_feature(TRW_TABLE)],
+        trw_out,
         out[_feature(RW_TABLE)],
         msg=lambda m: (
             f"after loading a checkpoint into {args.trw_sharding}, the two tables "
@@ -415,11 +453,55 @@ def check_pooling(args, device, rank, world_size) -> None:
         print(f"pooling ok: mean * {length} == sum")
 
 
+def check_grad(args, device, rank, world_size) -> None:
+    """One optimizer step, table-row-wise against row-wise.
+
+    A table-row-wise table's gradient reaches its rows divided twice: by `L` in
+    the intra-node reduce-scatter and by `N` in the cross-node all-to-all, whose
+    product is the `1/W` a row-wise table gets in its one all-to-all (§3.3).
+    Neither division is ours -- both collectives are TorchRec's, used unchanged
+    -- which is exactly why the product is worth asserting: nothing in the
+    forward path reads it, so a missing or doubled division is invisible until a
+    row moves.
+
+    Same rows, same keys, same loss, so the two tables have to move by the same
+    amount. A factor of `N` out and they move by amounts `N` apart.
+    """
+    model, _ = _build(device, TRW, args.dist_type)
+    keys = _rank_keys(rank, world_size)
+    kjt = _kjt(keys, device)
+
+    out = model(kjt)
+    before = {name: t.detach().clone() for name, t in out.to_dict().items()}
+    # The fused optimizer steps inside backward; there is no separate step().
+    out.values().sum().backward()
+    after = model(kjt).to_dict()
+
+    trw_step = after[_feature(TRW_TABLE)] - before[_feature(TRW_TABLE)]
+    rw_step = after[_feature(RW_TABLE)] - before[_feature(RW_TABLE)]
+    assert (
+        rw_step.abs().sum() > 0
+    ), "no row moved, so there is no step to compare; the backward did nothing"
+    torch.testing.assert_close(
+        trw_step,
+        rw_step,
+        msg=lambda m: (
+            "A table-row-wise table and a row-wise one moved by different "
+            "amounts from the same loss. The table-row-wise gradient is divided "
+            "by the node size in the reduce-scatter and by the node count in "
+            "the all-to-all, and that product has to be the row-wise 1/W.\n" + m
+        ),
+    )
+    if rank == 0:
+        print(f"grad ok: both tables moved by {rw_step.flatten()[0].item():+.6f}")
+
+
 MODES = {
     "plan": check_plan,
     "parity": check_parity,
     "pooling": check_pooling,
     "jagged": check_jagged,
+    "grad": check_grad,
     "dump": check_dump,
     "load": check_load,
 }

@@ -52,12 +52,18 @@ done
 # sent one to the wrong rank would already have failed `parity` above.
 run 2 1 --mode pooling --dist-type hash_roundrobin
 
+# The backward: the gradient divisions depend on the node size and the node
+# count, not on the rule that placed the key, so one rule and both topologies.
+# The four-rank one below is the only place the two divisions are both > 1.
+run 2 1 --mode grad --dist-type hash_roundrobin
+
 # Four ranks split two ways, so a node holds more than one rank. The only
 # topology here where intra-node is itself a group.
 if [ "$(nvidia-smi -L | wc -l)" -ge 4 ]; then
   run 4 2 --mode plan   --dist-type hash_roundrobin
   run 4 2 --mode parity --dist-type hash_roundrobin
   run 4 2 --mode jagged --dist-type hash_roundrobin
+  run 4 2 --mode grad   --dist-type hash_roundrobin
 fi
 fi  # fwd_bwd
 
