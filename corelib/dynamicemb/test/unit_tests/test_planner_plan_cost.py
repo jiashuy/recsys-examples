@@ -331,7 +331,7 @@ class TestTheBroadcastSeam:
         assert completed.dynamicemb_options is planned.options
         for f in fields(ParameterSharding):
             if f.name == "sharding_spec":
-                continue
+                continue  # copied, not shared -- the next test is about that
             assert getattr(completed, f.name) == getattr(
                 planned.sharding, f.name
             ), f.name
@@ -340,6 +340,31 @@ class TestTheBroadcastSeam:
         assert completed.get_additional_fused_params() == {
             "dynamicemb_options": planned.options
         }
+
+    def test_the_completed_entry_does_not_share_metadata_with_the_record(self):
+        """The one field the loop above cannot check, because `==` cannot tell a
+        copy from the original.
+
+        DMP rewrites placements in place when its device is `meta`
+        (`embeddingbag.py:183-188`), and on rank 0 the plan still holds the
+        planner's own record -- a broadcast hands the leader back its own object
+        rather than a round trip (`collective_utils.py:65-67`). Sharing the spec
+        would let the first DMP rewrite what a second `plan` call hands out, on
+        rank 0 and nowhere else.
+        """
+        planned = _sharding(range(WORLD_SIZE))
+
+        completed = DynamicEmbParameterSharding.with_options(
+            planned.sharding, planned.options
+        )
+
+        # Two steps: `is not` alone passes for a shallow copy, which still shares
+        # the `shards` list and the ShardMetadata objects DMP actually writes to.
+        assert completed.sharding_spec is not planned.sharding.sharding_spec
+        completed.sharding_spec.shards[0].placement = "rank:7/cuda:7"
+        assert (
+            str(planned.sharding.sharding_spec.shards[0].placement) != "rank:7/cuda:7"
+        ), "a write through the completed entry reached the planner's own record"
 
 
 # --- where the refusal happens ---------------------------------------------

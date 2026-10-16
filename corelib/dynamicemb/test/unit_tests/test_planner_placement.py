@@ -25,7 +25,7 @@ from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 from dynamicemb.planner.placement import BalancedNodePlacer, TableToPlace
 from dynamicemb.planner.plan import make_storage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
-from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.planner.types import CustomTopologyData, Topology
 from torchrec.modules.embedding_configs import PoolingType
 
 GB = 1024**3
@@ -41,6 +41,27 @@ def _topology(hbm: int = 80 * GB, ddr: int = 128 * GB) -> Topology:
         compute_device="cuda",
         hbm_cap=hbm,
         ddr_cap=ddr,
+    )
+
+
+def _uneven_topology(hbm_per_rank_gb):
+    """A machine whose GPUs are not all the same size.
+
+    TorchRec takes a per-device capacity through ``custom_topology_data`` and
+    carries it into ``devices[r].storage``, so this is a shape the planner can
+    really be handed -- and the only way the ranks of one node differ, since
+    what the placer is told has been spent is the row-wise tables' cost, which
+    is the same on every rank of the world.
+    """
+    return Topology(
+        world_size=WORLD,
+        local_world_size=LOCAL,
+        compute_device="cuda",
+        ddr_cap=128 * GB,
+        custom_topology_data=CustomTopologyData(
+            data={"hbm_cap": [gb * GB for gb in hbm_per_rank_gb]},
+            world_size=WORLD,
+        ),
     )
 
 
@@ -243,6 +264,31 @@ def test_a_node_is_charged_on_every_one_of_its_ranks():
     assert BalancedNodePlacer().place([_table("b", second)], topology, on_node_0) == {
         "b": 1
     }
+
+
+def test_a_node_is_only_as_large_as_its_smallest_gpu():
+    """A table-row-wise table is split over every rank of its node, so the node
+    holds it only if its *tightest* rank does. Room on the other three is room
+    the table cannot reach.
+
+    This is what `capacity`'s `min` is for, and the only arrangement that tells
+    `min` from `max`: a node whose ranks differ. Reading the roomiest rank
+    instead would put the table where one of its shards cannot fit, and the
+    plan would look feasible until the run.
+    """
+    # Node 0: three large GPUs and one small one. Node 1: four middling ones.
+    topology = _uneven_topology([80, 80, 80, 20] + [40] * LOCAL)
+
+    # 30 GB a rank. Node 0 has more room in total and more room on three of its
+    # four ranks, and still cannot take it.
+    assert BalancedNodePlacer().place(
+        [_table("t", 30)], topology, _nothing_spent()
+    ) == {"t": 1}
+
+    # 50 GB a rank fits on no node, though node 0 has three ranks that could
+    # hold it.
+    with pytest.raises(ValueError, match="No node can hold"):
+        BalancedNodePlacer().place([_table("t", 50)], topology, _nothing_spent())
 
 
 def test_the_answer_does_not_depend_on_the_order_it_was_asked():
