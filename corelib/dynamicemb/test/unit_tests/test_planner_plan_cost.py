@@ -543,9 +543,39 @@ class TestTableRanks:
 
     def test_a_row_wise_table_is_split_the_same_way_it_always_was(self):
         """`table_fanout` replaced a bare `dist.get_world_size()`. For row-wise it
-        has to be that same number, or every existing table resizes."""
+        has to be that same number, or every existing table resizes.
+
+        The node size is varied to say that row-wise does not read it at all."""
         for world, local in [(8, 4), (2, 2), (1, 1), (16, 8), (4, 1)]:
             assert table_fanout(RW, world, local) == world
+
+    def test_a_table_row_wise_table_is_split_over_one_node(self):
+        """The mirror: a node's worth of ranks, whichever node it turns out to be.
+
+        Not depending on *which* node is what lets a table's capacity and HBM
+        budget be settled before the placer has decided where to put it."""
+        for world, local in [(8, 4), (2, 2), (1, 1), (16, 8), (4, 1)]:
+            assert table_fanout(TRW, world, local) == local
+
+    @pytest.mark.parametrize(
+        "sharding_type, world, local, message",
+        [
+            # DynamicEmb plans row-wise and table-row-wise and no others.
+            (ShardingType.COLUMN_WISE.value, WORLD_8, LOCAL_4, "not 'column_wise'"),
+            # A world that is not a whole number of nodes has no node to split
+            # over -- and neither does a node of no ranks.
+            (TRW, 7, LOCAL_4, "does not divide into nodes"),
+            (TRW, WORLD_8, 0, "does not divide into nodes"),
+        ],
+        ids=[
+            "unsupported_sharding_type",
+            "world_is_not_whole_nodes",
+            "node_of_no_ranks",
+        ],
+    )
+    def test_table_fanout_refuses(self, sharding_type, world, local, message):
+        with pytest.raises(ValueError, match=message):
+            table_fanout(sharding_type, world, local)
 
 
 class TestGroupedTiers:
