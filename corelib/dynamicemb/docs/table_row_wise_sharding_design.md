@@ -40,18 +40,25 @@ is the state this branch started from -- read them as history, not as a tour of
 the current tree, and prefer the symbol names in them to the file names, which
 moved (§5).
 
+Symbols rather than line numbers: every line number into our own files that
+this document once carried had rotted by the time someone followed it, because
+editing a docstring moves everything below it. Line numbers into TorchRec are
+kept -- that tree does not move under us.
+
 ```
-plan       planner/planners.py:203   _prepare_dynemb_table_options -- capacity, HBM budget
-           planner/planners.py:398   _plan_dynamicemb -- the DynamicEmb half of the plan
-           planner/planners.py:491   sharding_type read off the constraint: RW or TRW
-           planner/plan.py:506,537   table_fanout / table_ranks -- the divisor, and the ranks
-place      planner/placement.py      BalancedNodePlacer -- which node a TRW table lands on
-budget     planner/plan.py:211,344   per_rank_storage -> topology_minus
-sharding   shard/embeddingbag.py:96  RW  -> RwPooledDynamicEmbeddingSharding
-           shard/embeddingbag.py:103 TRW -> TwRwPooledDynamicEmbeddingSharding
-input      shard/input_dist.py:227   RW:  bucketize(num_buckets=world_size)
-           shard/twrw_sharding.py:122 TRW: bucketize(num_buckets=local_size)
-kernel     src/sparse_block_bucketize_features.cu:217 / :299
+plan       planner/planners.py   _prepare_dynemb_table_options -- capacity, HBM budget
+           planner/planners.py   _plan_dynamicemb -- the DynamicEmb half of the plan
+           planner/planners.py   _sharding_type_of -- RW or TRW, read off the constraint
+           planner/plan.py       table_fanout / table_ranks -- the divisor, and the ranks
+place      planner/placement.py  BalancedNodePlacer -- which node a TRW table lands on
+budget     planner/plan.py       per_rank_storage -> topology_minus
+sharding   shard/embeddingbag.py create_embedding_bag_sharding --
+                                 RW  -> RwPooledDynamicEmbeddingSharding
+                                 TRW -> TwRwPooledDynamicEmbeddingSharding
+input      shard/input_dist.py    RW:  bucketize(num_buckets=world_size)
+           shard/twrw_sharding.py TRW: bucketize(num_buckets=local_size)
+kernel     src/sparse_block_bucketize_features.cu
+                                 _block_bucketize_sparse_features_cuda_kernel1 / 2
 lookup     batched_dynamicemb_compute_kernel.py -> BatchedDynamicEmbeddingBag
 output     (inherited) torchrec RwPooledEmbeddingDist / TwRw reduce-scatter + all-to-all
 ```
@@ -473,7 +480,7 @@ downgrade in §3.1.
 
 **Must be verified:** the variable-batch path in §3.2(f). The recat order,
 `_preprocess_batch_size_per_rank`, and DynamicEmb's
-`stride_per_key_per_rank * num_buckets` (`shard/input_dist.py:141`, via
+`stride_per_key_per_rank * num_buckets` (`shard/input_dist.py`, via
 `_fx_wrap_stride_per_key_per_rank`, where
 `num_buckets` becomes `L`) must all agree. Each can be individually right and
 the combination wrong, and the symptom is mismatched samples, not an error (F4).
@@ -567,7 +574,7 @@ one, since a DynamicEmb table is placed rather than searched for.
 
 ### 4.2 Capacity: the divisor becomes per-table, and it is computed too early. Done (M2).
 
-`_prepare_dynemb_table_options` (`planner/planners.py:203`) computes, for every
+`_prepare_dynemb_table_options` (`planner/planners.py`) computes, for every
 DynamicEmb table:
 
 ```python
@@ -640,7 +647,7 @@ New `TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding)` in
 (reduce-scatter + all-to-all) is used as-is, exactly as RW uses
 `RwPooledEmbeddingDist` as-is.
 
-Dispatch in `shard/embeddingbag.py:62` gains a `TABLE_ROW_WISE` branch.
+Dispatch in `shard/embeddingbag.py` gains a `TABLE_ROW_WISE` branch.
 
 **Shipped as written.** `shard/twrw_sharding.py` overrides exactly those two
 methods, and the dispatch branch is one `elif`. `GroupedPooledEmbeddingsLookup`
@@ -658,7 +665,7 @@ has no TwRw sharding to fall through to.
 
 ### 4.4 Input dist: a full-data permute, inherited. Done (M3).
 
-DynamicEmb's `RwSparseFeaturesDist` (`shard/input_dist.py:175`) has no equivalent of
+DynamicEmb's `RwSparseFeaturesDist` (`shard/input_dist.py`) has no equivalent of
 TorchRec's `_staggered_shuffle` (`twrw_sharding.py:439`), because RW's a2a splits
 are uniform (`[num_features] * world_size`) and the bucketized layout is already
 ordered by destination rank.
@@ -722,9 +729,9 @@ meet — the planner builds one, the sharding the other, and they must name the
 same ranks — so the sizes are checked against each other there.
 
 Only DynamicEmb's kernels are told. `create_embedding_bag_sharding`
-(`shard/embeddingbag.py:102`) routes **by sharding type alone**, so a table
+(`shard/embeddingbag.py`) routes **by sharding type alone**, so a table
 sharded table-row-wise on a non-DynamicEmb kernel lands in this same sharding and
-falls back to TorchRec's kernel (`shard/rw_sharding.py:205`), which owns its
+falls back to TorchRec's kernel (`shard/rw_sharding.py`), which owns its
 collectives and never reads the field.
 
 `dump` and `load` still take a `pg`, and it is the barrier's fallback: the group
@@ -732,14 +739,14 @@ collectives and never reads the field.
 world. That restores upstream's behaviour for row-wise, where a table is on every
 rank and the caller's group is the right one. It cannot be more than a fallback,
 because a caller holds **one** group for a whole model while each kernel's tables
-may sit on a different node — `dump_load.py:197` passes the same `pg` to every
+may sit on a different node — `dump_load.py` passes the same `pg` to every
 module.
 
 **Shard identity deliberately does not consult `pg`.** `rank` and `world_size`
 for file naming stay `_shard_index` / `_num_shards`. Unlike the barrier group,
 these are never unknown — `__init__` always computes them — and they are the
 single authority for five things that must agree: the file names
-(`batched_dynamicemb_tables.py:1486`, `:1562`), the `num_shards`/`shard_ranks`
+(`batched_dynamicemb_tables.py`, `:1562`), the `num_shards`/`shard_ranks`
 written into the meta (`:1468`), the check that reads it back (`:1866`), and the
 key-ownership modulus (`:2134`). Letting `pg` into one of them splits it from the
 other four — a dump whose file names are numbered by the caller's group while the
@@ -748,7 +755,7 @@ meta beside them records the plan's shard count.
 This is a behaviour change from upstream for one case: upstream named files by
 `dist.get_rank(group=pg)`, so a caller passing a **sub-group** got names numbered
 within it. `DynamicEmbDump` and `DynamicEmbLoad` default to `dist.group.WORLD`
-(`dump_load.py:109`, `:224`), where the two agree; only an explicit sub-group
+(`dump_load.py`, `:224`), where the two agree; only an explicit sub-group
 differs. Checkpoints still round-trip either way, since dump and load derive the
 names the same way.
 
@@ -780,10 +787,10 @@ since.
 
 ### 4.7 Incremental dump / replay. Done (M4).
 
-`meta["world_size"]` (`incremental_dump.py:110`) means "the source's row-wise
+`meta["world_size"]` (`incremental_dump.py`) means "the source's row-wise
 fan-out, the modulo base for key → rank". Under TRW that is `local_size`, and the
 key→rank mapping additionally needs the node. `_replay_compatibility`
-(`batched_dynamicemb_tables.py:1820`) compares it for equality, which is correct in spirit
+(`batched_dynamicemb_tables.py`) compares it for equality, which is correct in spirit
 — replay does not reshard — but the field needs to carry enough to describe a TRW
 layout. Recommend replacing the single `world_size` field with the same triple
 the ownership function takes, and rejecting any delta whose triple differs.
@@ -821,22 +828,22 @@ implementation into, so overriding is the only way in.
 
 | Hook | Declared by | Our override |
 |---|---|---|
-| `ModuleSharder.shard()` | `distributed/types.py:1462` | `shard/embeddingbag.py:125`, `shard/embedding.py:368` |
-| `create_embedding_bag_sharding()` (classmethod) | `distributed/embeddingbag.py:979` | `shard/embeddingbag.py:80` |
-| `create_embedding_sharding()` (classmethod) | `distributed/embedding.py` | `shard/embedding.py:103` |
-| `EmbeddingSharding.create_lookup()` | `distributed/embedding_sharding.py:1232` | `shard/rw_sharding.py:183,272` |
-| `BaseEmbeddingLookup._create_embedding_kernel()` | `distributed/embedding_lookup.py:254,693` | `shard/rw_sharding.py:104,197` |
-| `get_additional_fused_params()` (duck-typed) | `torchrec/distributed/utils.py:518-526` | `planner/planners.py:152` |
+| `ModuleSharder.shard()` | `distributed/types.py:1462` | `shard/embeddingbag.py`, `shard/embedding.py` |
+| `create_embedding_bag_sharding()` (classmethod) | `distributed/embeddingbag.py:979` | `shard/embeddingbag.py` |
+| `create_embedding_sharding()` (classmethod) | `distributed/embedding.py` | `shard/embedding.py` |
+| `EmbeddingSharding.create_lookup()` | `distributed/embedding_sharding.py:1232` | `shard/rw_sharding.py` |
+| `BaseEmbeddingLookup._create_embedding_kernel()` | `distributed/embedding_lookup.py:254,693` | `shard/rw_sharding.py` |
+| `get_additional_fused_params()` (duck-typed) | `torchrec/distributed/utils.py:518-526` | `planner/planners.py` |
 
 Plus one enum value, `EmbeddingComputeKernel.CUSTOMIZED_KERNEL`
 (`embedding_types.py:98`).
 
 **`CUSTOMIZED_KERNEL` is a skip-pass, not a dispatch table.** It appears in
-exactly five places upstream -- `embedding.py:937,967`, `embeddingbag.py:1212,1240`,
-`utils.py:523` -- and every one of them *skips* something: state_dict handling,
-fused_params validation. The upstream comment says so directly: *"Skip state_dict
+exactly five places upstream -- `torchrec embedding.py:937,967`,
+`torchrec embeddingbag.py:1212,1240`, `torchrec utils.py:523` -- and every one
+of them *skips* something: state_dict handling, fused_params validation. The upstream comment says so directly: *"Skip state_dict
 handling for CUSTOMIZED_KERNEL, this should be implemented in child class."*
-The branch that actually selects our kernel is ours (`shard/rw_sharding.py:111`,
+The branch that actually selects our kernel is ours (`shard/rw_sharding.py`,
 and again at `:205` for the pooled lookup):
 
 ```python
@@ -850,7 +857,7 @@ So the chain that ends at `BatchedDynamicEmbeddingTablesV2` is ours at every
 step that matters; TorchRec supplies the scaffolding and the skip-pass, nothing
 more.
 
-This is a real cost, not a free win. `shard/rw_sharding.py:114-120` carries a
+This is a real cost, not a free win. `shard/rw_sharding.py` carries a
 `Version(torchrec.__version__) < Version("1.5.0")` branch because
 `_create_embedding_kernel` gained an `env` parameter. Six seams means six
 signatures to track. The mitigation is to keep the count at six and to keep each
@@ -874,7 +881,7 @@ on this side of the line: they are plain dataclasses carrying data across the
 boundary, not behaviour, and `get_additional_fused_params` (above) is the
 upstream-sanctioned way to move that data. Subclassing a dataclass to add
 defaulted fields is upgrade-safe; `get_additional_fused_params` computes its
-payload as a **field-set difference** (`planner/planners.py:152`, via
+payload as a **field-set difference** (`planner/planners.py`, via
 `_additional_field_names`), so fields added
 upstream are excluded automatically.
 
@@ -1005,7 +1012,7 @@ rather than implementing TRW reshard.
 `_preprocess_batch_size_per_rank` / `_preprocess_batch_size_per_rank_per_feature`
 machinery (`twrw_sharding.py:590-648`) that the RW path never exercises. Mean-
 while DynamicEmb's bucketizer multiplies `stride_per_key_per_rank` by
-`num_buckets` (`shard/input_dist.py:141`), which under TRW is `local_size`, not
+`num_buckets` (`shard/input_dist.py`), which under TRW is `local_size`, not
 `world_size`. These two must agree. This is the easiest place to be subtly wrong
 and the hardest to cover with a test.
 
@@ -1017,7 +1024,7 @@ them wrong would look like a pass.
 
 **F5 — mixed sharding types in one collection.** An EBC may hold RW tables, TRW
 tables and plain TorchRec tables. `create_embedding_bag_sharding` dispatches on
-`sharding_infos[0]` (`shard/embeddingbag.py:60`) — already a per-group decision,
+`sharding_infos[0]` (`shard/embeddingbag.py`) — already a per-group decision,
 but worth re-checking that grouping never mixes RW and TRW into one sharding.
 
 **F6 — EC must be rejected, not silently downgraded.** §4.8.
@@ -1067,7 +1074,7 @@ plan the caller passes on cannot reach back into the planner.
 **F11 — the key -> rank fan-out has three sources, and a sub-group splits
 them.** Routing takes it from the sharding process group -- `RwSparseFeaturesDist`
 inherits `self._world_size = pg.size()` (`torchrec .../sharding/rw_sharding.py:395`)
-and bucketizes into that many buckets (`shard/input_dist.py:227`). Ownership takes
+and bucketizes into that many buckets (`shard/input_dist.py`). Ownership takes
 it from the default group: `self._shard_world_size = dist.get_world_size()` in
 `BatchedDynamicEmbeddingTablesV2.__init__`, which is what `owned_key_mask` is
 given on the dump/load path. Planning takes it from the default group too, and
@@ -1099,7 +1106,7 @@ from the sharding environment rather than from `dist`, and reject
 `_shard_world_size` is now `len(_shard_ranks)`, the fan-out the bucketizer
 actually used, read off the placements TorchRec planned (§4.6).
 
-**The third is closed too.** `construct_twin_module.py:536` no longer spells the
+**The third is closed too.** `construct_twin_module.py` no longer spells the
 rule out as `indices % self._world_size == self._rank`; it calls `owned_key_mask`
 like everyone else, with the `dist_type` the tool configured its own tables
 with, so the seeding cannot disagree with the sharding. The fan-out there is
@@ -1288,8 +1295,8 @@ Two limits on how far that check reaches, both known and neither fixed:
   The message prints both tiers for the rank it names, so nothing is hidden;
   it is just not always the most useful rank to print.
 - *The host half is only as real as the `ddr_cap` it was given.* TorchRec
-  defaults it to 128 GB **per rank** (`planner/constants.py:26`, replicated to
-  every device at `types.py:1038`), so an 8-GPU node with no `ddr_cap` stated
+  defaults it to 128 GB **per rank** (`torchrec planner/constants.py:26`, replicated to
+  every device at `torchrec planner/types.py:1038`), so an 8-GPU node with no `ddr_cap` stated
   is assumed to have a terabyte of host memory and a host overdraft sails
   through. The TRW tests divide it themselves
   (`ddr_cap=1024**4 // local_size`); a caller who does not gets an HBM guard
@@ -1506,12 +1513,12 @@ surfaced only because TRW made someone check what `sharding_type` was for.
 |---|---|---|
 | ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
 | ~~**M1**~~ | ~~Measure R1 as a go/no-go~~ **Cancelled.** Customer demand for TWRW is strong enough that it ships regardless of the R1 outcome. The measurement still has value as *sizing* input for §4.2 and for the `node_index` guidance in §10.3 -- it is folded into M5, not a gate. |  |
-| ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `NodePlacer` component, with `node_index` surviving as a pin. Plan is TRW-shaped; nothing consumes it yet -- `shard/embeddingbag.py` still dispatches only ROW_WISE, so a TRW table reaches TorchRec's own TwRw sharding and will not work. M3 is what makes it run. | `table_fanout` / `table_ranks` / `BalancedNodePlacer` unit tests; plan inspection still owed |
+| ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `NodePlacer` component, with `node_index` surviving as a pin. It left the plan TRW-shaped with nothing consuming it -- that was M3's job, and M3 is done. | `table_fanout` / `table_ranks` / `BalancedNodePlacer` unit tests, and `test_table_row_wise.py --mode plan`, which asserts the plan directly |
 | ~~**M3**~~ | **Done.** `TwRwPooledDynamicEmbeddingSharding` + the input dist (§4.3, §4.4); the staggered shuffle turned out to be inherited. `EmbeddingCollection` refuses TRW outright. Running it found six defects the static reading had missed -- see §8.5. | Numerical parity vs row-wise, reached |
 | ~~**M4**~~ | **Done.** Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7). The kernel reads its shard geometry from the placements TorchRec planned rather than from the global process group, so the four refusals M3 added are gone. | Dump→load round-trip across TRW, reached: a two-node emulation both directions with unequal per-node table counts, and a 2x8 run whose 58 GB checkpoint reloaded onto 8 GPUs with exact key counts and bit-identical values |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
 
-With M1 cancelled, M2 is the first thing to do. R1 is still inherent to TRW and
+M2 through M4 are done and M5 is what remains. R1 is still inherent to TRW and
 cannot be engineered away -- dropping the gate does not make the N× capacity
 pressure go away, it only means the answer no longer decides whether to build.
 It decides which tables a user should put on TRW, so it belongs in the

@@ -59,7 +59,8 @@ Planning happens in two steps. The DynamicEmb tables are settled first -- their 
 
 The table configs come from the module at plan time, so there is no `eb_configs` argument: state the tables once, where the collection is built. `collective_plan` decides on rank 0 and broadcasts, as TorchREC's own planner does; the per-table options are reattached from each rank's own constraints afterwards, since `external_storage` and `score_function` are local to the process that made them.
 
-For row-wise DynamicEmb sharding, the supported `dist_type` values are:
+For DynamicEmb sharding -- row-wise and table-row-wise alike, since both
+bucketize by the same rule -- the supported `dist_type` values are:
 
 - `continuous`
 - `roundrobin`
@@ -117,7 +118,7 @@ For row-wise DynamicEmb sharding, the supported `dist_type` values are:
 3. **Plan the remaining tables** — TorchREC's own planning, over the memory that is left.
 4. **Assemble both halves** into one `ShardingPlan`.
 
-**Step 1.** The table configs are read off the module, each DynamicEmb table's `DynamicEmbTableOptions` are filled in place (the table below), and one `ParameterSharding` is written per table: `ROW_WISE`, one shard per rank of `[max_capacity, embedding_dim]`, placement by rank. Nothing is searched — a DynamicEmb table's capacity comes from its options and its placement from the key-to-rank rule.
+**Step 1.** The table configs are read off the module, each DynamicEmb table's `DynamicEmbTableOptions` are filled in place (the table below), and one `ParameterSharding` is written per table: `ROW_WISE` or `TABLE_ROW_WISE` as its constraint asks, one shard of `[max_capacity, embedding_dim]` on each rank that holds it -- every rank for a row-wise table, one node's for a table-row-wise one -- placement by rank. Nothing is searched — a DynamicEmb table's capacity comes from its options and its placement from the key-to-rank rule.
 
 **Step 2.** What each rank spends on those tables is worked out from the shard metadata written in step 1, including optimizer state (read from the sharders' `fused_params` or the parameters' `_optimizer_classes`), and taken out of the `Topology` per rank. Your `Topology` is not modified — say what the machine has, and the planner hands TorchREC the difference.
 
@@ -125,7 +126,7 @@ For row-wise DynamicEmb sharding, the supported `dist_type` values are:
 
 **Step 4.** The DynamicEmb entries are added back to the plan under the paths they live at in your module, and the result is returned as one `ShardingPlan`.
 
-Under `collective_plan`, step 1 runs on every rank and steps 2–4 on rank 0, whose result is broadcast — as TorchREC's own planner does. The per-table options are reattached from each rank's own constraints afterwards rather than sent, because `external_storage` is a live handle and `score_function` a callable, both local to the process that made them.
+Under `collective_plan`, steps 1 and 2 run on every rank and steps 3–4 on rank 0, whose result is broadcast — as TorchREC's own planner does. Step 2 is deliberately outside the broadcast: it is where a DynamicEmb table that does not fit is refused, and a refusal raised on rank 0 alone would leave every other rank waiting on a broadcast that never comes, turning an error into a hang. The per-table options are reattached from each rank's own constraints afterwards rather than sent, because `external_storage` is a live handle and `score_function` a callable, both local to the process that made them.
 
 So: the DynamicEmb tables never enter TorchREC's search space, their memory is accounted for before TorchREC plans anything, and every rank gets the same placement decisions.
 
@@ -165,7 +166,7 @@ To replace the rule, pass a `NodePlacer` to the planner:
 
 `BalancedNodePlacer` is the default: largest table first onto the emptiest node, measured against the tightest rank of a node rather than the node's total, because a table-row-wise table charges every rank of its node the same.
 
-**Not usable yet.** The plan comes out `TABLE_ROW_WISE`-shaped, but nothing consumes it — the sharding runtime still dispatches only `ROW_WISE`.
+**What it costs.** A table-row-wise table lives on one node, so each of that node's ranks holds `1/local_world_size` of its rows rather than `1/world_size` — the same table needs `world_size / local_world_size` times the memory per rank it would need row-wise. What it buys is the lookup: the all-to-all that gathers it runs inside the node, and only the pooled result crosses between nodes. Put the tables whose traffic dominates on it, not the ones whose rows do.
 
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 
