@@ -166,7 +166,11 @@ To replace the rule, pass a `NodePlacer` to the planner:
 
 `BalancedNodePlacer` is the default: largest table first onto the emptiest node, measured against the tightest rank of a node rather than the node's total, because a table-row-wise table charges every rank of its node the same.
 
-**What it costs.** A table-row-wise table lives on one node, so each of that node's ranks holds `1/local_world_size` of its rows rather than `1/world_size` — the same table needs `world_size / local_world_size` times the memory per rank it would need row-wise. What it buys is the lookup: the all-to-all that gathers it runs inside the node, and only the pooled result crosses between nodes. Put the tables whose traffic dominates on it, not the ones whose rows do.
+**What it costs.** A table-row-wise table lives on one node, so each of that node's ranks holds `1/local_world_size` of its rows rather than `1/world_size` — the same table needs `world_size / local_world_size` times the memory per rank it would need row-wise. For a DynamicEmb table that is not only memory: the table is bounded and evicts, so holding N times the rows per rank changes the eviction rate, and with it accuracy.
+
+**What it buys, and what it does not.** The saving is on the **output** side. A row-wise table's pooled result is reduce-scattered across every rank, so the reduction itself crosses nodes; a table-row-wise table reduces inside its node first and only then sends one pooled result per node across — `O(B · D · world_size)` of cross-node output traffic becomes `O(B · D)`.
+
+**Input keys still cross nodes.** The input distribution is a KJT all-to-all over the *global* process group under both sharding types; what table-row-wise changes is the number of buckets the keys are sorted into (`local_world_size` rather than `world_size`) and a staggered shuffle before the exchange — not its scope. A rank that does not sit on the node holding the table still sends that table's keys across the fabric. Choose table-row-wise for a table whose cross-node *output* traffic is a measured bottleneck, not to keep its lookups on one node.
 
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 
