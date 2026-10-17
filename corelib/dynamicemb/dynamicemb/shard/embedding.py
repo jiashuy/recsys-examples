@@ -69,6 +69,7 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
         seq_vbe_ctx: Optional[List] = None,
         frequency_counters: Optional[List[torch.Tensor]] = None,
     ) -> None:
+        # TorchRec may retain None for these fields; dedup and VBE append to them.
         super().__init__(
             sharding_contexts=[] if sharding_contexts is None else sharding_contexts,
             input_features=[] if input_features is None else input_features,
