@@ -36,11 +36,7 @@ from tests.test_utils import is_sm90_or_above
 # Import jagged_flash_attn_block directly to avoid model/__init__.py
 # which pulls in heavy dependencies (dynamicemb, megatron, torchrec).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-from jagged_flash_attn_block import (  # noqa: E402
-    JaggedGPTLayer,
-    _beam_decode_attn_reference,
-    _get_beam_decode_attn,
-)
+from jagged_flash_attn_block import JaggedGPTLayer, _get_beam_decode_attn  # noqa: E402
 
 sys.path.pop(0)
 
@@ -78,12 +74,11 @@ _E2E_SKIP_REASON = (
 )
 
 
-# Some paths still go through `flash_attn.cute` (target-aware arbitrary
-# mask in baseline `generate()` and the Mode-3 dense prefill fallback),
-# which asserts SM90+. Tests that exercise either are gated on this.
+# These end-to-end cases remain gated on their currently validated SM90 target.
+# Training and prefill use standard FA2; beam decode uses gr_decode_atten.
 _SM90_AVAILABLE = is_sm90_or_above()
 _SM90_SKIP_REASON = (
-    "requires SM90+ (cute FA arbitrary-mask path / dense Mode-3 prefill); "
+    "requires the currently validated SM90+ SID-GR test target; "
     "current device compute capability < 9.0"
 )
 
@@ -264,6 +259,82 @@ class TestBeamSearchParentIndices:
 
 
 # ---------------------------------------------------------------------------
+# Test: beam bookkeeping against hand-computed expectations
+# ---------------------------------------------------------------------------
+def test_beam_bookkeeping_matches_hand_computed_expectations():
+    """Drive BeamSearch with fixed log-probs whose outcome is computable by hand.
+
+    No model and no kernel run here: beams, parents and beam-KV slots are
+    compared exactly, and the only tolerance is on the accumulated log-probs,
+    where fp32 addition of the hand-written values is not exact. Step 1 is
+    chosen so the two best candidates come from swapped parents, which is
+    what an off-by-one in the parent chain would break.
+    """
+    bs = BeamSearch(2, 3, [4, 4, 4], record_history=True)
+
+    # Step 0 — one beam in, so the candidates are just the log-probs:
+    #   code0 -0.1   code1 -0.2   code2 -3.0   code3 -4.0
+    #   top-2 -> code0 (-0.1), code1 (-0.2)
+    bs.propagate(torch.tensor([[[-0.1, -0.2, -3.0, -4.0]]], device="cuda"))
+    assert bs.get_sids().tolist() == [[[0], [1]]]
+    assert bs.parent_indices[0].tolist() == [[0, 0]]
+
+    # Step 1 — accumulated = previous score + this step:
+    #   beam0 (-0.1):  -1.1  -0.6  -9.1  -9.1
+    #   beam1 (-0.2):  -0.4  -2.2  -9.2  -9.2
+    #   top-2 -> beam1+code0 (-0.4) then beam0+code1 (-0.6): the parents swap.
+    bs.propagate(
+        torch.tensor(
+            [[[-1.0, -0.5, -9.0, -9.0], [-0.2, -2.0, -9.0, -9.0]]], device="cuda"
+        )
+    )
+    assert bs.get_sids().tolist() == [[[1, 0], [0, 1]]]
+    assert bs.parent_indices[1].tolist() == [[1, 0]]
+    torch.testing.assert_close(
+        bs.get_log_probs(),
+        torch.tensor([[-0.4, -0.6]], device="cuda"),
+        rtol=0,
+        atol=1e-6,
+    )
+
+    # Step 2 — accumulated:
+    #   beam0 (-0.4):  -3.4  -0.5   -9.4  -9.4
+    #   beam1 (-0.6):  -0.65 -5.6   -9.6  -9.6
+    #   top-2 -> beam0+code1 (-0.5) then beam1+code0 (-0.65): parents stay put.
+    bs.propagate(
+        torch.tensor(
+            [[[-3.0, -0.1, -9.0, -9.0], [-0.05, -5.0, -9.0, -9.0]]], device="cuda"
+        )
+    )
+    assert bs.get_sids().tolist() == [[[1, 0, 1], [0, 1, 0]]]
+    assert bs.parent_indices[2].tolist() == [[0, 1]]
+    torch.testing.assert_close(
+        bs.get_log_probs(),
+        torch.tensor([[-0.5, -0.65]], device="cuda"),
+        rtol=0,
+        atol=1e-6,
+    )
+
+    # The beam KV holds one block per decode step: step 0 in slots 0..1,
+    # step 1 in slots 2..3, step 2 in slots 4..5. At decode step 1 beam0
+    # descends from old beam1 and beam1 from old beam0, so beam0 reads slot 1
+    # then 2, and beam1 slot 0 then 3. Rows are decode steps, columns beams.
+    topk = bs.build_beam_topk_indices(decode_step=1, num_heads=3)
+    assert topk.shape == (1, 1, 3, 2, 2)
+    for head in range(3):
+        assert topk[0, 0, head].tolist() == [[1, 0], [2, 3]]
+
+    # Decode step 2 walks both recorded transitions, which is the part a
+    # single-hop test cannot reach: beam0's ancestor at step 1 is beam0
+    # (parent_indices[2] = [0, 1]) and that beam's ancestor at step 0 is
+    # beam1 (parent_indices[1] = [1, 0]), so beam0 reads slots 1, 2, 4.
+    topk = bs.build_beam_topk_indices(decode_step=2, num_heads=3)
+    assert topk.shape == (1, 1, 3, 3, 2)
+    for head in range(3):
+        assert topk[0, 0, head].tolist() == [[1, 0], [2, 3], [4, 5]]
+
+
+# ---------------------------------------------------------------------------
 # Test: JaggedGPTLayer prefill & decode_beam (smoke)
 # ---------------------------------------------------------------------------
 class TestJaggedGPTLayerPrefillDecode:
@@ -382,8 +453,6 @@ class TestVariableLengthHistory:
         )
 
         kernel_fn = _get_beam_decode_attn()
-        if kernel_fn is _beam_decode_attn_reference:
-            pytest.skip("CuTe kernel needed for seqused_k masking")
         out_a, _ = kernel_fn(
             q,
             valid_k,
@@ -556,147 +625,6 @@ def test_generate_beam_decode_e2e(
 @pytest.mark.parametrize("num_layers", [2])
 @pytest.mark.parametrize("codebook_sizes", [[128, 128, 128]])
 @pytest.mark.parametrize("batchsize", [4])
-def test_generate_vs_generate_beam_decode_regression_guard(
-    dtype,
-    max_history_length,
-    num_layers,
-    codebook_sizes,
-    batchsize,
-):
-    """Regression guard between generate() and generate_beam_decode().
-
-    Both paths implement the same beam-isolated attention semantics by
-    different means (full-sequence rerun with arbitrary mask vs
-    prefill+incremental decode with topk_indices). They should produce
-    very close results, but bf16 attention's per-layer rounding plus
-    beam-search's topk decision boundary make bit-exact match impossible.
-
-    This is a regression GUARD — it catches a path going significantly off
-    spec. It is NOT a mathematical equivalence proof; for that, see the
-    kernel-level reference oracle in
-    `corelib/gr_decode_atten/tests/test_fwd.py`, which compares the CuTe
-    kernel against a fp32 PyTorch reference at the attention-call level.
-
-    Thresholds:
-      - top-1 SID per sample matches exactly (small bf16 noise should not
-        flip the argmax of accumulated log-probs)
-      - per-position |log_prob delta| < 0.15
-      - top-K beam SID set overlap >= 70%
-    """
-    hidden_size = 256
-    num_attention_heads = 4
-    kv_channels = 64
-
-    init = _E2E_DEPS["init"]
-    get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
-    ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
-    create_sid_gr_model_and_optimizer = _E2E_DEPS["create_sid_gr_model_and_optimizer"]
-
-    num_hierarchies = len(codebook_sizes)
-    init.initialize_distributed()
-    init.initialize_model_parallel(1)
-    init.set_random_seed(7)
-
-    hist_name = "hist_sids"
-    cand_name = "cand_sids"
-    codebook_embedding_config = ShardedEmbeddingConfig(
-        feature_names=[hist_name, cand_name],
-        table_name="codebook",
-        vocab_size=sum(codebook_sizes),
-        dim=hidden_size,
-        sharding_type="data_parallel",
-    )
-
-    with init.auto_destroy_global_state():
-        model, optimizer = create_sid_gr_model_and_optimizer(
-            dtype=dtype,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            kv_channels=kv_channels,
-            num_layers=num_layers,
-            num_hierarchies=num_hierarchies,
-            codebook_embedding_config=codebook_embedding_config,
-            codebook_sizes=codebook_sizes,
-            use_jagged_flash_attn=True,
-        )
-        optimizer.reload_model_params()
-        model_unwrapped = get_unwrapped_module(model)
-        model_unwrapped.eval()
-
-        batch = _generate_random_batch(
-            batchsize=batchsize,
-            max_history_length=max_history_length,
-            codebook_sizes=codebook_sizes,
-            history_feature_name=hist_name,
-            candidate_feature_name=cand_name,
-        )
-        batch.to(torch.cuda.current_device())
-
-        with torch.no_grad():
-            sids_a, lp_a = model_unwrapped.generate(batch)
-            sids_b, lp_b = model_unwrapped.generate_beam_decode(batch)
-
-        assert sids_a.shape == sids_b.shape
-        assert lp_a.shape == lp_b.shape
-
-        # Both paths use beam-isolating attention (generate() builds
-        # padded_target_aware_causal_mask which is then converted to the
-        # jagged arbitrary_func; generate_beam_decode uses topk_indices for
-        # the same isolation). With both paths mathematically equivalent,
-        # the only differences are bf16 layout/order rounding.
-
-        # 1. Top-1 beam's full SID tuple must match (this is THE selection
-        #    that downstream consumers use; tiny rounding usually cannot
-        #    flip the argmax of accumulated log-probs).
-        top1_a = sids_a[:, 0, :]
-        top1_b = sids_b[:, 0, :]
-        per_sample_match = (top1_a == top1_b).all(dim=-1)
-        assert per_sample_match.all(), (
-            f"Top-1 SIDs differ on samples "
-            f"{(~per_sample_match).nonzero(as_tuple=True)[0].tolist()}:\n"
-            f"  generate: {top1_a.tolist()}\n"
-            f"  decode:   {top1_b.tolist()}"
-        )
-
-        # 2. Per-position log_prob differences are within bf16 rounding —
-        #    a few times the typical attention rounding error.
-        lp_diff = (lp_a - lp_b).abs().max().item()
-        assert lp_diff < 0.15, (
-            f"log_probs differ by {lp_diff:.4f} (limit 0.15):\n"
-            f"  generate: {lp_a.tolist()}\n"
-            f"  decode:   {lp_b.tolist()}"
-        )
-
-        # 3. The top-K SIDs as sets must overlap by ≥ 70% per sample
-        #    (some beams at lower ranks may swap positions due to bf16
-        #    rounding when their log-probs are within ~lp_diff of each other).
-        top_k = sids_a.shape[1]
-
-        def _to_set_per_sample(sids):
-            return [
-                {tuple(sids[b, k].tolist()) for k in range(top_k)}
-                for b in range(sids.shape[0])
-            ]
-
-        sets_a = _to_set_per_sample(sids_a)
-        sets_b = _to_set_per_sample(sids_b)
-        for b, (sa, sb) in enumerate(zip(sets_a, sets_b)):
-            overlap = len(sa & sb) / len(sa)
-            assert overlap >= 0.7, (
-                f"Sample {b}: top-{top_k} beam overlap {overlap*100:.0f}% "
-                f"is below 70% threshold.\n"
-                f"  generate beams: {sorted(sa)}\n"
-                f"  decode beams:   {sorted(sb)}"
-            )
-
-
-@pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
-@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("max_history_length", [32, 128])
-@pytest.mark.parametrize("num_layers", [2])
-@pytest.mark.parametrize("codebook_sizes", [[128, 128, 128]])
-@pytest.mark.parametrize("batchsize", [4])
 def test_generate_beam_decode_jagged_kv_matches_dense(
     dtype,
     max_history_length,
@@ -704,12 +632,11 @@ def test_generate_beam_decode_jagged_kv_matches_dense(
     codebook_sizes,
     batchsize,
 ):
-    """Cross-check use_jagged_kv=True vs the default dense+seqused_k path.
+    """Cross-check default packed K/V against the padded-K/V variant.
 
     Both should produce the same top-1 SID tuple per sample. Lower-ranked
-    beams may swap due to bf16 reduction-order differences (jagged prefill
-    runs FA with arbitrary_func instead of causal=True), so we use the same
-    relaxed thresholds as the generate() regression guard.
+    beams may swap due to bf16 reduction-order differences between dense and
+    varlen FA2, so we use relaxed thresholds.
     """
     init = _E2E_DEPS["init"]
     get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
@@ -842,91 +769,6 @@ def test_use_jagged_kv_with_dsl_backend_rejected_at_entry():
                 model_unwrapped.generate_beam_decode(
                     batch,
                     backend="dsl",
-                    use_jagged_kv=True,
-                )
-
-
-@pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
-def test_use_jagged_kv_with_reference_fallback_rejected_at_entry(monkeypatch):
-    """When the real CuTe kernel isn't installed, the resolver returns
-    ``_beam_decode_attn_reference`` — which has ``cu_seqlens_k`` in its
-    signature for the explicit-raise contract but cannot actually run
-    jagged. The capability probe must catch this at entry, not later.
-    """
-    init = _E2E_DEPS["init"]
-    get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
-    ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
-    create_sid_gr_model_and_optimizer = _E2E_DEPS["create_sid_gr_model_and_optimizer"]
-
-    # gpt_model imports via `from .jagged_flash_attn_block import ...`,
-    # which registers the module under the package-qualified name. The
-    # standalone `import jagged_flash_attn_block` would land a *separate*
-    # module object in sys.modules, so patching that wouldn't affect the
-    # one the probe actually reads. Pull the right one out of sys.modules.
-    import sys as _sys
-
-    jfab = _sys.modules.get("model.jagged_flash_attn_block")
-    assert jfab is not None, (
-        "model.jagged_flash_attn_block not loaded; the test's "
-        "create_sid_gr_model_and_optimizer call should have triggered the "
-        "import chain"
-    )
-
-    init.initialize_distributed()
-    init.initialize_model_parallel(1)
-    init.set_random_seed(42)
-
-    hist_name = "hist_sids"
-    cand_name = "cand_sids"
-    codebook_sizes = [128, 128, 128]
-    codebook_embedding_config = ShardedEmbeddingConfig(
-        feature_names=[hist_name, cand_name],
-        table_name="codebook",
-        vocab_size=sum(codebook_sizes),
-        dim=256,
-        sharding_type="data_parallel",
-    )
-
-    with init.auto_destroy_global_state():
-        model, optimizer = create_sid_gr_model_and_optimizer(
-            dtype=torch.bfloat16,
-            hidden_size=256,
-            num_attention_heads=4,
-            kv_channels=64,
-            num_layers=2,
-            num_hierarchies=3,
-            codebook_embedding_config=codebook_embedding_config,
-            codebook_sizes=codebook_sizes,
-            use_jagged_flash_attn=True,
-        )
-        optimizer.reload_model_params()
-        model_unwrapped = get_unwrapped_module(model)
-        model_unwrapped.eval()
-
-        batch = _generate_random_batch(
-            batchsize=4,
-            max_history_length=64,
-            codebook_sizes=codebook_sizes,
-            history_feature_name=hist_name,
-            candidate_feature_name=cand_name,
-        )
-        batch.to(torch.cuda.current_device())
-
-        # Force the cached resolver result to be the PyTorch reference
-        # fallback, mimicking an environment without the CuTe kernel
-        # installed. _get_beam_decode_attn caches at the module level on
-        # the _beam_decode_attn name, so patch that directly.
-        monkeypatch.setattr(
-            jfab,
-            "_beam_decode_attn",
-            jfab._beam_decode_attn_reference,
-        )
-
-        with pytest.raises(RuntimeError, match="reference fallback does not implement"):
-            with torch.no_grad():
-                model_unwrapped.generate_beam_decode(
-                    batch,
-                    backend="3kernel",
                     use_jagged_kv=True,
                 )
 
@@ -1145,112 +987,10 @@ class TestBeamIsolationMask:
                 ), f"target at pos {target_pos} can't see all history: {hist_visible.tolist()}"
 
 
-def _arbitrary_func_to_dense_jagged(
-    af: torch.Tensor, total_tokens: int
-) -> torch.Tensor:
-    """Expand a flattened (B=1) arbitrary_func tensor to a dense
-    [total_tokens, total_tokens] bool mask using the interval semantics:
-        valid(q, k) = (k < F0[q]) OR (F1[q] <= k < F2[q]) OR ...
-    """
-    assert af.dim() == 4 and af.shape[0] == 1 and af.shape[1] == 1
-    n_func = af.shape[2]
-    device = af.device
-    mask = torch.zeros(total_tokens, total_tokens, dtype=torch.bool, device=device)
-    kv_idx = torch.arange(total_tokens, device=device)
-    af2d = af[0, 0, :, :total_tokens]  # [n_func, total_tokens]
-    for q in range(total_tokens):
-        f0 = af2d[0, q].item()
-        row = kv_idx < f0
-        for iv in range((n_func - 1) // 2):
-            f_start = af2d[2 * iv + 1, q].item()
-            f_end = af2d[2 * iv + 2, q].item()
-            row = row | ((kv_idx >= f_start) & (kv_idx < f_end))
-        mask[q] = row
-    return mask
-
-
-@pytest.mark.parametrize("history_seqlens", [[4, 4], [3, 5], [1, 6, 4]])
-@pytest.mark.parametrize("num_target_region", [0, 2, 3])
-@pytest.mark.parametrize("candidate_length", [1, 3])
-def test_jagged_target_aware_builder_matches_dense(
-    history_seqlens, num_target_region, candidate_length
-):
-    """Vectorised builder must produce the same flattened mask as the
-    dense path (padded_target_aware_causal_mask + dense_to_jagged).
-
-    Covers variable-length history, beam_width 0/2/3, candidate_length 1/3.
-    """
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-    try:
-        from attention_mask import (
-            build_jagged_target_aware_arbitrary_func,
-            dense_mask_to_jagged_arbitrary_func,
-            padded_target_aware_causal_mask,
-        )
-    finally:
-        sys.path.pop(0)
-
-    device = "cuda"
-    len(history_seqlens)
-    cl = candidate_length
-    W = num_target_region
-
-    # Per-sample concatenated layout: [hist_b, beam0(cl), ..., beam_{W-1}(cl)]
-    # Total per sample = hist_seqlen[b] + W * cl.
-    sample_lens = [hl + W * cl for hl in history_seqlens]
-    offsets = torch.tensor(
-        [0] + list(torch.tensor(sample_lens).cumsum(0).tolist()),
-        device=device,
-        dtype=torch.long,
-    )
-    total_tokens = int(offsets[-1].item())
-    history_t = torch.tensor(history_seqlens, device=device, dtype=torch.long)
-
-    # Vectorised path
-    af_fast = build_jagged_target_aware_arbitrary_func(
-        history_seqlen=history_t,
-        num_target_region=W,
-        target_max_seqlen_per_region=cl,
-        offsets=offsets,
-        total_tokens=total_tokens,
-    )
-
-    # Reference: build dense mask, then convert via dense_to_jagged.
-    # padded_target_aware_causal_mask uses a uniform max_history_seqlen,
-    # so we pad each sample to max(history_seqlens) + W*cl.
-    max_hist = max(history_seqlens)
-    dense_mask = padded_target_aware_causal_mask(
-        history_t,
-        max_hist,
-        W,
-        cl,
-    )
-    valid_dense = ~dense_mask  # [B, 1, max_hist+W*cl, max_hist+W*cl]
-    af_ref = dense_mask_to_jagged_arbitrary_func(
-        valid_dense,
-        offsets,
-        total_tokens,
-    )
-
-    fast_dense = _arbitrary_func_to_dense_jagged(af_fast, total_tokens)
-    ref_dense = _arbitrary_func_to_dense_jagged(af_ref, total_tokens)
-    assert torch.equal(fast_dense, ref_dense), (
-        f"vectorised builder mask differs from dense oracle.\n"
-        f"  diff at: {(fast_dense != ref_dense).nonzero(as_tuple=False).tolist()}"
-    )
-
-
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
 @pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 def test_generate_is_deterministic():
-    """generate() called twice on the same batch must produce identical SIDs.
-
-    A determinism prerequisite for any beam-level perturbation argument
-    (which would otherwise see noise from non-determinism). This is NOT
-    an actual perturbation invariance test — for that, see the
-    TestBeamIsolationMask geometric checks plus the equivalence-vs-decode
-    regression guard.
-    """
+    """Optimized generate() called twice must produce identical SIDs."""
     init = _E2E_DEPS["init"]
     get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
     ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
@@ -1288,26 +1028,8 @@ def test_generate_is_deterministic():
         batch = _generate_random_batch(2, 32, cs, "hist_sids", "cand_sids")
         batch.to(torch.cuda.current_device())
 
-        # Run generate twice on the same batch — should be deterministic.
+        # generate() dispatches to generate_beam_decode() for this backend.
         with torch.no_grad():
             sids_a, _ = m.generate(batch)
             sids_b, _ = m.generate(batch)
-        assert torch.equal(
-            sids_a, sids_b
-        ), "generate is non-deterministic, perturbation test would be invalid"
-
-        # Test: replace each beam's first-step code with a different code and
-        # verify the other beams' final SIDs don't change. We simulate this
-        # by re-running generate but injecting a different selection at step 0
-        # for ONE specific beam, then comparing the OTHER beams' outputs.
-        # For simplicity here we do a structural check: the mask used in
-        # generate() must be padded_target_aware_causal_mask (verified by the
-        # mask unit test above), and we already test that
-        # generate_beam_decode produces equivalent results — which only works
-        # under proper beam isolation. So this test is a smoke check that
-        # generate() itself is deterministic, which is required for the
-        # perturbation argument to even make sense.
-        # If beam isolation is broken, generate is still deterministic but
-        # the per-beam outputs would be cross-contaminated; that case is
-        # caught by the structural mask unit test above and by the
-        # equivalence test (which compares to the truly isolated decode path).
+        assert torch.equal(sids_a, sids_b), "optimized generate() is non-deterministic"
