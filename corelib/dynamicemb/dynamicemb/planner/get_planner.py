@@ -115,6 +115,13 @@ def get_planner(
                 use_dynamicemb=False,
                 compute_kernels=compute_kernel_type,
             )
+        # Keyed by table name, which is what `eb_configs` offers: a flat list,
+        # with no module to take a path from. That is every model whose table
+        # names are unique, which is nearly all of them. A model where two
+        # collections declare one name needs a key naming one of them -- see
+        # `get_constraint_key` -- and so cannot be configured through here;
+        # build the constraints and the DynamicEmbeddingShardingPlanner
+        # directly for that case.
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
 

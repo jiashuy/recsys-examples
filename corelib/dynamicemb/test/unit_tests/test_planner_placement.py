@@ -23,7 +23,7 @@ import pytest
 import torch
 from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 from dynamicemb.planner.placement import BalancedNodePlacer, TableToPlace
-from dynamicemb.planner.plan import make_storage
+from dynamicemb.planner.plan import TableKey, make_storage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torchrec.distributed.planner.types import CustomTopologyData, Topology
 from torchrec.modules.embedding_configs import PoolingType
@@ -69,6 +69,16 @@ def _nothing_spent():
     return [make_storage(hbm=0, ddr=0, ssd=0) for _ in range(WORLD)]
 
 
+def _names(chosen):
+    """A placement by table name, for the tests that use one collection.
+
+    The placer answers by `TableKey`, since a name need not be unique. Where a
+    test says nothing about collections there is only one, and the name is the
+    whole of the identity.
+    """
+    return {key.name: node for key, node in chosen.items()}
+
+
 def _table(
     name,
     size_gb,
@@ -78,6 +88,7 @@ def _table(
     embedding_dtype=torch.float32,
     optimizer_type=None,
     pooling=None,
+    collection="ebc",
 ):
     """A table weighing `size_gb` per rank, as float32.
 
@@ -87,14 +98,18 @@ def _table(
     or one with budget to spare for a groupmate.
 
     `size_gb` sizes the row count, not the bytes: with a narrower
-    `embedding_dtype` the same rows weigh proportionally less. The last four
+    `embedding_dtype` the same rows weigh proportionally less. The last five
     arguments are the fields two tables must match on to fuse, and the row
     count is held fixed across them so a test can vary one and nothing else.
+    `collection` defaults to one shared value so that tables which say nothing
+    about it still fuse, which is what every test that predates it assumes.
+    Two tables with one name and different collections are two tables, which
+    is what `TestATableInMoreThanOneCollection` is about.
     """
     rows = size_gb * GB // (DIM * 4) or 1
     budget = size_gb if budget_gb is None else budget_gb
     return TableToPlace(
-        name=name,
+        key=TableKey(collection, name),
         options=DynamicEmbTableOptions(
             max_capacity=rows,
             dim=DIM,
@@ -119,8 +134,12 @@ class TestPins:
     """
 
     def test_a_pin_that_fits_is_honoured(self):
-        assert BalancedNodePlacer().place(
-            [_table("a", 70, pinned_to=1)], _topology(hbm=80 * GB), _nothing_spent()
+        assert _names(
+            BalancedNodePlacer().place(
+                [_table("a", 70, pinned_to=1)],
+                _topology(hbm=80 * GB),
+                _nothing_spent(),
+            )
         ) == {"a": 1}
 
     def test_the_rest_are_fitted_around_it(self):
@@ -131,7 +150,7 @@ class TestPins:
             _topology(),
             _nothing_spent(),
         )
-        assert chosen == {"a": 1, "b": 0}
+        assert _names(chosen) == {"a": 1, "b": 0}
 
     @pytest.mark.parametrize(
         "table, message",
@@ -154,9 +173,10 @@ class TestPins:
         """The fit is checked against what is left, not against an empty
         machine. Both are pinned to node 0 and together they overflow it, so
         the second is refused -- by name, since the message is otherwise the
-        same for either."""
+        same for either -- and the name it says is the qualified one, since a
+        bare name would not say which collection's table was refused."""
         tables = [_table("first", 60, pinned_to=0), _table("second", 40, pinned_to=0)]
-        with pytest.raises(ValueError, match="'second'"):
+        with pytest.raises(ValueError, match=r"'ebc\.second'"):
             BalancedNodePlacer().place(tables, _topology(hbm=80 * GB), _nothing_spent())
 
 
@@ -182,7 +202,7 @@ def test_largest_first_onto_the_emptiest_node():
     # a is biggest and goes first; both nodes are empty so it takes the lower.
     # b then sees node 1 emptier, and c follows b only because node 1 still has
     # more room than node 0 does after a.
-    assert chosen == {"a": 0, "b": 1, "c": 1}
+    assert _names(chosen) == {"a": 0, "b": 1, "c": 1}
 
 
 def test_equal_tables_spread_rather_than_stack():
@@ -232,7 +252,9 @@ def test_what_is_spent_can_still_rule_a_table_out():
 
     # Which node it lands on is `test_largest_first_onto_the_emptiest_node`'s
     # to say; all this one needs is that it lands somewhere.
-    assert "big" in BalancedNodePlacer().place([big], topology, _nothing_spent())
+    assert "big" in _names(
+        BalancedNodePlacer().place([big], topology, _nothing_spent())
+    )
 
     with pytest.raises(ValueError, match="No node can hold"):
         BalancedNodePlacer().place([big], topology, everywhere)
@@ -253,17 +275,17 @@ def test_a_node_is_charged_on_every_one_of_its_ranks():
     assert second > per_rank - first, "and leaves too little for the second"
 
     topology = _topology(hbm=per_rank * GB)
-    assert BalancedNodePlacer().place(
-        [_table("a", first)], topology, _nothing_spent()
+    assert _names(
+        BalancedNodePlacer().place([_table("a", first)], topology, _nothing_spent())
     ) == {"a": 0}
 
     on_node_0 = [
         make_storage(hbm=first * GB if r < LOCAL else 0, ddr=0, ssd=0)
         for r in range(WORLD)
     ]
-    assert BalancedNodePlacer().place([_table("b", second)], topology, on_node_0) == {
-        "b": 1
-    }
+    assert _names(
+        BalancedNodePlacer().place([_table("b", second)], topology, on_node_0)
+    ) == {"b": 1}
 
 
 def test_a_node_is_only_as_large_as_its_smallest_gpu():
@@ -281,8 +303,8 @@ def test_a_node_is_only_as_large_as_its_smallest_gpu():
 
     # 30 GB a rank. Node 0 has more room in total and more room on three of its
     # four ranks, and still cannot take it.
-    assert BalancedNodePlacer().place(
-        [_table("t", 30)], topology, _nothing_spent()
+    assert _names(
+        BalancedNodePlacer().place([_table("t", 30)], topology, _nothing_spent())
     ) == {"t": 1}
 
     # 50 GB a rank fits on no node, though node 0 has three ranks that could
@@ -309,7 +331,7 @@ def test_the_answer_does_not_depend_on_the_order_it_was_asked():
         list(reversed(tables)), _topology(), _nothing_spent()
     )
     assert first == second
-    assert first["p"] == 1 and first["q"] == 0
+    assert _names(first)["p"] == 1 and _names(first)["q"] == 0
 
 
 def test_a_groupmate_with_spare_budget_makes_room():
@@ -329,7 +351,9 @@ def test_a_groupmate_with_spare_budget_makes_room():
     assert needy.cost_alone().ddr == 14 * GB, "priced alone it spills 14 GB to host"
     assert generous.cost_alone().ddr == 0
 
-    chosen = BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
+    chosen = _names(
+        BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
+    )
     assert chosen["generous"] == chosen["needy"], (
         "they fuse, so together they fit in the pooled 22 GB budget and need no "
         "host memory -- which only shows if the placer prices them together"
@@ -349,9 +373,13 @@ def test_a_groupmate_with_spare_budget_makes_room():
         ("optimizer_type", OptimType.ADAM, False),
         # ...the pooling, which lives on the TorchRec config...
         ("pooling", PoolingType.SUM, False),
-        # ...and the data type, which get_grouped_key leaves out because
-        # DynamicEmb reads it off the options separately.
+        # ...the data type, which get_grouped_key leaves out because
+        # DynamicEmb reads it off the options separately...
         ("embedding_dtype", torch.float16, False),
+        # ...and the owning collection, which is not on either side: TorchRec
+        # shards each collection separately, so these two build runtimes that
+        # cannot lend each other HBM however identical the rest of them is.
+        ("collection", "other_ebc", False),
     ],
 )
 def test_tables_that_do_not_fuse_do_not_pool_their_budgets(
@@ -371,9 +399,9 @@ def test_tables_that_do_not_fuse_do_not_pool_their_budgets(
     same amount, which accepts layouts the runtime cannot hold (see
     `plan.fusion_key`).
 
-    Two of the four also change what `needy` weighs -- Adam adds optimizer
+    Two of the five also change what `needy` weighs -- Adam adds optimizer
     state to every row, float16 halves it, since `_table` sizes the row count
-    as float32 -- which does not matter here: unpooled, all four overflow the
+    as float32 -- which does not matter here: unpooled, all five overflow the
     4 GB host tier.
     """
     topo = _topology(hbm=80 * GB, ddr=4 * GB)
@@ -388,3 +416,62 @@ def test_tables_that_do_not_fuse_do_not_pool_their_budgets(
 
     with pytest.raises(ValueError, match="No node can hold"):
         BalancedNodePlacer().place([generous, needy], topo, _nothing_spent())
+
+
+class TestATableInMoreThanOneCollection:
+    """A name declared in two collections is two tables on the node.
+
+    Each collection is sharded on its own and builds its own runtime with its
+    own storage, so the node holds both -- and because they are in different
+    groups they never pool their budgets with each other, which is the whole
+    point of the collection being in the key.
+    """
+
+    def test_the_same_name_in_two_collections_is_two_keys(self):
+        a = _table("t", 4, collection="ebc_a")
+        b = _table("t", 4, collection="ebc_b")
+        assert a.key != b.key
+        assert a.fusion_key != b.fusion_key
+
+    def test_the_copies_do_not_lend_each_other_budget(self):
+        """The mirror of `test_a_groupmate_with_spare_budget_makes_room`, with
+        the groupmate being the same name in another collection: 16 GiB of rows
+        against a 20 GB budget fits once over, but the second gets its own
+        20 GB and its own 16 GiB, not the first one's leftovers.
+
+        Both are pinned to node 0, because left to itself the placer would put
+        them on different nodes -- which is the right answer and not what this
+        is asking. What it asks is what one node owes for both.
+        """
+        topo = _topology(hbm=20 * GB, ddr=0)
+        one = _table("t", 16, budget_gb=20, collection="ebc_a", pinned_to=0)
+        assert one.cost_alone().ddr == 0
+        assert BalancedNodePlacer().place([one], topo, _nothing_spent()) == {
+            TableKey("ebc_a", "t"): 0
+        }
+
+        two = _table("t", 16, budget_gb=20, collection="ebc_b", pinned_to=0)
+        with pytest.raises(ValueError, match=r"'ebc_b\.t'"):
+            BalancedNodePlacer().place([one, two], topo, _nothing_spent())
+
+    def test_both_are_placed_and_told_apart(self):
+        """Two entries out, not one -- a name-keyed answer would collapse them,
+        and one of the two runtimes would never be placed."""
+        topo = _topology(hbm=20 * GB, ddr=0)
+        chosen = BalancedNodePlacer().place(
+            [
+                _table("t", 4, collection="ebc_a"),
+                _table("t", 4, collection="ebc_b"),
+            ],
+            topo,
+            _nothing_spent(),
+        )
+        assert set(chosen) == {TableKey("ebc_a", "t"), TableKey("ebc_b", "t")}
+
+    def test_a_refusal_says_which_collection(self):
+        """A message that said only "t" would name both."""
+        topo = _topology(hbm=1 * GB, ddr=0)
+        with pytest.raises(ValueError, match=r"'ebc_b\.t'"):
+            BalancedNodePlacer().place(
+                [_table("t", 16, collection="ebc_b")], topo, _nothing_spent()
+            )

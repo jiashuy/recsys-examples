@@ -37,7 +37,7 @@ from torchrec.distributed.planner.types import Storage, Topology
 from torchrec.distributed.types import ShardingType
 
 from ..dynamicemb_config import DynamicEmbTableOptions, get_group_value_bytes_by_tier
-from .plan import fusion_key, make_storage, storage_ssd
+from .plan import TableKey, fusion_key, make_storage, storage_ssd
 
 __all__ = ["TableToPlace", "NodePlacer", "BalancedNodePlacer"]
 
@@ -53,8 +53,13 @@ class TableToPlace:
 
     Attributes
     ----------
-    name : str
-        The table's name, and the tie-break when two tables weigh the same.
+    key : TableKey
+        Which table this is: the collection it was declared in and its name.
+        Also the tie-break when two tables weigh the same. The collection is
+        part of the identity because collections are sharded separately and
+        build separate runtimes, so their tables never fuse and cannot lend
+        each other HBM however alike the rest of this is -- a name declared in
+        two of them arrives here as two entries and is charged twice.
     options : DynamicEmbTableOptions
         The table's own options. These are both its size and -- through
         ``get_grouped_key`` -- which other tables it fuses with.
@@ -70,7 +75,7 @@ class TableToPlace:
         A placer must honour it, and must still check that it fits.
     """
 
-    name: str
+    key: TableKey
     options: "DynamicEmbTableOptions"
     optimizer_type: Optional[OptimType] = None
     pooling: object = None
@@ -82,8 +87,8 @@ class TableToPlace:
 
         The module-level :func:`~dynamicemb.planner.plan.fusion_key` -- not
         this property, which a method body does not see -- so the placer and
-        `per_rank_storage` cannot disagree about which tables share a TBE --
-        and a table-row-wise table is always that, since a pin or a placement
+        `per_rank_storage` cannot disagree about which tables share a TBE. The
+        sharding type is table-row-wise by construction: a pin or a placement
         decides only the node.
         """
         return fusion_key(
@@ -91,6 +96,7 @@ class TableToPlace:
             self.options,
             self.optimizer_type,
             self.pooling,
+            self.key.collection,
         )
 
     @property
@@ -98,8 +104,8 @@ class TableToPlace:
         """This table as one of the ``members`` a group is costed from.
 
         :func:`get_group_value_bytes_by_tier` takes a list of these. The group
-        is whatever shares a :attr:`fusion_key`; this is the one element of it
-        that is this table.
+        is whatever shares this table's :attr:`fusion_key`; this is the one
+        element of it that is this table.
         """
         return (self.options, self.optimizer_type)
 
@@ -123,8 +129,8 @@ class NodePlacer(abc.ABC):
         tables: List[TableToPlace],
         topology: Topology,
         committed: List[Storage],
-    ) -> Dict[str, int]:
-        """Return ``{table name: node index}``, covering every table given.
+    ) -> Dict[TableKey, int]:
+        """Return ``{table: node index}``, covering every table given.
 
         Parameters
         ----------
@@ -158,7 +164,7 @@ class BalancedNodePlacer(NodePlacer):
     GRID_SHARD tables. Filling nodes in order would hand it a machine with
     nothing left on the low-numbered ones.
 
-    Ties break on the table name and then the lower node index, so every rank
+    Ties break on the table's key and then the lower node index, so every rank
     reaches the same answer.
     """
 
@@ -167,7 +173,7 @@ class BalancedNodePlacer(NodePlacer):
         tables: List[TableToPlace],
         topology: Topology,
         committed: List[Storage],
-    ) -> Dict[str, int]:
+    ) -> Dict[TableKey, int]:
         local_size = topology.local_world_size
         world_size = len(topology.devices)
         if local_size <= 0 or world_size % local_size:
@@ -227,7 +233,7 @@ class BalancedNodePlacer(NodePlacer):
             left = room[node] - cost_of(node)
             return left
 
-        chosen: Dict[str, int] = {}
+        chosen: Dict[TableKey, int] = {}
 
         # Pinned tables first: they are not choices, and what they take has to
         # be gone from the room before anything is fitted around them.
@@ -236,7 +242,7 @@ class BalancedNodePlacer(NodePlacer):
                 continue
             if not 0 <= table.pinned_to < num_nodes:
                 raise ValueError(
-                    f"Table {table.name!r} is pinned to node {table.pinned_to}, "
+                    f"Table {str(table.key)!r} is pinned to node {table.pinned_to}, "
                     f"which is outside the {num_nodes} nodes of this topology."
                 )
             # Checked the same as a table this placer chose for. A pin says
@@ -248,20 +254,20 @@ class BalancedNodePlacer(NodePlacer):
             needs, left = added_by(table.pinned_to, table), spare(table.pinned_to)
             if not needs.fits_in(left):
                 raise ValueError(
-                    f"Table {table.name!r} is pinned to node {table.pinned_to}, "
+                    f"Table {str(table.key)!r} is pinned to node {table.pinned_to}, "
                     f"which cannot hold it. It adds {needs} to each of that "
                     f"node's {local_size} ranks, which have {left} left. Pin "
                     "it elsewhere, leave node_index unset and let the placer "
                     "choose, or give it row-wise sharding."
                 )
-            chosen[table.name] = table.pinned_to
+            chosen[table.key] = table.pinned_to
             give(table.pinned_to, table)
 
         # Then the rest, biggest first. "Biggest" is what a table weighs on its
         # own, which is the only size there is before anything is placed.
-        def weight(table: TableToPlace) -> Tuple[int, int, str]:
+        def weight(table: TableToPlace) -> Tuple[int, int, TableKey]:
             alone = table.cost_alone()
-            return (-alone.hbm, -alone.ddr, table.name)
+            return (-alone.hbm, -alone.ddr, table.key)
 
         unpinned = sorted((t for t in tables if t.pinned_to is None), key=weight)
         for table in unpinned:
@@ -285,13 +291,13 @@ class BalancedNodePlacer(NodePlacer):
             needs, left = priced[node]
             if not needs.fits_in(left):
                 raise ValueError(
-                    f"No node can hold the table-row-wise table {table.name!r}. "
+                    f"No node can hold the table-row-wise table {str(table.key)!r}. "
                     f"It adds {needs} to each of a node's {local_size} ranks, "
                     f"and the emptiest node has {left} left on its tightest "
                     "rank. Give it row-wise sharding, lower its capacity, or "
                     "pin the tables so they pack differently."
                 )
-            chosen[table.name] = node
+            chosen[table.key] = node
             give(node, table)
 
         return chosen
