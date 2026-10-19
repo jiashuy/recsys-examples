@@ -1201,8 +1201,7 @@ Five gigabytes of HBM the old arithmetic did not reserve.
 **The grouping used is ours, and is coarser than the real one.** One function,
 `fusion_key`, answers what two tables must agree on, and both the placer and
 `per_rank_storage` bucket by it, so they cannot disagree about what fuses. The
-placer reaches it through `TableToPlace.fusion_key`, which carries the same
-name because it is the same answer:
+placer reaches it through `TableToPlace.fusion_key`, which is the same answer:
 
 | In the key | Why |
 |---|---|
@@ -1211,6 +1210,7 @@ name because it is the same answer:
 | optimizer | its state is part of a row, and TorchRec keys on it through the fused params |
 | data type | TorchRec keys on it; `get_grouped_key` does not |
 | pooling | likewise, and not DynamicEmb's to know -- the planner passes it in |
+| the owning collection | each shardable module is sharded on its own -- one `ShardedEmbedding*Collection` apiece, each with its own `EmbeddingSharding`s -- so tables from two collections never reach the same `group_tables` call, and the runtimes they build cannot lend each other HBM |
 
 Not in it: TorchRec's dimension bucket, and the rest of the fused params. Those
 need `_get_grouping_fused_params`, the bucketer and `_prefetch_and_cached` --
@@ -1219,7 +1219,92 @@ upstream internals that would have to be tracked as they change.
 An earlier version of this section lumped all five of those together as
 impractical. Three of them were not: the optimizer was already in hand, the
 data type is on the options, and the pooling only needed passing through. Two
-tables differing in any of them were being pooled. What is left out -- the
+tables differing in any of them were being pooled.
+
+The collection was a sixth, and was missed for a different reason: it was never
+on the options or the plan at all. `_table_configs` walks the model to find the
+tables and so is the one place that knows which module each came out of, and it
+flattened that away into a bare list of configs. Two collections with per-rank
+sizes of 4 GiB and 16 GiB and budgets of 20 GB and 2 GB were costed as one
+22 GB budget over 20 GiB of rows -- no host memory at all, where the truth is
+6 GiB of HBM and 14 GiB of host. The walk now carries the **path** to the
+owning module alongside each config, and the planner keys everything by
+`TableKey(collection, name)` — the pair, feeding both the reservation and the
+placer. The path rather than `id()`: every rank runs that walk on its own and
+has to reach the same grouping, and object addresses do not agree across
+processes.
+
+**One name in two collections is two tables, and is treated as two.** They do
+not share anything: each collection is sharded on its own and builds its own
+`BatchedDynamicEmbeddingTablesV2`, with its own storage and its own optimizer
+state, and neither sees the other's updates. `DynamicEmbDump` already reads it
+that way, writing each collection into its own directory, and so does TorchRec,
+which identifies a sharding option by `path + "." + name`
+(`planner/types.py`), enumerates per module path and costs both copies.
+
+So a table's identity in this planner is `TableKey(collection, name)`, and
+every per-table record is keyed by it — `_dyn_emb_plan`, `_dyn_emb_options`,
+`_table_poolings`, `optimizer_types`, `per_rank_storage`, `TableToPlace`, and
+the set `module_without_tables` prunes by. Two occurrences of a name are two
+entries throughout: charged separately by the reservation, placed separately by
+the placer, grouped apart by `fusion_key` (the collection is in it), filed
+under their own paths by `_insert_dynamicemb_plan`, and handed their own
+options by `_attach_options`.
+
+**Addressing one of them: `get_constraint_key`.** `constraints` is keyed by
+string, and a bare table name names both occurrences. A DynamicEmb table cannot
+accept that: `DynamicEmbTableOptions` is both the caller's policy and the
+runtime's per-table config, and `_prepare_dynemb_table_options` writes the
+geometry into it — `dim` from `embedding_dim`, `max_capacity` from
+`num_embeddings` through the bucket layout, `embedding_dtype` from `data_type`.
+One object cannot describe two tables, and the function is not idempotent
+besides: it reads back `bucket_capacity`, `max_capacity` and `init_capacity`
+after writing them. (TorchRec avoids the whole question by keeping
+`ParameterConstraints` policy-only and taking each occurrence's geometry from
+its own `tensor=param`.)
+
+The key for one occurrence is `collection.name`, and `get_constraint_key`
+returns it:
+
+```python
+keys = [get_constraint_key(config, model) for config in (shared_a, shared_b)]
+# ['sparse.ebc_a.shared', 'sparse.ebc_b.shared']
+```
+
+Two things about its shape. It takes the **config object**, not a name, because
+by name there is nothing to tell the two apart — and the collections return the
+config objects they were constructed from (`modules/embedding_modules.py`), so
+identity matches what the caller built. And the `module` argument is the root
+the path is relative to, so passing a collection itself returns the bare name:
+a caller with one collection needs no special case, and the answer is a
+function of the arguments alone rather than of whether some unrelated
+collection happens to share a name.
+
+`resolve_constraints` is the other half. Each occurrence asks for its keys in
+turn — qualified, then bare — and takes the first `constraints` has. That order
+is the whole of the addressing rule: a bare name still reaches a table nothing
+more specific names, which is why **a model whose table names are unique needs
+no change at all**, and a qualified key overrides it for one collection.
+
+Three things it refuses, all of them cases where a constraint would otherwise
+be silently unused:
+
+| Refused | Why it is not just ignored |
+|---|---|
+| a key no occurrence answers to | the model and `constraints` are two statements of what tables exist; a typo that reads as "plan this with TorchRec's defaults" is found in a profile |
+| a qualified key on a non-DynamicEmb table | TorchRec's planner is keyed by table name alone, so it would never look the key up |
+| one `DynamicEmbTableOptions` object reached by two occurrences | the geometry problem above; the message names `get_constraint_key` |
+
+What the planner used to do was refuse any duplicate name outright, on a
+uniqueness check at the top of `_prepare_dynemb_table_options` — and for
+*every* table, DynamicEmb's and TorchRec's alike, so it rejected models
+TorchRec's own planner accepts. An intermediate version narrowed that to
+refusing only two declarations of one name with **different shapes**, which was
+still a refusal forced by the name-keyed options rather than by anything about
+the model. Both are gone: each occurrence has options of its own, so two shapes
+under one name is now simply two tables.
+
+What is left out -- the
 dimension bucket and the rest of the fused params -- would mean reimplementing
 `_get_grouping_fused_params`, the dimension bucketer and `_prefetch_and_cached`,
 and then owning them as TorchRec changes them, the kind of fork §4.9 exists to

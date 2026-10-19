@@ -31,7 +31,8 @@ error messages use (``planner/planners.py:1138``, ``planner/stats.py:1109``).
 
 import copy
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
@@ -74,7 +75,9 @@ def storage_ssd(storage: Storage) -> int:
 
 
 __all__ = [
+    "TableKey",
     "optimizer_types",
+    "sharded_modules",
     "shard_rank",
     "per_rank_storage",
     "topology_minus",
@@ -85,6 +88,59 @@ __all__ = [
     "table_fanout",
     "table_ranks",
 ]
+
+
+@dataclass(frozen=True, order=True)
+class TableKey:
+    """Which table, as TorchRec identifies one: a collection and a name.
+
+    TorchRec names a sharding option ``module_path + "." + name``
+    (``planner/types.py``) and keys a ``ShardingPlan`` by ``plan[path][name]``,
+    because each shardable module is sharded on its own. A name alone is
+    therefore not an identity: two collections may each declare ``"item_id"``,
+    and those are two tables -- separate storage, separate optimizer state,
+    and neither sees the other's updates.
+
+    DynamicEmb keyed everything by name until this type existed, which made a
+    name's second occurrence share the first one's ``DynamicEmbTableOptions``.
+    Those carry geometry, written into them at plan time -- ``dim``,
+    ``max_capacity``, ``embedding_dtype`` -- so one object cannot describe two
+    tables, and the planner refused the model outright rather than mis-size
+    them. Keying by the pair is what lets each occurrence hold its own
+    options, and `get_constraint_key` is how a caller addresses one.
+
+    ``collection`` is the **path** to the module, not its ``id()``: every rank
+    runs the walk on its own and has to reach the same key, and object
+    addresses do not agree across processes. The root's path is ``""``, which
+    is as sound a collection as any other -- a sharder may claim the root.
+    """
+
+    collection: str
+    name: str
+
+    def __str__(self) -> str:
+        """``collection.name``, or the bare name at the root.
+
+        The form a caller writes in ``constraints`` and the form error messages
+        report, so what is said back is what can be typed in.
+        """
+        return f"{self.collection}.{self.name}" if self.collection else self.name
+
+    @property
+    def constraint_keys(self) -> Tuple[str, ...]:
+        """The keys this table answers to in ``constraints``, most specific first.
+
+        Qualified before bare, so a constraint naming this one collection wins
+        over one naming the table wherever it appears. That order is what makes
+        a bare name usable as the default it has always been while a single
+        collection overrides it -- and it is why a model that never duplicates
+        a name needs no change: its bare keys still match, there being nothing
+        more specific to lose to.
+
+        At the root the two forms coincide, and there is one.
+        """
+        qualified = str(self)
+        return (qualified,) if qualified == self.name else (qualified, self.name)
 
 
 def shard_rank(shard: ShardMetadata) -> int:
@@ -119,11 +175,51 @@ def _parameter_optimizer(param: nn.Parameter) -> Optional[OptimType]:
         return None
 
 
+def sharded_modules(
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+) -> Iterator[Tuple[str, nn.Module, ModuleSharder[nn.Module]]]:
+    """Every module a sharder claims, with the path ``ShardingPlan`` keys it by.
+
+    The descent the planner and the enumerator both make: a module some sharder
+    claims is a leaf, and anything else is recursed into
+    (``planner/enumerators.py``). Written once because several callers make it
+    and two of them have to agree about the paths it produces --
+    :func:`~dynamicemb.planner.planners._table_configs`, which records which
+    collection a table came out of, and ``_insert_dynamicemb_plan``, which puts
+    the table's ParameterSharding under that path. A plan filed under a path
+    `DistributedModelParallel` does not look for is not an error there: it
+    shards the modules its plan names and leaves the rest alone, so two walks
+    that drifted apart would show up as a collection that silently stayed
+    unsharded. One walk cannot drift from itself.
+
+    A generator, so a caller that only wants the modules does not pay for the
+    tables, and ``module_without_tables`` is not here: it rebuilds the tree
+    from the bottom up rather than reading it, which is a different shape.
+    """
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+    queue: List[Tuple[str, nn.Module]] = [("", module)]
+    while queue:
+        path, node = queue.pop()
+        sharder = sharder_map.get(sharder_name(type(node)))
+        if sharder is not None:
+            yield path, node, sharder
+            continue
+        # `child_name` is the attribute the parent holds the child under, not
+        # a table name -- which is what `name` means nearly everywhere else
+        # here. The root's path is "", where a dotted join would leave a
+        # leading dot.
+        queue.extend(
+            (f"{path}.{child_name}" if path else child_name, child)
+            for child_name, child in node.named_children()
+        )
+
+
 def optimizer_types(
     module: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
-) -> Dict[str, Optional[OptimType]]:
-    """The optimizer each table trains with, by table name, from either convention.
+) -> Dict[TableKey, Optional[OptimType]]:
+    """The optimizer each table trains with, by table, from either convention.
 
     TorchRec lets a model say this two ways, and DynamicEmb's own tests use both.
     `apply_optimizer_in_backward` puts the class on the parameter, which is where
@@ -143,25 +239,22 @@ def optimizer_types(
     :func:`module_without_tables` prunes by, so a table that is planned is a
     table that appears here.
 
+    Keyed by :class:`TableKey` rather than by name, since the walk is standing
+    in the collection already and two collections may each declare a name --
+    and they need not have been given the same optimizer.
+
     A table with neither convention is reported as ``None``: the caller reserves
     its rows and nothing for optimizer state, which keeps the reservation a
     floor rather than a guess.
     """
-    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
-    per_table: Dict[str, Optional[OptimType]] = {}
-
-    def visit(node: nn.Module) -> None:
-        sharder = sharder_map.get(sharder_name(type(node)))
-        if sharder is None:
-            for _, child in node.named_children():
-                visit(child)
-            return
+    per_table: Dict[TableKey, Optional[OptimType]] = {}
+    for path, node, sharder in sharded_modules(module, sharders):
         from_sharder = (getattr(sharder, "fused_params", None) or {}).get("optimizer")
         for table_name, param in sharder.shardable_parameters(node).items():
             applied = _parameter_optimizer(param)
-            per_table[table_name] = from_sharder if applied is None else applied
-
-    visit(module)
+            per_table[TableKey(path, table_name)] = (
+                from_sharder if applied is None else applied
+            )
     return per_table
 
 
@@ -170,6 +263,11 @@ def fusion_key(
     options: "object",
     optimizer_type: Optional[OptimType] = None,
     pooling: "object" = None,
+    # New components go after this line, never before it: the callers pass the
+    # ones above positionally, so a parameter inserted ahead of them would be
+    # handed someone else's argument and quietly coarsen the key instead of
+    # narrowing it.
+    collection: "object" = None,
 ) -> Tuple:
     """What two tables must agree on before they can be costed as one.
 
@@ -184,8 +282,13 @@ def fusion_key(
     (``embeddingbag.py:267``, ``rw_sharding.py:178``); the **options**, which
     hash on their own grouping key; the **optimizer**, since its state is part
     of a row and TorchRec keys on it through the fused params; the **data
-    type**, which ``DynamicEmbTableOptions.get_grouped_key`` leaves out; and
-    the **pooling**, likewise not DynamicEmb's to know but cheap to pass.
+    type**, which ``DynamicEmbTableOptions.get_grouped_key`` leaves out; the
+    **pooling**, likewise not DynamicEmb's to know but cheap to pass; and the
+    **owning collection**, since each shardable module is sharded on its own
+    -- one ``ShardedEmbedding*Collection`` per collection, each with its own
+    ``EmbeddingSharding``s -- so two tables in different collections never
+    reach the same ``group_tables`` call however alike everything else about
+    them is, and build separate runtimes that cannot lend each other HBM.
 
     What is not: TorchRec's dimension bucket, and the rest of the fused params.
     Those need `_get_grouping_fused_params`, the bucketer and
@@ -219,15 +322,16 @@ def fusion_key(
         optimizer_type,
         getattr(options, "embedding_dtype", None),
         pooling,
+        collection,
     )
 
 
 def per_rank_storage(
-    parameter_shardings: Dict[str, ParameterSharding],
-    options: Dict[str, "DynamicEmbTableOptions"],
-    optimizer_types: Dict[str, Optional[OptimType]],
+    parameter_shardings: Dict["TableKey", ParameterSharding],
+    options: Dict["TableKey", "DynamicEmbTableOptions"],
+    optimizer_types: Dict["TableKey", Optional[OptimType]],
     world_size: int,
-    poolings: Optional[Dict[str, object]] = None,
+    poolings: Optional[Dict["TableKey", object]] = None,
 ) -> List[Storage]:
     """What the DynamicEmb tables take from each rank, as one Storage per rank.
 
@@ -261,14 +365,28 @@ def per_rank_storage(
     -- the kind of fork §4.9 exists to avoid. What that coarseness costs, in
     both directions, is :func:`fusion_key`'s docstring.
 
-    Coarser is the safe inexactness. Merging tables the runtime would keep apart
-    only moves ``min(sum total, sum budget)`` up, so this over-states HBM rather
-    than under-stating it: a plan may be refused that would have fit, and none
-    is accepted that will not.
+    Coarser is not safe in both directions, and this docstring used to say that
+    it was. Merging tables the runtime keeps apart moves
+    ``min(sum total, sum budget)`` up, which over-states HBM -- that half only
+    ever refuses a layout that would have fit. But the host tier is ``total -
+    hbm`` and ``total`` does not move, so the same merge under-states the host
+    tier by exactly as much, and *that* half accepts layouts the machine will
+    not hold. Every component :func:`fusion_key` carries narrows the gap; see
+    its docstring for the full statement.
 
-    ``optimizer_types`` maps table name -> ``OptimType``; a table missing from it
+    Every map here is keyed by :class:`TableKey`, so a name declared in two
+    collections arrives as two entries and is charged for twice -- which is
+    what the runtime does, building one table per collection. The collection
+    is also in the grouping key, so the two never pool budgets.
+
+    ``optimizer_types`` maps table -> ``OptimType``; a table missing from it
     is counted without optimizer state, which is a floor rather than a guess (see
     :func:`~dynamicemb.dynamicemb_config.get_group_value_bytes_by_tier`).
+
+    ``poolings`` carries what TorchRec groups on and neither the plan record
+    nor the options know. A table missing from it is grouped as ``None``, which
+    pools it with the others that are missing, so it is passed whole or not at
+    all.
     """
     totals = [make_storage() for _ in range(world_size)]
 
@@ -280,39 +398,43 @@ def per_rank_storage(
         defaultdict(list) for _ in range(world_size)
     ]
 
-    for name, parameter_sharding in parameter_shardings.items():
-        table_options = options.get(name)
+    for key, parameter_sharding in parameter_shardings.items():
+        table_options = options.get(key)
         if table_options is None:
             raise ValueError(
-                f"Table {name!r} is planned but has no DynamicEmbTableOptions, "
+                f"Table {str(key)!r} is planned but has no DynamicEmbTableOptions, "
                 "so its footprint cannot be sized."
             )
 
         spec = parameter_sharding.sharding_spec
         if not isinstance(spec, EnumerableShardingSpec) or not spec.shards:
             raise ValueError(
-                f"Table {name!r} has no EnumerableShardingSpec, so which ranks "
+                f"Table {str(key)!r} has no EnumerableShardingSpec, so which ranks "
                 "hold it is unknown."
             )
 
         # Options carry max_capacity and local_hbm_for_values already divided by
         # the table's fan-out, so every shard of a table weighs the same and
         # only the set of ranks differs.
-        member = (table_options, optimizer_types.get(name))
-        key = fusion_key(
+        member = (table_options, optimizer_types.get(key))
+        # The collection is in the key, so a name declared twice groups twice
+        # -- once per runtime that will exist -- without this loop knowing it
+        # is a duplicate.
+        group = fusion_key(
             parameter_sharding.sharding_type,
             table_options,
-            optimizer_types.get(name),
-            (poolings or {}).get(name),
+            optimizer_types.get(key),
+            (poolings or {}).get(key),
+            key.collection,
         )
         for shard in spec.shards:
             rank = shard_rank(shard)
             if not 0 <= rank < world_size:
                 raise ValueError(
-                    f"Table {name!r} places a shard on rank {rank}, which is "
+                    f"Table {str(key)!r} places a shard on rank {rank}, which is "
                     f"outside the world of {world_size}."
                 )
-            per_rank_groups[rank][key].append(member)
+            per_rank_groups[rank][group].append(member)
 
     for rank, groups in enumerate(per_rank_groups):
         for members in groups.values():
@@ -466,10 +588,14 @@ def _collection_without(collection: nn.Module, table_names: Set[str]) -> nn.Modu
 
 def module_without_tables(
     module: nn.Module,
-    table_names: Set[str],
+    tables: Set["TableKey"],
     sharders: List[ModuleSharder[nn.Module]],
 ) -> nn.Module:
     """``module`` as TorchRec should plan it: without the DynamicEmb tables.
+
+    ``tables`` names them by :class:`TableKey`, since a name DynamicEmb planned
+    in one collection may be TorchRec's in another, and only the one that was
+    planned here may be taken away.
 
     TorchRec's enumerator walks the module it is given and enumerates every table
     a sharder claims, so tables DynamicEmb has already placed have to be out of
@@ -489,16 +615,25 @@ def module_without_tables(
     """
     sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
 
-    def prune(node: nn.Module) -> nn.Module:
+    def prune(path: str, node: nn.Module) -> nn.Module:
         sharder = sharder_map.get(sharder_name(type(node)))
         if sharder is not None:
-            owned = set(sharder.shardable_parameters(node)) & table_names
+            # By `TableKey`, so a name DynamicEmb planned in one collection is
+            # taken out of that one and left in the other -- which is the whole
+            # point of keying by the pair. The path is carried down the
+            # recursion for this alone.
+            owned = {
+                table_name
+                for table_name in sharder.shardable_parameters(node)
+                if TableKey(path, table_name) in tables
+            }
             return _collection_without(node, owned) if owned else node
 
         replacements = {
-            name: pruned
-            for name, child in node.named_children()
-            if (pruned := prune(child)) is not child
+            child_name: pruned
+            for child_name, child in node.named_children()
+            if (pruned := prune(f"{path}.{child_name}" if path else child_name, child))
+            is not child
         }
         if not replacements:
             return node
@@ -506,11 +641,11 @@ def module_without_tables(
         copied = copy.copy(node)
         # Same shared-`_modules` reason as `_collection_without`.
         copied._modules = dict(node._modules)
-        for name, child in replacements.items():
-            setattr(copied, name, child)
+        for child_name, child in replacements.items():
+            setattr(copied, child_name, child)
         return copied
 
-    return prune(module)
+    return prune("", module)
 
 
 def table_fanout(sharding_type: str, world_size: int, local_size: int) -> int:
