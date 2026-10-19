@@ -195,7 +195,7 @@ def apply_dmp(
         set(data_parallel_embedding_table_names),
         dynamicemb_options_dict,
         device,
-        pipeline_type,
+        pipeline_type=pipeline_type,
     )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(

@@ -50,11 +50,14 @@ def get_planner(
     data_parallel_embedding_table_names: Set[str],
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
+    # Keep pipeline_type fifth. Callers pass it positionally, so a parameter
+    # inserted ahead of it silently swallows their argument and leaves the
+    # pipeline unconstrained -- new parameters go after it, not before.
+    pipeline_type: str = "none",
     # Which DynamicEmb tables go on a single node each. Which node is chosen by
     # the planner's NodePlacer; name one here by setting node_index on the
     # table's options, which pins it.
     table_row_wise_embedding_table_names: Optional[Set[str]] = None,
-    pipeline_type: str = "none",
     # Host memory of one node, not one rank: Topology keeps ddr per rank and
     # this is divided by the local world size below. A terabyte is a
     # conservative figure for the nodes this runs on rather than a measurement
