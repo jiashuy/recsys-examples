@@ -37,7 +37,6 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
     ShardingType,
-    compute_kernel_to_embedding_location,
 )
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_configs import DataType, data_type_to_dtype
