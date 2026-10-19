@@ -14,15 +14,19 @@
 # limitations under the License.
 
 
-from .enumerators import DynamicEmbeddingEnumerator
-from .planner import (
+from .get_planner import get_planner
+from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
+from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
 )
 
 __all__ = [
-    "DynamicEmbeddingEnumerator",
+    "get_planner",
+    "BalancedNodePlacer",
+    "NodePlacer",
+    "TableToPlace",
     "DynamicEmbeddingShardingPlanner",
     "DynamicEmbParameterConstraints",
     "DynamicEmbParameterSharding",

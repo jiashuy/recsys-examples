@@ -24,10 +24,10 @@ from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.modules.embedding import DataParallelEmbeddingCollection
 from commons.optimizer import OptimizerParam
 from dynamicemb import DynamicEmbTableOptions
-from dynamicemb.get_planner import get_planner
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
+from dynamicemb.planner import get_planner
 from dynamicemb.shard import (
     DynamicEmbeddingBagCollectionSharder,
     DynamicEmbeddingCollectionSharder,
@@ -195,7 +195,7 @@ def apply_dmp(
         set(data_parallel_embedding_table_names),
         dynamicemb_options_dict,
         device,
-        pipeline_type,
+        pipeline_type=pipeline_type,
     )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(

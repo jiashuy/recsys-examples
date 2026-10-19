@@ -31,10 +31,10 @@ from dynamicemb.types import (
     DEFAULT_UNIFORM_UPPER,
     AdmissionStrategy,
     Counter,
-    MultiTableAdmitter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     MemoryType,
+    MultiTableAdmitter,
     group_key_of,
 )
 from dynamicemb_extensions import flagged_compact
@@ -116,8 +116,23 @@ class MultiTableKVCounter(Counter):
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
 
-    def load(self, key_file, counter_file, table_id: int) -> None:
-        self.table_.load(key_file, {self.score_name_: counter_file}, table_id=table_id)
+    def load(
+        self,
+        key_file,
+        counter_file,
+        table_id: int,
+        dist_type: str,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None:
+        self.table_.load(
+            key_file,
+            {self.score_name_: counter_file},
+            table_id=table_id,
+            dist_type=dist_type,
+            shard_index=shard_index,
+            num_shards=num_shards,
+        )
 
     def dump(self, key_file, counter_file, table_id: int) -> None:
         self.table_.dump(key_file, {self.score_name_: counter_file}, table_id=table_id)

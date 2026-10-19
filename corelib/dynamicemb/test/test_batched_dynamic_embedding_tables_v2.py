@@ -1118,6 +1118,13 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         opt_file_path: Optional[str],
         include_optim: bool = False,
         timestamp: int = 0,
+        # The table's own shard geometry, which this demo accepts and ignores:
+        # it reads every key in the file it is handed. A store that re-splits a
+        # checkpoint -- loaded at a different shard count than it was dumped at
+        # -- filters by these instead of by the global rank and world size,
+        # which a table-row-wise table does not share.
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> None:
         if meta_file_path and os.path.exists(meta_file_path):
             with open(meta_file_path, "r") as f:

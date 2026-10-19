@@ -20,7 +20,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
@@ -36,10 +36,11 @@ from dynamicemb.types import (
     Storage,
     group_key_of,
 )
+from dynamicemb.utils import DTYPE_NUM_BYTES
 
 # fbgemm exports its own PoolingMode, so the bound C++ enum is aliased below to
 # keep the two apart wherever both are in scope.
-from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
+from dynamicemb_extensions import DistType, DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
@@ -47,7 +48,23 @@ from torchrec.types import DataType
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
-SUPPORTED_DIST_TYPES = ("continuous", "roundrobin", "hash_roundrobin")
+# The key -> rank rule, as its user-facing name and as the code the bucketize
+# kernel switches on. The codes come from the bound C++ enum rather than being
+# restated here, the same way DynamicEmbPoolingMode takes its values from
+# BagPoolingMode -- ``dyn_emb::DistType`` in src/utils.h documents what each
+# one does.
+#
+# The two sides are named differently on purpose. The C++ enum uses the
+# block / cyclic vocabulary its own kernels are written in; these strings are
+# older, and they are written into every checkpoint's meta and compared on
+# load, so renaming them would strand existing checkpoints. This dict is the
+# only place the two meet, and the only place a rename would have to start.
+DIST_TYPE_CODES: Dict[str, int] = {
+    "continuous": int(DistType.KBlock),
+    "roundrobin": int(DistType.KCyclic),
+    "hash_roundrobin": int(DistType.KHashedCyclic),
+}
+SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
@@ -481,7 +498,7 @@ class DynamicEmbTableOptions:
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-        With :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`, it is rounded up
+        With :class:`~dynamicemb.planner.planners.DynamicEmbeddingShardingPlanner`, it is rounded up
         to a multiple of the effective ``bucket_capacity`` in ``_prepare_dynemb_table_options``,
         then capped at ``max_capacity`` if the aligned value is larger.
         As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
@@ -537,6 +554,22 @@ class DynamicEmbTableOptions:
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
         ``roundrobin``.
+    node_index : Optional[int], optional
+        Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
+        unset -- the default -- and the planner's
+        :class:`~dynamicemb.planner.placement.NodePlacer` chooses, packing the
+        table-row-wise tables across nodes by what they weigh. Set it only to
+        override that.
+
+        Nodes are numbered ``0 .. world_size // local_world_size - 1``, and the
+        table lands on that node's ``local_world_size`` ranks. TorchREC spells
+        the same thing ``table_row_wise(host_index=...)``; the name differs here
+        because in DynamicEmb *host* already means host memory, the DDR tier a
+        table spills to. TorchREC's own docstring glosses it the same way --
+        "index of host (node) to do row wise".
+
+        Meaningless under row-wise sharding, and refused rather than ignored
+        there: a row-wise table is on every rank, so there is no node to name.
     admit_strategy : Optional[AdmissionStrategy], optional
         Admission strategy for controlling which keys are allowed to enter the embedding table.
         If provided, only keys that meet the strategy's criteria will be inserted into the table.
@@ -551,7 +584,7 @@ class DynamicEmbTableOptions:
     Notes
     -----
     The ``DynamicEmb_APIs.md`` file in the ``dynamicemb`` package mirrors this class and related planner
-    behavior (e.g. :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`).
+    behavior (e.g. :class:`~dynamicemb.planner.planners.DynamicEmbeddingShardingPlanner`).
     """
 
     embedding_dtype: Optional[torch.dtype] = None
@@ -583,6 +616,7 @@ class DynamicEmbTableOptions:
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     dist_type: str = "roundrobin"
+    node_index: Optional[int] = None
     admit_strategy: Optional[AdmissionStrategy] = None
 
     admission_counter: Optional[Any] = None
@@ -972,6 +1006,91 @@ def get_sharded_table_capacity(
         embedding_config, world_size, bucket_capacity
     )
     return int(num_buckets * effective_bucket)
+
+
+def get_group_value_bytes_by_tier(
+    members: "List[Tuple[DynamicEmbTableOptions, Optional[OptimType]]]",
+) -> Tuple[int, int]:
+    """What one rank spends on a set of tables the runtime will fuse, as ``(hbm, host)``.
+
+    The runtime decides per **grouped module**, not per table:
+    ``BatchedDynamicEmbeddingTablesV2._create_cache_storage`` sums both the
+    tables' bytes and their ``local_hbm_for_values`` and takes one
+    HBM-or-host decision for the sum. That is not the same as deciding for each
+    table and adding up, because a table whose budget exceeds its size lends the
+    remainder to its groupmates: ``sum(min(total, budget))`` is at most
+    ``min(sum total, sum budget)``, so counting per table **under-states HBM**
+    and over-states host. Under-stating HBM is the unsafe direction -- the
+    planner would believe there is room it will not find.
+
+    ``caching`` and ``external_storage`` are both part of the grouping key
+    (``DynamicEmbTableOptions.get_grouped_key``), so every member of a real
+    group agrees on them and reading them off the first is exact.
+
+    Rows that fit the HBM budget stay there and the rest go to the host; under
+    ``caching`` the HBM is a cache in front of a host tier holding every row
+    rather than a disjoint partition, so the host figure is the whole thing. An
+    external store takes that backing tier off this box, which is honoured in
+    the two layouts that have one to move -- CACHING_PS and HOST_PS.
+    ``HybridStorage`` ignores it and warns, so its host tier is local and counts.
+
+    An ``optimizer_type`` of ``None`` counts a table's rows without optimizer
+    state -- the honest answer when the caller cannot tell which optimizer it
+    trains with, and a floor rather than a guess. A table whose options have not
+    been through ``_prepare_dynemb_table_options`` has no size to compute, so it
+    contributes its HBM budget and nothing else.
+    """
+    if not members:
+        return 0, 0
+
+    total = 0
+    hbm_budget = 0
+    for options, optimizer_type in members:
+        hbm_budget += options.local_hbm_for_values
+        dim = options.dim
+        dtype = options.embedding_dtype
+        if not dim or dtype is None or not options.max_capacity:
+            # Nothing to size from: count it as filling its own budget, so a
+            # lone unsized table still reports (budget, 0).
+            total += options.local_hbm_for_values
+            continue
+        state_dim = (
+            get_optimizer_state_dim(optimizer_type, dim, dtype)
+            if optimizer_type is not None
+            else 0
+        )
+        total += options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+
+    first = members[0][0]
+    caching = first.caching
+    external = first.external_storage is not None
+
+    if caching:
+        return hbm_budget, 0 if external else total
+    if total > hbm_budget:
+        if external and hbm_budget <= 0:
+            return 0, 0
+        return hbm_budget, total - hbm_budget
+    return total, 0
+
+
+def get_local_value_bytes_by_tier(
+    options: "DynamicEmbTableOptions",
+    optimizer_type: Optional[OptimType],
+) -> Tuple[int, int]:
+    """One table's per-rank value bytes, as ``(hbm, host)``.
+
+    Where :func:`get_table_value_bytes` answers how much a table's values weigh
+    across every rank, this answers where one rank's share of them lands, which
+    is not the same question: ``local_hbm_for_values`` is a budget, and a table
+    spends the difference on the host tier.
+
+    **A table on its own is a group of one.** The runtime fuses tables and
+    decides for the group, so this is only exact for a table that ends up alone;
+    :func:`get_group_value_bytes_by_tier` is the one to call when the caller
+    knows which tables travel together.
+    """
+    return get_group_value_bytes_by_tier([(options, optimizer_type)])
 
 
 def get_table_value_bytes(

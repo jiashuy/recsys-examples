@@ -289,8 +289,24 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         opt_file_path: Optional[str],
         include_optim: bool,
         timestamp: int,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> None:
-        pass
+        """Read one checkpoint shard of *table_id* back into this store.
+
+        Args:
+            shard_index (Optional[int]): this shard's position among the ranks
+                that hold the table, and *num_shards* how many there are: the
+                world for a row-wise table, one node for a table-row-wise one.
+                They are the table's own geometry rather than the global rank
+                and world size, which a table-row-wise table does not share.
+                An implementation that re-splits a checkpoint across ranks --
+                keeping the keys this shard owns and dropping the rest --
+                filters by these. Left ``None`` they fall back to the global
+                rank and world size, which is the row-wise answer, so a store
+                that only ever serves row-wise tables may ignore them.
+            num_shards (Optional[int]): see *shard_index*.
+        """
 
     @abc.abstractmethod
     def embedding_dtype(
@@ -456,7 +472,15 @@ class Counter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file, table_id: int) -> None:
+    def load(
+        self,
+        key_file,
+        counter_file,
+        table_id: int,
+        dist_type: str,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None:
         """
         Load keys and frequencies from input file path.
 
@@ -464,6 +488,17 @@ class Counter(abc.ABC):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
             table_id (int): the logical table to load into.
+            dist_type (str): the key -> rank rule the counter's table is
+                sharded by, so an implementation keeps only the keys this rank
+                owns. Required rather than optional: a counter belongs to a
+                sharded table, so its rule is always known, and an
+                implementation that guesses one drops the keys it guesses
+                wrong about without saying so.
+            shard_index (Optional[int]): this shard's position among the ranks
+                that hold the counter's table, and *num_shards* how many there
+                are. Same meaning as on :meth:`Storage.load`, including the
+                fall back to the global rank and world size when ``None``.
+            num_shards (Optional[int]): see *shard_index*.
         """
 
     @abc.abstractmethod
