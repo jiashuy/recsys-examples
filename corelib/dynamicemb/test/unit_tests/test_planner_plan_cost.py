@@ -42,7 +42,6 @@ from dynamicemb.planner.plan import (
     optimizer_types,
     per_rank_storage,
     shard_rank,
-    sharded_modules,
     table_fanout,
     table_ranks,
     topology_minus,
@@ -51,9 +50,7 @@ from dynamicemb.planner.planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
-    _table_configs,
     get_constraint_key,
-    resolve_constraints,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch.distributed.optim import (
@@ -848,36 +845,7 @@ class TestOptimizerTypes:
         }
 
 
-# --- _table_configs: which collection each table came out of ----------------
-
-
-class TestTableConfigs:
-    """The walk that finds the tables, and the module identity it carries out.
-
-    Grouping is what that identity is for: TorchRec shards each collection on
-    its own, so two collections build runtimes that cannot lend each other
-    HBM. The walk is the only place that knows which one a table came from --
-    flattening it away here is what let `per_rank_storage` pool budgets across
-    collections and report a host tier smaller than the machine will be asked
-    for.
-    """
-
-    @pytest.fixture
-    def model(self):
-        return _MixedModel()
-
-    def test_each_table_is_paired_with_the_path_to_its_collection(self, model):
-        assert dict(
-            (config.name, path)
-            for path, config in _table_configs(model, _mixed_sharders())
-        ) == {"p0": "pooled", "p1": "pooled", "s0": "sequence"}
-
-    def test_a_collection_at_the_root_is_still_keyed(self, model):
-        """A sharder may match the module it was handed. The empty path is as
-        sound a key as any other, since there is then only one collection."""
-        assert {
-            path for path, _ in _table_configs(_ebc(["t0"]), _mixed_sharders())
-        } == {""}
+# --- costing: two collections are two runtimes ------------------------------
 
 
 class TestCollectionsDoNotPoolBudgets:
@@ -1027,48 +995,65 @@ class TestResolveConstraints:
     Qualified before bare, and nothing silently unused: a constraint that would
     reach no table, or that TorchRec would never look up, is refused rather
     than ignored.
+
+    Driven through the planner rather than by calling `resolve_constraints`,
+    because what a caller writes is a `constraints` dict and what they get back
+    is a planned table or an error. Which function inside reaches that answer
+    is ours to move.
     """
 
     def test_a_bare_name_still_reaches_its_table(self):
         """Every constraints dict written before this existed is keyed this way,
         and keeps working."""
         module = _TwoCollections(["l"], ["r"])
-        resolved = resolve_constraints(
-            _table_configs(module, _sharders()), _dynamicemb_constraints("l", "r")
-        )
-        assert set(resolved) == {TableKey("left", "l"), TableKey("right", "r")}
+        planner = _planned(module, _dynamicemb_constraints("l", "r"))
+        assert set(planner._dyn_emb_options) == {
+            TableKey("left", "l"),
+            TableKey("right", "r"),
+        }
 
     def test_a_qualified_key_wins_over_a_bare_one(self):
         """Which is what makes a bare name usable as a default that one
         collection then overrides.
 
         That the bare key is overridden here and still not reported as naming
-        no table is part of the same assertion: `resolve_constraints` marks
-        every key a table answers to, not only the one that won, so reaching
-        these asserts at all means the override did not read as a typo.
+        no table is part of the same assertion: every key a table answers to is
+        marked, not only the one that won, so reaching these asserts at all
+        means the override did not read as a typo.
         """
         module = _TwoCollections(["shared"], ["shared"])
-        constraints = _dynamicemb_constraints("shared", "right.shared")
-        resolved = resolve_constraints(_table_configs(module, _sharders()), constraints)
-        assert resolved[TableKey("left", "shared")] is constraints["shared"]
-        assert resolved[TableKey("right", "shared")] is constraints["right.shared"]
+        constraints = {
+            **_dynamicemb_constraints("shared", hbm_budget=GB),
+            **_dynamicemb_constraints("right.shared", hbm_budget=2 * GB),
+        }
+        options = _planned(module, constraints)._dyn_emb_options
+        # By identity: the table was planned with the options off the constraint
+        # that won it, not with a copy that happens to match.
+        assert (
+            options[TableKey("left", "shared")]
+            is constraints["shared"].dynamicemb_options
+        )
+        assert (
+            options[TableKey("right", "shared")]
+            is constraints["right.shared"].dynamicemb_options
+        )
 
     def test_a_key_no_table_answers_to_is_refused(self):
         """Silently ignoring it reads as "plan this table with TorchRec's
         defaults", which is found in a profile rather than in an error."""
         module = _TwoCollections(["l"], ["r"])
         with pytest.raises(ValueError, match="does not have"):
-            resolve_constraints(
-                _table_configs(module, _sharders()), _dynamicemb_constraints("typo")
-            )
+            _planned(module, _dynamicemb_constraints("typo"))
 
     def test_a_qualified_key_on_a_torchrec_table_is_refused(self):
         """TorchRec's planner is keyed by table name alone, so it would never
         look the key up and the constraint would do nothing."""
         module = _TwoCollections(["l"], ["r"])
-        constraints = {"left.l": DynamicEmbParameterConstraints(use_dynamicemb=False)}
         with pytest.raises(ValueError, match="TorchRec plans"):
-            resolve_constraints(_table_configs(module, _sharders()), constraints)
+            _planned(
+                module,
+                {"left.l": DynamicEmbParameterConstraints(use_dynamicemb=False)},
+            )
 
     def test_two_tables_sharing_one_options_object_are_refused(self):
         """What a bare name does when two collections declare it. The options
@@ -1076,9 +1061,7 @@ class TestResolveConstraints:
         cannot describe both -- and the message names the way out."""
         module = _TwoCollections(["shared"], ["shared"])
         with pytest.raises(ValueError, match="get_constraint_key"):
-            resolve_constraints(
-                _table_configs(module, _sharders()), _dynamicemb_constraints("shared")
-            )
+            _planned(module, _dynamicemb_constraints("shared"))
 
 
 class TestATableInMoreThanOneCollection:
@@ -1179,47 +1162,12 @@ class TestATableInMoreThanOneCollection:
 class TestShardedModules:
     """The walk the planner makes, written once.
 
-    Three callers made it separately: `_table_configs`, which records which
-    collection a table came out of, `_insert_dynamicemb_plan`, which files the
-    table's ParameterSharding under that collection's path, and
-    `optimizer_types`, which wants the sharder and not the path. The first two
-    have to produce the same paths, and nothing made them -- each built the
-    path with its own copy of `f"{path}.{name}" if path else name`.
+    `_table_configs` records which collection a table came out of and
+    `_insert_dynamicemb_plan` files that table's ParameterSharding under the
+    collection's path. They have to produce the same paths, and nothing made
+    them -- each built the path with its own copy of
+    `f"{path}.{name}" if path else name`.
     """
-
-    def test_it_yields_the_path_torchrec_keys_the_plan_by(self):
-        module = _Model(_ebc(["t"]))
-        assert [path for path, _, _ in sharded_modules(module, _sharders())] == [
-            "sparse.ebc"
-        ]
-
-    def test_a_sharder_claiming_the_root_gets_the_empty_path(self):
-        assert [path for path, _, _ in sharded_modules(_ebc(["t"]), _sharders())] == [
-            ""
-        ]
-
-    def test_it_yields_the_sharder_that_claimed_each_module(self):
-        """`optimizer_types` reads `fused_params` off this rather than off the
-        sharder list, since collections need not agree on the optimizer."""
-        module = _MixedModel()
-        sharders = _mixed_sharders(
-            pooled_optimizer=OptimType.ADAM,
-            sequence_optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
-        )
-        found = {
-            path: sharder.fused_params["optimizer"]
-            for path, _, sharder in sharded_modules(module, sharders)
-        }
-        assert found == {
-            "pooled": OptimType.ADAM,
-            "sequence": OptimType.EXACT_ROWWISE_ADAGRAD,
-        }
-
-    def test_a_module_no_sharder_claims_is_recursed_into_not_yielded(self):
-        module = _Model(_ebc(["t"]))
-        assert [type(node) for _, node, _ in sharded_modules(module, _sharders())] == [
-            torchrec.EmbeddingBagCollection
-        ]
 
     def test_the_plan_lands_on_the_path_the_collection_was_recorded_as(self):
         """The invariant the shared walk exists for. A ParameterSharding filed
