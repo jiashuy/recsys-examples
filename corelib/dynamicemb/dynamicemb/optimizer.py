@@ -794,12 +794,14 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     With ``group_lasso_reg > 0`` this is G-FTRL (Ni et al., CIKM 2019, Algorithm
     1 and Eq. 3): a row of width ``d`` is one group, and its weights are zeroed
-    together when ``||linear||_2 <= group_lasso_reg * sqrt(d)``; otherwise
+    together when ``||s||_2 <= group_lasso_reg * sqrt(d)``; otherwise
 
-        w_i = -eta_i * (1 - group_lasso_reg * sqrt(d) / ||linear||_2) * linear_i
+        w_i = -eta_i * (1 - group_lasso_reg * sqrt(d) / ||s||_2) * s_i
         eta_i = 1 / ((ftrl_beta + accum_i^0.5) / lr + group_lasso_reg * group_lasso_gamma)
 
-    ``l1_reg`` has no place in that update and is rejected alongside it.
+    where ``s`` is ``linear`` soft-thresholded by ``l1_reg`` (``s = linear``
+    when ``l1_reg = 0``, the paper's closed form; with ``l1_reg > 0`` it is the
+    sparse group lasso step of Yue et al., arXiv:2107.14432, Algorithm 3).
     ``group_lasso_reg = 0`` is plain FTRL.
 
     ``linear`` starts at zero and ``accum`` at ``initial_accumulator_value``.
@@ -827,7 +829,6 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             opt_args.learning_rate_power,
             opt_args.group_lasso_reg,
             opt_args.group_lasso_gamma,
-            opt_args.l1_reg,
         )
 
     @staticmethod
@@ -836,7 +837,6 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         learning_rate_power: float,
         group_lasso_reg: float = 0.0,
         group_lasso_gamma: float = 0.0,
-        l1_reg: float = 0.0,
     ) -> None:
         if group_lasso_reg < 0.0:
             raise ValueError(
@@ -845,11 +845,6 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         if group_lasso_gamma < 0.0:
             raise ValueError(
                 f"FTRL's group_lasso_gamma must be >= 0; got {group_lasso_gamma}."
-            )
-        if group_lasso_reg > 0.0 and l1_reg != 0.0:
-            raise ValueError(
-                "FTRL with group_lasso_reg > 0 is G-FTRL, whose update has no "
-                f"separate L1 term, so l1_reg must be 0; got {l1_reg}."
             )
         if learning_rate <= 0.0:
             raise ValueError(
@@ -955,7 +950,6 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             learning_rate_power,
             group_lasso_reg,
             group_lasso_gamma,
-            get_required_arg(args, "l1_reg"),
         )
         self._opt_args.group_lasso_reg = group_lasso_reg
         self._opt_args.group_lasso_gamma = group_lasso_gamma

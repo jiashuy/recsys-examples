@@ -295,10 +295,6 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
   TORCH_CHECK(group_lasso_gamma >= 0.0f,
               "FTRL group_lasso_gamma must be non-negative, got ",
               group_lasso_gamma);
-  TORCH_CHECK(group_lasso_reg == 0.0f || l1_reg == 0.0f,
-              "FTRL with group_lasso_reg > 0 does not take l1_reg; the "
-              "group-sparse update has no separate L1 term (got l1_reg = ",
-              l1_reg, ")");
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
@@ -537,10 +533,6 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(group_lasso_gamma >= 0.0f,
               "FTRL group_lasso_gamma must be non-negative, got ",
               group_lasso_gamma);
-  TORCH_CHECK(group_lasso_reg == 0.0f || l1_reg == 0.0f,
-              "FTRL with group_lasso_reg > 0 does not take l1_reg; the "
-              "group-sparse update has no separate L1 term (got l1_reg = ",
-              l1_reg, ")");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);

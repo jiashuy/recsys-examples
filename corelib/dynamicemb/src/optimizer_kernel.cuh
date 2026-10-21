@@ -503,20 +503,21 @@ struct FTRLVecOptimizer {
 
   // G-FTRL, Algorithm 1 and Eq. 3 of Ni et al., CIKM 2019 ("Feature Selection
   // for Facebook Feed Ranking System via a Group-Sparsity-Regularized Training
-  // Algorithm"), with a row of width d as the group. Per row:
-  //   zero the row            if ||z||_2 <= lambda * sqrt(d)
-  //   w_i = -eta_i * (1 - lambda * sqrt(d) / ||z||_2) * z_i      otherwise
+  // Algorithm"), with a row of width d as the group. Per row, with s the
+  // linear term z soft-thresholded by l1_reg (s = z when l1_reg = 0, which is
+  // the paper's closed form; with l1_reg > 0 it is the sparse-group-lasso
+  // step of Yue et al., arXiv:2107.14432, Algorithm 3):
+  //   zero the row            if ||s||_2 <= lambda * sqrt(d)
+  //   w_i = -eta_i * (1 - lambda * sqrt(d) / ||s||_2) * s_i      otherwise
   //   eta_i = 1 / ((beta + n_i^(-p)) / lr + lambda * gamma [+ l2_reg])
-  // with z the raw linear term (no L1 soft-threshold: the paper's closed form
-  // has none) and lambda = group_lasso_reg, gamma = group_lasso_gamma. l2_reg is
-  // not in the paper; it is kept as an extra term in eta that is zero by
-  // default. The row norm is needed before any weight can be written, so a row
+  // with lambda = group_lasso_reg, gamma = group_lasso_gamma. l2_reg is not in
+  // the paper; it is kept as an extra term in eta that is zero by default. The row norm is needed before any weight can be written, so a row
   // is two passes: pass one advances (linear, accum) and sums z_i^2; pass two
   // re-solves the weights. The same thread owns the same elements in both, so
   // the second pass reads back its own stores without a barrier.
 
   // Advance one coordinate's state, leaving the weight alone: the linear term
-  // needs the weight from before this step. Returns z_i^2 for the row norm,
+  // needs the weight from before this step. Returns s_i^2 for the row norm,
   // taken from the state as it will be stored so the two passes agree.
   DEVICE_INLINE float advance_one(const float weight, float &linear,
                                   float &accum, const float grad) const {
@@ -527,7 +528,8 @@ struct FTRLVecOptimizer {
         TypeConvertFunc<weight_t, float>::convert(linear));
     accum = TypeConvertFunc<float, weight_t>::convert(
         TypeConvertFunc<weight_t, float>::convert(accum));
-    return linear * linear;
+    const float s = fmaxf(fabsf(linear) - l1_reg, 0.0f);
+    return s * s;
   }
 
   // 1 - lambda * sqrt(d) / ||z||_2, or 0 when the row does not clear the
@@ -542,9 +544,11 @@ struct FTRLVecOptimizer {
                                 const float scale) const {
     // A zero here also keeps a 0/0 out of the arithmetic when the learning
     // rate's denominator is still zero.
-    if (scale == 0.0f || linear == 0.0f)
+    const float s = fmaxf(fabsf(linear) - l1_reg, 0.0f);
+    if (scale == 0.0f || s == 0.0f)
       return 0.0f;
-    return -scale * linear /
+    const float sign_linear = (0.0f < linear) - (linear < 0.0f);
+    return -scale * sign_linear * s /
            ((beta + accum_pow(accum)) / lr + l2_reg +
             group_lasso_reg * group_lasso_gamma);
   }

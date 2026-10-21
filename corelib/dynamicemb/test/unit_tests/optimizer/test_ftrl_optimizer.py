@@ -88,19 +88,22 @@ def ftrl_step(
     )
     if group_lasso_reg > 0.0:
         # G-FTRL, Algorithm 1 and Eq. 3 of Ni et al., CIKM 2019. The last dim is
-        # the group (one embedding row, width d). Its raw linear term is zeroed
-        # when ||z||_2 <= lambda * sqrt(d), and otherwise shrunk by
-        # 1 - lambda * sqrt(d) / ||z||_2. There is no L1 soft-threshold in the
-        # paper's closed form, and gamma enters only through the learning rate.
-        assert l1_reg == 0.0, "the group-sparse update has no separate L1 term"
+        # the group (one embedding row, width d). With s the linear term
+        # soft-thresholded by l1_reg (s = linear when l1_reg = 0, the paper's
+        # closed form; otherwise the sparse-group-lasso step of Yue et al.,
+        # arXiv:2107.14432, Algorithm 3), the row is zeroed when
+        # ||s||_2 <= lambda * sqrt(d), and otherwise shrunk by
+        # 1 - lambda * sqrt(d) / ||s||_2. gamma enters only through the
+        # learning rate.
+        s = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
         threshold = group_lasso_reg * linear.size(-1) ** 0.5
-        norm = linear.norm(dim=-1, keepdim=True)
+        norm = s.norm(dim=-1, keepdim=True)
         scale = torch.where(
             norm > threshold,
             1.0 - threshold / norm.clamp(min=1e-300),
             torch.zeros_like(norm),
         )
-        numerator = scale * linear
+        numerator = scale * s
         denom = (
             (ftrl_beta + new_accum_pow) / learning_rate
             + l2_reg
@@ -357,7 +360,8 @@ def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
 @cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False), (70, False)])
 @pytest.mark.parametrize("gamma", [0.0, 0.5], ids=["no_gamma", "gamma"])
-def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma):
+@pytest.mark.parametrize("l1_reg", [0.0, 0.01], ids=["no_l1", "l1"])
+def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma, l1_reg):
     """Rows of very different gradient scale, so some clear the threshold and some do not.
 
     Checks the weights against the float64 transcription, that the rows below
@@ -368,7 +372,11 @@ def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma):
     num_rows = 64
     row_width = 3 * emb_dim
     params = dict(
-        learning_rate=0.1, group_lasso_reg=0.3, group_lasso_gamma=gamma, l2_reg=0.01
+        learning_rate=0.1,
+        l1_reg=l1_reg,
+        group_lasso_reg=0.3,
+        group_lasso_gamma=gamma,
+        l2_reg=0.01,
     )
     optimizer = _ftrl_optimizer(**params)
 
@@ -455,11 +463,8 @@ def test_ftrl_group_args_validation_and_ckpt_meta():
         _ftrl_optimizer(group_lasso_reg=-0.1)
     with pytest.raises(ValueError, match="group_lasso_gamma"):
         _ftrl_optimizer(group_lasso_reg=0.1, group_lasso_gamma=-1.0)
-    # The paper's update has no separate L1 term, so asking for both is refused
-    # rather than one of them being silently dropped.
-    with pytest.raises(ValueError, match="l1_reg"):
-        _ftrl_optimizer(group_lasso_reg=0.1, l1_reg=0.01)
-    assert _ftrl_optimizer(group_lasso_reg=0.0, l1_reg=0.01) is not None
+    # L1 and the group term combine: sparse group lasso.
+    assert _ftrl_optimizer(group_lasso_reg=0.1, l1_reg=0.01) is not None
     opt = _ftrl_optimizer(group_lasso_reg=0.25)
     assert opt.get_opt_args()["group_lasso_reg"] == 0.25
     assert opt.get_opt_args()["group_lasso_gamma"] == 0.0
@@ -548,7 +553,11 @@ _GROUP_DIMS = [[8], [5], [8, 4, 12], [12, 5, 8]]
 _GROUP_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 _GROUP_DIMS_IDS = ["8", "5", "vec4_mixed", "unaligned_mixed"]
 _GROUP_PARAMS = dict(
-    learning_rate=0.1, l2_reg=0.01, group_lasso_reg=0.5, group_lasso_gamma=0.1
+    learning_rate=0.1,
+    l1_reg=0.005,
+    l2_reg=0.01,
+    group_lasso_reg=0.5,
+    group_lasso_gamma=0.1,
 )
 
 

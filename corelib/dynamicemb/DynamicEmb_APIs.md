@@ -564,7 +564,7 @@ square root and so recovers its `α / (β + √n)` learning rate exactly. Pass t
 | `initial_accumulator_value` | `0.0` | Seeds `accum`; `linear` always starts at 0. Read the note below before setting it non-zero. |
 | `l1_reg` | `0.0` | λ1. |
 | `l2_reg` | `0.0` | λ2. |
-| `group_lasso_reg` | `0.0` | λ of G-FTRL -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`, and `l1_reg` must be `0` when it is positive. |
+| `group_lasso_reg` | `0.0` | λ of G-FTRL -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`. Combines with `l1_reg` (sparse group lasso). |
 | `group_lasso_gamma` | `0.0` | γ_g of G-FTRL: adds `λ·γ` to the learning rate's denominator. Must be `>= 0`; only read when `group_lasso_reg > 0`. |
 
 Two behaviours worth knowing before choosing FTRL:
@@ -604,17 +604,20 @@ Setting `group_lasso_reg > 0` gives **G-FTRL**, Algorithm 1 and Eq. 3 of *Featur
 System via a Group-Sparsity-Regularized Training Algorithm* (Ni et al., CIKM 2019), with **one embedding row of width
 `d` as the group**. Where `l1_reg` zeroes individual elements, the group term thresholds the L2 norm of the whole row,
 so a row's weights vanish *together*. `linear` and `accum` are updated exactly as in FTRL; only the weight solve differs.
-With `z = linear` after the update, `λ = group_lasso_reg` and `γ = group_lasso_gamma`:
+With `z = linear` after the update, `s = sign(z)·max(|z| − l1_reg, 0)`, `λ = group_lasso_reg` and
+`γ = group_lasso_gamma`:
 
 ```
-weight = 0                                                       if ‖z‖₂ ≤ λ·√d
-       = −η_i · (1 − λ·√d / ‖z‖₂) · z_i                           otherwise
+weight = 0                                                       if ‖s‖₂ ≤ λ·√d
+       = −η_i · (1 − λ·√d / ‖s‖₂) · s_i                           otherwise
 η_i    = 1 / ((ftrl_beta + new_accum_i^(−p)) / lr + λ·γ + l2_reg)       ‖·‖₂ over the row
 ```
 
-- The threshold is on the **raw** `linear` and carries the group-size factor `√d`, so one `λ` serves rows of different
-  widths. There is no L1 soft-threshold in the paper's closed form, which is why `l1_reg` has no place in this update
-  and a positive `l1_reg` together with `group_lasso_reg > 0` is rejected rather than silently dropped.
+- The threshold carries the group-size factor `√d`, so one `λ` serves rows of different widths.
+- With `l1_reg = 0` (the default) `s = z`, which is the paper's closed form exactly. With `l1_reg > 0` the row norm is
+  taken after the L1 soft-threshold, the sparse-group-lasso step of *Adaptive Optimizers with Sparse Group Lasso for
+  Neural Networks in CTR Prediction* (Yue et al., arXiv:2107.14432, Algorithm 3), so L1 zeroes elements inside a row
+  that survives the group test.
 - `γ` enters only through the learning rate. `l2_reg` is not in the paper; it is kept as an extra term in `η` that does
   nothing at its default of `0`.
 - `η_i` is per element, as in the paper's Algorithm 1, so within a non-zero row the shrink factor is common but the
@@ -635,10 +638,10 @@ is compared against the threshold, only the gradient history it has accumulated 
 linear = g − |g| · weight / lr
 ```
 
-so a row whose gradients are small has a small `‖z‖₂`, and if it does not exceed `λ·√d` the whole row, initializer
+so a row whose gradients are small has a small `‖s‖₂`, and if it does not exceed `λ·√d` the whole row, initializer
 included, is written as zero. This is the same effect as the initializer-retention table above, only all-or-nothing per
 row, and a larger `group_lasso_reg` makes it more likely. Choose `group_lasso_reg` below what a row with a typical
-first-step gradient reaches (`‖z‖₂ / √d`), or expect the rows that are touched only a few times to come out as zero.
+first-step gradient reaches (`‖s‖₂ / √d`), or expect the rows that are touched only a few times to come out as zero.
 A zeroed row is not removed: its `linear` and `accum` keep accumulating, so it can become non-zero again once enough
 gradient has built up.
 
