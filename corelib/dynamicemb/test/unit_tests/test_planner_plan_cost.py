@@ -95,8 +95,8 @@ class _Planned(NamedTuple):
     options: DynamicEmbTableOptions
 
 
-def _sharding(ranks, rows: int = ROWS, hbm_budget: int = 0) -> _Planned:
-    """One shard of `rows` rows on each of `ranks`, and its options."""
+def _planned_table(ranks, rows: int = ROWS, hbm_budget: int = 0) -> _Planned:
+    """One shard of `rows` rows on each of `ranks`, and the options beside it."""
     return _Planned(
         ParameterSharding(
             sharding_type=ShardingType.ROW_WISE.value,
@@ -117,16 +117,16 @@ def _sharding(ranks, rows: int = ROWS, hbm_budget: int = 0) -> _Planned:
     )
 
 
-def _key(name, collection="ebc"):
+def _key(name, collection="sparse.ebc"):
     """A `TableKey` from a bare name, for the tests that use one collection.
 
     `per_rank_storage` is keyed by the pair, since a name need not be unique.
-    Where a test says nothing about collections there is only one, and these
-    helpers put them all in the same one -- which is what the tests that
-    predate the collection being part of the key assume. A test that is about
-    collections passes `TableKey`s itself, and they are left alone.
+    Where a test says nothing about collections there is only one, and this
+    puts them all in it -- `sparse.ebc`, the path `_Model` holds its collection
+    at, so the string means the same thing everywhere in this file. A test that
+    is about collections builds its `TableKey`s itself.
     """
-    return name if isinstance(name, TableKey) else TableKey(collection, name)
+    return TableKey(collection, name)
 
 
 def _spent(
@@ -189,7 +189,7 @@ class TestPerRankStorage:
 
     def test_row_wise_table_charges_every_rank_equally(self):
         per_rank = _spent(
-            {"t": _sharding(range(WORLD_SIZE))}, optimizer_types={"t": None}
+            {"t": _planned_table(range(WORLD_SIZE))}, optimizer_types={"t": None}
         )
         assert len(per_rank) == WORLD_SIZE
         values = ROWS * DIM * 4  # float32, no optimizer state
@@ -202,7 +202,7 @@ class TestPerRankStorage:
         for it would reserve four nodes' worth of room for one node's table.
         """
         per_rank = _spent(
-            {"t": _sharding([2, 3])},  # the second node only
+            {"t": _planned_table([2, 3])},  # the second node only
             optimizer_types={"t": None},
         )
         values = ROWS * DIM * 4
@@ -216,11 +216,11 @@ class TestPerRankStorage:
         cannot come out of HBM -- they all spill to the host tier."""
         hbm_budget = ROWS * DIM * 4  # exactly the values, nothing spare
         without = _spent(
-            {"t": _sharding(range(WORLD_SIZE), hbm_budget=hbm_budget)},
+            {"t": _planned_table(range(WORLD_SIZE), hbm_budget=hbm_budget)},
             optimizer_types={"t": None},
         )
         with_adam = _spent(
-            {"t": _sharding(range(WORLD_SIZE), hbm_budget=hbm_budget)},
+            {"t": _planned_table(range(WORLD_SIZE), hbm_budget=hbm_budget)},
             optimizer_types={"t": OptimType.ADAM},
         )
 
@@ -230,7 +230,7 @@ class TestPerRankStorage:
 
     def test_a_shard_outside_the_world_is_an_error(self):
         with pytest.raises(ValueError, match="outside the world"):
-            _spent({"t": _sharding([WORLD_SIZE])}, optimizer_types={"t": None})
+            _spent({"t": _planned_table([WORLD_SIZE])}, optimizer_types={"t": None})
 
 
 class TestTopologyMinus:
@@ -333,7 +333,7 @@ class TestTheBroadcastSeam:
         the record has to be exactly what the plan carries. Options on it would
         ride the broadcast, where `external_storage` is a live handle this process
         opened and `score_function` is a Python callable."""
-        planned = _sharding(range(WORLD_SIZE))
+        planned = _planned_table(range(WORLD_SIZE))
 
         assert type(planned.sharding) is ParameterSharding
         assert not hasattr(planned.sharding, "dynamicemb_options")
@@ -343,7 +343,7 @@ class TestTheBroadcastSeam:
         options it kept. Every inherited field has to survive, which is why
         `with_options` copies them through `fields(ParameterSharding)` rather than
         naming them."""
-        planned = _sharding(range(WORLD_SIZE))
+        planned = _planned_table(range(WORLD_SIZE))
 
         completed = DynamicEmbParameterSharding.with_options(
             planned.sharding, planned.options
@@ -374,7 +374,7 @@ class TestTheBroadcastSeam:
         would let the first DMP rewrite what a second `plan` call hands out, on
         rank 0 and nowhere else.
         """
-        planned = _sharding(range(WORLD_SIZE))
+        planned = _planned_table(range(WORLD_SIZE))
 
         completed = DynamicEmbParameterSharding.with_options(
             planned.sharding, planned.options
@@ -434,7 +434,7 @@ class TestWhereTheRefusalHappens:
         asserts it by calling step 1 alone -- `_plan_torchrec` is never reached."""
         # Row-wise over WORLD_SIZE ranks: 2**26 rows of DIM fp32 each, so 4 GiB a
         # rank, against a budget that allows it and a rank that has 1 GB.
-        module = _ebc(["big"], rows=2**28)
+        module = _ebc(table_names=["big"], rows=2**28)
         sharders = [EmbeddingBagCollectionSharder()]
         planner = _dynamicemb_planner(_topology(hbm=1 * GB), "big", 64 * GB)
 
@@ -445,7 +445,7 @@ class TestWhereTheRefusalHappens:
         """Step 1 deducts into a Topology of its own. `self._topology` still says
         what the machine has, because a second `plan` call has to start there."""
         topology = _topology()
-        module = _ebc(["small"])
+        module = _ebc(table_names=["small"])
         planner = _dynamicemb_planner(topology, "small", 1 * GB)
 
         planner._plan_dynamicemb(module, [EmbeddingBagCollectionSharder()])
@@ -458,7 +458,7 @@ class TestWhereTheRefusalHappens:
 # --- module_without_tables -------------------------------------------------
 
 
-def _ebc(names, device=torch.device("meta"), rows: int = ROWS):
+def _ebc(table_names, device=torch.device("meta"), rows: int = ROWS):
     return torchrec.EmbeddingBagCollection(
         tables=[
             EmbeddingBagConfig(
@@ -467,7 +467,7 @@ def _ebc(names, device=torch.device("meta"), rows: int = ROWS):
                 num_embeddings=rows,
                 feature_names=[f"f_{name}"],
             )
-            for name in names
+            for name in table_names
         ],
         device=device,
     )
@@ -481,22 +481,21 @@ class _Model(torch.nn.Module):
         self.dense = torch.nn.Linear(DIM, DIM, device=torch.device("meta"))
 
 
-def _sharders():
-    return [EmbeddingBagCollectionSharder()]
+def _plan_dynamicemb(module, constraints, sharders=None):
+    """Run the planner's step 1 over `module` and hand back the planner.
 
+    Afterwards `_dyn_emb_plan`, `_dyn_emb_options` and `_reduced_topology` are
+    filled in. Nothing of TorchRec's has run and there is no `ShardingPlan`
+    yet; `_insert_dynamicemb_plan` is what turns this into one.
 
-def _planned(module, constraints):
-    """A planner that has run step 1 over `module`, and nothing further."""
+    `sharders` defaults to the pooled collection's, which is what every table
+    here is in. A test with a sequence collection passes its own.
+    """
     planner = DynamicEmbeddingShardingPlanner(
         topology=_topology(), constraints=constraints
     )
-    planner._plan_dynamicemb(module, _sharders())
+    planner._plan_dynamicemb(module, sharders or [EmbeddingBagCollectionSharder()])
     return planner
-
-
-def _at_ebc(name):
-    """`name` in `_Model`'s one collection, which lives at `sparse.ebc`."""
-    return TableKey("sparse.ebc", name)
 
 
 class TestModuleWithoutTables:
@@ -504,9 +503,11 @@ class TestModuleWithoutTables:
     path the plan is keyed by still where it was."""
 
     def test_named_tables_are_gone_from_the_copy(self):
-        model = _Model(_ebc(["a", "b", "c"]))
+        model = _Model(_ebc(table_names=["a", "b", "c"]))
         reduced = module_without_tables(
-            model, {_at_ebc("a"), _at_ebc("c")}, _sharders()
+            model,
+            {TableKey("sparse.ebc", "a"), TableKey("sparse.ebc", "c")},
+            [EmbeddingBagCollectionSharder()],
         )
 
         assert set(reduced.sparse.ebc.embedding_bags.keys()) == {"b"}
@@ -514,8 +515,10 @@ class TestModuleWithoutTables:
         assert set(model.sparse.ebc.embedding_bags.keys()) == {"a", "b", "c"}
 
     def test_the_tree_keeps_its_shape_so_plan_paths_still_match(self):
-        model = _Model(_ebc(["a", "b"]))
-        reduced = module_without_tables(model, {_at_ebc("a")}, _sharders())
+        model = _Model(_ebc(table_names=["a", "b"]))
+        reduced = module_without_tables(
+            model, {TableKey("sparse.ebc", "a")}, [EmbeddingBagCollectionSharder()]
+        )
 
         assert [n for n, _ in reduced.named_children()] == [
             n for n, _ in model.named_children()
@@ -527,18 +530,32 @@ class TestModuleWithoutTables:
     def test_a_collection_of_only_dynamicemb_tables_becomes_empty(self):
         """It stays in the tree. Removing it would change the paths the plan is
         keyed by, and an empty collection simply yields no shardable parameters."""
-        model = _Model(_ebc(["a", "b"]))
+        model = _Model(_ebc(table_names=["a", "b"]))
         reduced = module_without_tables(
-            model, {_at_ebc("a"), _at_ebc("b")}, _sharders()
+            model,
+            {TableKey("sparse.ebc", "a"), TableKey("sparse.ebc", "b")},
+            [EmbeddingBagCollectionSharder()],
         )
 
         assert len(reduced.sparse.ebc.embedding_bags) == 0
-        assert _sharders()[0].shardable_parameters(reduced.sparse.ebc) == {}
+        assert [EmbeddingBagCollectionSharder()][0].shardable_parameters(
+            reduced.sparse.ebc
+        ) == {}
 
     def test_nothing_is_copied_when_nothing_is_removed(self):
-        model = _Model(_ebc(["a"]))
-        assert module_without_tables(model, set(), _sharders()) is model
-        assert module_without_tables(model, {_at_ebc("absent")}, _sharders()) is model
+        model = _Model(_ebc(table_names=["a"]))
+        assert (
+            module_without_tables(model, set(), [EmbeddingBagCollectionSharder()])
+            is model
+        )
+        assert (
+            module_without_tables(
+                model,
+                {TableKey("sparse.ebc", "absent")},
+                [EmbeddingBagCollectionSharder()],
+            )
+            is model
+        )
 
 
 # --- table_ranks: which ranks hold a table, and what its rows divide by ----
@@ -605,7 +622,9 @@ class TestTableRanks:
         per_rank_storage reads it off the shard metadata."""
         ranks = table_ranks(TRW, 1, WORLD_8, LOCAL_4)
         spent = _spent(
-            {"t": _sharding(ranks)}, optimizer_types={"t": None}, world_size=WORLD_8
+            {"t": _planned_table(ranks)},
+            optimizer_types={"t": None},
+            world_size=WORLD_8,
         )
 
         # No HBM budget and no optimizer state, so the whole shard is host bytes.
@@ -732,7 +751,7 @@ class TestGroupedTiers:
 # --- optimizer_types: which optimizer each table trains with ----------------
 
 
-def _ec(names, device=torch.device("meta")):
+def _ec(table_names, device=torch.device("meta")):
     return torchrec.EmbeddingCollection(
         tables=[
             EmbeddingConfig(
@@ -741,7 +760,7 @@ def _ec(names, device=torch.device("meta")):
                 num_embeddings=ROWS,
                 feature_names=[f"f_{name}"],
             )
-            for name in names
+            for name in table_names
         ],
         device=device,
     )
@@ -756,8 +775,8 @@ class _MixedModel(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.pooled = _ebc(["p0", "p1"], device=torch.device("cpu"))
-        self.sequence = _ec(["s0"], device=torch.device("cpu"))
+        self.pooled = _ebc(table_names=["p0", "p1"], device=torch.device("cpu"))
+        self.sequence = _ec(table_names=["s0"], device=torch.device("cpu"))
 
 
 def _mixed_sharders(pooled_optimizer=None, sequence_optimizer=None):
@@ -851,7 +870,7 @@ class TestOptimizerTypes:
 class TestCollectionsDoNotPoolBudgets:
     """Two collections are costed apart, however alike their tables are."""
 
-    def _sharding(self, options):
+    def _row_wise_sharding(self, options):
         ranks = list(range(WORLD_SIZE))
         return ParameterSharding(
             sharding_type=ShardingType.ROW_WISE.value,
@@ -885,8 +904,8 @@ class TestCollectionsDoNotPoolBudgets:
         def records(generous_key, needy_key):
             return (
                 {
-                    generous_key: self._sharding(generous),
-                    needy_key: self._sharding(needy),
+                    generous_key: self._row_wise_sharding(generous),
+                    needy_key: self._row_wise_sharding(needy),
                 },
                 {generous_key: generous, needy_key: needy},
                 {generous_key: None, needy_key: None},
@@ -923,10 +942,12 @@ class TestCollectionsDoNotPoolBudgets:
 class _TwoCollections(torch.nn.Module):
     """Two collections, told separately which tables to hold."""
 
-    def __init__(self, left, right, right_rows=ROWS):
+    def __init__(self, left_names, right_names, right_rows=ROWS):
         super().__init__()
-        self.left = _ebc(left, device=torch.device("meta"))
-        self.right = _ebc(right, device=torch.device("meta"), rows=right_rows)
+        self.left = _ebc(table_names=left_names, device=torch.device("meta"))
+        self.right = _ebc(
+            table_names=right_names, device=torch.device("meta"), rows=right_rows
+        )
 
 
 class TestGetConstraintKey:
@@ -938,13 +959,13 @@ class TestGetConstraintKey:
     """
 
     def test_without_a_module_it_is_the_table_name(self):
-        config = _ebc(["t"]).embedding_bag_configs()[0]
+        config = _ebc(table_names=["t"]).embedding_bag_configs()[0]
         assert get_constraint_key(config) == "t"
 
     def test_a_collection_passed_as_the_root_gives_the_bare_name(self):
         """Its path from itself is empty, so a caller holding one collection and
         no enclosing model needs no special case."""
-        ebc = _ebc(["t"])
+        ebc = _ebc(table_names=["t"])
         assert get_constraint_key(ebc.embedding_bag_configs()[0], ebc) == "t"
 
     def test_a_module_gives_the_path_to_the_collection(self):
@@ -952,7 +973,7 @@ class TestGetConstraintKey:
         "qualify only what is ambiguous". The answer is a function of the
         arguments alone, so a key does not move when an unrelated collection
         later grows a table of the same name."""
-        module = _TwoCollections(["shared", "l"], ["shared"])
+        module = _TwoCollections(left_names=["shared", "l"], right_names=["shared"])
         assert [
             get_constraint_key(c, module) for c in module.left.embedding_bag_configs()
         ] == ["left.shared", "left.l"]
@@ -963,8 +984,8 @@ class TestGetConstraintKey:
     def test_the_config_is_matched_by_identity_not_by_name(self):
         """By name there is nothing to tell two declarations apart, which is the
         whole problem this solves."""
-        module = _TwoCollections(["shared"], ["shared"])
-        stranger = _ebc(["shared"]).embedding_bag_configs()[0]
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
+        stranger = _ebc(table_names=["shared"]).embedding_bag_configs()[0]
         with pytest.raises(ValueError, match="matched by identity"):
             get_constraint_key(stranger, module)
 
@@ -1015,12 +1036,12 @@ class TestResolveConstraints:
         marked, not only the one that won, so reaching these asserts at all
         means the override did not read as a typo.
         """
-        module = _TwoCollections(["shared"], ["shared"])
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
         constraints = {
             **_dynamicemb_constraints("shared", hbm_budget=GB),
             **_dynamicemb_constraints("right.shared", hbm_budget=2 * GB),
         }
-        options = _planned(module, constraints)._dyn_emb_options
+        options = _plan_dynamicemb(module, constraints)._dyn_emb_options
         # By identity: the table was planned with the options off the constraint
         # that won it, not with a copy that happens to match.
         assert (
@@ -1035,16 +1056,16 @@ class TestResolveConstraints:
     def test_a_key_no_table_answers_to_is_refused(self):
         """Silently ignoring it reads as "plan this table with TorchRec's
         defaults", which is found in a profile rather than in an error."""
-        module = _TwoCollections(["l"], ["r"])
+        module = _TwoCollections(left_names=["l"], right_names=["r"])
         with pytest.raises(ValueError, match="does not have"):
-            _planned(module, _dynamicemb_constraints("typo"))
+            _plan_dynamicemb(module, _dynamicemb_constraints("typo"))
 
     def test_a_qualified_key_on_a_torchrec_table_is_refused(self):
         """TorchRec's planner is keyed by table name alone, so it would never
         look the key up and the constraint would do nothing."""
-        module = _TwoCollections(["l"], ["r"])
+        module = _TwoCollections(left_names=["l"], right_names=["r"])
         with pytest.raises(ValueError, match="TorchRec plans"):
-            _planned(
+            _plan_dynamicemb(
                 module,
                 {"left.l": DynamicEmbParameterConstraints(use_dynamicemb=False)},
             )
@@ -1053,9 +1074,9 @@ class TestResolveConstraints:
         """What a bare name does when two collections declare it. The options
         carry each table's own geometry, written in at plan time, so one object
         cannot describe both -- and the message names the way out."""
-        module = _TwoCollections(["shared"], ["shared"])
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
         with pytest.raises(ValueError, match="get_constraint_key"):
-            _planned(module, _dynamicemb_constraints("shared"))
+            _plan_dynamicemb(module, _dynamicemb_constraints("shared"))
 
 
 class TestATableInMoreThanOneCollection:
@@ -1073,8 +1094,8 @@ class TestATableInMoreThanOneCollection:
     def test_each_copy_holds_its_own_options(self):
         """The thing that was not expressible before: two tables under one name,
         each sized and budgeted on its own."""
-        module = _TwoCollections(["shared"], ["shared"])
-        planner = _planned(
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
+        planner = _plan_dynamicemb(
             module,
             {
                 **_dynamicemb_constraints("left.shared", hbm_budget=GB),
@@ -1096,8 +1117,10 @@ class TestATableInMoreThanOneCollection:
         declarations of different shapes used to be refused for that reason.
         Each occurrence now has its own, so each is sized from its own config.
         """
-        module = _TwoCollections(["shared"], ["shared"], right_rows=ROWS * 4)
-        planner = _planned(
+        module = _TwoCollections(
+            left_names=["shared"], right_names=["shared"], right_rows=ROWS * 4
+        )
+        planner = _plan_dynamicemb(
             module, _dynamicemb_constraints("left.shared", "right.shared")
         )
         options = planner._dyn_emb_options
@@ -1110,11 +1133,11 @@ class TestATableInMoreThanOneCollection:
         """The reservation has to charge for each runtime the model builds.
         Charging once leaves a whole table's HBM asked for and never reserved.
         """
-        shared = _TwoCollections(["shared"], ["shared"])
-        alone = _TwoCollections(["shared"], ["other"])
+        shared = _TwoCollections(left_names=["shared"], right_names=["shared"])
+        alone = _TwoCollections(left_names=["shared"], right_names=["other"])
 
         def reduced(module, constraints):
-            planner = _planned(module, constraints)
+            planner = _plan_dynamicemb(module, constraints)
             assert planner._reduced_topology is not None
             return planner._reduced_topology.devices[0].storage.hbm
 
@@ -1130,12 +1153,12 @@ class TestATableInMoreThanOneCollection:
         assert spent_twice == spent_apart
 
     def test_each_copy_is_filed_under_its_own_collection(self):
-        module = _TwoCollections(["shared"], ["shared"])
-        planner = _planned(
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
+        planner = _plan_dynamicemb(
             module, _dynamicemb_constraints("left.shared", "right.shared")
         )
         plan = ShardingPlan({})
-        planner._insert_dynamicemb_plan(plan, module, _sharders())
+        planner._insert_dynamicemb_plan(plan, module, [EmbeddingBagCollectionSharder()])
         assert set(plan.plan) == {"left", "right"}
         assert "shared" in plan.plan["left"] and "shared" in plan.plan["right"]
 
@@ -1143,9 +1166,11 @@ class TestATableInMoreThanOneCollection:
         """One name, DynamicEmb's in one collection and TorchRec's in the other.
         Pruning by name alone would take both away and leave TorchRec a table it
         was told to plan and can no longer see."""
-        module = _TwoCollections(["shared"], ["shared"])
-        planner = _planned(module, _dynamicemb_constraints("left.shared"))
-        reduced = module_without_tables(module, set(planner._dyn_emb_plan), _sharders())
+        module = _TwoCollections(left_names=["shared"], right_names=["shared"])
+        planner = _plan_dynamicemb(module, _dynamicemb_constraints("left.shared"))
+        reduced = module_without_tables(
+            module, set(planner._dyn_emb_plan), [EmbeddingBagCollectionSharder()]
+        )
         assert set(reduced.left.embedding_bags) == set()
         assert set(reduced.right.embedding_bags) == {"shared"}
 
@@ -1169,11 +1194,11 @@ class TestCollectionPathsAgree:
         error there -- it shards the modules its plan names and leaves the rest
         alone -- so two walks that disagreed would surface as a collection that
         silently stayed unsharded."""
-        module = _Model(_ebc(["t"]))
-        planner = _planned(module, _dynamicemb_constraints("t"))
+        module = _Model(_ebc(table_names=["t"]))
+        planner = _plan_dynamicemb(module, _dynamicemb_constraints("t"))
 
         plan = ShardingPlan({})
-        planner._insert_dynamicemb_plan(plan, module, _sharders())
+        planner._insert_dynamicemb_plan(plan, module, [EmbeddingBagCollectionSharder()])
 
         assert set(plan.plan) == {"sparse.ebc"}
         assert {key.collection for key in planner._dyn_emb_plan} == {"sparse.ebc"}
