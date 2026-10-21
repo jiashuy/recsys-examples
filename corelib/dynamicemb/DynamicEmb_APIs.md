@@ -130,9 +130,31 @@ Under `collective_plan`, steps 1 and 2 run on every rank and steps 3–4 on rank
 
 So: the DynamicEmb tables never enter TorchREC's search space, their memory is accounted for before TorchREC plans anything, and every rank gets the same placement decisions.
 
+### Naming a table in `constraints`
+
+`constraints` is keyed by string, and a table is named either by its own name or by `collection.name` -- the collection being the path to the module that holds it, as the model sees it. Each table asks for the qualified key first and the bare one second, and takes the first that is there. So **a model whose table names are unique needs nothing new**: a bare name reaches its table as it always has, and a qualified key overrides it for one collection.
+
+The qualified form exists because two collections may declare one table name, and those are two tables: TorchREC shards each collection on its own, so they build separate runtimes with separate storage and separate optimizer state, and neither sees the other's updates. A DynamicEmb table cannot share its constraint with another, because `DynamicEmbTableOptions` is both your policy and the runtime's per-table config -- the planner writes each table's geometry into it -- so one object cannot describe two tables.
+
+`get_constraint_key` writes the key for you:
+
+    from dynamicemb.planner import get_constraint_key
+
+    constraints = {
+        get_constraint_key(shared_a, model): ...,   # 'sparse.ebc_a.shared'
+        get_constraint_key(shared_b, model): ...,   # 'sparse.ebc_b.shared'
+        get_constraint_key(item_id): ...,           # 'item_id'
+    }
+
+It takes the config **object** rather than a name, since by name there is nothing to tell two declarations apart, and the second argument is the root the path is relative to -- pass the model, or pass a collection itself to get the bare name back. Omit it and you get `config.name`.
+
+Three things are refused rather than quietly ignored, since each would otherwise leave a constraint doing nothing: a key no table answers to; a qualified key on a table TorchREC plans, because TorchREC's planner looks constraints up by table name alone and would never find it; and one `DynamicEmbTableOptions` object reached by two tables.
+
+**Not for `get_planner`.** Its `table_row_wise_embedding_table_names`, `data_parallel_embedding_table_names` and `dynamicemb_options_dict` are keyed by the bare table name -- it takes a flat `eb_configs` with no module to take a path from. A qualified key matches none of them, and `get_planner` refuses a name that `eb_configs` does not declare rather than planning the table some other way. A model that needs a qualified key builds its constraints and the planner directly.
+
 ### What the planner writes into your options
 
-At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the module and validates that they and `constraints` are consistent (every table name appears exactly once, matches the keys of `constraints`, and there are no extra keys). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
+At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the module and resolves each one against `constraints` (see **Naming a table in `constraints`** above). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
@@ -156,11 +178,13 @@ To override, set **`node_index`** on `DynamicEmbTableOptions` to a node numbered
 
 To replace the rule, pass a `NodePlacer` to the planner:
 
-    from dynamicemb.planner import BalancedNodePlacer, NodePlacer, TableToPlace
+    from dynamicemb.planner import BalancedNodePlacer, NodePlacer, TableKey, TableToPlace
 
     class MyPlacer(NodePlacer):
-        def place(self, tables, topology, committed) -> Dict[str, int]:
-            ...   # {table name: node index}, deterministic on every rank
+        def place(self, tables, topology, committed) -> Dict[TableKey, int]:
+            ...   # {table.key: node index}, deterministic on every rank
+
+A `TableKey` is the pair `(collection, name)` -- the collection being the path to the module the table was declared in -- because a name alone is not an identity when two collections declare one. Each `TableToPlace` carries its own as `table.key`, so a placer returns the keys it was given.
 
     DynamicEmbeddingShardingPlanner(topology=..., constraints=..., node_placer=MyPlacer())
 

@@ -66,6 +66,33 @@ def get_planner(
     intra_host_bw: int = 450e9,  # Nvlink bandwidth
     inter_host_bw: int = 25e9,  # NIC bandwidth
 ):
+    # Every name these three are keyed by has to be a table `eb_configs`
+    # declares. A name that matches none of them is otherwise dropped without a
+    # word, and what the caller asked for simply does not happen: a table named
+    # for table-row-wise sharding is planned row-wise, one named for data
+    # parallel is planned model parallel. `resolve_constraints` refuses the
+    # same mistake in `constraints`, for the same reason -- a constraint that
+    # reaches no table reads as "plan this with the defaults", which is found
+    # in a profile rather than in an error.
+    declared = {config.name for config in eb_configs}
+    for argument, names in (
+        ("data_parallel_embedding_table_names", data_parallel_embedding_table_names),
+        (
+            "table_row_wise_embedding_table_names",
+            table_row_wise_embedding_table_names or (),
+        ),
+        ("dynamicemb_options_dict", dynamicemb_options_dict),
+    ):
+        unknown = sorted(set(names) - declared)
+        if unknown:
+            raise ValueError(
+                f"{argument} names tables that eb_configs does not declare: "
+                f"{unknown}. The tables declared are {sorted(declared)}. These "
+                "arguments are keyed by the bare table name, so a key from "
+                "`get_constraint_key(config, model)` -- which is qualified by "
+                "the collection the table is in -- will not match one."
+            )
+
     constraints = {}
     for config in eb_configs:
         if config.name in data_parallel_embedding_table_names:
@@ -115,6 +142,13 @@ def get_planner(
                 use_dynamicemb=False,
                 compute_kernels=compute_kernel_type,
             )
+        # Keyed by table name, which is what `eb_configs` offers: a flat list,
+        # with no module to take a path from. That is every model whose table
+        # names are unique, which is nearly all of them. A model where two
+        # collections declare one name needs a key naming one of them -- see
+        # `get_constraint_key` -- and so cannot be configured through here;
+        # build the constraints and the DynamicEmbeddingShardingPlanner
+        # directly for that case.
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
 

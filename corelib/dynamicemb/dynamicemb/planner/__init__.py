@@ -16,14 +16,18 @@
 
 from .get_planner import get_planner
 from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
+from .plan import TableKey
 from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
+    get_constraint_key,
 )
 
 __all__ = [
     "get_planner",
+    "get_constraint_key",
+    "TableKey",
     "BalancedNodePlacer",
     "NodePlacer",
     "TableToPlace",
