@@ -675,19 +675,26 @@ How the group threshold is set, and what surrounds the update:
 
 **A freshly initialized row is the one most likely to be zeroed.** The threshold is on the row's accumulated
 `linear`, not on its weights, and `linear` starts at 0 -- so on the first update a row's initializer is not what
-is compared against the threshold, only the gradient history it has accumulated so far. With
-`initial_accumulator_value = 0` and `ftrl_beta = 0` that first step is, per element,
+is compared against the threshold, only the gradient history it has accumulated so far. The first step is, per element
+(`ftrl_beta` does not enter `linear`; it only changes the weight solved from it),
 
 ```
-linear = g − |g| · weight / lr
+linear = g − (n₁^(−p) − n₀^(−p)) / lr · weight         p = learning_rate_power,  n₀ = initial_accumulator_value,  n₁ = n₀ + g²
 ```
 
-so a row whose gradients are small has a small `‖s‖₂`, and if it does not exceed `λ·√d` the whole row, initializer
-included, is written as zero. This is the same effect as the initializer-retention table above, only all-or-nothing per
-row, and a larger `group_lasso_reg` makes it more likely. Choose `group_lasso_reg` below what a row with a typical
-first-step gradient reaches (`‖s‖₂ / √d`), or expect the rows that are touched only a few times to come out as zero.
-A zeroed row is not removed: its `linear` and `accum` keep accumulating, so it can become non-zero again once enough
-gradient has built up.
+which depends on `learning_rate_power`:
+
+- **`learning_rate_power = −0.5` (the default) with `initial_accumulator_value = 0`:** `linear = g − |g| · weight / lr`.
+  A row whose gradients are small has a small `‖s‖₂`, and if it does not exceed `λ·√d` the whole row, initializer
+  included, is written as zero. This is the same effect as the initializer-retention table above, only all-or-nothing
+  per row, and a larger `group_lasso_reg` makes it more likely.
+- **`learning_rate_power = 0`:** the two powers are both 1 and cancel, so `linear = g` whatever the initializer or
+  `initial_accumulator_value`; the first step's `‖s‖₂` is just the gradient's own, and the formula above does not apply.
+- **Any other power:** `linear = g − |g|^(−2p) · weight / lr` for `initial_accumulator_value = 0`.
+
+Choose `group_lasso_reg` below what a row with a typical first-step gradient reaches under your `learning_rate_power`
+(`‖s‖₂ / √d`), or expect the rows that are touched only a few times to come out as zero. A zeroed row is not removed:
+its `linear` and `accum` keep accumulating, so it can become non-zero again once enough gradient has built up.
 
 Unlike the `EmbOptimType` optimizers, FTRL has no FBGEMM counterpart, so `construct_twin_module` cannot
 build a TorchRec twin for a model that uses it.
