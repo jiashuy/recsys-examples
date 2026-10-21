@@ -240,8 +240,15 @@ def get_constraint_key(
     Returns
     -------
     str
-        The key for ``constraints``, and for ``get_planner``'s
-        ``table_row_wise_embedding_table_names``.
+        The key for ``constraints``.
+
+        Not for ``get_planner``'s ``table_row_wise_embedding_table_names``,
+        ``data_parallel_embedding_table_names`` or ``dynamicemb_options_dict``:
+        those are keyed by the bare table name, since ``get_planner`` takes a
+        flat ``eb_configs`` with no module to take a path from. A qualified key
+        matches none of them, and ``get_planner`` says so rather than planning
+        the table some other way. A model that needs a qualified key builds its
+        constraints and the planner directly.
 
     Raises
     ------
