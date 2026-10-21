@@ -62,6 +62,7 @@ def ftrl_step(
     l1_reg: float = 0.0,
     l2_reg: float = 0.0,
     group_lasso_reg: float = 0.0,
+    group_lasso_gamma: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One FTRL-Proximal step, from Algorithm 1 of McMahan et al. 2013.
 
@@ -85,26 +86,36 @@ def ftrl_step(
     linear = (
         linear + grad - (new_accum_pow - accum**exponent) / learning_rate * weight
     )
-    # |linear| <= l1_reg pins the weight to exactly zero; that is the whole
-    # point of the L1 term and what separates FTRL from a shrinkage update.
-    thresholded = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
     if group_lasso_reg > 0.0:
-        # Group sparsity: the last dim is the group (one embedding row). Its
-        # whole thresholded linear term is shrunk by 1 - group_lasso_reg/||.||, or zeroed
-        # outright when the norm does not clear group_lasso_reg.
-        norm = thresholded.norm(dim=-1, keepdim=True)
+        # G-FTRL, Algorithm 1 and Eq. 3 of Ni et al., CIKM 2019. The last dim is
+        # the group (one embedding row, width d). Its raw linear term is zeroed
+        # when ||z||_2 <= lambda * sqrt(d), and otherwise shrunk by
+        # 1 - lambda * sqrt(d) / ||z||_2. There is no L1 soft-threshold in the
+        # paper's closed form, and gamma enters only through the learning rate.
+        assert l1_reg == 0.0, "the group-sparse update has no separate L1 term"
+        threshold = group_lasso_reg * linear.size(-1) ** 0.5
+        norm = linear.norm(dim=-1, keepdim=True)
         scale = torch.where(
-            norm > group_lasso_reg,
-            1.0 - group_lasso_reg / norm.clamp(min=1e-300),
+            norm > threshold,
+            1.0 - threshold / norm.clamp(min=1e-300),
             torch.zeros_like(norm),
         )
-        thresholded = thresholded * scale
-    denom = (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
+        numerator = scale * linear
+        denom = (
+            (ftrl_beta + new_accum_pow) / learning_rate
+            + l2_reg
+            + group_lasso_reg * group_lasso_gamma
+        )
+    else:
+        # |linear| <= l1_reg pins the weight to exactly zero; that is the whole
+        # point of the L1 term and what separates FTRL from a shrinkage update.
+        numerator = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
+        denom = (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
     # A coordinate with no gradient and no state has denom == 0 when beta and
     # l2_reg are zero; its numerator is zero too, and the answer is zero, not
     # the 0/0 an unguarded division gives.
     weight = torch.where(
-        thresholded == 0, torch.zeros_like(thresholded), -thresholded / denom
+        numerator == 0, torch.zeros_like(numerator), -numerator / denom
     )
     return weight, linear, new_accum
 
@@ -345,8 +356,8 @@ def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
 
 @cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False), (70, False)])
-@pytest.mark.parametrize("l1_reg", [0.0, 0.01], ids=["no_l1", "l1"])
-def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l1_reg):
+@pytest.mark.parametrize("gamma", [0.0, 0.5], ids=["no_gamma", "gamma"])
+def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma):
     """Rows of very different gradient scale, so some clear the threshold and some do not.
 
     Checks the weights against the float64 transcription, that the rows below
@@ -356,7 +367,9 @@ def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l1_reg):
     device = torch.device("cuda")
     num_rows = 64
     row_width = 3 * emb_dim
-    params = dict(learning_rate=0.1, l1_reg=l1_reg, group_lasso_reg=0.3, l2_reg=0.01)
+    params = dict(
+        learning_rate=0.1, group_lasso_reg=0.3, group_lasso_gamma=gamma, l2_reg=0.01
+    )
     optimizer = _ftrl_optimizer(**params)
 
     values = _fresh_ftrl_values(
@@ -440,8 +453,16 @@ def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
 def test_ftrl_group_args_validation_and_ckpt_meta():
     with pytest.raises(ValueError, match="group_lasso_reg"):
         _ftrl_optimizer(group_lasso_reg=-0.1)
+    with pytest.raises(ValueError, match="group_lasso_gamma"):
+        _ftrl_optimizer(group_lasso_reg=0.1, group_lasso_gamma=-1.0)
+    # The paper's update has no separate L1 term, so asking for both is refused
+    # rather than one of them being silently dropped.
+    with pytest.raises(ValueError, match="l1_reg"):
+        _ftrl_optimizer(group_lasso_reg=0.1, l1_reg=0.01)
+    assert _ftrl_optimizer(group_lasso_reg=0.0, l1_reg=0.01) is not None
     opt = _ftrl_optimizer(group_lasso_reg=0.25)
     assert opt.get_opt_args()["group_lasso_reg"] == 0.25
+    assert opt.get_opt_args()["group_lasso_gamma"] == 0.0
     meta = opt.get_opt_args()
     fresh = _ftrl_optimizer()
     fresh.set_opt_args(meta)
@@ -466,7 +487,7 @@ def _group_case(dims, dtype, rows_per_table=16, seed=31):
     """Rows that are decisively on one side of the threshold, one set of tables.
 
     Even rows get tiny gradients and odd rows large ones, so after one step the
-    row norm is far below ``group_lasso_reg`` for the first and far above it for
+    row norm is far below the group threshold for the first and far above it for
     the second. Nothing sits near the threshold, so the narrow dtypes' rounding
     cannot flip a row between the kernel and the float64 reference. The tiny
     gradients are kept large enough that their square is not lost in fp16.
@@ -526,7 +547,9 @@ def _check_group_rows(dims, dtype, params, weights, grads, table_of_row, out_of_
 _GROUP_DIMS = [[8], [5], [8, 4, 12], [12, 5, 8]]
 _GROUP_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 _GROUP_DIMS_IDS = ["8", "5", "vec4_mixed", "unaligned_mixed"]
-_GROUP_PARAMS = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.01, group_lasso_reg=1.0)
+_GROUP_PARAMS = dict(
+    learning_rate=0.1, l2_reg=0.01, group_lasso_reg=0.5, group_lasso_gamma=0.1
+)
 
 
 @cuda

@@ -281,7 +281,8 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta, const float l1_reg,
                                 const float l2_reg, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
-                                const float group_lasso_reg) {
+                                const float group_lasso_reg,
+                                const float group_lasso_gamma) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -291,6 +292,13 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
   TORCH_CHECK(group_lasso_reg >= 0.0f, "FTRL group_lasso_reg must be non-negative, got ",
               group_lasso_reg);
+  TORCH_CHECK(group_lasso_gamma >= 0.0f,
+              "FTRL group_lasso_gamma must be non-negative, got ",
+              group_lasso_gamma);
+  TORCH_CHECK(group_lasso_reg == 0.0f || l1_reg == 0.0f,
+              "FTRL with group_lasso_reg > 0 does not take l1_reg; the "
+              "group-sparse update has no separate L1 term (got l1_reg = ",
+              l1_reg, ")");
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
@@ -314,7 +322,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         FTRLVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
                                        use_sqrt, beta,
                                        l1_reg, l2_reg,
-                                       group_lasso_reg};
+                                       group_lasso_reg, group_lasso_gamma};
 
         // Only the group-sparse path reduces across the block, and it needs
         // one float of shared memory per thread to do it; plain FTRL asks for
@@ -512,7 +520,8 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float learning_rate_power,
                                    float beta, float l1_reg, float l2_reg,
-                                   float group_lasso_reg) {
+                                   float group_lasso_reg,
+                                   float group_lasso_gamma) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -525,6 +534,13 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
   TORCH_CHECK(group_lasso_reg >= 0.0f, "FTRL group_lasso_reg must be non-negative, got ",
               group_lasso_reg);
+  TORCH_CHECK(group_lasso_gamma >= 0.0f,
+              "FTRL group_lasso_gamma must be non-negative, got ",
+              group_lasso_gamma);
+  TORCH_CHECK(group_lasso_reg == 0.0f || l1_reg == 0.0f,
+              "FTRL with group_lasso_reg > 0 does not take l1_reg; the "
+              "group-sparse update has no separate L1 term (got l1_reg = ",
+              l1_reg, ")");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
@@ -539,7 +555,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
       FTRLVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
                                      use_sqrt, beta,
                                      l1_reg, l2_reg,
-                                     group_lasso_reg};
+                                     group_lasso_reg, group_lasso_gamma};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
@@ -593,7 +609,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_value_dims"), py::arg("table_emb_dims"), py::arg("lr"),
         py::arg("learning_rate_power"), py::arg("beta"), py::arg("l1_reg"),
         py::arg("l2_reg"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"), py::arg("group_lasso_reg") = 0.0f);
+        py::arg("table_dtype"), py::arg("group_lasso_reg") = 0.0f,
+        py::arg("group_lasso_gamma") = 0.0f);
 
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
@@ -630,5 +647,6 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("learning_rate_power"), py::arg("beta"),
-        py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f);
+        py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f,
+        py::arg("group_lasso_gamma") = 0.0f);
 }

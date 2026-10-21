@@ -564,7 +564,8 @@ square root and so recovers its `α / (β + √n)` learning rate exactly. Pass t
 | `initial_accumulator_value` | `0.0` | Seeds `accum`; `linear` always starts at 0. Read the note below before setting it non-zero. |
 | `l1_reg` | `0.0` | λ1. |
 | `l2_reg` | `0.0` | λ2. |
-| `group_lasso_reg` | `0.0` | Group-lasso strength λ_group -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`. |
+| `group_lasso_reg` | `0.0` | λ of G-FTRL -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`, and `l1_reg` must be `0` when it is positive. |
+| `group_lasso_gamma` | `0.0` | γ_g of G-FTRL: adds `λ·γ` to the learning rate's denominator. Must be `>= 0`; only read when `group_lasso_reg > 0`. |
 
 Two behaviours worth knowing before choosing FTRL:
 
@@ -599,20 +600,47 @@ Two behaviours worth knowing before choosing FTRL:
 
 #### FTRL with group sparsity
 
-Setting `group_lasso_reg > 0` gives FTRL with group sparsity (G-FTRL, *Feature Selection for Facebook Feed Ranking System via a Group-Sparsity-Regularized Training Algorithm*, Ni et al., CIKM 2019), with
-**one embedding row as the group**. `l1_reg` zeroes individual elements; the group term thresholds the L2 norm of the
-whole row, so a row's weights vanish *together*. With `s = sign(linear)·max(|linear| − l1_reg, 0)` per element:
+Setting `group_lasso_reg > 0` gives **G-FTRL**, Algorithm 1 and Eq. 3 of *Feature Selection for Facebook Feed Ranking
+System via a Group-Sparsity-Regularized Training Algorithm* (Ni et al., CIKM 2019), with **one embedding row of width
+`d` as the group**. Where `l1_reg` zeroes individual elements, the group term thresholds the L2 norm of the whole row,
+so a row's weights vanish *together*. `linear` and `accum` are updated exactly as in FTRL; only the weight solve differs.
+With `z = linear` after the update, `λ = group_lasso_reg` and `γ = group_lasso_gamma`:
 
 ```
-scale  = max(0, 1 − group_lasso_reg / ‖s‖₂)                      ‖·‖₂ over the row
-weight = −scale · s / ((ftrl_beta + new_accum^(−p)) / lr + l2_reg)
+weight = 0                                                       if ‖z‖₂ ≤ λ·√d
+       = −η_i · (1 − λ·√d / ‖z‖₂) · z_i                           otherwise
+η_i    = 1 / ((ftrl_beta + new_accum_i^(−p)) / lr + λ·γ + l2_reg)       ‖·‖₂ over the row
 ```
 
-The row is exactly zero whenever `‖s‖₂ ≤ group_lasso_reg`; otherwise every element is shrunk by the same factor. `linear` and
-`accum` are updated exactly as in FTRL, so the state layout, checkpoint width and `initial_accumulator_value` notes
-above all apply unchanged -- only the weight solve differs, and `group_lasso_reg = 0` takes the original single-pass kernel
-path and is bit-identical to it. The solve needs the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes
-over the row. Checkpoints written before this option existed load as `group_lasso_reg = 0`.
+- The threshold is on the **raw** `linear` and carries the group-size factor `√d`, so one `λ` serves rows of different
+  widths. There is no L1 soft-threshold in the paper's closed form, which is why `l1_reg` has no place in this update
+  and a positive `l1_reg` together with `group_lasso_reg > 0` is rejected rather than silently dropped.
+- `γ` enters only through the learning rate. `l2_reg` is not in the paper; it is kept as an extra term in `η` that does
+  nothing at its default of `0`.
+- `η_i` is per element, as in the paper's Algorithm 1, so within a non-zero row the shrink factor is common but the
+  step is not.
+- Eq. 3 as printed in the paper is typeset with a prefactor that reads as `1/η_t`; this follows Algorithm 1 and the
+  minimizer of Eq. 2, which give `η_t`.
+
+`group_lasso_reg = 0` takes the original single-pass kernel path and is bit-identical to plain FTRL. The solve needs
+the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes over the row. Checkpoints written before
+this option existed load as `group_lasso_reg = 0`, `group_lasso_gamma = 0`.
+
+**A freshly initialized row is the one most likely to be zeroed.** The threshold is on the row's accumulated
+`linear`, not on its weights, and `linear` starts at 0 -- so on the first update a row's initializer is not what
+is compared against the threshold, only the gradient history it has accumulated so far. With
+`initial_accumulator_value = 0` and `ftrl_beta = 0` that first step is, per element,
+
+```
+linear = g − |g| · weight / lr
+```
+
+so a row whose gradients are small has a small `‖z‖₂`, and if it does not exceed `λ·√d` the whole row, initializer
+included, is written as zero. This is the same effect as the initializer-retention table above, only all-or-nothing per
+row, and a larger `group_lasso_reg` makes it more likely. Choose `group_lasso_reg` below what a row with a typical
+first-step gradient reaches (`‖z‖₂ / √d`), or expect the rows that are touched only a few times to come out as zero.
+A zeroed row is not removed: its `linear` and `accum` keep accumulating, so it can become non-zero again once enough
+gradient has built up.
 
 Unlike the `EmbOptimType` optimizers, FTRL has no FBGEMM counterpart, so `construct_twin_module` cannot
 build a TorchRec twin for a model that uses it.
