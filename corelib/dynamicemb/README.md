@@ -96,7 +96,7 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 ## Usage Notes
 
 1. Only the following optimizer types are supported: `EXACT_SGD`, `ADAM`, `EXACT_ADAGRAD`,`EXACT_ROWWISE_ADAGRAD`. This behavior is to maintain consistency with TorchREC.
-2. The sharding method for dynamic embedding tables is always `row-wise sharding`, which will be evenly distributed across all GPUs within the TorchREC scope, unlike the `table-wise` and other sharding methods in TorchREC.
+2. A dynamic embedding table is sharded `row-wise`, over every GPU in the TorchREC scope, or `table-row-wise`, over the GPUs of a single node. Ask for the latter with `ShardingType.TABLE_ROW_WISE` in the table's `DynamicEmbParameterConstraints`, or by naming the table in `get_planner`'s `table_row_wise_embedding_table_names`; which node it lands on is chosen by the planner unless you pin it with `node_index`. TorchREC's `table-wise` and `column-wise` are not supported.
 3. The allocated memory for dynamic embedding tables may differ slightly from the requested `num_embeddings`. Capacity is aligned through `bucket_capacity` rules in `DynamicEmbTableOptions` (`BUCKET_ALIGNMENT` = 16), and the planner writes the effective per-rank `max_capacity`.
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
@@ -172,7 +172,7 @@ To get started with DynamicEmb, we highly recommend checking out the [example.py
 
 1. Continue tracking compatible TorchRec and FBGEMM_GPU releases.
 2. Support separation of backward and optimizer update, which is required by some large model frameworks.
-3. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise`, and `column-wise`.
+3. Add more shard types for dynamic embedding tables, including `table-wise` and `column-wise`.
 
 ## Acknowledgements
 

@@ -95,7 +95,9 @@ depends on the optimizer can be computed there.
 (`_table_configs`, which is what the `eb_configs` argument used to carry), fills
 each DynamicEmb table's options in place (`_prepare_dynemb_table_options`:
 initializer bounds, `max_capacity` via `_sharded_table_bucket_layout`,
-`local_hbm_for_values`, `dim`, `index_type`, `embedding_dtype`), chooses a node
+`local_hbm_for_values` from `global_hbm_for_values` and the table's own fanout
+-- the world under row-wise, one node under table-row-wise (§4.2) -- then
+`dim`, `index_type`, `embedding_dtype`), chooses a node
 for each table-row-wise table (`_choose_nodes`), and writes one
 `ParameterSharding` per table: the sharding type read off the constraint, one
 shard of `[max_capacity, dim]` per rank in `table_ranks` -- every rank for
@@ -129,7 +131,7 @@ with it; a rank's own copy is used for its capacity check and then replaced.
 ```python
 try:
     self._topology = self._reduced_topology                             # 2
-    reduced_module = module_without_tables(module, table_names, sharders)
+    reduced_module = module_without_tables(module, planned_keys, sharders)
     torchrec_plan = super().plan(reduced_module, sharders)              # 3
 finally:
     self._topology = whole_topology
@@ -547,8 +549,8 @@ held, and no later stage revisits the choice. Both are gone now that the placer
 and `per_rank_storage` call the same function over the same buckets.
 
 It must be deterministic: it runs on every rank, and two ranks that disagreed
-would shard one table onto two nodes. Ties break on the table name, then the
-lower node index.
+would shard one table onto two nodes. Ties break on the table's `TableKey` --
+its collection and then its name -- and then the lower node index.
 
 **`node_index` survives as a pin.** Set it and the placer honours it; leave it
 unset and the placer chooses. Pinned tables are charged first, so unpinned ones
@@ -564,7 +566,8 @@ caller expected something the plan will not do.
 
 **A pin is checked for fit like any other placement.** It says which node, not
 that the node will hold the table, so `BalancedNodePlacer` tests it against what
-is left on that node's tightest rank and refuses by name when it does not fit.
+is left on that node's tightest rank and refuses when it does not fit, naming
+the table as `collection.name`.
 Charging it unchecked was the earlier behaviour, on the reasoning that an
 overdraft would surface downstream -- §7.3 is where that reasoning fails.
 
@@ -906,7 +909,7 @@ key -> rank rule now lives in `key_ownership.py`.
 |---|---|---|
 | `dynamicemb_config.py` | `node_index` in `DynamicEmbTableOptions`. Done (M2). `_sharded_table_bucket_layout` needed no change -- it already takes the divisor as an argument; what changed is who computes it (`table_fanout`) | S |
 | `planner/planners.py` | TRW branch in `_plan_dynamicemb`; per-table capacity divisor. Done (M2). The ordering worry did not arise -- see §4.2 | M |
-| `planner/plan.py` | **new in M2** -- `table_fanout`, `table_ranks`. `per_rank_storage` needed no change: already per rank, and reads the shard metadata `_plan_dynamicemb` writes | S |
+| `planner/plan.py` | **new in M2** -- `table_fanout`, `table_ranks`. `per_rank_storage` was already per rank and reads the shard metadata `_plan_dynamicemb` writes, so M2 left it alone; it is keyed by `TableKey` and buckets by `fusion_key` since (§7.2). The file also holds `TableKey`, `sharded_modules`, `fusion_key`, `optimizer_types` and `module_without_tables` | S |
 | `planner/placement.py` | **new in M2** -- `NodePlacer`, `BalancedNodePlacer` | S |
 | `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` and `TwRwSparseFeaturesDist`. Done (M3): 169 lines of code, two overridden methods and one overridden `forward` | S |
 | `shard/embeddingbag.py` | dispatch TRW. Done (M3): one `elif` | S |
@@ -1295,6 +1298,14 @@ be silently unused:
 | a qualified key on a non-DynamicEmb table | TorchRec's planner is keyed by table name alone, so it would never look the key up |
 | one `DynamicEmbTableOptions` object reached by two occurrences | the geometry problem above; the message names `get_constraint_key` |
 
+`get_planner` cannot express the qualified form: its `eb_configs` is a flat
+list with no module to take a path from, so its name arguments are bare names
+and a qualified key matches none of them. It now refuses a name `eb_configs`
+does not declare rather than silently planning that table some other way --
+`table_row_wise_embedding_table_names` is the one that matters, since an
+unmatched name there reads as row-wise and nothing says so. A model that needs
+a qualified key builds its constraints and the planner directly.
+
 What the planner used to do was refuse any duplicate name outright, on a
 uniqueness check at the top of `_prepare_dynemb_table_options` — and for
 *every* table, DynamicEmb's and TorchRec's alike, so it rejected models
@@ -1326,8 +1337,11 @@ under-statement reaches the Topology handed to TorchRec as well — the two agre
 they are simply both short. That is why each attribute that *can* be known is in
 the key rather than left out, and why
 `test_tables_that_do_not_fuse_do_not_pool_their_budgets` has a case per
-attribute: drop any one and a layout the host tier cannot hold stops being
-refused.
+attribute the placer can vary -- the options, the optimizer, the pooling, the
+data type and the collection: drop any one from the key and a layout the host
+tier cannot hold stops being refused. The sharding type has no case there
+because `TableToPlace.fusion_key` fixes it at table-row-wise; what guards that
+component is `per_rank_storage`, which reads each table's own.
 
 **Two things this is not.** `caching` and `external_storage` are *in* the
 grouping key, so a group where one member asks for caching and another does not

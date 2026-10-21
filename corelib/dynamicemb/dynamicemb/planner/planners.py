@@ -452,7 +452,8 @@ def _prepare_dynemb_table_options(
     ``max_capacity`` becomes the per-rank row count a few lines down -- then
     ``_sharded_table_bucket_layout`` (sets effective ``bucket_capacity`` and per-rank
     ``max_capacity``), then ``local_hbm_for_values`` from
-    ``global_hbm_for_values`` and world size; then default ``index_type`` / ``embedding_dtype``,
+    ``global_hbm_for_values`` and the table's own ``fanout`` -- the world under
+    row-wise, one node under table-row-wise, not the world either way; then default ``index_type`` / ``embedding_dtype``,
     align ``init_capacity`` to the effective ``bucket_capacity`` when set; if aligned
     ``init_capacity`` exceeds ``max_capacity``, clamp it to ``max_capacity``; if ``init_capacity``
     was unset, set it to ``max_capacity``; set ``dim`` from ``BaseEmbeddingConfig.embedding_dim``.
