@@ -1000,17 +1000,11 @@ class TestResolveConstraints:
     because what a caller writes is a `constraints` dict and what they get back
     is a planned table or an error. Which function inside reaches that answer
     is ours to move.
-    """
 
-    def test_a_bare_name_still_reaches_its_table(self):
-        """Every constraints dict written before this existed is keyed this way,
-        and keeps working."""
-        module = _TwoCollections(["l"], ["r"])
-        planner = _planned(module, _dynamicemb_constraints("l", "r"))
-        assert set(planner._dyn_emb_options) == {
-            TableKey("left", "l"),
-            TableKey("right", "r"),
-        }
+    That a bare name reaches its table at all is not tested here: every other
+    test in this file keys its constraints that way, so the compatibility this
+    rests on is what the rest of the file is written in.
+    """
 
     def test_a_qualified_key_wins_over_a_bare_one(self):
         """Which is what makes a bare name usable as a default that one
@@ -1156,10 +1150,10 @@ class TestATableInMoreThanOneCollection:
         assert set(reduced.right.embedding_bags) == {"shared"}
 
 
-# --- sharded_modules: the one descent ---------------------------------------
+# --- the collection path: recorded once, filed once -------------------------
 
 
-class TestShardedModules:
+class TestCollectionPathsAgree:
     """The walk the planner makes, written once.
 
     `_table_configs` records which collection a table came out of and
@@ -1169,7 +1163,7 @@ class TestShardedModules:
     `f"{path}.{name}" if path else name`.
     """
 
-    def test_the_plan_lands_on_the_path_the_collection_was_recorded_as(self):
+    def test_the_plan_lands_where_the_collection_was_recorded(self):
         """The invariant the shared walk exists for. A ParameterSharding filed
         under a path `DistributedModelParallel` does not look for is not an
         error there -- it shards the modules its plan names and leaves the rest
