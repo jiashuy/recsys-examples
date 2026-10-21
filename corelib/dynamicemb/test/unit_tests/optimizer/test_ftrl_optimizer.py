@@ -810,6 +810,9 @@ def test_ftrl_group_threshold_boundary(all_dims_vec4, dtype):
         values[row, emb_dim : 2 * emb_dim] = level
     values[:, 2 * emb_dim :] = 0.1
     stored_linear = values[:, emb_dim : 2 * emb_dim].double()
+    # The buffer is updated in place, so keep the state as it was before the
+    # step to compare against; reading it back afterwards compares it to itself.
+    state_before = values[:, emb_dim:].clone()
     values = values.to(device)
 
     _padded_group_step(
@@ -825,8 +828,9 @@ def test_ftrl_group_threshold_boundary(all_dims_vec4, dtype):
     assert bool((out[0, :emb_dim] == 0).all())
     assert bool((out[1, :emb_dim] == 0).all()), "norm == threshold must zero the row"
     assert bool((out[2, :emb_dim] != 0).all())
-    # State is untouched by a zero gradient.
-    torch.testing.assert_close(out[:, emb_dim:].double(), values.cpu()[:, emb_dim:].double())
+    # A zero gradient leaves the state exactly as it was: accum does not move
+    # and sigma is zero, so linear does not either.
+    torch.testing.assert_close(out[:, emb_dim:], state_before, rtol=0, atol=0)
 
 
 @cuda
