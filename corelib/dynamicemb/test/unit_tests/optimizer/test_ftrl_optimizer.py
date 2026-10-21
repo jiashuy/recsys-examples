@@ -666,6 +666,349 @@ def test_ftrl_step_reference_is_zero_for_untouched_coordinate():
         assert bool((weight == 0).all()) and bool((accum == 0).all())
 
 
+def _padded_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
+    """One padded-buffer step on a single-table buffer; see _run_group_step."""
+    _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4)
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
+def test_ftrl_group_multistep_reactivation_matches_reference(emb_dim, all_dims_vec4):
+    """Several steps from a non-zero history, with rows that go to zero and come back.
+
+    The single-step tests start from zero state. Here every step is checked
+    against the float64 reference with the state carried forward, a row that
+    was zeroed keeps accumulating, and a later gradient brings it back.
+    """
+    device = torch.device("cuda")
+    num_rows = 12
+    params = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.3)
+    optimizer = _ftrl_optimizer(**params)
+
+    values = _fresh_ftrl_values(
+        num_rows, emb_dim, 3 * emb_dim, emb_dim, 0.0, device, seed=2
+    )
+    ref_w = values[:, :emb_dim].cpu().double()
+    ref_l = values[:, emb_dim : 2 * emb_dim].cpu().double()
+    ref_a = values[:, 2 * emb_dim :].cpu().double()
+
+    generator = torch.Generator(device="cpu").manual_seed(8)
+    small, large = 5e-3, 1.0
+    # Even rows: quiet, quiet, loud, quiet. Odd rows: loud, quiet, quiet, quiet.
+    schedule = [
+        [small, large],
+        [small, small],
+        [large, small],
+        [small, small],
+    ]
+    was_zero = torch.zeros(num_rows, dtype=torch.bool)
+    reactivated = False
+    for step, (even_scale, odd_scale) in enumerate(schedule):
+        scale = torch.where(
+            torch.arange(num_rows) % 2 == 0,
+            torch.tensor(even_scale),
+            torch.tensor(odd_scale),
+        ).unsqueeze(1)
+        grads = torch.randn(num_rows, emb_dim, generator=generator) * scale
+        ref_w, ref_l, ref_a = ftrl_step(ref_w, ref_l, ref_a, grads, **params)
+        _padded_group_step(optimizer, values, grads.to(device), emb_dim, all_dims_vec4)
+
+        out = values.cpu()
+        torch.testing.assert_close(
+            out[:, :emb_dim].double(),
+            ref_w,
+            rtol=1e-4,
+            atol=1e-5,
+            msg=lambda m, i=step: f"weight, step {i}: {m}",
+        )
+        torch.testing.assert_close(
+            out[:, emb_dim : 2 * emb_dim].double(), ref_l, rtol=1e-4, atol=1e-5
+        )
+        zero_now = (ref_w == 0).all(dim=1)
+        assert bool((out[zero_now, :emb_dim] == 0).all()), f"step {step}"
+        reactivated = reactivated or bool((was_zero & ~zero_now).any())
+        was_zero = zero_now
+    assert reactivated, "the schedule should bring a zeroed row back"
+
+
+@cuda
+def test_ftrl_group_resume_matches_uninterrupted():
+    """Checkpoint meta carries everything needed to keep training with the group term.
+
+    Step, rebuild the optimizer from its own meta alone (as a resumed run
+    does), step again: the result must match two uninterrupted steps exactly.
+    """
+    device = torch.device("cuda")
+    emb_dim = 8
+    params = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.3)
+    generator = torch.Generator(device="cpu").manual_seed(4)
+    grads = [
+        (torch.randn(16, emb_dim, generator=generator) * 0.5).to(device)
+        for _ in range(2)
+    ]
+
+    straight = _fresh_ftrl_values(16, emb_dim, 3 * emb_dim, emb_dim, 0.0, device)
+    resumed = straight.clone()
+    optimizer = _ftrl_optimizer(**params)
+    for g in grads:
+        _padded_group_step(optimizer, straight, g, emb_dim, True)
+
+    first = _ftrl_optimizer(**params)
+    _padded_group_step(first, resumed, grads[0], emb_dim, True)
+    # The resumed run starts from the default (plain FTRL) configuration and
+    # takes everything else from the checkpoint meta.
+    second = _ftrl_optimizer()
+    second.set_opt_args(first.get_opt_args())
+    _padded_group_step(second, resumed, grads[1], emb_dim, True)
+
+    torch.testing.assert_close(resumed, straight, rtol=0, atol=0)
+
+
+@cuda
+def test_ftrl_group_single_coordinate_is_a_larger_l1():
+    """With d = 1 the group term is a plain L1 threshold of l1_reg + group_lasso_reg."""
+    device = torch.device("cuda")
+    num_rows = 64
+    l1, group = 0.03, 0.04
+    grouped = _fresh_ftrl_values(num_rows, 1, 3, 1, 0.0, device, seed=6)
+    plain = grouped.clone()
+    generator = torch.Generator(device="cpu").manual_seed(12)
+    scale = torch.logspace(-2, 0, num_rows).unsqueeze(1)
+    grads = (torch.randn(num_rows, 1, generator=generator) * scale).to(device)
+
+    _padded_group_step(
+        _ftrl_optimizer(l1_reg=l1, group_lasso_reg=group), grouped, grads, 1, False
+    )
+    _padded_group_step(_ftrl_optimizer(l1_reg=l1 + group), plain, grads, 1, False)
+
+    assert bool((plain[:, 0] == 0).any()) and bool((plain[:, 0] != 0).any())
+    assert torch.equal(grouped[:, 0] == 0, plain[:, 0] == 0)
+    torch.testing.assert_close(grouped, plain, rtol=1e-4, atol=1e-6)
+
+
+@cuda
+@pytest.mark.parametrize("all_dims_vec4", [True, False], ids=["vec4", "scalar"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["fp32", "fp16", "bf16"]
+)
+def test_ftrl_group_threshold_boundary(all_dims_vec4, dtype):
+    """A row exactly at the threshold is zeroed; just above it is not; just below is.
+
+    With zero gradient the state does not move, so the row norm is the
+    linear term's and the case can be built exactly: four elements of 0.5 have
+    norm 1.0 and the threshold is 0.5 * sqrt(4) = 1.0.
+    """
+    device = torch.device("cuda")
+    emb_dim = 4
+    params = dict(learning_rate=0.1, group_lasso_reg=0.5)
+    optimizer = _ftrl_optimizer(**params)
+
+    linear_levels = [0.49, 0.5, 0.51]
+    values = torch.zeros(len(linear_levels), 3 * emb_dim, dtype=dtype)
+    values[:, :emb_dim] = 0.3
+    for row, level in enumerate(linear_levels):
+        values[row, emb_dim : 2 * emb_dim] = level
+    values[:, 2 * emb_dim :] = 0.1
+    stored_linear = values[:, emb_dim : 2 * emb_dim].double()
+    values = values.to(device)
+
+    _padded_group_step(
+        optimizer, values, torch.zeros(3, emb_dim, dtype=dtype, device=device),
+        emb_dim, all_dims_vec4,
+    )
+    out = values.cpu()
+
+    norms = stored_linear.norm(dim=1)
+    assert bool(norms[0] < 1.0) and bool(norms[2] > 1.0)
+    # The middle row's norm is exactly the threshold in every dtype.
+    assert float(norms[1]) == 1.0
+    assert bool((out[0, :emb_dim] == 0).all())
+    assert bool((out[1, :emb_dim] == 0).all()), "norm == threshold must zero the row"
+    assert bool((out[2, :emb_dim] != 0).all())
+    # State is untouched by a zero gradient.
+    torch.testing.assert_close(out[:, emb_dim:].double(), values.cpu()[:, emb_dim:].double())
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(2048, True), (3001, False)])
+def test_ftrl_group_large_dim_matches_reference(emb_dim, all_dims_vec4):
+    """Rows wider than a thread block: several elements per thread, two passes."""
+    device = torch.device("cuda")
+    num_rows = 8
+    params = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.3)
+    values = _fresh_ftrl_values(
+        num_rows, emb_dim, 3 * emb_dim, emb_dim, 0.0, device, seed=9
+    )
+    generator = torch.Generator(device="cpu").manual_seed(15)
+    row_scale = torch.where(
+        torch.arange(num_rows) % 2 == 0, torch.tensor(1e-3), torch.tensor(1.0)
+    ).unsqueeze(1)
+    grads = torch.randn(num_rows, emb_dim, generator=generator) * row_scale
+
+    ref_w, ref_l, ref_a = ftrl_step(
+        values[:, :emb_dim].cpu(),
+        values[:, emb_dim : 2 * emb_dim].cpu(),
+        values[:, 2 * emb_dim :].cpu(),
+        grads,
+        **params,
+    )
+    _padded_group_step(
+        _ftrl_optimizer(**params), values, grads.to(device), emb_dim, all_dims_vec4
+    )
+    weight = values[:, :emb_dim].cpu()
+    zero_rows = (ref_w == 0).all(dim=1)
+    assert zero_rows.any() and not zero_rows.all()
+    assert bool((weight[zero_rows] == 0).all())
+    torch.testing.assert_close(weight.double(), ref_w, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        values[:, emb_dim : 2 * emb_dim].cpu().double(), ref_l, rtol=1e-4, atol=1e-5
+    )
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
+def test_ftrl_group_update_satisfies_optimality_when_curvature_is_shared(
+    emb_dim, all_dims_vec4
+):
+    """Independent of any transcription of the update: check the objective's KKT conditions.
+
+    For
+
+        min_w  z.w + 1/2 sum h_i w_i^2 + l1 |w|_1 + tau |w|_2,   tau = lambda * sqrt(d)
+
+    a non-zero row satisfies z_i + h_i w_i + l1 sign(w_i) + tau w_i / |w|_2 = 0
+    where w_i != 0 and |z_i| <= l1 where w_i == 0, and a zero row needs
+    |soft_threshold(z, l1)|_2 <= tau. The kernel's update is exact when every
+    h_i in the row is equal, so make them equal: every element of a row gets a
+    gradient of the same magnitude on the same seeded accumulator.
+    """
+    device = torch.device("cuda")
+    num_rows = 48
+    beta, lr, l1, l2, lam = 0.2, 0.1, 0.05, 0.03, 0.3
+    optimizer = _ftrl_optimizer(
+        learning_rate=lr, ftrl_beta=beta, l1_reg=l1, l2_reg=l2, group_lasso_reg=lam
+    )
+    values = _fresh_ftrl_values(
+        num_rows, emb_dim, 3 * emb_dim, emb_dim, 0.1, device, seed=3
+    )
+    generator = torch.Generator(device="cpu").manual_seed(21)
+    magnitude = torch.logspace(-2, 0.3, num_rows).unsqueeze(1)
+    signs = torch.randint(0, 2, (num_rows, emb_dim), generator=generator) * 2 - 1
+    grads = (signs * magnitude).to(device)
+
+    _padded_group_step(optimizer, values, grads, emb_dim, all_dims_vec4)
+    out = values.cpu().double()
+    w = out[:, :emb_dim]
+    z = out[:, emb_dim : 2 * emb_dim]
+    n = out[:, 2 * emb_dim :]
+    h = (beta + n.sqrt()) / lr + l2
+    tau = lam * emb_dim**0.5
+
+    soft = torch.sign(z) * (z.abs() - l1).clamp(min=0)
+    row_zero = (w == 0).all(dim=1)
+    assert row_zero.any() and not row_zero.all()
+    assert bool((soft[row_zero].norm(dim=1) <= tau * (1 + 1e-4)).all())
+
+    live = ~row_zero
+    wn = w[live].norm(dim=1, keepdim=True)
+    resid = z[live] + h[live] * w[live] + l1 * torch.sign(w[live]) + tau * w[live] / wn
+    nonzero = w[live] != 0
+    assert float(resid[nonzero].abs().max()) < 1e-3
+    assert bool((z[live][~nonzero].abs() <= l1 * (1 + 1e-4)).all())
+
+
+@cuda
+@pytest.mark.parametrize("emb_dim", [8, 6], ids=["vec4", "unaligned"])
+def test_ftrl_group_backward_duplicate_keys_update_once_with_summed_gradient(emb_dim):
+    """A key looked up several times in one step is updated once, with the summed gradient.
+
+    (g1 + g2)^2 is not g1^2 + g2^2, so applying the optimizer once per lookup
+    would accumulate a different ``accum`` than aggregating first. With
+    ``loss = embs.sum()`` a key looked up ``c`` times receives a gradient of
+    ``c`` on every element, so the reference steps each row once with ``c``.
+    """
+    device_id = 0
+    device = torch.device(f"cuda:{device_id}")
+    key_type = torch.int64
+    value_type = torch.float32
+    num_keys = 12
+    opt_params = dict(
+        learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.5
+    )
+
+    options = DynamicEmbTableOptions(
+        dim=emb_dim,
+        max_capacity=2048,
+        index_type=key_type,
+        embedding_dtype=value_type,
+        device_id=device_id,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=False,
+        local_hbm_for_values=1024**3,
+    )
+    bdeb = BatchedDynamicEmbeddingTablesV2(
+        table_names=["table0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=DynamicEmbOptimType.FTRL,
+        **opt_params,
+    )
+    optimizer = bdeb.optimizer
+    storage = bdeb.tables
+    state_dim = optimizer.get_state_dim(emb_dim)
+    max_emb_dim = storage.max_embedding_dim()
+    max_value_dim = storage.max_value_dim()
+
+    generator = torch.Generator(device="cpu").manual_seed(19)
+    weights = torch.rand(num_keys, emb_dim, generator=generator).to(device)
+    values = torch.zeros(num_keys, max_value_dim, dtype=value_type, device=device)
+    values[:, :emb_dim] = weights
+    optimizer.reset_optimizer_states(
+        values[:, max_emb_dim : max_emb_dim + state_dim], emb_dims=emb_dim
+    )
+    all_keys = torch.arange(num_keys, device=device, dtype=key_type)
+    storage.set_score(1)
+    storage.insert(all_keys, torch.zeros_like(all_keys), values)
+
+    # Key k is looked up (k % 3) + 1 times in every step.
+    counts = (torch.arange(num_keys) % 3) + 1
+    keys = all_keys.cpu().repeat_interleave(counts).to(device)
+    offsets = torch.arange(keys.numel() + 1, device=device).to(key_type)
+
+    ref_w = weights.double().cpu()
+    ref_l = torch.zeros(num_keys, emb_dim, dtype=torch.float64)
+    ref_a = torch.zeros(num_keys, emb_dim, dtype=torch.float64)
+    grad = counts.double().unsqueeze(1).expand(num_keys, emb_dim)
+    for _ in range(3):
+        embs = bdeb(keys, offsets)
+        embs.sum().backward()
+        torch.cuda.synchronize()
+        ref_w, ref_l, ref_a = ftrl_step(ref_w, ref_l, ref_a, grad, **opt_params)
+
+    seen = 0
+    for keys_b, emb_b, opt_b, _ in export_keys_values_iter(
+        storage._state, device, table_id=0
+    ):
+        if keys_b.numel() == 0:
+            continue
+        seen += keys_b.numel()
+        idx = keys_b.cpu()
+        zero_rows = (ref_w[idx] == 0).all(dim=1)
+        assert bool((emb_b.cpu()[zero_rows] == 0).all())
+        torch.testing.assert_close(
+            emb_b.cpu().double(), ref_w[idx], rtol=1e-4, atol=1e-5, msg="weight"
+        )
+        torch.testing.assert_close(
+            opt_b[:, emb_dim:].cpu().double(),
+            ref_a[idx],
+            rtol=1e-5,
+            atol=1e-6,
+            msg="accum",
+        )
+    assert seen == num_keys
+
+
 if __name__ == "__main__":
     import sys
 

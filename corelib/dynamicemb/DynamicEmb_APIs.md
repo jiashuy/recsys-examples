@@ -647,8 +647,31 @@ weight = 0                                         if ‖s‖₂ ≤ τ
   solution when every `hᵢ` in the row is the same and is an approximation when they differ.
 
 `group_lasso_reg = 0` takes the original single-pass kernel path and is bit-identical to plain FTRL. The solve needs
-the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes over the row. Checkpoints written before
-this option existed load as `group_lasso_reg = 0`.
+the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes over the row.
+
+How the group threshold is set, and what surrounds the update:
+
+- **The group size scaling is fixed at `√d`.** `τ = group_lasso_reg · √d`, with `d` the row's real embedding width (not
+  a padded buffer's widest row), so a table's own `dim` is what enters. There is no option to change it. As above, this
+  is a convention, not a promise of equal sparsity across widths.
+- **Regularization lives in the update, not the gradient.** `l1_reg`, `l2_reg` and `group_lasso_reg` are applied when the
+  row is rebuilt from `(linear, accum)`; the gradient handed to the optimizer must not also carry their gradients. On the
+  way there a gradient is clipped (when clipping is on), summed over repeated lookups of the same key, cast to the
+  embedding dtype, and only then given to the optimizer, so a key looked up several times in a step is updated **once**
+  with the summed gradient. That is not the same as updating once per lookup, since `(g₁+g₂)² ≠ g₁²+g₂²`.
+- **Only rows touched in a step are updated.** A row that no key in the step looks up is not visited: its `linear` and
+  `accum` do not change and it is not re-solved, so this is not equivalent to a pass over every row at each step.
+- **The learning rate is read at each step but never applied retroactively.** `σ = (n_new^(−p) − n_old^(−p)) / lr`
+  is computed with the current `lr`, and `linear` already holds the history built under earlier values. Changing the
+  learning rate with `set_learning_rate` partway through training therefore does not reproduce a run that used the new
+  value from the start. This is the behaviour of FTRL here, not specific to the group term.
+- **State precision.** `linear` and `accum` live in the table's value row at the table's dtype, so a fp16 or bf16 table
+  keeps them at that precision (`optimizer_state_dtype` is only for row-wise Adagrad). The group path rounds the
+  updated state to that dtype *before* taking the row norm, so the zero test is of what is stored. A row whose norm is
+  very close to `τ` can therefore fall on the other side than it would in fp32.
+- **Checkpoints.** The meta records `group_lasso_reg` and loading restores it, so a resumed run keeps training with the
+  group term instead of falling back to plain FTRL. Checkpoints written before this option existed carry no
+  `group_lasso_reg` and load as `group_lasso_reg = 0`.
 
 **A freshly initialized row is the one most likely to be zeroed.** The threshold is on the row's accumulated
 `linear`, not on its weights, and `linear` starts at 0 -- so on the first update a row's initializer is not what
