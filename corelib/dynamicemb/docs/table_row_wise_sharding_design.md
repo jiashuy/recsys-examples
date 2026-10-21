@@ -1351,6 +1351,13 @@ accounted for: it zeroes the host tier in the two layouts that have a backing
 tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
 and warns, so its host tier is local and is counted, which is correct.
 
+Both are read only *after* the group is found not to fit, as the runtime reads
+them: `_create_cache_storage` tests `total_memory > local_hbm` first, and a
+group that fits is HBM_ONLY whatever it asked for. Asking about `caching`
+before that cost a group its whole budget in HBM and its whole size again on
+the host -- 20 GB and 4 GiB where the runtime spends 4 GiB and nothing -- which
+is the over-stating direction, so it refused layouts that would have run.
+
 ---
 
 ### 7.2.1 The placer prices a table against its neighbours
