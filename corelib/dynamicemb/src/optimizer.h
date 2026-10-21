@@ -74,8 +74,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta, const float l1_reg,
                                 const float l2_reg, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
-                                const float group_lasso_reg = 0.0f,
-                                const float group_lasso_gamma = 0.0f);
+                                const float group_lasso_reg = 0.0f);
 
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_ids,
@@ -110,8 +109,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float learning_rate_power,
                                    float beta, float l1_reg, float l2_reg,
-                                   float group_lasso_reg,
-                                   float group_lasso_gamma = 0.0f);
+                                   float group_lasso_reg);
 
 } // namespace dyn_emb
 #endif // OPTIMIZER_H

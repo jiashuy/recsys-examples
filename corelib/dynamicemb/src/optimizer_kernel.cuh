@@ -471,13 +471,9 @@ struct FTRLVecOptimizer {
   // lambda1 and lambda2 in the paper.
   const float l1_reg;
   const float l2_reg;
-  // lambda of G-FTRL (Ni et al., CIKM 2019): a row whose accumulated linear
-  // term has L2 norm of at most lambda * sqrt(row width) is zeroed as a whole.
-  // Zero is plain FTRL and takes the single-pass path.
+  // tau_g = group_lasso_reg * sqrt(d) is the threshold on a row's L2 norm (see
+  // the update below). Zero is plain FTRL and takes the single-pass path.
   const float group_lasso_reg;
-  // gamma_g of G-FTRL. It enters only through the learning rate, as
-  // lambda * gamma added to the denominator.
-  const float group_lasso_gamma;
 
   DEVICE_INLINE float accum_pow(const float accum) const {
     return use_sqrt ? sqrtf(accum) : powf(accum, -learning_rate_power);
@@ -501,20 +497,22 @@ struct FTRLVecOptimizer {
     }
   }
 
-  // G-FTRL, Algorithm 1 and Eq. 3 of Ni et al., CIKM 2019 ("Feature Selection
-  // for Facebook Feed Ranking System via a Group-Sparsity-Regularized Training
-  // Algorithm"), with a row of width d as the group. Per row, with s the
-  // linear term z soft-thresholded by l1_reg (s = z when l1_reg = 0, which is
-  // the paper's closed form; with l1_reg > 0 it is the sparse-group-lasso
-  // step of Yue et al., arXiv:2107.14432, Algorithm 3):
-  //   zero the row            if ||s||_2 <= lambda * sqrt(d)
-  //   w_i = -eta_i * (1 - lambda * sqrt(d) / ||s||_2) * s_i      otherwise
-  //   eta_i = 1 / ((beta + n_i^(-p)) / lr + lambda * gamma [+ l2_reg])
-  // with lambda = group_lasso_reg, gamma = group_lasso_gamma. l2_reg is not in
-  // the paper; it is kept as an extra term in eta that is zero by default. The row norm is needed before any weight can be written, so a row
-  // is two passes: pass one advances (linear, accum) and sums z_i^2; pass two
-  // re-solves the weights. The same thread owns the same elements in both, so
-  // the second pass reads back its own stores without a barrier.
+  // Group-sparse FTRL. Each step rebuilds a row (the group g, width d) from
+  // its FTRL state (z = linear, n = accum) as the solution of
+  //   min_w  z.w + 1/2 sum_i a_i w_i^2 + l1 |w|_1 + l2/2 |w|_2^2 + tau |w|_2
+  //   a_i = (beta + n_i^(-p)) / lr,   tau = group_lasso_reg * sqrt(d)
+  // which follows G-FTRL (Ni et al., CIKM 2019, Algorithm 1 and Eq. 3) with the
+  // L1 term of the sparse group lasso of Yue et al., arXiv:2107.14432,
+  // Algorithm 3. With s_i = sign(z_i) * max(|z_i| - l1, 0) and h_i = a_i + l2:
+  //   zero the row            if ||s||_2 <= tau        (exact)
+  //   w_i = -(1 - tau / ||s||_2) * s_i / h_i           otherwise
+  // The shrink factor is common to the row, which is the paper's practical
+  // form; it is exact when every h_i in the row is equal, and an approximation
+  // when they differ. l1 = 0 is the paper's closed form, group_lasso_reg = 0 is
+  // plain FTRL. The row norm is needed before any weight can be written, so a
+  // row is two passes: pass one advances (linear, accum) and sums s_i^2; pass
+  // two re-solves the weights. The same thread owns the same elements in both,
+  // so the second pass reads back its own stores without a barrier.
 
   // Advance one coordinate's state, leaving the weight alone: the linear term
   // needs the weight from before this step. Returns s_i^2 for the row norm,
@@ -549,8 +547,7 @@ struct FTRLVecOptimizer {
       return 0.0f;
     const float sign_linear = (0.0f < linear) - (linear < 0.0f);
     return -scale * sign_linear * s /
-           ((beta + accum_pow(accum)) / lr + l2_reg +
-            group_lasso_reg * group_lasso_gamma);
+           ((beta + accum_pow(accum)) / lr + l2_reg);
   }
 
   DEVICE_INLINE void update4_group(const OptimizierInput<wgrad_t, weight_t> &input) {

@@ -565,7 +565,6 @@ square root and so recovers its `α / (β + √n)` learning rate exactly. Pass t
 | `l1_reg` | `0.0` | λ1. |
 | `l2_reg` | `0.0` | λ2. |
 | `group_lasso_reg` | `0.0` | λ of G-FTRL -- see [FTRL with group sparsity](#ftrl-with-group-sparsity). `0` is plain FTRL. Must be `>= 0`. Combines with `l1_reg` (sparse group lasso). |
-| `group_lasso_gamma` | `0.0` | γ_g of G-FTRL: adds `λ·γ` to the learning rate's denominator. Must be `>= 0`; only read when `group_lasso_reg > 0`. |
 
 Two behaviours worth knowing before choosing FTRL:
 
@@ -600,34 +599,56 @@ Two behaviours worth knowing before choosing FTRL:
 
 #### FTRL with group sparsity
 
-Setting `group_lasso_reg > 0` gives **G-FTRL**, Algorithm 1 and Eq. 3 of *Feature Selection for Facebook Feed Ranking
-System via a Group-Sparsity-Regularized Training Algorithm* (Ni et al., CIKM 2019), with **one embedding row of width
-`d` as the group**. Where `l1_reg` zeroes individual elements, the group term thresholds the L2 norm of the whole row,
-so a row's weights vanish *together*. `linear` and `accum` are updated exactly as in FTRL; only the weight solve differs.
-With `z = linear` after the update, `s = sign(z)·max(|z| − l1_reg, 0)`, `λ = group_lasso_reg` and
-`γ = group_lasso_gamma`:
+Setting `group_lasso_reg > 0` adds a group-lasso term to FTRL, following **G-FTRL** (Algorithm 1 and Eq. 3 of *Feature
+Selection for Facebook Feed Ranking System via a Group-Sparsity-Regularized Training Algorithm*, Ni et al., CIKM 2019),
+with **one embedding row of width `d` as the group**. `linear` and `accum` are updated exactly as in FTRL; only the
+weight solve differs.
+
+`l1_reg`, `l2_reg` and `group_lasso_reg` are independent parameters. Each step rebuilds a row from its FTRL state
+(`z = linear`, `n = accum`) as the solution of
 
 ```
-weight = 0                                                       if ‖s‖₂ ≤ λ·√d
-       = −η_i · (1 − λ·√d / ‖s‖₂) · s_i                           otherwise
-η_i    = 1 / ((ftrl_beta + new_accum_i^(−p)) / lr + λ·γ + l2_reg)       ‖·‖₂ over the row
+min_w   z·w + ½ Σᵢ aᵢ wᵢ² + l1_reg·‖w‖₁ + (l2_reg / 2)·‖w‖₂² + τ·‖w‖₂
+aᵢ = (ftrl_beta + nᵢ^(−p)) / lr          τ = group_lasso_reg · √d          ‖·‖₂ over the row
 ```
 
-- The threshold carries the group-size factor `√d`, so one `λ` serves rows of different widths.
-- With `l1_reg = 0` (the default) `s = z`, which is the paper's closed form exactly. With `l1_reg > 0` the row norm is
-  taken after the L1 soft-threshold, the sparse-group-lasso step of *Adaptive Optimizers with Sparse Group Lasso for
-  Neural Networks in CTR Prediction* (Yue et al., arXiv:2107.14432, Algorithm 3), so L1 zeroes elements inside a row
-  that survives the group test.
-- `γ` enters only through the learning rate. `l2_reg` is not in the paper; it is kept as an extra term in `η` that does
-  nothing at its default of `0`.
-- `η_i` is per element, as in the paper's Algorithm 1, so within a non-zero row the shrink factor is common but the
-  step is not.
+This is the interface contract of this option, not a claim that the papers define exactly this version. The papers
+define the update below; for the objective above that update is exact in the zero test and in the equal-`h` case, and
+an approximation otherwise (see the last bullet). The configurations it gives:
+
+| Set | Effect |
+| --- | --- |
+| `l1_reg` only | element-level sparsity |
+| `group_lasso_reg` only | row-level sparsity |
+| `l1_reg` + `group_lasso_reg` | row-level and element-level sparsity together |
+| plus `l2_reg` | bounds the weights on top of any of the above |
+
+With `s = sign(z)·max(|z| − l1_reg, 0)` and `hᵢ = aᵢ + l2_reg`, the update is
+
+```
+weight = 0                                         if ‖s‖₂ ≤ τ
+       = −(1 − τ / ‖s‖₂) · sᵢ / hᵢ                  otherwise
+```
+
+- The threshold carries the group-size factor `√d`, a scaling convention taken from the paper. It does not guarantee
+  that rows of different widths end up with the same sparsity rate: how often a row clears `λ·√d` still depends on the
+  gradients it receives, so `λ` may need tuning per table when the widths differ.
+- With `l1_reg = 0` (the default) `s = z`, which is the paper's closed form. With `l1_reg > 0` the row norm is taken
+  after the L1 soft-threshold, the sparse-group-lasso step of *Adaptive Optimizers with Sparse Group Lasso for Neural
+  Networks in CTR Prediction* (Yue et al., arXiv:2107.14432, Algorithm 3), so L1 zeroes elements inside a row that
+  survives the group test.
+- The paper's own `γ_g`, which only adds `λ·γ_g` to the denominator that `l2_reg` already feeds, is not a separate
+  knob; `l2_reg = λ·γ_g` reproduces it.
 - Eq. 3 as printed in the paper is typeset with a prefactor that reads as `1/η_t`; this follows Algorithm 1 and the
-  minimizer of Eq. 2, which give `η_t`.
+  minimizer of the objective, which give `η_t`.
+- **The zero test is exact, the shrink factor is not always.** The stationarity condition of the objective gives
+  `wᵢ = −sᵢ / (hᵢ + τ/‖w‖₂)`, which is zero for the whole row exactly when `‖s‖₂ ≤ τ`. In a non-zero row the update above
+  uses one shrink factor `1 − τ/‖s‖₂` for the row and the per-element `hᵢ`, as the papers do; that equals the exact
+  solution when every `hᵢ` in the row is the same and is an approximation when they differ.
 
 `group_lasso_reg = 0` takes the original single-pass kernel path and is bit-identical to plain FTRL. The solve needs
 the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes over the row. Checkpoints written before
-this option existed load as `group_lasso_reg = 0`, `group_lasso_gamma = 0`.
+this option existed load as `group_lasso_reg = 0`.
 
 **A freshly initialized row is the one most likely to be zeroed.** The threshold is on the row's accumulated
 `linear`, not on its weights, and `linear` starts at 0 -- so on the first update a row's initializer is not what

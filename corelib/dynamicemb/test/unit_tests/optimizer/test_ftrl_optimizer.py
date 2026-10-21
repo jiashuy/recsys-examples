@@ -62,7 +62,6 @@ def ftrl_step(
     l1_reg: float = 0.0,
     l2_reg: float = 0.0,
     group_lasso_reg: float = 0.0,
-    group_lasso_gamma: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One FTRL-Proximal step, from Algorithm 1 of McMahan et al. 2013.
 
@@ -93,8 +92,7 @@ def ftrl_step(
         # closed form; otherwise the sparse-group-lasso step of Yue et al.,
         # arXiv:2107.14432, Algorithm 3), the row is zeroed when
         # ||s||_2 <= lambda * sqrt(d), and otherwise shrunk by
-        # 1 - lambda * sqrt(d) / ||s||_2. gamma enters only through the
-        # learning rate.
+        # 1 - lambda * sqrt(d) / ||s||_2.
         s = torch.sign(linear) * (linear.abs() - l1_reg).clamp(min=0)
         threshold = group_lasso_reg * linear.size(-1) ** 0.5
         norm = s.norm(dim=-1, keepdim=True)
@@ -104,11 +102,7 @@ def ftrl_step(
             torch.zeros_like(norm),
         )
         numerator = scale * s
-        denom = (
-            (ftrl_beta + new_accum_pow) / learning_rate
-            + l2_reg
-            + group_lasso_reg * group_lasso_gamma
-        )
+        denom = (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
     else:
         # |linear| <= l1_reg pins the weight to exactly zero; that is the whole
         # point of the L1 term and what separates FTRL from a shrinkage update.
@@ -359,9 +353,9 @@ def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
 
 @cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False), (70, False)])
-@pytest.mark.parametrize("gamma", [0.0, 0.5], ids=["no_gamma", "gamma"])
+@pytest.mark.parametrize("l2_reg", [0.0, 0.05], ids=["no_l2", "l2"])
 @pytest.mark.parametrize("l1_reg", [0.0, 0.01], ids=["no_l1", "l1"])
-def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma, l1_reg):
+def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l2_reg, l1_reg):
     """Rows of very different gradient scale, so some clear the threshold and some do not.
 
     Checks the weights against the float64 transcription, that the rows below
@@ -375,8 +369,7 @@ def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, gamma, l1
         learning_rate=0.1,
         l1_reg=l1_reg,
         group_lasso_reg=0.3,
-        group_lasso_gamma=gamma,
-        l2_reg=0.01,
+        l2_reg=l2_reg,
     )
     optimizer = _ftrl_optimizer(**params)
 
@@ -461,13 +454,10 @@ def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
 def test_ftrl_group_args_validation_and_ckpt_meta():
     with pytest.raises(ValueError, match="group_lasso_reg"):
         _ftrl_optimizer(group_lasso_reg=-0.1)
-    with pytest.raises(ValueError, match="group_lasso_gamma"):
-        _ftrl_optimizer(group_lasso_reg=0.1, group_lasso_gamma=-1.0)
     # L1 and the group term combine: sparse group lasso.
     assert _ftrl_optimizer(group_lasso_reg=0.1, l1_reg=0.01) is not None
     opt = _ftrl_optimizer(group_lasso_reg=0.25)
     assert opt.get_opt_args()["group_lasso_reg"] == 0.25
-    assert opt.get_opt_args()["group_lasso_gamma"] == 0.0
     meta = opt.get_opt_args()
     fresh = _ftrl_optimizer()
     fresh.set_opt_args(meta)
@@ -557,7 +547,6 @@ _GROUP_PARAMS = dict(
     l1_reg=0.005,
     l2_reg=0.01,
     group_lasso_reg=0.5,
-    group_lasso_gamma=0.1,
 )
 
 
