@@ -1536,13 +1536,16 @@ dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch k
 
 **What the cache does and does not decide.** The cache holds hot rows on the GPU and keeps a row from being reused while a step in flight is using it. It holds no score and makes no decision about which keys stay in the system: admission, scoring (LRU / LFU / customized) and which key to evict when the table is full all belong to the backing store, and apply to every key of every step, cached or not. When the cache needs a row for a new key it gives up the one that has been idle the longest (first in, first out). See [the cache design](./docs/lightweight_cache_design.md).
 
-With a `DynamicEmbStorage` backing, a key is inserted into the backing store when it is admitted, and the cache holds a copy of some of the keys the backing store holds. The backing store never evicts a key a step in flight is using; if every key it could evict is in use, inserting a new key fails with an error, so size the backing store (`max_capacity`) with room beyond the cache and the keys in flight. With an external storage, the storage is written when the cache gives a row up, and its scores are not updated for keys that stay cached.
+A key is inserted into the backing store when it is admitted, and the cache holds a copy of some of the keys the backing store holds. The backing store never evicts a key a step in flight is using; if every key it could evict is in use, inserting a new key fails with an error, so size the backing store (`max_capacity`) with room beyond the cache and the keys in flight.
 
 The cache's row count per table is `init_capacity` rounded up to a multiple of `bucket_capacity` (1024 for a cache), and a step's unique keys must fit in it, together with those of the steps still in flight; otherwise prefetch raises an error naming the table.
 
 ## External storage
 
-dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
+`external_storage` in `DynamicEmbTableOptions` names a class inheriting the `Storage` interface under [types.py](./dynamicemb/types.py). It is the tier **below** the table, whichever layout the table is in (HBM table, host table, or an HBM cache over a host table). The table in front is sized as it is without an external storage (`max_capacity` rows); the external storage holds what the table evicts, with its values, and is asked for a key the table does not have. A key found there is not new: it skips admission and comes back up into the table with the value it had.
+
+Limits to know: dump/load, export, incremental dump and `erase` cover the table only, not the external storage, which persists itself, and a key erased from the table can still be read back from it. A key that has been through the external storage starts its score again when it returns to the table. `HybridStorage` ignores `external_storage`.
+
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
 
 
@@ -1551,7 +1554,6 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
 
 - **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
-- **Cache write-back** (external storage): before writing evicted keys back to storage. With a `DynamicEmbStorage` backing the keys are inserted at admission, which is the prefetch path above.
 - **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
 - **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
 

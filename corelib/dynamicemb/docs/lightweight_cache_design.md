@@ -941,21 +941,21 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 - `forward/backward` 只通过三样东西使用缓存：`cache._state`（各表行池的指针 `table_ptrs_dev`、各表维度、`optimizer`）、`value_row_indices`（就是缓存里的行号）、反向里的 `cache.decrement_counter(slot_indices, table_ids)`。所以新缓存的行池只要仍以"每表一个张量加 `table_ptrs_dev`"的形式暴露，前向与反向几乎不用改；`decrement_counter` 换成 `release`。
 - `dynamicemb_prefetch` 里 `storage.expand_if_need(...)` 在缓存路径之前（§4.5 已核对）。
 - 缓存还被这些地方用到：显存报告（`_print_memory_consume` 读 `cache._state`）、`flush`/`flush_cache`、`reset_cache_states`、`cache_metrics`、eval 路径（`_eval_lookup_cached`）、增量回放后的失效（`_invalidate_cache` 调 `cache.key_index_map.erase`）、`outstanding_keys` 的容量检查（全局，对比缓存容量）。
-- **后端有两类**：`DynamicEmbStorage`（行可寻址，有 `key_index_map`），以及外部存储 PS（只实现 `Storage` 接口：按 key 的 `find`/`insert`，拷贝值）。测试里 `caching` 与 `PS` 是两个组合的参数。
+- **后端原有两类**：`DynamicEmbStorage`（行可寻址，有 `key_index_map`），以及外部存储 PS（只实现 `Storage` 接口：按 key 的 `find`/`insert`，拷贝值），PS 当时直接取代 host 表。现在后端只有 `DynamicEmbStorage`，PS 是它下面的一层，见 §17.8。
 
 ### 17.2 方案
 
 - 保留类名与导入路径：`DynamicEmbCache` 仍在 `dynamicemb.key_value_table`，只换内部实现。这样 `isinstance(cache, DynamicEmbCache)` 一类的检查不变。
 - 新增 C++ 绑定 `EmbeddingCacheCore`（`src/embedding_cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
-- 按两种后端分两阶段做：
-  - **阶段 1：通用流程（拷贝式）。** 适用于任何 `Storage`（含 PS）。数据搬运沿用现有的 `storage.find` / `storage.insert` / `load_from_flat` / `store_to_flat`，只把"缓存的索引与淘汰"换成新缓存。后端在缓存淘汰时才被插入（惰性）。不需要改后端的 kernel，先验证绑定与编排，并让现有测试能跑。
-  - **阶段 2：行可寻址流程（§6.5）。** 仅适用于 `DynamicEmbStorage`：每步所有 key 先过 backing（更新 score），新 key 准入后立刻插入 backing，搬运用 `rows.cuh` 的零拷贝 kernel，淘汰前用 `EvictionGuard` 保护。需要改后端的 `insert` kernel 与 LruLfu cubin（§17.4）。
+- 分两阶段做（阶段 1 是为了能先验证绑定与编排，已在阶段 2 完成后删除）：
+  - **阶段 1：通用流程（拷贝式）。** 数据搬运沿用 `storage.find` / `storage.insert`，后端在缓存淘汰时才被插入（惰性）。当时用来承载 PS 后端；PS 改为第三层之后没有调用方，已删除。
+  - **阶段 2：行可寻址流程（§6.5）。** 每步所有 key 先过 backing（更新 score），新 key 准入后立刻插入 backing，淘汰前用 `EvictionGuard` 保护。需要改后端的 `insert` kernel 与 LruLfu cubin（§17.4）。现在是唯一的流程。
 
 ### 17.3 假设与待定项
 
 不确定的点先按下面的假设推进，之后如果证明不对再回来改。
 
-1. **PS 后端只走阶段 1 的流程**，不走急切插入与守卫。PS 的淘汰由它自己决定，缓存副本是权威，淘汰时回写即可。待定：PS 是否需要缓存回写时带 score。
+1. ~~**PS 后端只走阶段 1 的流程**~~ （作废：PS 成为第三层，缓存的后端永远是 `DynamicEmbStorage`，见 §17.8。）
 2. **缓存没有 score，`training` 与 `set_score` 变成空操作**，只为兼容调用方保留。待定：阶段 1 下回写后端时的 score 如何给（先传 `None`，由后端按当前 step 的默认值处理；LFU 策略下频率信息会丢失，这是阶段 1 的已知缺口，阶段 2 才补上）。
 3. **`cache_metrics` 保留四个槽位的含义**：`[0]` 本步 unique 数，`[1]` 命中数，`[2]` 插入数，`[3]` 淘汰数。
 4. **`key_index_map` 属性不再存在**，测试里直接读它的地方要改；`size()` 用统计 RESIDENT 节点数实现。
@@ -975,19 +975,34 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 ### 17.5 实现中做出的决定（与 17.3 的假设对照）
 
 - **缓存容量取整**：每表 `C_t` 向上取到桶容量（缓存是 1024）的整数倍，与旧缓存的索引一致，只是不再有 overflow 区。原因：缓存必须同时装下一个 step 的全部 key，极小的配置（几百行）原来靠取整才能跑，新实现若恰好取配置值，现有测试里一批这样的配置会直接报容量错误。17.3 里"恰好是 `C_t`"的假设作废。
-- **两种驱动方式，按后端选**（`_prefetch_cache_path`）：
-  - 后端是 `DynamicEmbStorage`（含 `DEMB_DETERMINISM_MODE`）：**急切流程**（§6.5）。每个 key 先过后端（`_find_keys`，更新 score），新 key 准入后立刻插入后端（带守卫、收集被淘汰的 key），缓存再据此作废。LFU/LRU 的 score 因此对每次访问都准确，不论缓存是否命中。
-  - 其他（外部 PS）：**通用流程**。后端只在缓存淘汰时被 `Storage.insert`，缓存命中不更新后端 score。PS 的淘汰由它自己决定。确定性模式原先也走这条，因为后端的确定性插入不能报告淘汰了哪些 key；现在 `_deterministic_insert` 逐波用 `table_insert_collect_evicted` 并按波顺序拼接淘汰列表，确定性模式也走急切流程。
+- **只有一种驱动方式**（`_prefetch_cache_path`）：**急切流程**（§6.5）。每个 key 先过后端（`_find_keys`，更新 score），新 key 准入后立刻插入后端（带守卫、收集被淘汰的 key），缓存再据此作废。LFU/LRU 的 score 因此对每次访问都准确，不论缓存是否命中。确定性模式原先走不了，因为后端的确定性插入不能报告淘汰了哪些 key；现在 `_deterministic_insert` 逐波用 `table_insert_collect_evicted` 并按波顺序拼接淘汰列表，所以也走这条。
 - **急切流程里后端插入失败**（一个桶里所有可淘汰的 key 都被守卫保护）：抛出明确的容量错误，不降级为"未准入"。这是容量规划错误，与缓存装不下一个 step 的 key 同类。已定：保持报错；降级路径目前没有调用方，需要时再加。
-- **`flush`**：`DynamicEmbStorage` 后端下原地写行（每个缓存里的 key 在后端都有行），不再 `insert`，也不再预先扩容后端；若发现缓存里有后端已没有的 key（理论上不该有），回退到 `insert`。
+- **`flush`**：原地写行（每个缓存里的 key 在后端都有行），不再 `insert`，也不再预先扩容后端；若发现缓存里有后端已没有的 key（理论上不该有），回退到 `insert`。
 - **取值交给保留逻辑**（§6.5 第 8 步）：目前 `EvictedItemMode` 只有 `RETAIN_KEY`，只需要 key，所以急切流程里只把被后端淘汰的 key 交给 `_append_evicted`，没有取值。`rows.cuh` 的 `fetch_rows_kernel` 已备好，但没有任何调用者，所以没有暴露到绑定里；等 `EvictedItemMode` 增加保留值的标志时再接。
-- **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的（确定性模式也是急切流程）；只有 PS 的通用流程里，后端插入的时机由缓存的淘汰顺序决定，确定性不保证。
+- **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的。
 
 - **事件接线没有测试证明**：绑定里用两个 CUDA event 实现 §6.4 的快照屏障（allocate 等已发起的 release，release 等已取的快照）。`test_embedding_cache_core.py` 里的两流压力测试检查了"被持有的节点没有被复用"和"静止时队列条目数等于带标志的节点数"，但**去掉这两个事件后它仍然通过**（五次），因为那个窗口只有几条指令宽。所以事件是否必要，只有 `test/embedding_cache/gpu` 里显式控制流序的设备测试在覆盖；绑定层的接线是按设计写的，没有被变异检验证明。
 
 ### 17.6 后端的守卫（已完成）
 
 后端普通 `insert` 的两处计数检查（`reduce`、`reduce_ranked`）和锁后复查，都增加了对 `EvictionGuardView`（`embedding_cache/guard.h`）的询问；AoT 的 `table_insert_kernel`、`table_insert_collect_kernel` 与 LruLfu cubin 的 `dyn_emb_insert_entry`、`dyn_emb_insert_collect_entry` 都接上了。`ScoredHashTable.insert(..., guard=...)` 与两个绑定函数多了两个默认为 0 的参数（守卫的设备指针与表数），不传即与原来一致。测试：`test/unit_tests/table_operation/test_eviction_guard.py`，覆盖两条淘汰路径、带与不带 `collect_evicted`、"没有守卫时这些 key 会被淘汰"的对照，以及一个桶里全是受保护 key 时插入被拒。
+
+### 17.8 PS 作为第三层
+
+外部存储（PS）不再取代 host 表，而是接在表的下面。HBM 表、host 表、"HBM 缓存 + host 表"三种布局下都一样：前面那张表（缓存的后端就是这张 host 表）按现在没有 PS 时的大小建（`max_capacity` 不变），PS 接住它淘汰出来的行，并在它没有某个 key 时被查。`StorageLayout` 里原来的 `CACHING_PS`、`HOST_PS` 去掉了，PS 是 `DynamicEmbStorage.lower`。
+
+- **读（表里没有的 key）**：向 PS `find`。PS 里有的 key 不算新 key，不过准入器，值用 PS 的；它们随后被插入表里（"升上来"），并在缓存布局下进缓存。通用路径（host 表、eval）由 `DynamicEmbStorage.find` 合并 PS 的结果；HBM 直连与缓存的急切流程在各自的步骤里显式查。
+- **写（表淘汰的行）**：连同值写进 PS。值要在新 key 的行被写之前读出，所以后端的 `collect_evicted` 多返回了被淘汰 key 原来占的槽位（新 key 占了同一个槽，它的值行还是旧值）。通用路径与 HBM 直连用 `insert_and_evict`（本来就返回槽位、score），缓存的急切流程用带守卫的 collect。缓存里有副本的被淘汰 key，值取缓存的（比后端新），再作废缓存项。
+- **同一次插入里自己被淘汰的 key**：后面的 key 可能淘汰前面刚插入的 key，它的行还没写，读出来是别的 key 的旧值。这时它自己的值是正在插入的那个（`take_values_of_keys_evicted_in_the_same_insert`）。去掉这一步，确定性模式下的测试会失败（一次插入的各"波"按序执行，这种情况必然出现）；非确定性模式下取决于竞争，测试没有稳定复现。
+- **后端的"保持已有"插入**（反向里刷新值）：表里没有、是从 PS 读出来的 key，按新 key 插入（有自己的 score），而不是用不变分数的 CONST 策略——后者给的分数最低，会被下一个 key 立刻淘汰。这是在确定性模式的端到端测试里发现的。
+- **PS 里的旧副本**：key 升上表之后，PS 里那份是过期的，不删（`Storage` 没有删除接口）。表是权威：先问表，写表在后，所以不影响正确性。代价是 PS 里可能留着已升上来的 key 的旧值，在表淘汰它时被覆盖。
+- **PS 不参与淘汰决策，也没有 score 的契约**：回写时带上表给的 score，但读回来时表按自己的策略给分，不沿用 PS 的。LFU 的历史频率因此在经过 PS 一次后丢失。已知缺口。
+- **dump / load / 导出 / 增量 dump / `erase` 只覆盖表，不含 PS**。PS 是外部存储，自己负责持久化。`erase` 不会删掉 PS 里的副本，所以被擦除的 key 之后仍可能被 PS 读回来。已知缺口。
+- **`RETAIN_KEY`（保留被淘汰的 key）**：表下面有 PS 时，被淘汰的 key 没有离开系统，所以不保留（表的 `evicted_item_mode` 被置为 `DISCARD`）。
+- **HybridStorage 仍忽略 `external_storage`**（警告）。
+- **规划**：`get_group_value_bytes_by_tier` 不再把 PS 当成"把后端从这台机器上拿走"，host 字节数与没有 PS 时一样。
+
+测试：`test/unit_tests/test_ps_tier.py`，三种布局 × 默认/确定性模式，让工作集（6000 个 key）大于表（2048 行），用"每个 key 初始 1.0、loss 为输出之和、SGD"检查每个 key 最终都是 `1 - lr × 出现次数`，并对一个丢弃一切写入的 PS 做对照（必须失败）。另有一个单独的测试覆盖"同一次插入里自己被淘汰"。
 
 ### 17.7 进度
 
@@ -999,7 +1014,8 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 主测试文件与大部分单测通过，见下 |
 | 2a | 后端 `insert` 的守卫与 cubin 入口 | 完成 |
 | 2b | 急切流程，`DynamicEmbStorage` 后端切换过去 | 完成，LFU 测试脚本通过 |
-| 3 | 删除旧实现，更新文档与示例 | 完成：旧缓存代码已无引用；多卡脚本（dump/load 全矩阵、pooled、sequence、twin、table_row_wise、LFU）在 EOS 上全部 exit=0 |
+| 3 | 删除旧实现，更新文档与示例 | 完成：旧缓存代码已无引用 |
+| 4 | PS 作为表下面的第三层，删除 lazy 流程 | 实现完成，见 §17.8；全量测试与 benchmark 见下 |
 
 性能（EOS H100，`TestCaching and adam`，10 表，D=128，每步约 43 万唯一 key；单位 ms，旧实现 → 新实现）：
 
