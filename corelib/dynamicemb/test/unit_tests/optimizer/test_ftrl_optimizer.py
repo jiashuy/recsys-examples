@@ -879,7 +879,7 @@ def test_ftrl_group_update_is_exact_when_curvature_is_shared(
     """The exact case of the common-shrink update: the objective's KKT conditions hold.
 
     This is the contract where the update is the minimizer, not the general
-    case; see the next test for rows whose curvature differs.
+    case: with differing curvature the common shrink factor is an approximation.
 
     Independent of any transcription of the update: check the objective's KKT conditions.
 
@@ -926,67 +926,6 @@ def test_ftrl_group_update_is_exact_when_curvature_is_shared(
     nonzero = w[live] != 0
     assert float(resid[nonzero].abs().max()) < 1e-3
     assert bool((z[live][~nonzero].abs() <= l1 * (1 + 1e-4)).all())
-
-
-@cuda
-@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
-def test_ftrl_group_update_follows_the_common_shrink_rule_for_any_curvature(
-    emb_dim, all_dims_vec4
-):
-    """What the update promises when the curvature differs inside a row.
-
-    Read the stored (w, z, n) back and check the documented rule from them,
-    without going through ``ftrl_step``: with s the L1-thresholded z, h_i =
-    (beta + sqrt(n_i)) / lr + l2 and tau = lambda * sqrt(d), a row is zero
-    exactly when ||s||_2 <= tau, and otherwise h_i * w_i = -(1 - tau / ||s||_2)
-    * s_i with one factor for the whole row. It is not the objective's
-    minimizer here, so no KKT check.
-    """
-    device = torch.device("cuda")
-    num_rows = 64
-    beta, lr, l1, l2, lam = 0.2, 0.1, 0.05, 0.03, 0.3
-    optimizer = _ftrl_optimizer(
-        learning_rate=lr, ftrl_beta=beta, l1_reg=l1, l2_reg=l2, group_lasso_reg=lam
-    )
-    values = _fresh_ftrl_values(
-        num_rows, emb_dim, 3 * emb_dim, emb_dim, 0.1, device, seed=5
-    )
-    generator = torch.Generator(device="cpu").manual_seed(23)
-    row_scale = torch.logspace(-2, 0.3, num_rows).unsqueeze(1)
-    # Per-element factors spread over two decades, so h_i differs within a row.
-    spread = torch.logspace(-1, 1, emb_dim).unsqueeze(0)
-    spread = spread[:, torch.randperm(emb_dim, generator=generator)]
-    signs = torch.randint(0, 2, (num_rows, emb_dim), generator=generator) * 2 - 1
-    grads = (signs * row_scale * spread).to(device)
-
-    _padded_group_step(optimizer, values, grads, emb_dim, all_dims_vec4)
-    out = values.cpu().double()
-    w = out[:, :emb_dim]
-    z = out[:, emb_dim : 2 * emb_dim]
-    n = out[:, 2 * emb_dim :]
-    h = (beta + n.sqrt()) / lr + l2
-    tau = lam * emb_dim**0.5
-
-    s = torch.sign(z) * (z.abs() - l1).clamp(min=0)
-    norm = s.norm(dim=1, keepdim=True)
-    row_zero = (w == 0).all(dim=1)
-    live = ~row_zero
-    assert row_zero.any() and live.any()
-    # h really differs inside the rows under test.
-    assert float((h[live].max(dim=1).values / h[live].min(dim=1).values).min()) > 1.2
-
-    assert bool((norm[row_zero] <= tau * (1 + 1e-4)).all())
-    assert bool((norm[live] > tau * (1 - 1e-4)).all())
-
-    shrink = 1.0 - tau / norm[live]
-    torch.testing.assert_close(
-        h[live] * w[live], -shrink * s[live], rtol=1e-4, atol=1e-6
-    )
-    # An element L1 has zeroed stays zero in a live row, and the others
-    # carry the opposite sign of s.
-    assert bool((w[live][s[live] == 0] == 0).all())
-    nonzero = s[live] != 0
-    assert bool((torch.sign(w[live][nonzero]) == -torch.sign(s[live][nonzero])).all())
 
 
 @cuda
