@@ -48,9 +48,10 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _is_worker() -> bool:
-    # torchrun sets LOCAL_RANK; the launcher sets WORKER_ENV. Either means
-    # "this pytest is a rank", including a developer running torchrun by hand.
-    return "LOCAL_RANK" in os.environ or WORKER_ENV in os.environ
+    # The launcher sets WORKER_ENV; a developer running torchrun by hand gets
+    # torchrun's TORCHELASTIC_RUN_ID. LOCAL_RANK / WORLD_SIZE are not usable
+    # for this: some container images export them in every shell.
+    return WORKER_ENV in os.environ or "TORCHELASTIC_RUN_ID" in os.environ
 
 
 def _declared_nprocs(path: Path):
