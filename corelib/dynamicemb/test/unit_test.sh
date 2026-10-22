@@ -1,77 +1,15 @@
+#!/bin/bash
+# CI entry point. All case selection and parametrization lives in the pytest
+# files; this only maps a group name to a pytest marker expression.
+#   test/unit_test.sh [fwd_bwd | load_dump | unit | integration]   (from corelib/dynamicemb)
+# Extra arguments go to pytest, e.g. `test/unit_test.sh unit -k lru`.
+# See test/README.md for the layout and the catalog of what each test covers.
 set -e
-FWD_BWD_TEST_FILES=(
-    "test/unit_tests/table_operation/test_table_operation.sh"
-    "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
-    "test/unit_tests/test_hybrid_storage_export.sh"
-    "test/unit_tests/test_lfu_scores.sh"
-    "test/test_batched_dynamic_embedding_tables_v2.py"
-    "test/test_unique_op.py"
-    "test/unit_tests/test_sequence_embedding.sh"
-    "test/unit_tests/test_pooled_embedding.sh"
-    "test/unit_tests/test_weighted_pooled_embedding_v2.py"
-    "test/unit_tests/test_twin_module.sh"
-    "test/unit_tests/test_alignment.sh"
-    "test/unit_tests/test_hash_roundrobin_kuairand.py"
-    "test/unit_tests/test_vmm_tensor.py"
-    "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
-    "test/unit_tests/optimizer/test_ftrl_optimizer.py"
-    # Added by #495 and never registered, so its CUDA checks on the packed
-    # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
-    # precision -- have not run in CI since.
-    "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
-    "test/unit_tests/test_no_eviction_row_indexing.py"
-    "test/unit_tests/test_expansion_value_capacity.py"
-    "test/unit_tests/test_planner_plan_cost.py"
-    "test/unit_tests/test_planner_placement.py"
-    "test/unit_tests/test_table_row_wise.sh"
-)
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-LOAD_DUMP_TEST_FILES=(
-    "test/unit_tests/admission/test_embedding_admission.sh"
-    "test/unit_tests/test_embedding_dump_load.sh"
-    "test/unit_tests/incremental_dump/test_incremental_dump.sh"
-    # Registered in both groups: it covers forward and checkpoints, and runs
-    # only the half named by the group it is passed.
-    "test/unit_tests/test_table_row_wise.sh"
-)
-
-case "$1" in
-    fwd_bwd)
-        TEST_FILES=("${FWD_BWD_TEST_FILES[@]}")
-        ;;
-    load_dump)
-        TEST_FILES=("${LOAD_DUMP_TEST_FILES[@]}")
-        ;;
-    *)
-        TEST_FILES=("${FWD_BWD_TEST_FILES[@]}" "${LOAD_DUMP_TEST_FILES[@]}")
-        ;;
+case "${1:-all}" in
+    fwd_bwd|load_dump|unit|integration) MARK=(-m "$1"); shift ;;
+    *) MARK=() ;;
 esac
 
-# Run each test file using the appropriate command
-for TEST_FILE in "${TEST_FILES[@]}"; do
-    echo "Running tests in $TEST_FILE"
-    if [[ "$TEST_FILE" == *.py ]]; then
-        # Run Python test files with pytest
-        pytest -svv "$TEST_FILE"
-        # Check if the test failed
-        if [ $? -ne 0 ]; then
-            echo "ERROR: Test failed in $TEST_FILE"
-            exit 1
-        fi
-    elif [[ "$TEST_FILE" == *.sh ]]; then
-        # Run shell scripts with bash. The group travels in the environment
-        # rather than as an argument, so that a script spanning both groups
-        # can run only the half being asked for without the others seeing an
-        # argument they did not expect -- test_hybrid_storage_export.sh
-        # forwards "$@" to pytest, which would read "fwd_bwd" as a path to
-        # collect and fail.
-        DYNAMICEMB_TEST_GROUP="$1" bash "$TEST_FILE"
-        # Check if the test failed
-        if [ $? -ne 0 ]; then
-            echo "ERROR: Test failed in $TEST_FILE"
-            exit 1
-        fi
-    else
-        echo "Unknown test file type: $TEST_FILE"
-    fi
-done
+exec python -m pytest "${MARK[@]}" "$@"

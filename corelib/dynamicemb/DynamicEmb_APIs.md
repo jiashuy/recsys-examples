@@ -1119,7 +1119,7 @@ The meaning of the threshold depends on the table's `score_strategy`:
         """
     ```
 
-More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main/corelib/dynamicemb/test/unit_tests/incremental_dump/test_distributed_dynamicemb.py)
+More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main/corelib/dynamicemb/test/integration/test_incremental_dump_distributed.py)
 
 ## replay_increment
 
@@ -1513,7 +1513,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 
 Weighted-sum pooling for `EmbeddingBagCollection` tables backed by DynamicEmb is supported in training and eval (see
 [DynamicEmbPoolingMode](#dynamicembpoolingmode)). Gradients are scaled per-position: `grad_embᵢ = wᵢ · grad_pooled`, verified against an exact SGD
-reference in `test/unit_tests/test_weighted_pooled_embedding_v2.py` and end-to-end, sharded, forward and backward, against a twin TorchRec model in `test/unit_tests/test_twin_module.py` (`is_weighted=True`).
+reference in `test/unit/module/test_weighted_pooled_embedding_v2.py` and end-to-end, sharded, forward and backward, against a twin TorchRec model in `test/integration/test_twin_module.py` (`is_weighted=True`).
 
 ### Breaking API change: `per_sample_weights` split
 

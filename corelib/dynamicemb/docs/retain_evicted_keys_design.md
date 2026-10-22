@@ -392,7 +392,7 @@ def pop_evicted_keys(model, table_names=None, pg=None)
 
 ## 8. Tests (compiled and passing on EOS / H100)
 
-All retain tests live under `test/unit_tests/retain_evicted_keys/`.
+All retain tests live under `test/unit/eviction/` and `test/integration/`.
 
 - **Table level** (`test_insert_collect_evicted.py`, 5 cases): a whole-set
   eviction oracle checks the (evicted_keys, evicted_table_ids) collected by
@@ -450,6 +450,6 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
 | `dynamicemb/batched_dynamicemb_tables.py` | thread the config through + module-level `pop_evicted_keys` |
 | `dynamicemb/incremental_dump.py` | model-level `pop_evicted_keys` + variable-length all_gather |
 | `dynamicemb/__init__.py` | export `pop_evicted_keys` |
-| `test/unit_tests/retain_evicted_keys/test_insert_collect_evicted.py` | table + storage level (8 cases) |
-| `test/unit_tests/retain_evicted_keys/test_pop_evicted_keys.py` | module level (3 cases) |
-| `test/unit_tests/retain_evicted_keys/test_distributed_pop_evicted_keys.py` | distributed + model level |
+| `test/unit/eviction/test_insert_collect_evicted.py` | table + storage level (8 cases) |
+| `test/unit/eviction/test_pop_evicted_keys.py` | module level (3 cases) |
+| `test/integration/test_pop_evicted_keys_distributed.py` | distributed + model level |

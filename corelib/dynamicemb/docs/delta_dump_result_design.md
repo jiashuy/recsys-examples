@@ -198,14 +198,14 @@ semantics (read-and-clear, pg aggregation) are unchanged.
 ---
 
 ## 7. Callers / Test Updates (breaking change)
-- `test/unit_tests/incremental_dump/test_distributed_dynamicemb.py`
+- `test/integration/test_incremental_dump_distributed.py`
   `ret_tensors, ret_scores = incremental_dump(...)` → consume
   `Dict[str, DeltaDumpResult]` (`res["model"].keys[i]` /
   `.meta[i]["current_score"]`, etc.).
-- `test/unit_tests/incremental_dump/test_batched_dynamicemb_tables.py`
+- `test/unit/incremental_dump/test_batched_dynamicemb_tables.py`
   `ret_tensors, score = model.incremental_dump(...)` → consume a single
   `DeltaDumpResult`.
-- `test/unit_tests/table_operation/test_table_dump_load.py` uses
+- `test/unit/table/test_table_dump_load.py` uses
   **`LinearBucketTable.incremental_dump`** (the low-level one, returning
   `(keys, named_scores, indices)`), which is **out of scope** and untouched.
 
@@ -227,9 +227,9 @@ semantics (read-and-clear, pg aggregation) are unchanged.
 | `dynamicemb/key_value_table.py` | storage-level `incremental_dump` adds `slot_index` (§4 encoding + continuous raise); `_all_gather_dumped_keys_values` grows to a triple; `_pop_state_evicted_keys` |
 | `dynamicemb/batched_dynamicemb_tables.py` | module-level `incremental_dump` returns `DeltaDumpResult` (assembling keys/values/evicted/meta); record `_shard_world_size` in `__init__` |
 | `dynamicemb/__init__.py` | export `DeltaDumpResult` |
-| `test/unit_tests/incremental_dump/test_distributed_dynamicemb.py` | adapt to the new return shape |
-| `test/unit_tests/incremental_dump/test_batched_dynamicemb_tables.py` | adapt to the new return shape |
-| `test/unit_tests/retain_evicted_keys/*` | `pop_evicted_keys` now returns host tensors (`.tolist()`/`.numel()` assertions unaffected) |
+| `test/integration/test_incremental_dump_distributed.py` | adapt to the new return shape |
+| `test/unit/incremental_dump/test_batched_dynamicemb_tables.py` | adapt to the new return shape |
+| `test/unit/eviction/` and `test/integration/*` | `pop_evicted_keys` now returns host tensors (`.tolist()`/`.numel()` assertions unaffected) |
 
 ---
 

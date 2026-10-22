@@ -1,0 +1,419 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Worker: frequency admission through a sharded dynamicemb model.
+
+Launched by ``integration/test_embedding_admission.py`` under ``torchrun``.
+Trains on features whose per-key access counts are known and checks that only
+keys whose count reached the threshold are stored (and, with
+``--expect-all-rejected``, that none is stored and every forward value equals
+the initializer constant that owns non-admitted rows).
+"""
+
+import os
+from typing import Dict, List, Optional, Set
+
+import click
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from common.dynamicemb_model import (
+    ADMISSION_COUNTER_CAPACITY,
+    TABLE_INITIALIZER_VALUE,
+    assert_batched_dynamicemb_storage_class,
+    create_model,
+    get_optimizer_kwargs,
+    get_score_strategy,
+)
+from common.frequency_features import (
+    generate_deterministic_sparse_features_with_frequency_tracking,
+)
+from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
+from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
+
+
+
+def get_table_keys(
+    model: nn.Module,
+    table_names: Optional[Dict[str, List[str]]] = None,
+    pg: Optional[dist.ProcessGroup] = None,
+) -> Dict[str, Set[int]]:
+    """
+    Get keys from dynamic embedding tables directly (without disk I/O).
+
+    Returns:
+        Dict[table_name, Set[key]]: Keys stored in each table
+    """
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    batch_size = 65536
+
+    all_table_keys = {}
+
+    for _, collection_name, sharded_module in find_sharded_modules(model, ""):
+        dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
+
+        for dynamic_emb_module in dynamic_emb_modules:
+            dynamic_emb_module.flush()
+            storage = dynamic_emb_module.tables
+
+            for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
+                if table_names is not None and table_name not in set(
+                    table_names[collection_name]
+                ):
+                    continue
+
+                table_keys = set()
+
+                for keys, _, _, _ in storage.export_keys_values(
+                    device, batch_size, table_id=table_idx
+                ):
+                    for key in keys:
+                        table_keys.add(int(key))
+
+                all_table_keys[table_name] = table_keys
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+
+    return all_table_keys
+
+
+def validate_admission_keys(
+    expected_frequencies: Dict[str, Dict[int, int]],
+    actual_keys: Dict[str, Set[int]],
+    threshold: int,
+):
+    """
+    Validate that only keys with frequency >= threshold are stored in tables.
+
+    In multi-GPU scenarios, keys are sharded across GPUs. Each rank only validates
+    keys that are actually present in its local tables (i.e., keys that were sharded to it).
+    This is similar to how LFU score validation works.
+
+    Args:
+        expected_frequencies: Dict mapping table_name -> {key: frequency}
+        actual_keys: Dict mapping table_name -> Set[key]
+        threshold: Admission threshold
+    """
+    for table_name in expected_frequencies:
+        if table_name not in actual_keys:
+            raise AssertionError(f"Table {table_name} missing from actual keys")
+
+        expected = expected_frequencies[table_name]
+        actual = actual_keys[table_name]
+
+        for key in actual:
+            if key not in expected:
+                raise AssertionError(
+                    f"Table {table_name}, Key {key}: "
+                    f"Found in table but not in expected frequencies (unexpected key)"
+                )
+
+            if expected[key] < threshold:
+                raise AssertionError(
+                    f"Table {table_name}, Key {key}: "
+                    f"Admitted with frequency={expected[key]} < threshold={threshold} "
+                    f"(should have been rejected)"
+                )
+
+        # Count expected admitted/rejected for reporting
+        expected_admitted_count = sum(
+            1 for freq in expected.values() if freq >= threshold
+        )
+        expected_rejected_count = sum(
+            1 for freq in expected.values() if freq < threshold
+        )
+        actual_admitted_count = len(actual)
+
+        print(
+            f"✓ Table {table_name}: "
+            f"{actual_admitted_count} keys admitted on this rank "
+            f"(global: {expected_admitted_count} expected admitted, "
+            f"{expected_rejected_count} expected rejected), "
+            f"threshold={threshold}"
+        )
+
+
+def validate_non_admitted_embedding_values(
+    output: torch.Tensor,
+    expected_value: float,
+    iteration: int,
+):
+    """
+    Validate the embedding values a rejected key is looked up with.
+
+    Under a threshold no key can reach, admission rejects every key, so the
+    whole forward output comes from whichever initializer owns non-admitted
+    rows -- the strategy's when it has one, the table's otherwise. Any other
+    value means those rows were left uninitialized or the wrong initializer
+    wrote them.
+
+    Args:
+        output: Forward output, one row per looked-up key.
+        expected_value: The constant the owning initializer writes.
+        iteration: Iteration index, for the failure message.
+    """
+    expected = torch.full_like(output, expected_value)
+    if torch.allclose(output, expected, rtol=0, atol=1e-6):
+        return
+
+    mismatched = ~torch.isclose(output, expected, rtol=0, atol=1e-6)
+    num_mismatched = int(mismatched.sum())
+    sample = output[mismatched][:8].tolist()
+    raise AssertionError(
+        f"Iteration {iteration}: {num_mismatched} of {output.numel()} values "
+        f"of rejected keys are not {expected_value} "
+        f"(range [{float(output.min())}, {float(output.max())}], "
+        f"first mismatches {sample})"
+    )
+
+
+@click.command()
+@click.option("--num-embedding-collections", type=int, default=1)
+@click.option("--num-embeddings", type=str, default="1000")
+@click.option("--multi-hot-sizes", type=str, default="3")
+@click.option("--embedding-dim", type=int, default=16)
+@click.option(
+    "--optimizer-type",
+    type=click.Choice(["sgd", "adam", "adagrad", "rowwise_adagrad"]),
+    default="sgd",
+)
+@click.option("--batch-size", type=int, default=16)
+@click.option("--num-iterations", type=int, default=3)
+@click.option("--threshold", type=int, default=5, help="Admission frequency threshold")
+@click.option("--caching", is_flag=True, help="Enable cache + storage architecture")
+@click.option(
+    "--cache-capacity-ratio",
+    type=float,
+    default=0.5,
+    help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
+)
+@click.option(
+    "--score-strategy",
+    type=click.Choice(["timestamp", "lfu", "step"]),
+    default="timestamp",
+    help="Score strategy",
+)
+@click.option(
+    "--global-hbm-budget-scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Scale DynamicEmb HBM byte budget vs full table (after planner: per-rank "
+        "local_hbm). Values < 1.0 force HybridStorage and prefetch StorageMode "
+        "DEFAULT (_generic_forward_path), not HBM_DIRECT."
+    ),
+)
+@click.option(
+    "--non-admitted-init-value",
+    type=float,
+    default=0.0,
+    help="Constant the admission strategy initializes non-admitted embeddings with.",
+)
+@click.option(
+    "--no-strategy-initializer",
+    is_flag=True,
+    help=(
+        "Give the admission strategy no initializer of its own, so non-admitted "
+        "rows fall back to the table's initializer."
+    ),
+)
+@click.option(
+    "--expect-all-rejected",
+    is_flag=True,
+    help=(
+        "Assert no key is admitted and every forward value equals the initializer "
+        "constant that owns non-admitted rows. Pass a threshold no key can reach."
+    ),
+)
+def main(
+    num_embedding_collections: int,
+    num_embeddings: str,
+    multi_hot_sizes: str,
+    embedding_dim: int,
+    optimizer_type: str,
+    batch_size: int,
+    num_iterations: int,
+    threshold: int,
+    caching: bool,
+    cache_capacity_ratio: float,
+    score_strategy: str,
+    global_hbm_budget_scale: float,
+    non_admitted_init_value: float,
+    no_strategy_initializer: bool,
+    expect_all_rejected: bool,
+):
+    """Test admission strategy correctness by comparing with naive frequency counting.
+
+    This test validates that only keys with frequency >= threshold are stored in tables.
+    It supports:
+    - Storage-only (default): HBM-only DynamicEmbStorage when budget fits (HBM_DIRECT)
+    - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use HybridStorage
+    - Cache + Storage (--caching): admission through cache to storage
+    """
+
+    num_embeddings = [int(v) for v in num_embeddings.split(",")]
+    multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
+    use_index_dedup = True
+
+    if not caching:
+        for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
+            if batch_size * num_iterations * multi_hot_size > num_embedding:
+                raise ValueError(
+                    "batch_size * num_iterations * multi_hot_size > num_embedding, "
+                    "this may lead to eviction of dynamicemb and cause test fail"
+                )
+
+    print(f"Configuration:")
+    print(f"  - Embedding collections: {num_embedding_collections}")
+    print(f"  - Num embeddings: {num_embeddings}")
+    print(f"  - Multi-hot sizes: {multi_hot_sizes}")
+    print(f"  - Embedding dim: {embedding_dim}")
+    print(f"  - Optimizer: {optimizer_type}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Iterations: {num_iterations}")
+    print(f"  - Admission threshold: {threshold}")
+    print(f"  - Use index dedup: {use_index_dedup}")
+    print(f"  - Score strategy: {score_strategy}")
+    if caching:
+        print(f"  - Caching: ENABLED ✓")
+        print(f"  - Cache capacity ratio: {cache_capacity_ratio}")
+    else:
+        print(f"  - Caching: DISABLED")
+    print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
+    if not caching and global_hbm_budget_scale < 1.0:
+        print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
+
+    # Create admission strategy. Without an initializer of its own, a rejected
+    # key's row is left to the table initializer.
+    if no_strategy_initializer:
+        non_admitted_initializer_args = None
+        expected_non_admitted_value = TABLE_INITIALIZER_VALUE
+    else:
+        non_admitted_initializer_args = DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT,
+            value=non_admitted_init_value,
+        )
+        expected_non_admitted_value = non_admitted_init_value
+    if expect_all_rejected:
+        print(f"  - Expecting every key rejected, value {expected_non_admitted_value}")
+
+    admission_strategy = FrequencyAdmissionStrategy(
+        threshold=threshold,
+        counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
+        initializer_args=non_admitted_initializer_args,
+    )
+
+    # Create model with admission strategy
+    optimizer_kwargs = get_optimizer_kwargs(optimizer_type)
+    model = create_model(
+        num_embedding_collections=num_embedding_collections,
+        num_embeddings=num_embeddings,
+        embedding_dim=embedding_dim,
+        optimizer_kwargs=optimizer_kwargs,
+        score_strategy=get_score_strategy(
+            score_strategy
+        ),  # Use timestamp for admission
+        use_index_dedup=use_index_dedup,
+        caching=caching,
+        cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
+        admit_strategy=admission_strategy,  # Pass admission strategy
+        global_hbm_budget_scale=global_hbm_budget_scale,
+    )
+    assert_batched_dynamicemb_storage_class(
+        model,
+        caching=caching,
+        global_hbm_budget_scale=global_hbm_budget_scale,
+    )
+    if dist.get_rank() == 0:
+        for _, _, sm in find_sharded_modules(model, ""):
+            for emb in get_dynamic_emb_module(sm):
+                print(f"  - Storage class: {type(emb.tables).__name__}")
+
+    # Generate features with frequency tracking
+    (
+        kjts,
+        expected_frequencies,
+    ) = generate_deterministic_sparse_features_with_frequency_tracking(
+        num_embedding_collections=num_embedding_collections,
+        num_embeddings=num_embeddings,
+        multi_hot_sizes=multi_hot_sizes,
+        rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+        batch_size=batch_size,
+        num_iterations=num_iterations,
+        caching=caching,
+    )
+
+    # Run forward passes to trigger admission logic
+    if caching:
+        print(
+            f"\nRunning {num_iterations} iterations with cache and admission enabled..."
+        )
+    else:
+        print(f"\nRunning {num_iterations} iterations with admission enabled...")
+
+    for iteration, kjt in enumerate(kjts):
+        ret = model(kjt)
+        torch.cuda.synchronize()
+        if expect_all_rejected:
+            validate_non_admitted_embedding_values(
+                ret, expected_non_admitted_value, iteration
+            )
+        loss = ret.sum() * dist.get_world_size()
+        loss.backward()
+        torch.cuda.synchronize()
+
+    # Extract actual keys stored in tables
+    actual_keys = get_table_keys(model)
+
+    torch.cuda.synchronize()
+
+    # Validate admission logic
+    print(f"\nValidating admission with threshold={threshold}...")
+    validate_admission_keys(expected_frequencies, actual_keys, threshold)
+
+    if expect_all_rejected:
+        for table_name, keys in actual_keys.items():
+            if keys:
+                raise AssertionError(
+                    f"Table {table_name}: {len(keys)} keys admitted under "
+                    f"threshold={threshold}, expected none"
+                )
+        print(
+            f"✓ No key admitted; every looked-up value was "
+            f"{expected_non_admitted_value}"
+        )
+
+    print(f"\n✓ Admission strategy test passed!")
+
+
+if __name__ == "__main__":
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(LOCAL_RANK)
+
+    dist.init_process_group(backend="nccl")
+    main()
+    dist.barrier()
+    dist.destroy_process_group()

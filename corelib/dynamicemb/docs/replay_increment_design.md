@@ -332,14 +332,14 @@ class ReplayStats:
 | `dynamicemb/__init__.py` | export `replay_increment`, `ReplayStats`, `pop_erased_keys`, `ReplayContent` |
 | `dynamicemb/batched_dynamicemb_function.py` | split slot vs value-row indices in the HBM-direct prefetch (§12) |
 | `DynamicEmb_APIs.md` | document both |
-| `test/unit_tests/incremental_dump/test_replay_increment.py` | new |
-| `test/unit_tests/test_no_eviction_row_indexing.py` | new (§12 regression) |
+| `test/unit/incremental_dump/test_replay_increment.py` | new |
+| `test/unit/table/test_no_eviction_row_indexing.py` | new (§12 regression) |
 
 ---
 
 ## 10. Tests
 
-`test/unit_tests/incremental_dump/test_replay_increment.py` (single process, one
+`test/unit/incremental_dump/test_replay_increment.py` (single process, one
 `BatchedDynamicEmbeddingTablesV2` as source and another as target):
 
 | Test | Covers |
@@ -364,7 +364,7 @@ class ReplayStats:
 | `test_replay_with_caching` | a lookup after replay sees the replayed value, not a stale cached one |
 | `test_replay_does_not_leave_displaced_keys_in_the_cache` | a key whose slot a delta key takes over is dropped from the cache too, or `flush_cache` would resurrect it into storage on the next dump |
 
-¹ in `test/unit_tests/retain_evicted_keys/test_insert_collect_evicted.py`, with
+¹ in `test/unit/eviction/test_insert_collect_evicted.py`, with
 the rest of the retention coverage.
 
 | Test | Covers |
@@ -420,7 +420,7 @@ overwrote `new_indices` with the row *before* `increment_counter`, so newly
 inserted NO_EVICTION keys pinned the wrong counter entry while looked-up keys
 pinned the right one.
 
-Regression coverage: `test/unit_tests/test_no_eviction_row_indexing.py` drives
+Regression coverage: `test/unit/table/test_no_eviction_row_indexing.py` drives
 resident keys through the forward and checks each row against its own key's DEBUG
 pattern (`key % 100000`), so a wrong-row read fails on values, not merely on a
 crash.
