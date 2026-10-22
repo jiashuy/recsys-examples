@@ -498,18 +498,19 @@ struct FTRLVecOptimizer {
   }
 
   // Group-sparse FTRL. Each step rebuilds a row (the group g, width d) from
-  // its FTRL state (z = linear, n = accum) as the solution of
+  // its FTRL state (z = linear, n = accum). The reference objective is
   //   min_w  z.w + 1/2 sum_i a_i w_i^2 + l1 |w|_1 + l2/2 |w|_2^2 + tau |w|_2
   //   a_i = (beta + n_i^(-p)) / lr,   tau = group_lasso_reg * sqrt(d)
-  // which follows G-FTRL (Ni et al., CIKM 2019, Algorithm 1 and Eq. 3) with the
-  // L1 term of the sparse group lasso of Yue et al., arXiv:2107.14432,
-  // Algorithm 3. With s_i = sign(z_i) * max(|z_i| - l1, 0) and h_i = a_i + l2:
+  // and the update is the common-shrink form of G-FTRL (Ni et al., CIKM 2019,
+  // Algorithm 1 and Eq. 3) with the L1 term of the sparse group lasso of Yue
+  // et al., arXiv:2107.14432, Algorithm 3. With
+  // s_i = sign(z_i) * max(|z_i| - l1, 0) and h_i = a_i + l2:
   //   zero the row            if ||s||_2 <= tau        (exact)
   //   w_i = -(1 - tau / ||s||_2) * s_i / h_i           otherwise
-  // The shrink factor is common to the row, which is the paper's practical
-  // form; it is exact when every h_i in the row is equal, and an approximation
-  // when they differ. l1 = 0 is the paper's closed form, group_lasso_reg = 0 is
-  // plain FTRL. The row norm is needed before any weight can be written, so a
+  // This is not the exact minimizer of the objective: the shrink factor is
+  // common to the row, which is exact only when every h_i in the row is equal
+  // and an approximation, with no error bound, when they differ. l1 = 0 is the
+  // paper's closed form, group_lasso_reg = 0 is plain FTRL. The row norm is needed before any weight can be written, so a
   // row is two passes: pass one advances (linear, accum) and sums s_i^2; pass
   // two re-solves the weights. The same thread owns the same elements in both,
   // so the second pass reads back its own stores without a barrier.
@@ -530,7 +531,7 @@ struct FTRLVecOptimizer {
     return s * s;
   }
 
-  // 1 - lambda * sqrt(d) / ||z||_2, or 0 when the row does not clear the
+  // 1 - lambda * sqrt(d) / ||s||_2, or 0 when the row does not clear the
   // threshold. `width` is the row's embedding width, the paper's d_g.
   DEVICE_INLINE float group_scale(const float sum_sq, const uint32_t width) const {
     const float norm = sqrtf(sum_sq);

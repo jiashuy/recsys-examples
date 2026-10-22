@@ -605,16 +605,16 @@ with **one embedding row of width `d` as the group**. `linear` and `accum` are u
 weight solve differs.
 
 `l1_reg`, `l2_reg` and `group_lasso_reg` are independent parameters. Each step rebuilds a row from its FTRL state
-(`z = linear`, `n = accum`) as the solution of
+(`z = linear`, `n = accum`) with the update below, which takes this objective as its reference:
 
 ```
 min_w   z·w + ½ Σᵢ aᵢ wᵢ² + l1_reg·‖w‖₁ + (l2_reg / 2)·‖w‖₂² + τ·‖w‖₂
 aᵢ = (ftrl_beta + nᵢ^(−p)) / lr          τ = group_lasso_reg · √d          ‖·‖₂ over the row
 ```
 
-This is the interface contract of this option, not a claim that the papers define exactly this version. The papers
-define the update below; for the objective above that update is exact in the zero test and in the equal-`h` case, and
-an approximation otherwise (see the last bullet). The configurations it gives:
+The update is the papers' common-shrink form, **not** the exact minimizer of this objective. It is exact in the zero
+test and when every `hᵢ` in the row is equal; otherwise it is an approximation with no error bound and does not
+satisfy the objective's first-order conditions (see the last bullet). The configurations it gives:
 
 | Set | Effect |
 | --- | --- |
@@ -644,7 +644,9 @@ weight = 0                                         if ‖s‖₂ ≤ τ
 - **The zero test is exact, the shrink factor is not always.** The stationarity condition of the objective gives
   `wᵢ = −sᵢ / (hᵢ + τ/‖w‖₂)`, which is zero for the whole row exactly when `‖s‖₂ ≤ τ`. In a non-zero row the update above
   uses one shrink factor `1 − τ/‖s‖₂` for the row and the per-element `hᵢ`, as the papers do; that equals the exact
-  solution when every `hᵢ` in the row is the same and is an approximation when they differ.
+  solution when every `hᵢ` in the row is the same and is an approximation when they differ. For example, with
+  `z = [3, 4]`, `h = [1, 2]`, `τ = 1` the update gives `[−2.4, −1.6]` while the exact minimizer is about
+  `[−2.207, −1.695]`.
 
 `group_lasso_reg = 0` takes the original single-pass kernel path and is bit-identical to plain FTRL. The solve needs
 the whole row's norm, so `group_lasso_reg > 0` makes the kernel two passes over the row.

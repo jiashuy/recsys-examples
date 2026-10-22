@@ -135,7 +135,9 @@ class OptimizerArgs:
     optimizer_state_dtype: Optional[torch.dtype] = None
     # FTRL group sparsity, G-FTRL (Ni et al., CIKM 2019): `group_lasso_reg` is
     # the paper's lambda. A row whose L1-thresholded linear term has L2 norm of
-    # at most lambda * sqrt(emb_dim) is zeroed as a whole. Zero is plain FTRL.
+    # at most lambda * sqrt(emb_dim) is zeroed as a whole. It combines with
+    # l1_reg and l2_reg; the non-zero update is the papers' common-shrink
+    # approximation (see DynamicEmb_APIs.md). Zero is plain FTRL.
     # Last, so it shifts no positional construction.
     group_lasso_reg: float = 0.0
 
@@ -795,12 +797,16 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     together when ``||s||_2 <= group_lasso_reg * sqrt(d)``; otherwise
 
         w_i = -eta_i * (1 - group_lasso_reg * sqrt(d) / ||s||_2) * s_i
-        eta_i = 1 / ((ftrl_beta + accum_i^0.5) / lr + l2_reg)
+        eta_i = 1 / ((ftrl_beta + accum_i^(-p)) / lr + l2_reg)
 
-    where ``s`` is ``linear`` soft-thresholded by ``l1_reg`` (``s = linear``
-    when ``l1_reg = 0``, the paper's closed form; with ``l1_reg > 0`` it is the
+    with ``p = learning_rate_power`` (default -0.5, i.e. ``accum_i^0.5``).
+    ``s`` is ``linear`` soft-thresholded by ``l1_reg`` (``s = linear`` when
+    ``l1_reg = 0``, the paper's closed form; with ``l1_reg > 0`` it is the
     sparse group lasso step of Yue et al., arXiv:2107.14432, Algorithm 3).
-    ``group_lasso_reg = 0`` is plain FTRL.
+    The shrink factor is common to the row (the papers' form), so the update is
+    exact in the zero test and when all ``eta_i`` in the row are equal, and an
+    approximation otherwise; it is not the exact minimizer of the regularized
+    objective. ``group_lasso_reg = 0`` is plain FTRL.
 
     ``linear`` starts at zero and ``accum`` at ``initial_accumulator_value``.
     Seeding the state is not free here the way it is in the linear regression
