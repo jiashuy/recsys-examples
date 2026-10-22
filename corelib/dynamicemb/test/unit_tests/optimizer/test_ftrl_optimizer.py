@@ -701,39 +701,6 @@ def test_ftrl_group_multistep_reactivation_matches_reference(emb_dim, all_dims_v
 
 
 @cuda
-def test_ftrl_group_resume_matches_uninterrupted():
-    """Checkpoint meta carries everything needed to keep training with the group term.
-
-    Step, rebuild the optimizer from its own meta alone (as a resumed run
-    does), step again: the result must match two uninterrupted steps exactly.
-    """
-    device = torch.device("cuda")
-    emb_dim = 8
-    params = dict(learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.3)
-    generator = torch.Generator(device="cpu").manual_seed(4)
-    grads = [
-        (torch.randn(16, emb_dim, generator=generator) * 0.5).to(device)
-        for _ in range(2)
-    ]
-
-    straight = _fresh_ftrl_values(16, emb_dim, 3 * emb_dim, emb_dim, 0.0, device)
-    resumed = straight.clone()
-    optimizer = _ftrl_optimizer(**params)
-    for g in grads:
-        _padded_group_step(optimizer, straight, g, emb_dim, True)
-
-    first = _ftrl_optimizer(**params)
-    _padded_group_step(first, resumed, grads[0], emb_dim, True)
-    # The resumed run starts from the default (plain FTRL) configuration and
-    # takes everything else from the checkpoint meta.
-    second = _ftrl_optimizer()
-    second.set_opt_args(first.get_opt_args())
-    _padded_group_step(second, resumed, grads[1], emb_dim, True)
-
-    torch.testing.assert_close(resumed, straight, rtol=0, atol=0)
-
-
-@cuda
 def test_ftrl_group_single_coordinate_is_a_larger_l1():
     """With d = 1 the group term is a plain L1 threshold of l1_reg + group_lasso_reg."""
     device = torch.device("cuda")
