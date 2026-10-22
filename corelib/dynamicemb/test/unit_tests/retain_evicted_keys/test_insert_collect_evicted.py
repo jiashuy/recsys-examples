@@ -342,7 +342,9 @@ def test_evicted_slots_are_the_slots_the_victims_held(current_device, kind):
 
     new_keys = torch.arange(1001, 1001 + extra, dtype=torch.int64, device=device)
     new_tids = torch.zeros(extra, dtype=torch.int64, device=device)
-    new_scores = mk(extra) + (100 if kind == "assign" else 0)
+    new_scores = (mk(extra).to(torch.int64) + (100 if kind == "assign" else 0)).to(
+        torch.uint64
+    )
     indices, num_evicted, evicted_keys, _tids, evicted_slots = table.insert(
         new_keys,
         new_tids,

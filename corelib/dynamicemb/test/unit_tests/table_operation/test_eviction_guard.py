@@ -120,7 +120,7 @@ def test_referenced_keys_are_not_evicted(device, kind, collect):
 
     assert bool(_present(table, held, device).all()), "a referenced key was evicted"
     if collect:
-        _, num_evicted, evicted_keys, _ = out
+        _, num_evicted, evicted_keys, _, _ = out
         evicted = evicted_keys[: int(num_evicted.item())]
         assert not bool(torch.isin(evicted, held).any())
         assert num_evicted.item() > 0, "the insert should have had to evict"
