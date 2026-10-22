@@ -39,7 +39,7 @@ from dynamicemb.dynamicemb_config import ScoreStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import CommType
-from torchrec.distributed.planner import ParameterConstraints, Topology
+from torchrec.distributed.planner import Topology
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
@@ -106,12 +106,15 @@ def get_planner(args, device):
             args.data_parallel_embeddings is not None
             and i in args.data_parallel_embeddings
         ):
-            const = ParameterConstraints(
+            # DynamicEmbeddingShardingPlanner reads ``use_dynamicemb`` from every
+            # constraint, so a TorchRec-owned table still gets this class.
+            const = DynamicEmbParameterConstraints(
                 sharding_types=[ShardingType.DATA_PARALLEL.value],
                 pooling_factors=[args.multi_hot_sizes[i]],
                 num_poolings=[1],
                 enforce_hbm=True,
                 bounds_check_mode=BoundsCheckMode.NONE,
+                use_dynamicemb=False,
             )
         else:
             const = DynamicEmbParameterConstraints(
