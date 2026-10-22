@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <map>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "kernels.cuh"
@@ -522,6 +523,291 @@ static void test_release_overlaps_allocate() {
   CU(cudaStreamDestroy(push_stream));
 }
 
+// ---------------------------------------------------------------------------
+// 6. Evicting by key, and the guard in front of it
+// ---------------------------------------------------------------------------
+//
+// The backing evicts keys by its own score and the cache has no say, except that
+// a key a step is using must not go. Two things are checked:
+//
+//   * the guard says no exactly for the keys whose nodes hold references
+//   * find_nodes + invalidate take cached keys out cleanly — gone from the
+//     chains, their nodes empty and still queued, every other binding untouched —
+//     and the cache then carries on: the evicted keys miss and are bound again,
+//     the empty nodes are taken with no victim to unlink
+//
+// The second is the one a wrong unlink would break. allocate treats an empty node
+// as having nothing to remove, and remove() asserts on a node that is in no chain,
+// so a node invalidate left in a chain, or allocate mistook for resident, stops
+// the kernel here.
+
+using Guard = EvictionGuard<Map, Node>;
+
+__global__ void guard_probe_kernel(Guard guard, const int64_t* keys, int64_t n,
+                                   char* out) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    out[i] = guard.may_evict(keys[i]) ? 1 : 0;
+  }
+}
+
+// One cache, one step at a time. acquire() looks up, allocates and fills; it
+// leaves the step's references held until release(), which is what a step in
+// flight looks like to the guard.
+struct Harness {
+  int64_t capacity, per_step;
+  MapStore map_store;
+  QStore qs;
+  Node* nodes;
+  Dev<int64_t> rows, keys, miss_keys, miss_src;
+  Dev<int32_t> node_ids;
+  Dev<Slot> slots;
+  Dev<unsigned long long> miss_count, wrong, dry;
+  int64_t held = 0;
+
+  Harness(int64_t capacity_, int64_t per_step_)
+      : capacity(capacity_), per_step(per_step_), map_store(capacity_),
+        qs(capacity_), nodes(map_store.nodes()), rows(capacity_),
+        keys(per_step_), miss_keys(per_step_), miss_src(per_step_),
+        node_ids(per_step_), slots(per_step_), miss_count(1), wrong(1), dry(1) {
+    init_states_kernel<<<64, 256>>>(nodes, capacity);
+    CU(cudaDeviceSynchronize());
+  }
+
+  void acquire(const std::vector<int64_t>& h_keys) {
+    held = static_cast<int64_t>(h_keys.size());
+    const int grid = grid_for(held);
+    keys.put(h_keys);
+    CU(cudaMemset(miss_count.p, 0, sizeof(unsigned long long)));
+    lookup_pin_kernel<Map, Node><<<grid, kBlock>>>(
+        map_store.map(), nodes, keys.p, held, node_ids.p, miss_keys.p,
+        miss_src.p, miss_count.p);
+    qs.take_snapshot(nullptr);
+    allocate_kernel<Queue, Map, Node><<<grid, kBlock>>>(
+        qs.queue(), map_store.map(), nodes, miss_keys.p, miss_src.p,
+        miss_count.p, slots.p, node_ids.p);
+    fill_stub_kernel<<<grid, kBlock>>>(nodes, slots.p, miss_count.p, rows.p);
+    verify_kernel<<<grid, kBlock>>>(nodes, keys.p, node_ids.p, rows.p, held,
+                                    wrong.p, dry.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+  }
+
+  void release() {
+    release_kernel<Queue, Node><<<grid_for(held), kBlock>>>(qs.queue(), nodes,
+                                                            node_ids.p, held);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+    held = 0;
+  }
+
+  // Which of `h_keys` are cached: the node holding each, or kNoNode.
+  std::vector<int32_t> find(const std::vector<int64_t>& h_keys) {
+    Dev<int64_t> d_keys(h_keys.size());
+    Dev<int32_t> d_out(h_keys.size());
+    d_keys.put(h_keys);
+    find_nodes_kernel<Map><<<64, 256>>>(map_store.map(), d_keys.p,
+                                        static_cast<int64_t>(h_keys.size()),
+                                        d_out.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+    return d_out.get();
+  }
+
+  // Every key bound to a node, found by walking the chains.
+  std::vector<int64_t> bound_keys() {
+    const auto h_nodes = map_store.download_nodes();
+    const auto h_heads = map_store.download_heads();
+    std::vector<int64_t> out;
+    for (int64_t b = 0; b < map_store.num_buckets(); ++b) {
+      for (int32_t cur = h_heads[b]; cur != Map::kNoNode; cur = h_nodes[cur].next) {
+        out.push_back(h_nodes[cur].key);
+      }
+    }
+    return out;
+  }
+};
+
+static void test_evict_by_key() {
+  std::printf("=== evicting by key, and the guard ===\n");
+  const int64_t kCap = 2048, kPerStep = 256, kSpace = 4096;
+  Harness h(kCap, kPerStep);
+
+  std::mt19937_64 rng(7);
+  std::geometric_distribution<int64_t> hot(0.01);
+  auto draw = [&](int64_t n) {
+    std::vector<int64_t> out;
+    std::vector<char> present(kSpace, 0);
+    while ((int64_t)out.size() < n) {
+      const int64_t k = hot(rng) % kSpace;
+      if (present[k]) continue;
+      present[k] = 1;
+      out.push_back(k);
+    }
+    return out;
+  };
+
+  for (int s = 0; s < 80; ++s) {
+    h.acquire(draw(kPerStep));
+    h.release();
+  }
+
+  const auto cached = h.bound_keys();
+  CHECK((int64_t)cached.size() > kPerStep,
+        "the cache should be well populated, got %lld",
+        (long long)cached.size());
+
+  // --- the guard: hold some cached keys, as a step in flight would -----------
+  {
+    const std::vector<int64_t> held_keys(cached.begin(), cached.begin() + 64);
+    h.acquire(held_keys);
+
+    std::vector<int64_t> probe = cached;
+    for (int64_t k = 0; k < 100; ++k) probe.push_back(kSpace + k);  // never cached
+    std::vector<char> is_held_key(kSpace + 100, 0);
+    for (int64_t k : held_keys) is_held_key[k] = 1;
+
+    Dev<int64_t> d_probe(probe.size());
+    Dev<char> d_may(probe.size());
+    d_probe.put(probe);
+    guard_probe_kernel<<<64, 256>>>(Guard{h.map_store.map(), h.nodes},
+                                    d_probe.p,
+                                    static_cast<int64_t>(probe.size()), d_may.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+
+    const auto may = d_may.get();
+    int64_t wrong = 0, vetoed = 0;
+    for (size_t i = 0; i < probe.size(); ++i) {
+      const bool expect = !is_held_key[probe[i]];
+      if ((may[i] != 0) != expect) ++wrong;
+      if (!may[i]) ++vetoed;
+    }
+    std::printf("  guard: %zu keys probed, %lld vetoed\n", probe.size(),
+                (long long)vetoed);
+    CHECK(wrong == 0,
+          "%lld keys got the wrong answer from the guard: it must refuse "
+          "exactly the keys whose nodes hold references",
+          (long long)wrong);
+    CHECK(vetoed == (int64_t)held_keys.size(),
+          "expected %zu vetoes, got %lld", held_keys.size(), (long long)vetoed);
+
+    h.release();
+  }
+
+  // --- evict by key: a third of the cached keys, and some never cached -------
+  std::vector<int64_t> evict;
+  std::set<int64_t> evicted_cached;
+  for (size_t i = 0; i < cached.size(); i += 3) {
+    evict.push_back(cached[i]);
+    evicted_cached.insert(cached[i]);
+  }
+  for (int64_t k = 0; k < 50; ++k) evict.push_back(kSpace + 200 + k);
+
+  const auto nodes_found = h.find(evict);
+  const auto before = h.map_store.download_nodes();
+  int64_t found = 0;
+  for (size_t i = 0; i < evict.size(); ++i) {
+    const bool is_cached = evicted_cached.count(evict[i]) != 0;
+    CHECK((nodes_found[i] != Map::kNoNode) == is_cached,
+          "find_nodes should locate exactly the cached keys (key %lld)",
+          (long long)evict[i]);
+    if (nodes_found[i] != Map::kNoNode) {
+      ++found;
+      CHECK(before[nodes_found[i]].key == evict[i],
+            "the node found holds the key asked for");
+    }
+  }
+
+  {
+    Dev<int32_t> d_nodes(nodes_found.size());
+    d_nodes.put(nodes_found);
+    invalidate_kernel<Map, Node><<<64, 256>>>(
+        h.map_store.map(), h.nodes, d_nodes.p,
+        static_cast<int64_t>(nodes_found.size()));
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+  }
+  std::printf("  evicted %lld cached keys of %zu asked for\n", (long long)found,
+              evict.size());
+
+  // Gone from the chains, and nothing else disturbed.
+  for (int32_t n : h.find(evict)) {
+    CHECK(n == Map::kNoNode, "an evicted key must not resolve to a node");
+  }
+  std::vector<int64_t> kept;
+  for (int64_t k : cached)
+    if (!evicted_cached.count(k)) kept.push_back(k);
+  int64_t lost = 0;
+  const auto kept_nodes = h.find(kept);
+  for (size_t i = 0; i < kept.size(); ++i) {
+    if (kept_nodes[i] == Map::kNoNode) ++lost;
+  }
+  CHECK(lost == 0, "%lld keys that were not evicted lost their node",
+        (long long)lost);
+  CHECK(h.map_store.check_bindings() == 0,
+        "every node in a bucket still hashes to that bucket");
+
+  {
+    const auto after = h.map_store.download_nodes();
+    int64_t bad_state = 0, queued = 0;
+    for (int32_t n : nodes_found) {
+      if (n == Map::kNoNode) continue;
+      const NodeState s = after[n].state.get();
+      if (s.residency() != NodeState::kEmpty || s.has_refs() || !s.in_ring() ||
+          s.used()) {
+        ++bad_state;
+      }
+    }
+    for (int64_t i = 0; i < kCap; ++i)
+      if (after[i].state.get().in_ring()) ++queued;
+    CHECK(bad_state == 0,
+          "%lld invalidated nodes are not empty, idle, queued and without "
+          "recency",
+          (long long)bad_state);
+    CHECK(queued == h.qs.size(),
+          "invalidating must not change the queue: %lld flagged vs %lld held",
+          (long long)queued, (long long)h.qs.size());
+  }
+
+  // --- and the cache carries on ----------------------------------------------
+  //
+  // The evicted keys are asked for again first, so they miss and take nodes; then
+  // ordinary traffic. Empty nodes get popped along the way, with no victim.
+  std::vector<int64_t> again;
+  for (int64_t k : evicted_cached) {
+    again.push_back(k);
+    if ((int64_t)again.size() == kPerStep) break;
+  }
+  h.acquire(again);
+  h.release();
+  for (int s = 0; s < 60; ++s) {
+    h.acquire(draw(kPerStep));
+    h.release();
+  }
+
+  CHECK(h.wrong.get()[0] == 0ull, "%llu keys resolved to a node holding something else",
+        h.wrong.get()[0]);
+  CHECK(h.dry.get()[0] == 0ull, "%llu keys went unserved", h.dry.get()[0]);
+  CHECK(h.map_store.check_bindings() == 0, "bindings stay consistent afterwards");
+
+  const auto h_nodes = h.map_store.download_nodes();
+  const auto h_heads = h.map_store.download_heads();
+  std::map<int64_t, int> owner;
+  int64_t dupes = 0, queued = 0;
+  for (int64_t b = 0; b < h.map_store.num_buckets(); ++b) {
+    for (int32_t cur = h_heads[b]; cur != Map::kNoNode; cur = h_nodes[cur].next) {
+      if (!owner.emplace(h_nodes[cur].key, cur).second) ++dupes;
+    }
+  }
+  for (int64_t i = 0; i < kCap; ++i)
+    if (h_nodes[i].state.get().in_ring()) ++queued;
+  CHECK(dupes == 0, "%lld keys are bound to more than one node",
+        (long long)dupes);
+  CHECK(queued == h.qs.size(), "flags and queue disagree: %lld vs %lld",
+        (long long)queued, (long long)h.qs.size());
+}
+
 int main() {
   int dev = 0;
   CU(cudaGetDevice(&dev));
@@ -534,6 +820,7 @@ int main() {
   test_claim_exclusivity();
   test_queue_round_trip();
   test_release_overlaps_allocate();
+  test_evict_by_key();
   // Capacity below the working set on purpose: eviction has to actually happen.
   test_pipeline(/*steps=*/200, /*capacity=*/2048, /*per_step=*/512,
                 /*key_space=*/8192, /*seed=*/1234);

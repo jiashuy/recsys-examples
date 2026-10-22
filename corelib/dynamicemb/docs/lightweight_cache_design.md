@@ -6,7 +6,7 @@
 > 实现：`src/embedding_cache/`。与本文的差异，以实现为准，已回写到各节：
 > 去掉 `EVICTING` 状态（§4.3）；Step 4 合并为一个 kernel，靠桶锁（§6.1）；去掉 pin 后的身份复查（§6.3）；
 > ring 的槽位数取 `2C`，tail 快照在 kernel 启动前取，并作为 push/pop 两个阶段的屏障（§6.4、§7）。
-> 行号不再跨 kernel 携带，搬运 kernel 内按 key 现场探测（§4.5）。
+> 行号不存进 node；可在同一次 prefetch 调用内携带，但不得跨 `expand_if_need`（§4.5）。backing 是 score、准入、key 淘汰的唯一权威（§6.5）。
 > 附录 C 的逐步走查仍按"两趟 + `EVICTING`"、并把 backing 探测画在摘链趟里的早期表述画出，数据流不受影响。
 
 ---
@@ -118,9 +118,7 @@
 
 **embedding 与 optimizer state 同行**是刻意的：反向的优化器更新是访存密集型，两者分离会让访存次数翻倍且都退化为非合并访问；同时淘汰回写必须携带整行，同行布局让回写成为一次连续搬运。两者的 dtype 一致，因此 `emb_table_t` 是一个同构的 typed tensor。
 
-**node 中不存 backing 行号，kernel 之间也不传递行号。** 需要行号的 kernel（搬运、flush）用 key 自己现场探测 backing，用完即弃。这多了探测，但换来两件事：省 4 B/node，以及**对 backing 重哈希免疫**——行号一旦被存下来或带着走，backing 扩容重哈希后它就是野指针，回写会写到别的 key 的行上，造成静默的数值损坏。每次探测都取当前值则不存在陈旧问题。详见 §4.5。
-
-kernel 之间传递的只有 key、node、是否全新这类与位置无关的信息。
+**node 中不存 backing 行号。** 淘汰时的行号由 backing 按 key 给出，不随 node 长期保存。这换来两件事：省 4 B/node，以及**对 backing 重哈希免疫**——行号一旦长期保存，backing 扩容重哈希后它就是野指针，回写会写到别的 key 的行上，造成静默的数值损坏。行号只在一次 prefetch 调用内使用，不跨 `expand_if_need`。详见 §4.5。
 
 ### 4.2 状态字位布局
 
@@ -186,10 +184,18 @@ DynamicEmb 的 backing 表按每步各表的 unique 数由 host 驱动扩容（`
 
 由此得到两条规则：
 
-1. **不存、不传行号。** node 里没有行号；`allocate` 各 kernel 之间传递的结构里也没有（只有 `key`、`victim_key`、`node`、是否有受害者、是否全新）。需要行号的 kernel 在 kernel 内部用 key 探测，探测与使用在同一个 kernel 里完成。因此扩容可以落在 allocate 的任意两个 kernel 之间，不会留下过期的行号。
+1. **node 里不存行号；行号只在一次 prefetch 调用内携带，不得跨 `expand_if_need`。** 行号来自本步 backing 的 find/insert，以及搬运前对受害者 key 做的一次只读 lookup（Const 策略，不更新 score）。扩容只发生在一次 prefetch 调用的开头，所以调用内的行号不会过期；任何要跨调用保存行号的做法都是错的。
 2. **读 backing 的 kernel 不得与扩容并发。** 这是所有 backing 使用者共有的约束，缓存不例外：claim（find-or-insert）、搬运、flush 都是这样的 kernel。规则 1 消除的是"跨 kernel 的过期"，消除不了"kernel 运行时 backing 被搬动"。
 
-规则 2 在缓存 kernel 跑在独立的 prefetch 流上时，需要在流之间排好序，具体怎么排取决于 backing 的流语义。这件事要在写 backing 接口时与它一起定，现在没有实现可以依据。
+规则 2 在现有后端下已经成立，不需要额外的 event，依据是三点：
+
+- 扩容由 `dynamicemb_prefetch` 在开头调用 `storage.expand_if_need(...)` 同步触发，位于 prefetch 流上，先于该 step 的缓存路径（`batched_dynamicemb_function.py`）。
+- 扩容值缓冲前，`ExtendableBuffer.extend()` 先执行 `torch.cuda.synchronize()`，整设备排空（`extendable_tensor.py`）。
+- 扩容在 host 线程里同步完成，期间不会向其他流发射新的 kernel。
+
+所以只要缓存里读 backing 的 kernel 与 `expand_if_need` 发射在同一条 prefetch 流、同一次 prefetch 调用里，二者天然有序。反向的 release 不读 backing，不受影响。
+
+**扩容会整体替换 backing 的视图**：它新建一个 `key_index_map`（新的设备张量），把所有 key 重新插入，再把值行从旧槽搬到新槽，并刷新 `table_ptrs_dev`（`_expand_tables_impl`）。因此缓存 kernel 用的 backing 视图（索引表指针、各表值缓冲指针）必须在每次 launch 前从当前状态里取，不能跨 step 保存。
 
 扩容也可能让 backing 淘汰一些 key。搬运 kernel 探测不到某个 key 时按"backing 没有这个 key 的记录"处理，沿用 backing 契约（`src/lw_cache/backing.h` 的 `probe` 语义），不在缓存里另设分支。
 
@@ -236,9 +242,10 @@ DynamicEmb 的 backing 表按每步各表的 unique 数由 host 驱动扩容（`
 |---|---|---|
 | 1 | 去重：`keys[N]` → `unique_keys[U]`、`inverse[N]`、`table_range[T+1]` | `src/unique_op.cu` |
 | 2 | 哈希查找 + pin | 新写 |
-| 3 | miss 压紧后从 ring 弹出 node；对新 key 做 find-or-insert，判定准入与是否全新（带走判定结果，不带走行号） | 新写 |
+| 3 | 对 backing 里已有、或准入的 miss 从 ring 弹出 node（backing 的 find 与准入判定见 §6.5 的第 3、4 步） | 新写 |
 | 4 | 受害者摘链、新 key 插入桶头，一个 kernel | 新写 |
-| 5 | 双向搬运：kernel 内按 key 探测两侧行号，受害者行 → host，新行 host → `emb_table`；全新 key 走初始化 | `src/initializer.cu` |
+| 5 | 双向搬运：受害者行 → host，新行 host → `emb_table`；全新 key 走初始化 | `src/initializer.cu` |
+| 5b | backing 插入本步准入的新 key；缓存同时淘汰被 backing 淘汰的 key（§6.5 的第 7、8 步） | 新写 |
 | 6 | `out[i] = emb_table[node_ids[inverse[i]], :emb_dim]` | `src/lookup_forward.cu` |
 
 **Step 4 是一个 kernel。** 线程甲把受害者从桶 b 摘出、线程乙往桶 b 头部插入，是会发生的并发修改，这是无锁双向链表的一般性难题。解法是桶级锁：桶头自身兼作锁位，摘链和插链各自在持锁期间完成整个修改，而一次修改碰到的所有 node（受害者的前驱后继、原桶头）都在被锁的桶里，因为链不跨桶。所以不必把两者拆成两个阶段，省掉一次 launch。需要分阶段的是**查找**：查找无锁，读桶头与链都是普通读，因此不能与任何修改并发，这条才是与 ring 的读写相分离（§7.2）、pin 的阶段分离（§6.3）同一套纪律。
@@ -319,6 +326,35 @@ pin 失败也不是"多一次 H2D"那么便宜：key 仍绑定在原 node 上，
 配套要求：**所有 step 的 prefetch 工作走同一条 prefetch stream**，使各 step 的 lookup / allocate kernel 之间天然串行，§6.3 的阶段分离在 `d > 1` 下依然成立。若使用多条 prefetch stream，该保证失效，需要额外设计。
 
 深度的代价体现在容量下界（§10.1）：深度越大，本步释放的 node 越晚可用，`C_t` 需相应放大。`ref_counter` 的 27 位对任何现实深度都绰绰有余。
+
+### 6.5 与 backing 的分工
+
+**缓存里没有 score，也不做准入和 key 的淘汰。** 这些全部由 backing 的逻辑决定；缓存只做三件事：GPU 上的行副本与放置、ref 保护、在 ref 为 0 的 node 里按 FIFO 选换出对象。所以每一步**所有 unique key，不论缓存是否命中，都先过一遍 backing**：更新 score，缺失的过准入，准入的新 key 插入 backing。
+
+**保护规则（backing 淘汰前先查缓存）。** backing 要淘汰某个 key 时，先在缓存里找它：**不在缓存里，或在缓存里且 ref 为 0，才允许淘汰；ref 不为 0 则跳过这个候选。** 这一条同时覆盖了 in-flight 的 step 和本步已经拿到 node 的 key。实现上是 backing 的 `insert_and_evict` 在选 victim 时多带一个判定函数（查缓存桶链、读状态字 refs）。
+
+每步顺序（顺序本身就是正确性的一部分，见下）：
+
+1. 去重，`expand_if_need`。
+2. 缓存 lookup + pin：命中的 key 先 pin，ref 加一。
+3. backing 对**所有** key 做 find，更新 score，得到每个 key 是否存在及其行号。
+4. 对 backing 里缺失的 key 做准入判定（只判定，不插入）。
+5. 缓存对所有需要 node 的 miss（backing 里已有的，加上准入的新 key）做 allocate：FIFO 选受害者，rebind 到新 key，此时这些 node 的 ref 已是 1。
+6. 搬运：受害者行写回 backing，backing 已有的 key 从 backing 加载，新 key 初始化。
+7. **backing 插入本步准入的新 key**，判定函数保护 ref 不为 0 的缓存 key；得到被淘汰的 key 列表。插入失败的 key 视同未准入（缓存解绑，按非准入处理）。
+8. **缓存处理被淘汰的 key，与 backing 同时淘汰**：key 若在缓存里，必然是 ref 为 0 的空闲 node。先取下它最新的 embedding 与 optimizer state，交给保留逻辑（见下），再从桶链摘除并把 node 置为 EMPTY，**不写回 backing**（它的行正被新 key 占用）。
+9. 反向：缓存 refs 减一。
+
+**为什么是这个顺序。**
+
+- 2 先于 7：命中的 key 要先有 ref，才受保护。
+- 5、6 先于 7：本步在 backing 里已有、但不在缓存的 key，必须先拿到 node（ref 为 1）才受保护；受害者也必须先写回 backing，它的行才不会被 7 的插入重新分配。
+- 4 与 7 分开：准入只判定，插入放在 node 都就绪之后；这样新 key 的 node 在插入前就已存在，判定函数能保护它们。
+- 8 中"查找"与"摘除并改状态"要分成两个 kernel：桶链的 lookup 不能与任何修改并发（HashMap 的调用约定，见 `hashmap.h`）。7 里 backing 的判定函数会读缓存桶链，这没有问题，因为此时缓存不做修改。
+
+**取下来的值交给保留逻辑。** 第 8 步取下的 embedding 与 optimizer state，交给 `evicted_item_mode` 的保留逻辑（`_append_evicted` 一路），与 backing 自己淘汰、没有缓存副本的 key 走同一条路。缓存只负责把值取下来并交过去，要不要保留由模式决定，所以只有模式要求保留值时才需要取。目前 `EvictedItemMode` 只有 `RETAIN_KEY`，保留值需要在其中新增一个标志；这是保留逻辑那一侧的改动。
+
+**取最新值只发生在第 8 步，对象只能是空闲 node。** 空闲 node 没有人在写，取到的值是确定的最新值；这也是要求 ref 不为 0 的 key 不被淘汰的原因之一，否则要读的行可能正被反向修改。
 
 ---
 
@@ -546,15 +582,14 @@ if (st & USED) {
 方向相反、量级相等——这正是全双工的理想输入。合并后每个 warp 处理一对：
 
 ```
-warp 处理 (受害者 node n, 受害者 key k_old, 新 key k_new)：
-  0. r_old = probe(k_old)；r_new = probe(k_new)       （同一 kernel 内现场取，不跨 kernel）
+warp 处理 (受害者 node n, 受害者行 r_old, 新 key 的行 r_new)：
   1. emb_table[n] → 寄存器                （device 读）
   2. host[r_new]  → 寄存器                （PCIe H2D）┐ 同时在飞
   3. 寄存器(旧行) → host[r_old]           （PCIe D2H）┘
   4. 新行寄存器   → emb_table[n]          （device 写）
 ```
 
-由于回写是无条件的，kernel 内**没有 `if (dirty)` 分支，warp 不产生分化**——每个 warp 都执行完整的双向搬运。`r_old` 与 `r_new` 在本 kernel 内按 key 探测得到（§4.5），不依赖前面 kernel 留下的行号；全新 key 没有 `r_new`，走初始化。
+由于回写是无条件的，kernel 内**没有 `if (dirty)` 分支，warp 不产生分化**——每个 warp 都执行完整的双向搬运。`r_new` 来自 backing 的 find/insert，`r_old` 来自搬运前对受害者 key 的一次只读 lookup，二者都在同一次 prefetch 调用内取得（§4.5）；全新 key 没有历史值，走初始化。
 
 寄存器开销不成问题：`dim=128` fp32 加 Adam 两个 state 为 1536 B/行 = 96 个 `float4`，摊到 32 lane 上是每 lane 3 个 `float4`，两行共 24 个寄存器。可按 chunk 流水以进一步重叠。
 
@@ -566,7 +601,7 @@ warp 处理 (受害者 node n, 受害者 key k_old, 新 key k_new)：
 
 ### 9.3 准入即在 backing 分配行
 
-> 新 key 进入缓存时，立即在 backing 哈希中执行一次 **find-or-insert**，保证它在 backing 中有行。此时**不写任何值**，仅占位；行号不记录，用到时再探测（§4.5）。
+> 新 key 在准入时，立即在 backing 中 **insert**，保证它在 backing 中有行。此时**不写任何值**，仅占位。缓存不参与准入，也不参与 key 的淘汰（§6.5）。
 
 代价接近于零——miss 路径**本来就要探测 backing 哈希**（以判断该 key 是已有 key 还是全新 key），find-or-insert 只是同一次探测的自然延伸。
 
@@ -582,7 +617,7 @@ warp 处理 (受害者 node n, 受害者 key k_old, 新 key k_new)：
 
 配套语义：backing 的行一旦分配即**终身绑定该 key**，缓存淘汰不释放它。因此 backing 表的容量按总 key 数规划，而非活跃 key 数。
 
-注意行号**不缓存在 node 中，也不跨 kernel 传递**（§4.1、§4.5）：用到时现场探测。这使设计对 backing 重哈希免疫。
+注意行号**不缓存在 node 中**（§4.1、§4.5）：每次由 backing 给出，只在一次 prefetch 调用内使用。这使设计对 backing 重哈希免疫。
 
 ### 9.4 训练内 eval 路径
 
@@ -862,7 +897,9 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | INV-6 被破坏导致 ref 泄漏或状态字腐蚀 | 命中率单调下降；或 node 状态错乱 | 释放路径 `assert(REF(old) > 0)`；checkpoint 排空后全量校验（§9.5） |
 | 桶链并发修改 | 链表结构损坏，查找失效或死循环 | 桶级锁（§6.1）；查找与任何修改不并发 |
 | 多条 prefetch stream 破坏阶段分离 | ring 竞态、pin 身份竞态 | 约束为单条 prefetch stream（§6.4） |
-| 读 backing 的 kernel 与 backing 扩容并发 | 读到被搬动的索引或行，静默数值损坏 | 在流之间排序（§4.5 规则 2），待 backing 接口一并定 |
+| 读 backing 的 kernel 与 backing 扩容并发 | 读到被搬动的索引或行，静默数值损坏 | 现有后端已满足（§4.5 规则 2）；缓存 kernel 须与 `expand_if_need` 在同一条 prefetch 流 |
+| backing 淘汰了仍在 in-flight 的缓存 key | 行被重新分配，反向写到别人的行上 | §6.5 的保护：backing 选 victim 时先查缓存，ref 不为 0 则跳过 |
+| 一个桶里的 key 全部受保护，backing 插入失败 | 新 key 无法准入 | 失败视同未准入（§6.5 第 7 步）；容量规划保证 backing 远大于缓存与 in-flight 的 key 数 |
 | 容量规划不当，热表 ring 抽干 | 训练中断 | 配置期校验；ring 抽干计数作为告警指标 |
 | PCIe 非全双工 | §9.2 收益落空 | §12.1 前置验证；退化路径已设计 |
 | key 总数超出索引显存预算 | 无法训练全部 key | 配置期按 §10.3 的公式校验；收紧 backing 准入门槛 |

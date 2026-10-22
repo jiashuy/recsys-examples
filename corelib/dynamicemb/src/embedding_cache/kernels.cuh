@@ -36,6 +36,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   ---- forward, backward ----
 //   release             give the references back, and re-queue what went idle
 //
+// Around the backing's insert, which evicts keys of its own:
+//
+//   EvictionGuard       asked by the backing's eviction, per candidate: may it go?
+//   ---- backing insert ----
+//   find_nodes          which of the evicted keys are cached
+//   [fetch]             not yet: needs the row pool, takes the latest values off
+//   invalidate          drop those bindings; the node is empty, nothing to write back
+//
 // Two boundaries here are correctness requirements rather than launch-
 // granularity choices:
 //
@@ -51,6 +59,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //     pusher has reserved but not yet written reads the previous occupant. Once
 //     the snapshot is taken, a release may overlap the allocate kernel freely.
 //     See reclaim_queue.h.
+//
+//   * find_nodes and invalidate are two kernels, not one. A lookup runs
+//     concurrently with nothing, and invalidate removes from the bucket chains.
+//     The fetch of the latest values sits between them, and has to: invalidate is
+//     what lets a later allocate take the node.
 //
 // What is NOT a requirement any more: splitting the rebind into an unlinking
 // pass and a linking pass. That existed because removal and insertion racing on
@@ -263,6 +276,75 @@ __global__ void allocate_kernel(
     // array indexed by unique key and does not need a scattering kernel. A key
     // that got no node keeps the kNoNode lookup_pin already wrote.
     out_nodes[miss_src[i]] = slot.node;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Evicting by key
+// ---------------------------------------------------------------------------
+//
+// The backing decides which keys leave the system, by its own score. The cache
+// holds no score and has no say in that, except one: a key a step is using must
+// not go. Both halves live here.
+//
+// EvictionGuard is the question, asked by the backing's eviction for each
+// candidate it is about to take. A key that is not cached may go. A key that is
+// cached may go only if its node has no references — an idle node is a cache hit
+// waiting to happen, nothing more, and its row can be read for the latest values
+// without anyone writing it. A referenced node is held by an in-flight step, or
+// has just been taken for this one, and the answer is no.
+//
+// It reads the cache's chains, which is a lookup, so it may be asked only while
+// the cache is not being modified. That holds: the backing inserts after the
+// cache has bound this step's nodes and before it does anything else.
+//
+// A view, passed to the backing's kernel by value, like the others.
+
+template <typename MapT, typename NodeT>
+struct EvictionGuard {
+  MapT map;
+  const NodeT* nodes;
+
+  [[nodiscard]] __forceinline__ __device__ bool may_evict(
+      typename MapT::Key key) const {
+    const typename MapT::NodeId node = map.lookup(key);
+    return node == MapT::kNoNode || !nodes[node].state.load().has_refs();
+  }
+};
+
+// For each key, the node that holds it, or kNoNode. Pins nothing and changes
+// nothing: it is the lookup half of evicting, kept apart from the removal because
+// a lookup cannot overlap one.
+//
+// The keys are the backing's evicted keys, each evicted once. A cached one is
+// idle, which the guard promised; invalidate asserts it.
+
+template <typename MapT>
+__global__ void find_nodes_kernel(MapT map, const typename MapT::Key* keys,
+                                  int64_t n, typename MapT::NodeId* out_nodes) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    out_nodes[i] = map.lookup(keys[i]);
+  }
+}
+
+// Drop the bindings find_nodes found. Each node leaves its bucket and becomes
+// EMPTY; nothing is written back, because the key is gone.
+//
+// Removals overlap freely — the bucket lock serialises the ones that share a
+// bucket — and a node appears at most once, because a key does. kNoNode entries,
+// the evicted keys that were never cached, are skipped.
+
+template <typename MapT, typename NodeT>
+__global__ void invalidate_kernel(MapT map, NodeT* nodes,
+                                  const typename MapT::NodeId* node_ids,
+                                  int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const typename MapT::NodeId node = node_ids[i];
+    if (node == MapT::kNoNode) continue;
+    map.remove(node);
+    nodes[node].state.invalidate();
   }
 }
 

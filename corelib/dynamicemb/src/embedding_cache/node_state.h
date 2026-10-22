@@ -473,6 +473,33 @@ class AtomicNodeState {
             cuda::std::memory_order_release);
   }
 
+  // Drop an idle node's binding: RESIDENT with no references becomes EMPTY.
+  //
+  // For a key the backing has evicted. The key has left the system, so its row has
+  // nothing to be written back, and EMPTY is exactly "claimable, nothing to write
+  // back" — an allocate that pops this node later finds it as any other empty one.
+  //
+  // The caller guarantees RESIDENT and refs == 0, and this asserts it rather than
+  // checking. The guarantee is the eviction guard's: the backing does not take a
+  // key whose node has references, so a referenced node never reaches here.
+  //
+  // in_ring is left alone. An idle node always has its ring entry — a count
+  // reaching zero is what enqueues it — and that entry is what lets an allocate
+  // find the node now. used is cleared: the node carries no recency into whatever
+  // it holds next.
+  //
+  // A store rather than a compare-exchange, for the reason publish() gives: with
+  // no references nothing can write this word in this phase. A pin needs a lookup,
+  // a claim needs an allocate, and a release needs a reference to drop.
+  __forceinline__ __device__ void invalidate() {
+    auto a = ref();
+    const NodeState s = NodeState::from_raw(
+        a.load(cuda::std::memory_order_relaxed));
+    EC_ASSERT(s.residency() == NodeState::kResident && !s.has_refs());
+    a.store(s.with_residency(NodeState::kEmpty).with_used(false).raw(),
+            cuda::std::memory_order_release);
+  }
+
  private:
   using Ref = cuda::atomic_ref<Raw, cuda::thread_scope_device>;
 

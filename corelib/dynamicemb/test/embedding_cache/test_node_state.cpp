@@ -337,6 +337,24 @@ int main() {
     CHECK(a.try_pin(), "which the next hit takes");
   }
 
+  // --- invalidate: an idle node whose key the backing evicted ---------------
+  {
+    AtomicNodeState a;
+    a.set(NodeState::make(NodeState::kResident, 0u, /*in_ring=*/true,
+                          /*used=*/true));
+    a.invalidate();
+    CHECK(a.get() == NodeState::make(NodeState::kEmpty, 0u, /*in_ring=*/true,
+                                     /*used=*/false),
+          "an idle resident node becomes empty, keeps its ring entry, and loses "
+          "its recency");
+    CHECK(!a.try_pin(), "and a hit can no longer land on it");
+
+    NodeState was = NodeState::make(NodeState::kResident, 0, false, false);
+    CHECK(a.try_claim(&was), "but an allocate can take it");
+    CHECK(was.residency() == NodeState::kEmpty,
+          "as an empty node, so there is nothing to write back");
+  }
+
   if (failures == 0) {
     std::printf("all checks passed\n");
     return 0;
