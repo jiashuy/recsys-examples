@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // A HOST-ONLY STAND-IN FOR THE CUDA RUNTIME.  NOT THE REAL THING.
 //
-// Purpose: compile and exercise the *algorithmic* core of lw_cache (probe
+// Purpose: compile and exercise the *algorithmic* core of embedding_cache (probe
 // sequences, wraparound, collision handling, rebuild) on a machine with no CUDA
 // toolkit.  It maps device memory onto malloc, mapped-pinned onto malloc, and
 // atomics onto single-threaded reads/writes.
@@ -11,14 +11,14 @@
 // this shim says the logic is right, not that the kernels are.
 //
 // This directory must only ever be on the include path of the host-test build
-// (see run_host_tests.sh).  The guard below turns accidental use in a real
+// (see run_tests.sh).  The guard below turns accidental use in a real
 // device build into a compile error instead of a mystery.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
-#error "lw_cache host_shim/cuda_runtime.h was included in a CUDA compilation. \
-Remove testing/host_shim from the include path; it exists only for the \
+#error "embedding_cache host_shim/cuda_runtime.h was included in a CUDA compilation. \
+Remove test/embedding_cache/host_shim from the include path; it exists only for the \
 host-only test build."
 #endif
 

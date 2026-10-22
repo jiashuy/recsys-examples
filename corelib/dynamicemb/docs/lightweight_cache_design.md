@@ -193,7 +193,7 @@ DynamicEmb 的 backing 表按每步各表的 unique 数由 host 驱动扩容（`
 
 **扩容会整体替换 backing 的视图**：它新建一个 `key_index_map`（新的设备张量），把所有 key 重新插入，再把值行从旧槽搬到新槽，并刷新 `table_ptrs_dev`（`_expand_tables_impl`）。因此缓存 kernel 用的 backing 视图（索引表指针、各表值缓冲指针）必须在每次 launch 前从当前状态里取，不能跨 step 保存。
 
-扩容也可能让 backing 淘汰一些 key。搬运 kernel 探测不到某个 key 时按"backing 没有这个 key 的记录"处理，沿用 backing 契约（`src/lw_cache/backing.h` 的 `probe` 语义），不在缓存里另设分支。
+扩容也可能让 backing 淘汰一些 key。搬运 kernel 探测不到某个 key 时按"backing 没有这个 key 的记录"处理，这个契约在 backing 接口定下来时一并明确（早期原型的做法见 §16），不在缓存里另设分支。
 
 ---
 
@@ -918,6 +918,20 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 另外它的成本按 backing 槽数计（每槽 4 B），收益按缓存容量计，`N/C`（总 key 数与缓存容量之比）很大时得不偿失，且把 backing 索引锁死在 GPU 上。
 
 **结论。** 重哈希是硬需求，因此不采用。本设计让缓存自带索引、node 里存 key，换来的正是对 backing 重哈希免疫（§4.1、§4.5）。完整的原设计文档 `cache_fused_index_design.md` 在 git 历史中。
+
+---
+
+## 16. 被取代的原型：`lw_cache`
+
+本文最初对应 `src/lw_cache/` 与 `test/lw_cache/`，现已由 `src/embedding_cache/` 取代并删除。完整代码在提交 `0c2ee1a` 里（`git show 0c2ee1a:corelib/dynamicemb/src/lw_cache/...`；若历史被改写，用 `git log --all -S lw_cache` 找）。取代的原因与取走了什么：
+
+- **取代的原因**：`embedding_cache` 在同一设计上把并发协议收得更紧（`release` 与 `claim` 各为一次 CAS，节点一行、桶锁带 acquire/release 内存序，lookup 与压紧融合，ring 的聚合原子），并避开了读 `lw_cache` 代码时发现的两处问题（未复现，是按代码推出来的）：`release_ref` 先减后置位的两步窗口，以及桶锁成功后无 acquire 就读 `prev/next`。
+- **还没有对应实现、需要时从历史里取的**：
+  - **CLOCK**（`absorb_retry_kernel`、retry buffer）。有意推迟：先用 `used` 位占比测出是否值得做。取的时候带上它 README 里记的"计数没清零"缺陷，以及"CLOCK 的容量需求是 FIFO 的 `(1+k)` 倍"。
+  - **指标**（`metrics.h`）与**容量校验**（`CacheConfig::validate`）。
+  - **flush**（`flush_kernel`、`count_referenced_kernel`）。
+- **有意不采用**：多表融合分派（见 §4.4）、`backing.h` 的 `row_ptr` 契约（现在 backing 是 Python 现有的 `key_index_map` 加各表值缓冲指针，行号由外部给，见 §4.5）。
+- **值得借鉴的测试做法**：对着一个纯 Python 模型逐步比较的差分测试（`test_differential.py`、`test_multi_table.py`）。写 `embedding_cache` 的 Python 绑定时，端到端测试应照这个办法做。
 
 ---
 

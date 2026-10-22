@@ -72,7 +72,7 @@ run() {  # run <name> <binary>
 CXX="${CXX:-g++}"
 cxx_flags=(-std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter
            -I"$here/../../src/embedding_cache" -I"$here"
-           -I"$here/../lw_cache/host_shim")
+           -I"$here/host_shim")
 for src in "$here"/test_*.cpp; do
   name="$(basename "$src" .cpp)"
   for mode in -UNDEBUG -DNDEBUG; do
