@@ -64,3 +64,19 @@ class CustomizedScore:
         ret: Dict[str, int] = {name: self.step_ for name in self.table_names_}
         self.step_ += 1
         return ret
+
+
+class PerTableCustomizedScore:
+    """Per-table step counters: ``get(table_name)`` returns that table's next score."""
+
+    def __init__(self, table_names: List[str]):
+        self.table_names_ = table_names
+        self.steps_: Dict[str, int] = {table_name: 1 for table_name in table_names}
+
+    def get(self, table_name: str):
+        assert table_name in self.table_names_
+        ret = self.steps_[table_name]
+        self.steps_[table_name] += 1
+        return ret
+
+

@@ -22,7 +22,6 @@ Does not cover (see test_cache_flush.py): prefetch / flush of the cache;
 """
 
 import os
-import random
 
 import pytest
 import torch
@@ -33,6 +32,7 @@ from common.bdet_builders import (
     create_split_table_batched_embedding,
     init_embedding_tables,
 )
+from common.features import random_indices
 from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -395,13 +395,6 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
-
-
-def random_indices(batch, min_index, max_index):
-    result = set({})
-    while len(result) < batch:
-        result.add(random.randint(min_index, max_index))
-    return result
 
 
 @pytest.mark.parametrize(

@@ -30,31 +30,24 @@ Does not cover (see unit/incremental_dump/): the dump and replay on a bare
 DISTRIBUTED_NPROCS = (1, 8)
 
 import os
-import random
-from typing import Dict, List, Optional
+from typing import Dict
 
 import pytest
 import torch
 import torch.distributed as dist
 import torchrec
-from common.gpu_platform import Platform
+from common.features import generate_unbounded_sparse_feature
+from common.scores import PerTableCustomizedScore
+from common.sharding import get_per_table_planner
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
-    DynamicEmbTableOptions,
 )
-from dynamicemb.dynamicemb_config import ScoreStrategy
 from dynamicemb.incremental_dump import (
     get_score,
     incremental_dump,
     replay_increment,
     set_score,
-)
-from dynamicemb.planner import (
-    DynamicEmbeddingShardingPlanner,
-    DynamicEmbParameterConstraints,
 )
 from dynamicemb.shard import (
     DynamicEmbeddingBagCollectionSharder,
@@ -63,110 +56,9 @@ from dynamicemb.shard import (
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.comm import intra_and_cross_node_pg
 from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.distributed.planner import Topology
-from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
+from torchrec.modules.embedding_configs import PoolingType
 
 pytestmark = pytest.mark.load_dump
-
-
-class CustomizedScore:
-    def __init__(self, table_names: List[int]):
-        self.table_names_ = table_names
-        self.steps_: Dict[str, int] = {table_name: 1 for table_name in table_names}
-
-    def get(self, table_name: str):
-        assert table_name in self.table_names_
-        ret = self.steps_[table_name]
-        self.steps_[table_name] += 1
-        return ret
-
-
-def get_planner(
-    table_names: List[str],
-    eb_configs: List[BaseEmbeddingConfig],
-    use_dynamicembs: List[bool],
-    score_strategies: List[Optional[ScoreStrategy]],
-    batch_size: int,
-    multi_hot_sizes: List[int],
-    device,
-    training: bool = True,
-):
-    dict_const = {}
-    for i in range(len(table_names)):
-        const = DynamicEmbParameterConstraints(
-            sharding_types=[
-                ShardingType.ROW_WISE.value,
-            ],
-            pooling_factors=[multi_hot_sizes[i]],
-            num_poolings=[1],
-            enforce_hbm=True,
-            bounds_check_mode=BoundsCheckMode.NONE,
-            use_dynamicemb=use_dynamicembs[i],
-            dynamicemb_options=DynamicEmbTableOptions(
-                global_hbm_for_values=1024**3,
-                score_strategy=score_strategies[i],
-                training=training,
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.DEBUG,
-                ),
-            ),
-        )
-        dict_const[table_names[i]] = const
-
-    platform = Platform(device)
-    topology = Topology(
-        local_world_size=torchrec.distributed.comm.get_local_size(),
-        world_size=dist.get_world_size(),
-        compute_device=device.type,
-        hbm_cap=platform.hbm_cap,
-        # One node's host memory, not one rank's: Topology replicates
-        # whatever it is given to every device instead of dividing it.
-        ddr_cap=1024 * 1024 * 1024 * 1024 // torchrec.distributed.comm.get_local_size(),
-        intra_host_bw=platform.intra_host_bw,
-        inter_host_bw=platform.inter_host_bw,
-    )
-    return DynamicEmbeddingShardingPlanner(
-        topology=topology,
-        constraints=dict_const,
-        batch_size=batch_size,
-        debug=True,
-    )
-
-
-def generate_sparse_feature(
-    feature_names: List[str],
-    multi_hot_sizes: List[int],
-    local_batch_size: int,
-    unique_indices_list: List[set],
-    use_dynamicembs: List[bool],
-    num_embeddings: List[int],
-):
-    feature_num = len(feature_names)
-    feature_batch = feature_num * local_batch_size
-
-    indices = []
-    lengths = []
-
-    for i in range(feature_batch):
-        f = i // local_batch_size
-        cur_bag_size = random.randint(0, multi_hot_sizes[f])
-        cur_bag = set({})
-        while len(cur_bag) < cur_bag_size:
-            if use_dynamicembs[f]:
-                cur_bag.add(random.randint(0, (1 << 63) - 1))
-            else:
-                cur_bag.add(random.randint(0, num_embeddings[f] - 1))
-
-        unique_indices_list[f].update(cur_bag)
-        indices.extend(list(cur_bag))
-        lengths.append(cur_bag_size)
-
-    return torchrec.KeyedJaggedTensor(
-        keys=feature_names,
-        values=torch.tensor(indices, dtype=torch.int64).cuda(),
-        lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
-    )
 
 
 @pytest.fixture
@@ -297,7 +189,7 @@ def test_incremental_dump_api(
         )
 
     print("EmbeddingCollection:", ebc)
-    planner = get_planner(
+    planner = get_per_table_planner(
         table_names,
         eb_configs,
         use_dynamicembs,
@@ -325,7 +217,7 @@ def test_incremental_dump_api(
         plan=plan,
     )
 
-    customized_scores = CustomizedScore(table_names)
+    customized_scores = PerTableCustomizedScore(table_names)
     ret: Dict[str, Dict[str, int]] = get_score(model)
     prefix_path = "model"
 
@@ -362,7 +254,7 @@ def test_incremental_dump_api(
                         table_names[i]
                     )
             set_score(model, {prefix_path: scores_to_set})
-            sparse_feature = generate_sparse_feature(
+            sparse_feature = generate_unbounded_sparse_feature(
                 feature_names,
                 multi_hot_sizes,
                 local_batch,
@@ -408,7 +300,7 @@ def _build_sharded_model(
     embedding alone and there is no per-row state for a replay to restore.
     """
     ebc = torchrec.EmbeddingCollection(device=torch.device("meta"), tables=eb_configs)
-    planner = get_planner(
+    planner = get_per_table_planner(
         table_names,
         eb_configs,
         [True] * len(table_names),
@@ -462,7 +354,7 @@ def test_replay_increment_distributed(
     serve_model.eval()
 
     unique_indices = [set({}) for _ in table_names]
-    sparse_feature = generate_sparse_feature(
+    sparse_feature = generate_unbounded_sparse_feature(
         [f"f_{t}" for t in range(table_num)],
         [1] * table_num,
         local_batch,

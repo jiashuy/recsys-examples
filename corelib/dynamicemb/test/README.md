@@ -107,7 +107,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 
 ## Runtime
 
-A full run on one 8xH100 node takes about 2 h 10 min (1654 passed, 4 skipped, 0 failed).
+A full run on one 8xH100 node takes about 2 h 18 min (1654 passed, 4 skipped, 0 failed).
 Nearly all of it is integration cases that start one `torchrun` each, because a case is
 one worker configuration: `test_model_dump_load` (144 loads + 72 dumps, ~37 s per 8-rank
 load), `test_lfu_scores`, `test_embedding_admission`, `test_twin_module`. Unit tests total

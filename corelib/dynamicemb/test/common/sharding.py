@@ -22,6 +22,8 @@ with: ``num_embedding_table``, ``data_parallel_embeddings`` (list or None),
 fields from a platform name.
 """
 
+from typing import List, Optional
+
 import torch.distributed as dist
 from dynamicemb import (
     DynamicEmbCheckMode,
@@ -33,13 +35,16 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
+from dynamicemb.dynamicemb_config import ScoreStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import CommType
 from torchrec.distributed.planner import ParameterConstraints, Topology
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from common.features import table_idx_to_name
+from common.gpu_platform import Platform
 
 _COMM_TYPES = {
     "fp32": CommType.FP32,
@@ -146,3 +151,57 @@ def get_planner(args, device):
         batch_size=args.batch_size,
         debug=True,
     )
+
+
+def get_per_table_planner(
+    table_names: List[str],
+    eb_configs: List[BaseEmbeddingConfig],
+    use_dynamicembs: List[bool],
+    score_strategies: List[Optional[ScoreStrategy]],
+    batch_size: int,
+    multi_hot_sizes: List[int],
+    device,
+    training: bool = True,
+):
+    dict_const = {}
+    for i in range(len(table_names)):
+        const = DynamicEmbParameterConstraints(
+            sharding_types=[
+                ShardingType.ROW_WISE.value,
+            ],
+            pooling_factors=[multi_hot_sizes[i]],
+            num_poolings=[1],
+            enforce_hbm=True,
+            bounds_check_mode=BoundsCheckMode.NONE,
+            use_dynamicemb=use_dynamicembs[i],
+            dynamicemb_options=DynamicEmbTableOptions(
+                global_hbm_for_values=1024**3,
+                score_strategy=score_strategies[i],
+                training=training,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.DEBUG,
+                ),
+            ),
+        )
+        dict_const[table_names[i]] = const
+
+    platform = Platform(device)
+    topology = Topology(
+        local_world_size=get_local_size(),
+        world_size=dist.get_world_size(),
+        compute_device=device.type,
+        hbm_cap=platform.hbm_cap,
+        # One node's host memory, not one rank's: Topology replicates
+        # whatever it is given to every device instead of dividing it.
+        ddr_cap=1024 * 1024 * 1024 * 1024 // get_local_size(),
+        intra_host_bw=platform.intra_host_bw,
+        inter_host_bw=platform.inter_host_bw,
+    )
+    return DynamicEmbeddingShardingPlanner(
+        topology=topology,
+        constraints=dict_const,
+        batch_size=batch_size,
+        debug=True,
+    )
+
+
