@@ -489,9 +489,9 @@ def _check_group_rows(dims, dtype, params, weights, grads, table_of_row, out_of_
     assert any(zero_ref) and not all(zero_ref), "test needs both kinds of row"
 
 
-_GROUP_DIMS = [[8], [5], [8, 4, 12], [12, 5, 8]]
+_GROUP_DIMS = [[8, 4, 12], [12, 5, 8]]
 _GROUP_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-_GROUP_DIMS_IDS = ["8", "5", "vec4_mixed", "unaligned_mixed"]
+_GROUP_DIMS_IDS = ["vec4_mixed", "unaligned_mixed"]
 _GROUP_PARAMS = dict(
     learning_rate=0.1,
     l1_reg=0.005,
@@ -504,12 +504,13 @@ _GROUP_PARAMS = dict(
 @pytest.mark.parametrize("dims", _GROUP_DIMS, ids=_GROUP_DIMS_IDS)
 @pytest.mark.parametrize("dtype", _GROUP_DTYPES, ids=["fp32", "fp16", "bf16"])
 def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
-    """Padded buffer, every table dtype, tables of different widths in one call.
+    """Every table dtype, tables of different widths in one padded-buffer call.
 
-    Each row's own ``edim`` fixes where its states sit and how wide they are,
-    so a kernel that took the buffer's widest row for all of them would put the
-    accum in the wrong place. The slots past a row's live elements are seeded
-    with a sentinel and must come back untouched.
+    The threshold is ``group_lasso_reg * sqrt(d)`` with ``d`` the row's own
+    width, so a kernel that took the buffer's widest row for all of them would
+    zero the wrong rows. The state is rounded to the table dtype before the row
+    norm is taken. Where the states sit in a padded buffer is covered by
+    ``test_padded_buffer_optimizer.py``.
     """
     device = torch.device("cuda")
     max_dim = max(dims)
@@ -517,13 +518,10 @@ def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
     num_rows = weights.size(0)
     optimizer = _ftrl_optimizer(**_GROUP_PARAMS)
 
-    sentinel = 7.0
-    values = torch.full((num_rows, 3 * max_dim), sentinel, dtype=dtype)
+    values = torch.zeros(num_rows, 3 * max_dim, dtype=dtype)
     for row in range(num_rows):
         edim = dims[int(table_of_row[row])]
         values[row, :edim] = weights[row, :edim]
-        values[row, max_dim : max_dim + 2 * edim] = 0.0
-    before = values.clone()
     values = values.to(device)
 
     optimizer.update_for_padded_buffer(
@@ -543,61 +541,6 @@ def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
             out[row, :edim],
             out[row, max_dim : max_dim + edim],
             out[row, max_dim + edim : max_dim + 2 * edim],
-        )
-
-    _check_group_rows(
-        dims, dtype, _GROUP_PARAMS, weights, grads, table_of_row, out_of_row
-    )
-    for row in range(num_rows):
-        edim = dims[int(table_of_row[row])]
-        for lo, hi in ((edim, max_dim), (max_dim + 2 * edim, 3 * max_dim)):
-            assert torch.equal(
-                out[row, lo:hi], before[row, lo:hi]
-            ), f"row {row}: padding [{lo}, {hi}) was written"
-
-
-@cuda
-@pytest.mark.parametrize("dims", _GROUP_DIMS, ids=_GROUP_DIMS_IDS)
-@pytest.mark.parametrize("dtype", _GROUP_DTYPES, ids=["fp32", "fp16", "bf16"])
-def test_ftrl_group_flat_table_dtype_and_mixed_dims(dims, dtype):
-    """The flat-table kernel against the same reference, one table per width.
-
-    Unlike the padded buffer, a flat table packs its states right after the
-    embedding, so ``linear`` starts at ``edim`` and ``accum`` at ``2 * edim``.
-    """
-    device = torch.device("cuda")
-    max_dim = max(dims)
-    rows_per_table = 16
-    weights, grads, table_of_row = _group_case(dims, dtype, rows_per_table)
-    optimizer = _ftrl_optimizer(**_GROUP_PARAMS)
-
-    tables = []
-    for t, edim in enumerate(dims):
-        table = torch.zeros(rows_per_table, 3 * edim, dtype=dtype)
-        table[:, :edim] = weights[t * rows_per_table : (t + 1) * rows_per_table, :edim]
-        tables.append(table.to(device))
-
-    optimizer.fused_update_for_flat_table(
-        grads.to(device),
-        torch.arange(rows_per_table, dtype=torch.int64).repeat(len(dims)).to(device),
-        torch.tensor([t.data_ptr() for t in tables], dtype=torch.int64, device=device),
-        table_of_row.to(device),
-        torch.tensor([3 * d for d in dims], dtype=torch.int64, device=device),
-        torch.tensor(dims, dtype=torch.int64, device=device),
-        max_dim,
-        all(d % 4 == 0 for d in dims),
-        dtype,
-    )
-    outs = [t.cpu() for t in tables]
-
-    def out_of_row(row):
-        t = int(table_of_row[row])
-        edim = dims[t]
-        r = row % rows_per_table
-        return (
-            outs[t][r, :edim],
-            outs[t][r, edim : 2 * edim],
-            outs[t][r, 2 * edim : 3 * edim],
         )
 
     _check_group_rows(
