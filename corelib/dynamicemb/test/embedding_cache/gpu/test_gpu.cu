@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <vector>
@@ -555,14 +556,18 @@ static void test_release_overlaps_allocate() {
 // as having nothing to remove, and remove() asserts on a node that is in no chain,
 // so a node invalidate left in a chain, or allocate mistook for resident, stops
 // the kernel here.
+//
+// These kernels take an array of per-table maps and a table id per key, so here
+// they run with one table.
 
-using Guard = EvictionGuard<Map, Node>;
+using Guard = EvictionGuard<Map>;
 
-__global__ void guard_probe_kernel(Guard guard, const int64_t* keys, int64_t n,
+__global__ void guard_probe_kernel(Guard guard, const int64_t* keys,
+                                   const int64_t* table_ids, int64_t n,
                                    char* out) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
-    out[i] = guard.may_evict(keys[i]) ? 1 : 0;
+    out[i] = guard.may_evict(keys[i], table_ids[i]) ? 1 : 0;
   }
 }
 
@@ -578,15 +583,18 @@ struct Harness {
   Dev<int32_t> node_ids;
   Dev<Slot> slots;
   Dev<unsigned long long> miss_count, wrong, dry;
+  Dev<Map> d_map;  // this one table, as the one-element array the kernels take
   int64_t held = 0;
 
   Harness(int64_t capacity_, int64_t per_step_)
       : capacity(capacity_), per_step(per_step_), map_store(capacity_),
         qs(capacity_), nodes(map_store.nodes()), rows(capacity_),
         keys(per_step_), miss_keys(per_step_), miss_src(per_step_),
-        node_ids(per_step_), slots(per_step_), miss_count(1), wrong(1), dry(1) {
+        node_ids(per_step_), slots(per_step_), miss_count(1), wrong(1), dry(1),
+        d_map(1) {
     init_states_kernel<<<64, 256>>>(nodes, capacity);
     CU(cudaDeviceSynchronize());
+    d_map.put(std::vector<Map>{map_store.map()});
   }
 
   // Look the keys up, pin the hits, and bind a node to each miss. The misses are
@@ -631,15 +639,25 @@ struct Harness {
 
   // Which of `h_keys` are cached: the node holding each, or kNoNode.
   std::vector<int32_t> find(const std::vector<int64_t>& h_keys) {
-    Dev<int64_t> d_keys(h_keys.size());
+    Dev<int64_t> d_keys(h_keys.size()), d_tid(h_keys.size());  // tid: all zero
     Dev<int32_t> d_out(h_keys.size());
     d_keys.put(h_keys);
-    find_nodes_kernel<Map><<<64, 256>>>(map_store.map(), d_keys.p,
+    find_nodes_kernel<Map><<<64, 256>>>(d_map.p, d_keys.p, d_tid.p,
                                         static_cast<int64_t>(h_keys.size()),
                                         d_out.p);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
     return d_out.get();
+  }
+
+  void invalidate(const std::vector<int32_t>& found) {
+    Dev<int32_t> d_nodes(found.size());
+    Dev<int64_t> d_tid(found.size());
+    d_nodes.put(found);
+    invalidate_kernel<Map><<<64, 256>>>(d_map.p, d_nodes.p, d_tid.p,
+                                        static_cast<int64_t>(found.size()));
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
   }
 
   // Every key bound to a node, found by walking the chains.
@@ -654,7 +672,46 @@ struct Harness {
     }
     return out;
   }
+
+  // The invariants of a cache at rest, for any test that has run it for a while.
+  void check_at_rest(const char* name) {
+    CHECK(map_store.check_bindings() == 0, "%s: bindings stay consistent", name);
+    const auto h_nodes = map_store.download_nodes();
+    const auto h_heads = map_store.download_heads();
+    std::map<int64_t, int> owner;
+    int64_t dupes = 0, queued = 0, referenced = 0;
+    for (int64_t b = 0; b < map_store.num_buckets(); ++b) {
+      for (int32_t cur = h_heads[b]; cur != Map::kNoNode; cur = h_nodes[cur].next) {
+        if (!owner.emplace(h_nodes[cur].key, cur).second) ++dupes;
+      }
+    }
+    for (int64_t i = 0; i < capacity; ++i) {
+      const NodeState st = h_nodes[i].state.get();
+      if (st.in_ring()) ++queued;
+      if (st.has_refs()) ++referenced;
+    }
+    CHECK(dupes == 0, "%s: %lld keys are bound to more than one node", name,
+          (long long)dupes);
+    CHECK(referenced == 0, "%s: %lld nodes still hold a reference", name,
+          (long long)referenced);
+    CHECK(queued == qs.size(), "%s: flags and queue disagree: %lld vs %lld", name,
+          (long long)queued, (long long)qs.size());
+  }
 };
+
+static std::vector<int64_t> draw_keys(std::mt19937_64& rng,
+                                      std::geometric_distribution<int64_t>& hot,
+                                      int64_t n, int64_t space) {
+  std::vector<int64_t> out;
+  std::vector<char> present(space, 0);
+  while ((int64_t)out.size() < n) {
+    const int64_t k = hot(rng) % space;
+    if (present[k]) continue;  // unique within a step, as the cache requires
+    present[k] = 1;
+    out.push_back(k);
+  }
+  return out;
+}
 
 static void test_evict_by_key() {
   std::printf("=== evicting by key, and the guard ===\n");
@@ -663,20 +720,9 @@ static void test_evict_by_key() {
 
   std::mt19937_64 rng(7);
   std::geometric_distribution<int64_t> hot(0.01);
-  auto draw = [&](int64_t n) {
-    std::vector<int64_t> out;
-    std::vector<char> present(kSpace, 0);
-    while ((int64_t)out.size() < n) {
-      const int64_t k = hot(rng) % kSpace;
-      if (present[k]) continue;
-      present[k] = 1;
-      out.push_back(k);
-    }
-    return out;
-  };
 
   for (int s = 0; s < scaled(80); ++s) {
-    h.acquire(draw(kPerStep));
+    h.acquire(draw_keys(rng, hot, kPerStep, kSpace));
     h.release();
   }
 
@@ -695,11 +741,10 @@ static void test_evict_by_key() {
     std::vector<char> is_held_key(kSpace + 100, 0);
     for (int64_t k : held_keys) is_held_key[k] = 1;
 
-    Dev<int64_t> d_probe(probe.size());
+    Dev<int64_t> d_probe(probe.size()), d_tid(probe.size());  // tid: all zero
     Dev<char> d_may(probe.size());
     d_probe.put(probe);
-    guard_probe_kernel<<<64, 256>>>(Guard{h.map_store.map(), h.nodes},
-                                    d_probe.p,
+    guard_probe_kernel<<<64, 256>>>(Guard{h.d_map.p}, d_probe.p, d_tid.p,
                                     static_cast<int64_t>(probe.size()), d_may.p);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
@@ -747,15 +792,7 @@ static void test_evict_by_key() {
     }
   }
 
-  {
-    Dev<int32_t> d_nodes(nodes_found.size());
-    d_nodes.put(nodes_found);
-    invalidate_kernel<Map, Node><<<64, 256>>>(
-        h.map_store.map(), h.nodes, d_nodes.p,
-        static_cast<int64_t>(nodes_found.size()));
-    CU(cudaGetLastError());
-    CU(cudaDeviceSynchronize());
-  }
+  h.invalidate(nodes_found);
   std::printf("  evicted %lld cached keys of %zu asked for\n", (long long)found,
               evict.size());
 
@@ -781,9 +818,9 @@ static void test_evict_by_key() {
     int64_t bad_state = 0, queued = 0;
     for (int32_t n : nodes_found) {
       if (n == Map::kNoNode) continue;
-      const NodeState s = after[n].state.get();
-      if (s.residency() != NodeState::kEmpty || s.has_refs() || !s.in_ring() ||
-          s.used()) {
+      const NodeState st = after[n].state.get();
+      if (st.residency() != NodeState::kEmpty || st.has_refs() || !st.in_ring() ||
+          st.used()) {
         ++bad_state;
       }
     }
@@ -810,34 +847,18 @@ static void test_evict_by_key() {
   h.acquire(again);
   h.release();
   for (int s = 0; s < scaled(60); ++s) {
-    h.acquire(draw(kPerStep));
+    h.acquire(draw_keys(rng, hot, kPerStep, kSpace));
     h.release();
   }
 
   CHECK(h.wrong.get()[0] == 0ull, "%llu keys resolved to a node holding something else",
         h.wrong.get()[0]);
   CHECK(h.dry.get()[0] == 0ull, "%llu keys went unserved", h.dry.get()[0]);
-  CHECK(h.map_store.check_bindings() == 0, "bindings stay consistent afterwards");
-
-  const auto h_nodes = h.map_store.download_nodes();
-  const auto h_heads = h.map_store.download_heads();
-  std::map<int64_t, int> owner;
-  int64_t dupes = 0, queued = 0;
-  for (int64_t b = 0; b < h.map_store.num_buckets(); ++b) {
-    for (int32_t cur = h_heads[b]; cur != Map::kNoNode; cur = h_nodes[cur].next) {
-      if (!owner.emplace(h_nodes[cur].key, cur).second) ++dupes;
-    }
-  }
-  for (int64_t i = 0; i < kCap; ++i)
-    if (h_nodes[i].state.get().in_ring()) ++queued;
-  CHECK(dupes == 0, "%lld keys are bound to more than one node",
-        (long long)dupes);
-  CHECK(queued == h.qs.size(), "flags and queue disagree: %lld vs %lld",
-        (long long)queued, (long long)h.qs.size());
+  h.check_at_rest("after evicting and carrying on");
 }
 
 // ---------------------------------------------------------------------------
-// 7. Rows: the whole cycle, with values
+// 7. Rows: the whole cycle, with values — one table, then several
 // ---------------------------------------------------------------------------
 //
 // Every step "trains" what it touched: each key's row gets +1. A key starts as a
@@ -853,15 +874,16 @@ static void test_evict_by_key() {
 // loses it by being evicted from the system. The row numbers the kernels take are
 // worked out on the host between kernels, which is the position the integration
 // is in too — the backing finds them with its own kernels.
+//
+// With several tables the same key value appears in each, with a different start
+// value per table and a different row width, so a lookup, a node or a row that
+// crossed tables reads as a wrong value.
 
-constexpr int kRowElems = 8;
 using FRows = Rows<float>;
 
-static float start_value(int64_t key, int j) { return 1000.0f * key + j; }
-
 // New keys' rows, written in place. This is what the embedding initialiser and
-// the optimizer do in the integration.
-__global__ void init_fresh_kernel(FRows cache, const Slot* slots,
+// the optimizer do in the integration. `tag` is the table's offset.
+__global__ void init_fresh_kernel(FRows cache, float tag, const Slot* slots,
                                   const unsigned long long* count,
                                   const int64_t* new_row) {
   const int64_t n = static_cast<int64_t>(*count);
@@ -872,7 +894,7 @@ __global__ void init_fresh_kernel(FRows cache, const Slot* slots,
     const Slot slot = slots[s];
     if (slot.node == Map::kNoNode || new_row[s] >= 0) continue;
     for (int j = lane; j < cache.row_elems; j += kLanesPerRow) {
-      cache.row(slot.node)[j] = 1000.0f * slot.key + j;
+      cache.row(slot.node)[j] = tag + 1000.0f * slot.key + j;
     }
   }
 }
@@ -891,46 +913,46 @@ __global__ void train_kernel(FRows cache, const int32_t* node_ids, int64_t n) {
   }
 }
 
-static void test_value_cycle() {
-  std::printf("=== rows: the whole cycle, with values ===\n");
-  // Smaller than the working set, on purpose: a cache that holds every key it
-  // sees never evicts, and then neither direction of the move is exercised.
-  const int64_t kCap = 384, kPerStep = 128, kSpace = 3000;
-  Harness h(kCap, kPerStep);
-
-  Dev<float> d_pool(kCap * kRowElems), d_backing(kSpace * kRowElems);
-  const FRows pool{d_pool.p, kRowElems};
-  const FRows backing{d_backing.p, kRowElems};
-  Dev<int64_t> d_new_row(kPerStep), d_victim_row(kPerStep);
-  const int warp_grid = grid_for(kPerStep * kLanesPerRow);
-
-  std::vector<char> history(kSpace, 0);   // does the backing hold this key's row
-  std::vector<int64_t> touches(kSpace, 0);  // steps since the key was last new
-
-  std::mt19937_64 rng(11);
-  std::geometric_distribution<int64_t> hot(0.004);
-  auto draw = [&](int64_t n) {
-    std::vector<int64_t> out;
-    std::vector<char> present(kSpace, 0);
-    while ((int64_t)out.size() < n) {
-      const int64_t k = hot(rng) % kSpace;
-      if (present[k]) continue;
-      present[k] = 1;
-      out.push_back(k);
-    }
-    return out;
-  };
-
+// One table with its row pool, its backing rows, and the host's model of both.
+struct ValueTable {
+  const int64_t per_step, space;
+  const int row_elems;
+  const float tag;
+  Harness h;
+  Dev<float> d_pool, d_backing;
+  Dev<int64_t> d_new_row, d_victim_row;
+  std::vector<char> history;      // does the backing hold this key's row
+  std::vector<int64_t> touches;   // steps since the key was last new
   int64_t total_miss = 0, total_victims = 0, total_loaded = 0;
-  auto step = [&](const std::vector<int64_t>& step_keys) {
+
+  ValueTable(int64_t cap, int64_t per_step_, int64_t space_, int row_elems_,
+             float tag_)
+      : per_step(per_step_), space(space_), row_elems(row_elems_), tag(tag_),
+        h(cap, per_step_), d_pool(cap * row_elems_),
+        d_backing(space_ * row_elems_), d_new_row(per_step_),
+        d_victim_row(per_step_), history(space_, 0), touches(space_, 0) {}
+
+  FRows pool() const { return FRows{d_pool.p, row_elems}; }
+  FRows backing() const { return FRows{d_backing.p, row_elems}; }
+  float expected(int64_t key, int j) const {
+    return tag + 1000.0f * key + j + float(touches[key]);
+  }
+  // The key has left the system: no history, and whatever it was is gone.
+  void forget(int64_t key) {
+    history[key] = 0;
+    touches[key] = 0;
+  }
+
+  void step(const std::vector<int64_t>& step_keys) {
+    const int warp_grid = grid_for(per_step * kLanesPerRow);
     h.lookup_and_allocate(step_keys);
     const int64_t n_miss = static_cast<int64_t>(h.miss_count.get()[0]);
     const auto slots = h.slots.get();
 
-    std::vector<int64_t> new_row(kPerStep, -1), victim_row(kPerStep, -1);
+    std::vector<int64_t> new_row(per_step, -1), victim_row(per_step, -1);
     for (int64_t s = 0; s < n_miss; ++s) {
-      CHECK(slots[s].node != Map::kNoNode, "the cache is large enough to serve "
-                                           "every miss");
+      CHECK(slots[s].node != Map::kNoNode,
+            "the cache is large enough to serve every miss");
       new_row[s] = history[slots[s].key] ? slots[s].key : -1;
       victim_row[s] = slots[s].has_victim ? slots[s].victim_key : -1;
     }
@@ -938,14 +960,14 @@ static void test_value_cycle() {
     d_victim_row.put(victim_row);
 
     writeback_kernel<Map, float><<<warp_grid, kBlock>>>(
-        pool, backing, h.slots.p, h.miss_count.p, d_victim_row.p);
+        pool(), backing(), h.slots.p, h.miss_count.p, d_victim_row.p);
     fill_kernel<Map, float><<<warp_grid, kBlock>>>(
-        pool, backing, h.slots.p, h.miss_count.p, d_new_row.p);
-    init_fresh_kernel<<<warp_grid, kBlock>>>(pool, h.slots.p, h.miss_count.p,
-                                             d_new_row.p);
+        pool(), backing(), h.slots.p, h.miss_count.p, d_new_row.p);
+    init_fresh_kernel<<<warp_grid, kBlock>>>(pool(), tag, h.slots.p,
+                                             h.miss_count.p, d_new_row.p);
     publish_kernel<Map, Node><<<h.grid_slots(), kBlock>>>(h.nodes, h.slots.p,
                                                           h.miss_count.p);
-    train_kernel<<<warp_grid, kBlock>>>(pool, h.node_ids.p,
+    train_kernel<<<warp_grid, kBlock>>>(pool(), h.node_ids.p,
                                         static_cast<int64_t>(step_keys.size()));
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
@@ -961,14 +983,14 @@ static void test_value_cycle() {
     }
     for (int64_t k : step_keys) ++touches[k];
     total_miss += n_miss;
-  };
+  }
 
-  // The latest value of a key, from wherever it is.
-  auto check_all = [&](const char* when) {
+  // The latest value of every key touched, from wherever it is.
+  int64_t check_all(const char* when) {
     const auto cache_rows = d_pool.get();
     const auto backing_rows = d_backing.get();
     std::vector<int64_t> all_keys;
-    for (int64_t k = 0; k < kSpace; ++k)
+    for (int64_t k = 0; k < space; ++k)
       if (touches[k] > 0) all_keys.push_back(k);
     const auto where = h.find(all_keys);
     int64_t bad = 0, from_cache = 0;
@@ -976,89 +998,258 @@ static void test_value_cycle() {
       const int64_t k = all_keys[i];
       const float* row;
       if (where[i] != Map::kNoNode) {
-        row = &cache_rows[where[i] * kRowElems];
+        row = &cache_rows[where[i] * row_elems];
         ++from_cache;
       } else {
         if (!history[k]) { ++bad; continue; }  // neither cached nor written back
-        row = &backing_rows[k * kRowElems];
+        row = &backing_rows[k * row_elems];
       }
-      for (int j = 0; j < kRowElems; ++j) {
-        if (row[j] != start_value(k, j) + float(touches[k])) { ++bad; break; }
+      for (int j = 0; j < row_elems; ++j) {
+        if (row[j] != expected(k, j)) { ++bad; break; }
       }
     }
     std::printf("  %s: %zu keys touched, %lld read from the cache, %lld wrong\n",
                 when, all_keys.size(), (long long)from_cache, (long long)bad);
     CHECK(bad == 0, "%lld keys do not hold start + touches (%s)", (long long)bad,
           when);
-  };
+    return bad;
+  }
+};
 
-  for (int s = 0; s < scaled(150); ++s) step(draw(kPerStep));
-  std::printf("  %lld misses, %lld victims written back, %lld rows loaded\n",
-              (long long)total_miss, (long long)total_victims,
-              (long long)total_loaded);
-  CHECK(total_victims > 0 && total_loaded > 0,
-        "the run has to exercise both directions");
-  check_all("after the first run of steps");
+// All the tables' maps and row pools as the arrays the fused kernels take.
+struct Fused {
+  std::vector<ValueTable*> tables;
+  Dev<Map> maps;
+  Dev<FRows> rows;
 
-  // --- evict some cached keys from the system, taking their values off -------
-  //
-  // find_nodes, then fetch, then invalidate: the order the cache runs when the
-  // backing evicts. What is fetched must be the latest value, and afterwards the
-  // key starts over.
-  {
-    const auto cached = h.bound_keys();
-    std::vector<int64_t> evict;
-    for (size_t i = 0; i < cached.size(); i += 4) evict.push_back(cached[i]);
+  explicit Fused(const std::vector<ValueTable*>& t)
+      : tables(t), maps(t.size()), rows(t.size()) {
+    std::vector<Map> m;
+    std::vector<FRows> r;
+    for (ValueTable* v : t) {
+      m.push_back(v->h.map_store.map());
+      r.push_back(v->pool());
+    }
+    maps.put(m);
+    rows.put(r);
+  }
+};
 
-    const auto nodes_found = h.find(evict);
-    Dev<int32_t> d_nodes(nodes_found.size());
-    Dev<float> d_out(evict.size() * kRowElems);
-    d_nodes.put(nodes_found);
-    fetch_rows_kernel<Map, float><<<grid_for(evict.size() * kLanesPerRow),
-                                    kBlock>>>(
-        pool, d_nodes.p, static_cast<int64_t>(evict.size()), d_out.p);
-    CU(cudaGetLastError());
-    CU(cudaDeviceSynchronize());
-    const auto fetched = d_out.get();
+using KeyOf = std::pair<int, int64_t>;  // (table, key)
 
-    int64_t bad = 0;
-    for (size_t i = 0; i < evict.size(); ++i) {
-      if (nodes_found[i] == Map::kNoNode) { ++bad; continue; }
-      for (int j = 0; j < kRowElems; ++j) {
-        if (fetched[i * kRowElems + j] !=
-            start_value(evict[i], j) + float(touches[evict[i]])) {
-          ++bad;
-          break;
-        }
+// What the guard says about each (table, key), in the order given.
+static std::vector<char> probe_guard(Fused& f, const std::vector<KeyOf>& list) {
+  std::vector<int64_t> keys, tids;
+  for (const KeyOf& e : list) {
+    tids.push_back(e.first);
+    keys.push_back(e.second);
+  }
+  Dev<int64_t> d_keys(keys.size()), d_tid(keys.size());
+  Dev<char> d_may(keys.size());
+  d_keys.put(keys);
+  d_tid.put(tids);
+  guard_probe_kernel<<<64, 256>>>(Guard{f.maps.p}, d_keys.p, d_tid.p,
+                                  static_cast<int64_t>(keys.size()), d_may.p);
+  CU(cudaGetLastError());
+  CU(cudaDeviceSynchronize());
+  return d_may.get();
+}
+
+// The order the cache runs when the backing evicts: find, fetch, invalidate. The
+// list is cached keys from any tables in any order, as the backing hands them
+// over. What is fetched must be the latest value; afterwards each key starts over.
+// Returns how many fetched rows were wrong.
+static int64_t evict_and_fetch(Fused& f, const std::vector<KeyOf>& list) {
+  const int64_t n = static_cast<int64_t>(list.size());
+  std::vector<int64_t> keys, tids, offset;
+  int64_t total = 0;
+  for (const KeyOf& e : list) {
+    keys.push_back(e.second);
+    tids.push_back(e.first);
+    offset.push_back(total);
+    total += f.tables[e.first]->row_elems;
+  }
+  Dev<int64_t> d_keys(n), d_tid(n), d_off(n);
+  Dev<int32_t> d_nodes(n);
+  Dev<float> d_out(total);
+  d_keys.put(keys);
+  d_tid.put(tids);
+  d_off.put(offset);
+
+  find_nodes_kernel<Map><<<64, 256>>>(f.maps.p, d_keys.p, d_tid.p, n, d_nodes.p);
+  fetch_rows_kernel<Map, float><<<grid_for(n * kLanesPerRow), kBlock>>>(
+      f.rows.p, d_nodes.p, d_tid.p, n, d_out.p, d_off.p);
+  CU(cudaGetLastError());
+  CU(cudaDeviceSynchronize());
+
+  const auto nodes_found = d_nodes.get();
+  const auto fetched = d_out.get();
+  int64_t bad = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    const ValueTable& t = *f.tables[list[i].first];
+    if (nodes_found[i] == Map::kNoNode) { ++bad; continue; }
+    for (int j = 0; j < t.row_elems; ++j) {
+      if (fetched[offset[i] + j] != t.expected(list[i].second, j)) {
+        ++bad;
+        break;
       }
     }
-    std::printf("  fetched %zu rows off nodes about to be invalidated, %lld "
-                "wrong\n", evict.size(), (long long)bad);
-    CHECK(bad == 0, "%lld fetched rows are not the latest value", (long long)bad);
-
-    invalidate_kernel<Map, Node><<<64, 256>>>(
-        h.map_store.map(), h.nodes, d_nodes.p,
-        static_cast<int64_t>(nodes_found.size()));
-    CU(cudaGetLastError());
-    CU(cudaDeviceSynchronize());
-
-    // The key has left the system: no history, and whatever it was is gone.
-    for (int64_t k : evict) {
-      history[k] = 0;
-      touches[k] = 0;
-    }
-    // Ask for them again so they come back as new keys.
-    std::vector<int64_t> again(evict.begin(),
-                               evict.begin() + std::min<int64_t>(kPerStep,
-                                                                 evict.size()));
-    step(again);
   }
 
-  for (int s = 0; s < scaled(100); ++s) step(draw(kPerStep));
-  check_all("after evicting and more steps");
+  invalidate_kernel<Map><<<64, 256>>>(f.maps.p, d_nodes.p, d_tid.p, n);
+  CU(cudaGetLastError());
+  CU(cudaDeviceSynchronize());
+  for (const KeyOf& e : list) f.tables[e.first]->forget(e.second);
+  return bad;
+}
 
-  CHECK(h.dry.get()[0] == 0ull, "no key went unserved");
-  CHECK(h.map_store.check_bindings() == 0, "bindings stay consistent");
+static void test_value_cycle() {
+  std::printf("=== rows: the whole cycle, with values ===\n");
+  // Smaller than the working set, on purpose: a cache that holds every key it
+  // sees never evicts, and then neither direction of the move is exercised.
+  ValueTable t(384, 128, 3000, 8, 0.0f);
+  Fused f({&t});
+
+  std::mt19937_64 rng(11);
+  std::geometric_distribution<int64_t> hot(0.004);
+
+  for (int s = 0; s < scaled(150); ++s) t.step(draw_keys(rng, hot, t.per_step, t.space));
+  std::printf("  %lld misses, %lld victims written back, %lld rows loaded\n",
+              (long long)t.total_miss, (long long)t.total_victims,
+              (long long)t.total_loaded);
+  CHECK(t.total_victims > 0 && t.total_loaded > 0,
+        "the run has to exercise both directions");
+  t.check_all("after the first run of steps");
+
+  // Evict some cached keys from the system, taking their values off, then ask for
+  // them again so they come back as new keys.
+  std::vector<KeyOf> evict;
+  const auto cached = t.h.bound_keys();
+  for (size_t i = 0; i < cached.size(); i += 4) evict.push_back({0, cached[i]});
+  const int64_t bad = evict_and_fetch(f, evict);
+  std::printf("  fetched %zu rows off nodes about to be invalidated, %lld wrong\n",
+              evict.size(), (long long)bad);
+  CHECK(bad == 0, "%lld fetched rows are not the latest value", (long long)bad);
+
+  std::vector<int64_t> again;
+  for (const KeyOf& e : evict) {
+    again.push_back(e.second);
+    if ((int64_t)again.size() == t.per_step) break;
+  }
+  t.step(again);
+  for (int s = 0; s < scaled(100); ++s) t.step(draw_keys(rng, hot, t.per_step, t.space));
+  t.check_all("after evicting and more steps");
+  t.h.check_at_rest("value cycle");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Several tables
+// ---------------------------------------------------------------------------
+//
+// Three tables with different capacities, row widths and key traffic, the same
+// key values in all of them. Everything per table — lookup, allocate, the moves,
+// release — runs per table, on the kernels the single table uses; what runs over
+// all of them at once is what the backing's eviction needs: the guard, find,
+// fetch and invalidate, fed lists that mix the tables.
+
+static void test_multi_table() {
+  std::printf("=== several tables ===\n");
+  const int64_t kSpace = 600;
+  const int kTables = 3;
+  const int64_t caps[kTables] = {160, 256, 96};
+  const int64_t per_step[kTables] = {48, 64, 32};
+  const int widths[kTables] = {4, 8, 12};
+
+  std::vector<std::unique_ptr<ValueTable>> owned;
+  std::vector<ValueTable*> tables;
+  for (int i = 0; i < kTables; ++i) {
+    owned.emplace_back(new ValueTable(caps[i], per_step[i], kSpace, widths[i],
+                                      100000.0f * i));
+    tables.push_back(owned.back().get());
+  }
+  Fused f(tables);
+
+  std::mt19937_64 rng(23);
+  std::geometric_distribution<int64_t> hot(0.01);
+  auto all_tables_step = [&]() {
+    for (ValueTable* t : tables) t->step(draw_keys(rng, hot, t->per_step, kSpace));
+  };
+
+  for (int s = 0; s < scaled(120); ++s) all_tables_step();
+  for (int i = 0; i < kTables; ++i) {
+    std::printf("  table %d: %lld misses, %lld victims, %lld loaded\n", i,
+                (long long)tables[i]->total_miss,
+                (long long)tables[i]->total_victims,
+                (long long)tables[i]->total_loaded);
+    CHECK(tables[i]->total_victims > 0 && tables[i]->total_loaded > 0,
+          "table %d has to exercise both directions", i);
+    tables[i]->check_all("after the first run");
+  }
+
+  // --- the guard over a list that mixes the tables ---------------------------
+  //
+  // Hold some cached keys in every table; the others are idle. The same key value
+  // is cached in several tables, held in one and idle in another, so an answer
+  // taken from the wrong table is wrong.
+  {
+    std::vector<std::set<int64_t>> held(kTables);
+    std::vector<std::vector<int64_t>> cached(kTables);
+    for (int i = 0; i < kTables; ++i) {
+      cached[i] = tables[i]->h.bound_keys();
+      std::vector<int64_t> keys(cached[i].begin(), cached[i].begin() + 24);
+      held[i].insert(keys.begin(), keys.end());
+      tables[i]->h.lookup_and_allocate(keys);  // all hits: pins, binds nothing
+    }
+    std::vector<KeyOf> probe;
+    size_t longest = 0;
+    for (int i = 0; i < kTables; ++i) longest = std::max(longest, cached[i].size());
+    for (size_t k = 0; k < longest; ++k) {  // interleave the tables
+      for (int i = 0; i < kTables; ++i)
+        if (k < cached[i].size()) probe.push_back({i, cached[i][k]});
+    }
+    for (int i = 0; i < kTables; ++i)
+      for (int64_t k = 0; k < 30; ++k) probe.push_back({i, kSpace + k});
+
+    const auto may = probe_guard(f, probe);
+    int64_t wrong = 0, vetoed = 0;
+    for (size_t i = 0; i < probe.size(); ++i) {
+      const bool expect = !held[probe[i].first].count(probe[i].second);
+      if ((may[i] != 0) != expect) ++wrong;
+      if (!may[i]) ++vetoed;
+    }
+    std::printf("  guard: %zu (table, key) pairs probed, %lld vetoed\n",
+                probe.size(), (long long)vetoed);
+    CHECK(wrong == 0, "%lld pairs got the wrong answer from the guard",
+          (long long)wrong);
+    CHECK(vetoed == 24 * kTables, "expected %d vetoes, got %lld", 24 * kTables,
+          (long long)vetoed);
+    for (ValueTable* t : tables) t->h.release();
+  }
+
+  // --- evict a mixed list, taking the values off ------------------------------
+  {
+    std::vector<std::vector<int64_t>> cached(kTables);
+    size_t longest = 0;
+    for (int i = 0; i < kTables; ++i) {
+      cached[i] = tables[i]->h.bound_keys();
+      longest = std::max(longest, cached[i].size());
+    }
+    std::vector<KeyOf> evict;
+    for (size_t k = 0; k < longest; k += 3) {  // interleaved, a third of each
+      for (int i = 0; i < kTables; ++i)
+        if (k < cached[i].size()) evict.push_back({i, cached[i][k]});
+    }
+    const int64_t bad = evict_and_fetch(f, evict);
+    std::printf("  fetched %zu rows across %d tables, %lld wrong\n", evict.size(),
+                kTables, (long long)bad);
+    CHECK(bad == 0, "%lld fetched rows are not the latest value", (long long)bad);
+  }
+
+  for (int s = 0; s < scaled(80); ++s) all_tables_step();
+  for (int i = 0; i < kTables; ++i) {
+    tables[i]->check_all("after evicting and more steps");
+    tables[i]->h.check_at_rest("multi table");
+  }
 }
 
 int main() {
@@ -1075,6 +1266,7 @@ int main() {
   test_release_overlaps_allocate();
   test_evict_by_key();
   test_value_cycle();
+  test_multi_table();
   // Capacity below the working set on purpose: eviction has to actually happen.
   test_pipeline(/*steps=*/200, /*capacity=*/2048, /*per_step=*/512,
                 /*key_space=*/8192, /*seed=*/1234);

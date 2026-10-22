@@ -171,8 +171,12 @@ __global__ void publish_kernel(
   }
 }
 
-// The latest values of cached rows, copied to a dense buffer: row i of `out` is
-// the cache row of node_ids[i], and entries that are kNoNode are skipped.
+// The latest values of cached rows, copied to a dense buffer: for each i, the
+// cache row of node_ids[i] in table table_ids[i] lands at out + out_offset[i], and
+// entries that are kNoNode are skipped.
+//
+// Over every table at once, with the tables' own row widths, which is why the
+// destination is an offset per entry and not a stride: the caller sums the widths.
 //
 // For find_nodes' answer, between it and invalidate: the backing has evicted
 // these keys, and whoever retains evicted items wants what the cache held, which
@@ -180,17 +184,18 @@ __global__ void publish_kernel(
 // guard promised, so nothing is writing them and what is read is a settled value.
 
 template <typename MapT, typename ValueT>
-__global__ void fetch_rows_kernel(Rows<ValueT> cache,
+__global__ void fetch_rows_kernel(const Rows<ValueT>* cache,
                                   const typename MapT::NodeId* node_ids,
-                                  int64_t n, ValueT* out) {
+                                  const int64_t* table_ids, int64_t n,
+                                  ValueT* out, const int64_t* out_offset) {
   const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const int lane = static_cast<int>(tid % kLanesPerRow);
   const int64_t groups = int64_t(gridDim.x) * blockDim.x / kLanesPerRow;
   for (int64_t i = tid / kLanesPerRow; i < n; i += groups) {
     const typename MapT::NodeId node = node_ids[i];
     if (node == MapT::kNoNode) continue;
-    detail::copy_row(out + i * cache.row_elems, cache.row(node), cache.row_elems,
-                     lane);
+    const Rows<ValueT> rows = cache[table_ids[i]];
+    detail::copy_row(out + out_offset[i], rows.row(node), rows.row_elems, lane);
   }
 }
 

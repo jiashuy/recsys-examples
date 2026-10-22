@@ -7,6 +7,7 @@
 > 去掉 `EVICTING` 状态（§4.3）；Step 4 合并为一个 kernel，靠桶锁（§6.1）；去掉 pin 后的身份复查（§6.3）；
 > ring 的槽位数取 `2C`，tail 快照在 kernel 启动前取，并作为 push/pop 两个阶段的屏障（§6.4、§7）。
 > 行号不存进 node；可在同一次 prefetch 调用内携带，但不得跨 `expand_if_need`（§4.5）。backing 是 score、准入、key 淘汰的唯一权威（§6.5）。
+> 多表：块集体的 kernel 按表分别 launch，只有给 backing 用的几个融合（§4.4）。
 > 附录 C 的逐步走查仍按"两趟 + `EVICTING`"、并把 backing 探测画在摘链趟里的早期表述画出，数据流不受影响。
 
 ---
@@ -156,20 +157,15 @@ EMPTY ──占用──> LOADING ──加载完成──> RESIDENT ──被�
 
 **没有单独的 `EVICTING`。** 它只会存在于"占用"与"改派"之间，而这两步在同一个 kernel 的同一个线程里完成，没有任何其他线程能观察到；且 pin 与 claim 对它的处理与对 `LOADING` 完全一致（都拒绝）。多一个状态只是多一个没人读的取值。
 
-### 4.4 kernel 内的多表分派
+### 4.4 多表分派
 
-所有表在同一个 kernel 内处理。device 侧传入指针与参数数组（沿用 `dynamicemb/key_value_table.py:160` 的 `get_table_ptrs` 模式）：
+每张表是一套完整、互不相干的结构：行池、node、桶链、ring，行宽各自独立。分派分两类，取决于 kernel 是否做 ring 的块集体操作。
 
-```
-emb_ptrs, key_ptrs, state_ptrs, prev_ptrs, next_ptrs,
-hash_ptrs, ring_ptrs                : 指针数组 [T]
-ring_head, ring_tail                : uint64 [T]
-C, B, D                             : int32  [T]
-```
+**按表分别 launch：** lookup+pin、allocate、搬运（写回、加载、发布）、release。输入 `unique_keys[U]` 按表分段，`table_range[T+1]` 由 `segmented_unique_cuda` 直接给出，每张表取自己那一段，用的就是单表的 kernel，一行也不改。每表的 unique 数 host 本来就有（`unique_size_per_table` 是 CPU 张量），所以不需要同步。
 
-输入为 `unique_keys[U]` 与 `table_range[T+1]`，后者由 `segmented_unique_cuda` 直接给出（`dynamicemb/batched_dynamicemb_function.py:74`），无需额外计算。
+为什么这几个不融合成一次 launch：allocate 和 release 里的 ring 操作是**块集体**的（一个 block 共用一个计数器的聚合 ticket，内含 `__syncthreads`）。miss 压紧之后顺序被打乱，同一个 block 里会混着不同的表，聚合就不成立。要融合就得做"block 到表"的映射，让每个 block 只属于一张表，这是一块不小的新机制，现在没有证据表明启动开销是瓶颈：每步的 launch 数是 `T × kernel 数`，在预取与计算重叠的前提下是 host 侧的开销，而不是 GPU 的。留到 profile 说需要时再做。
 
-线程到表的映射采用 **block 级快路径**：`unique_keys` 按表分段，因此同一 block 内的线程绝大多数属于同一张表。由 block 的 0 号线程二分出本 block 首尾元素的 table id——若相同，整个 block 走快路径，把该表的全部参数一次读进 shared memory，后续所有线程零间接开销；只有跨越分段边界的 block 需要逐线程二分，这样的 block 至多 `T-1` 个。
+**一次 launch 覆盖所有表：** 守卫（`EvictionGuard`）、`find_nodes`、`invalidate`、`fetch_rows`。原因是 backing 的淘汰 kernel 本身是跨表的，交回来的被淘汰 key 列表混着各个表、没有顺序，没有"每表一段"可切。这几个都不是块集体操作，按元素分派就很便宜：device 侧传入每表的 `HashMap` 数组与行池数组，每个元素按自己的 table id 取对应那一张。取值的输出用每个元素一个偏移（各表行宽不同，调用方累加），不是固定步长。
 
 **每表独立结构的收益与代价：**
 

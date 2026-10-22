@@ -38,6 +38,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // Around the backing's insert, which evicts keys of its own:
 //
 //   EvictionGuard       asked by the backing's eviction, per candidate: may it go?
+//                       (this and the next two are launched over every table at once)
 //   ---- backing insert ----
 //   find_nodes          which of the evicted keys are cached
 //   fetch_rows          in rows.cuh: takes the latest values off those nodes
@@ -286,6 +287,14 @@ __global__ void allocate_kernel(
 // holds no score and has no say in that, except one: a key a step is using must
 // not go. Both halves live here.
 //
+// These three are the only kernels in the cache launched over every table at
+// once. The backing's eviction is one kernel over all its tables, and what it
+// hands back is a list of keys from any of them in no particular order, so there
+// is no per-table slice to launch over. Each takes an array of per-table maps and
+// a table id per key, and picks the map per element. None of them is
+// block-collective, which is what keeps that cheap; the kernels that are — the
+// ones that touch the reclaim queue — are launched per table instead.
+//
 // EvictionGuard is the question, asked by the backing's eviction for each
 // candidate it is about to take. A key that is not cached may go. A key that is
 // cached may go only if its node has no references — an idle node is a cache hit
@@ -299,31 +308,33 @@ __global__ void allocate_kernel(
 //
 // A view, passed to the backing's kernel by value, like the others.
 
-template <typename MapT, typename NodeT>
+template <typename MapT>
 struct EvictionGuard {
-  MapT map;
-  const NodeT* nodes;
+  const MapT* tables;  // [num_tables], on the device
 
   [[nodiscard]] __forceinline__ __device__ bool may_evict(
-      typename MapT::Key key) const {
+      typename MapT::Key key, int64_t table) const {
+    const MapT& map = tables[table];
     const typename MapT::NodeId node = map.lookup(key);
-    return node == MapT::kNoNode || !nodes[node].state.load().has_refs();
+    return node == MapT::kNoNode || !map.nodes[node].state.load().has_refs();
   }
 };
 
-// For each key, the node that holds it, or kNoNode. Pins nothing and changes
-// nothing: it is the lookup half of evicting, kept apart from the removal because
-// a lookup cannot overlap one.
+// For each key, the node that holds it in its table, or kNoNode. Pins nothing and
+// changes nothing: it is the lookup half of evicting, kept apart from the removal
+// because a lookup cannot overlap one.
 //
 // The keys are the backing's evicted keys, each evicted once. A cached one is
 // idle, which the guard promised; invalidate asserts it.
 
 template <typename MapT>
-__global__ void find_nodes_kernel(MapT map, const typename MapT::Key* keys,
-                                  int64_t n, typename MapT::NodeId* out_nodes) {
+__global__ void find_nodes_kernel(const MapT* tables,
+                                  const typename MapT::Key* keys,
+                                  const int64_t* table_ids, int64_t n,
+                                  typename MapT::NodeId* out_nodes) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
-    out_nodes[i] = map.lookup(keys[i]);
+    out_nodes[i] = tables[table_ids[i]].lookup(keys[i]);
   }
 }
 
@@ -331,19 +342,21 @@ __global__ void find_nodes_kernel(MapT map, const typename MapT::Key* keys,
 // EMPTY; nothing is written back, because the key is gone.
 //
 // Removals overlap freely — the bucket lock serialises the ones that share a
-// bucket — and a node appears at most once, because a key does. kNoNode entries,
-// the evicted keys that were never cached, are skipped.
+// bucket, and tables share nothing — and a node appears at most once in its
+// table, because a key does. kNoNode entries, the evicted keys that were never
+// cached, are skipped.
 
-template <typename MapT, typename NodeT>
-__global__ void invalidate_kernel(MapT map, NodeT* nodes,
+template <typename MapT>
+__global__ void invalidate_kernel(const MapT* tables,
                                   const typename MapT::NodeId* node_ids,
-                                  int64_t n) {
+                                  const int64_t* table_ids, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
     const typename MapT::NodeId node = node_ids[i];
     if (node == MapT::kNoNode) continue;
+    MapT map = tables[table_ids[i]];
     map.remove(node);
-    nodes[node].state.invalidate();
+    map.nodes[node].state.invalidate();
   }
 }
 
