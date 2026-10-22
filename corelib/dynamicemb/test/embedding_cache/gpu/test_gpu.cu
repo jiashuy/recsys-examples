@@ -13,6 +13,7 @@
 // nor a backing store, neither of which exists yet.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -1241,7 +1242,9 @@ static void test_multi_table() {
     for (ValueTable* t : tables) t->step(draw_keys(rng, hot, t->per_step, kSpace));
   };
 
-  for (int s = 0; s < scaled(120); ++s) all_tables_step();
+  // Not scaled below a floor: a table that never evicts exercises neither
+  // direction of the move, and the check below says so.
+  for (int s = 0; s < std::max(scaled(120), 60); ++s) all_tables_step();
   for (int i = 0; i < kTables; ++i) {
     std::printf("  table %d: %lld misses, %lld victims, %lld loaded\n", i,
                 (long long)tables[i]->total_miss,
