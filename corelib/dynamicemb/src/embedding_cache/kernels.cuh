@@ -19,10 +19,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The bookkeeping kernels: which key lives in which node.
 //
 // Everything here decides *placement*. Nothing here moves an embedding row —
-// the row pool and the backing store do not exist yet, and none of this needs
-// them. That split is deliberate rather than incidental: placement is where all
-// the concurrency is, and it can be run, raced and checked on a device with a
-// single integer standing in for a row.
+// rows.cuh does, and none of this needs it. That split is deliberate rather than
+// incidental: placement is where all the concurrency is, and it can be run,
+// raced and checked on a device with a single integer standing in for a row.
 //
 // ---------------------------------------------------------------------------
 // Launch order
@@ -31,8 +30,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   lookup_pin          which keys are already resident, and hold them
 //   ---- allocate ----
 //   allocate            take a node per miss, and rebind it to the new key
-//   [writeback]         not yet: needs the backing
-//   [fill, publish]     not yet: needs the row pool
+//   writeback, fill, publish   in rows.cuh: victim rows out, rows with a history in,
+//                       new keys' rows initialised by the caller in between
 //   ---- forward, backward ----
 //   release             give the references back, and re-queue what went idle
 //
@@ -41,7 +40,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   EvictionGuard       asked by the backing's eviction, per candidate: may it go?
 //   ---- backing insert ----
 //   find_nodes          which of the evicted keys are cached
-//   [fetch]             not yet: needs the row pool, takes the latest values off
+//   fetch_rows          in rows.cuh: takes the latest values off those nodes
 //   invalidate          drop those bindings; the node is empty, nothing to write back
 //
 // Two boundaries here are correctness requirements rather than launch-

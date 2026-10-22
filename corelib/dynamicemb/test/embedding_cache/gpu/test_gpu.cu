@@ -21,10 +21,25 @@
 #include <vector>
 
 #include "kernels.cuh"
+#include "rows.cuh"
 
 using namespace embedding_cache;
 
 static int failures = 0;
+
+// Under compute-sanitizer every memory access is instrumented, and the long runs
+// below stretch from minutes to hours. EC_TEST_SCALE=n divides their step counts
+// by n; unset, it is the full run. A scaled run checks the same properties on a
+// shorter history, which is what a race detector needs: it looks at the accesses,
+// and a few steps of them are the same accesses.
+static int scaled(int n) {
+  static const int divisor = [] {
+    const char* e = std::getenv("EC_TEST_SCALE");
+    const int v = e ? std::atoi(e) : 1;
+    return v > 0 ? v : 1;
+  }();
+  return n / divisor > 0 ? n / divisor : 1;
+}
 #define CHECK(cond, ...)                          \
   do {                                            \
     if (!(cond)) {                                \
@@ -447,7 +462,7 @@ static void test_release_overlaps_allocate() {
   std::printf("=== a release overlapping an allocate ===\n");
   const int64_t kNodes = 1 << 18;
   const int64_t n_even = kNodes / 2;
-  const int kIters = 100;
+  const int kIters = scaled(100);
 
   Dev<Node> nodes(kNodes);
   Dev<int32_t> got(n_even);
@@ -574,7 +589,9 @@ struct Harness {
     CU(cudaDeviceSynchronize());
   }
 
-  void acquire(const std::vector<int64_t>& h_keys) {
+  // Look the keys up, pin the hits, and bind a node to each miss. The misses are
+  // left LOADING: what moves their rows, and publishes them, is the caller's.
+  void lookup_and_allocate(const std::vector<int64_t>& h_keys) {
     held = static_cast<int64_t>(h_keys.size());
     const int grid = grid_for(held);
     keys.put(h_keys);
@@ -586,12 +603,23 @@ struct Harness {
     allocate_kernel<Queue, Map, Node><<<grid, kBlock>>>(
         qs.queue(), map_store.map(), nodes, miss_keys.p, miss_src.p,
         miss_count.p, slots.p, node_ids.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+  }
+
+  // The above, then a stand-in for moving rows: each key's row holds its key.
+  void acquire(const std::vector<int64_t>& h_keys) {
+    lookup_and_allocate(h_keys);
+    const int grid = grid_for(held);
     fill_stub_kernel<<<grid, kBlock>>>(nodes, slots.p, miss_count.p, rows.p);
     verify_kernel<<<grid, kBlock>>>(nodes, keys.p, node_ids.p, rows.p, held,
                                     wrong.p, dry.p);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
   }
+
+  // A grid for a kernel with one thread per slot.
+  int grid_slots() const { return grid_for(per_step); }
 
   void release() {
     release_kernel<Queue, Node><<<grid_for(held), kBlock>>>(qs.queue(), nodes,
@@ -647,7 +675,7 @@ static void test_evict_by_key() {
     return out;
   };
 
-  for (int s = 0; s < 80; ++s) {
+  for (int s = 0; s < scaled(80); ++s) {
     h.acquire(draw(kPerStep));
     h.release();
   }
@@ -781,7 +809,7 @@ static void test_evict_by_key() {
   }
   h.acquire(again);
   h.release();
-  for (int s = 0; s < 60; ++s) {
+  for (int s = 0; s < scaled(60); ++s) {
     h.acquire(draw(kPerStep));
     h.release();
   }
@@ -808,6 +836,231 @@ static void test_evict_by_key() {
         (long long)queued, (long long)h.qs.size());
 }
 
+// ---------------------------------------------------------------------------
+// 7. Rows: the whole cycle, with values
+// ---------------------------------------------------------------------------
+//
+// Every step "trains" what it touched: each key's row gets +1. A key starts as a
+// known function of itself, so after any run of steps, evictions and reloads,
+// its latest value is exactly start + (number of steps that touched it) — and
+// "latest" means the cache row if it is cached, the backing row if it is not.
+// A lost write-back, a stale load, a row overwritten before it was copied out,
+// or a row published before it was initialised all show up as a count that does
+// not add up. The values are small integers, exact in float.
+//
+// The backing is a plain buffer with one row per key, and which keys have a
+// history in it is kept on the host: a key gets one by being written back, and
+// loses it by being evicted from the system. The row numbers the kernels take are
+// worked out on the host between kernels, which is the position the integration
+// is in too — the backing finds them with its own kernels.
+
+constexpr int kRowElems = 8;
+using FRows = Rows<float>;
+
+static float start_value(int64_t key, int j) { return 1000.0f * key + j; }
+
+// New keys' rows, written in place. This is what the embedding initialiser and
+// the optimizer do in the integration.
+__global__ void init_fresh_kernel(FRows cache, const Slot* slots,
+                                  const unsigned long long* count,
+                                  const int64_t* new_row) {
+  const int64_t n = static_cast<int64_t>(*count);
+  const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int lane = static_cast<int>(tid % kLanesPerRow);
+  const int64_t groups = int64_t(gridDim.x) * blockDim.x / kLanesPerRow;
+  for (int64_t s = tid / kLanesPerRow; s < n; s += groups) {
+    const Slot slot = slots[s];
+    if (slot.node == Map::kNoNode || new_row[s] >= 0) continue;
+    for (int j = lane; j < cache.row_elems; j += kLanesPerRow) {
+      cache.row(slot.node)[j] = 1000.0f * slot.key + j;
+    }
+  }
+}
+
+// What a step does to what it touched.
+__global__ void train_kernel(FRows cache, const int32_t* node_ids, int64_t n) {
+  const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int lane = static_cast<int>(tid % kLanesPerRow);
+  const int64_t groups = int64_t(gridDim.x) * blockDim.x / kLanesPerRow;
+  for (int64_t i = tid / kLanesPerRow; i < n; i += groups) {
+    const int32_t node = node_ids[i];
+    if (node == Map::kNoNode) continue;
+    for (int j = lane; j < cache.row_elems; j += kLanesPerRow) {
+      cache.row(node)[j] += 1.0f;
+    }
+  }
+}
+
+static void test_value_cycle() {
+  std::printf("=== rows: the whole cycle, with values ===\n");
+  // Smaller than the working set, on purpose: a cache that holds every key it
+  // sees never evicts, and then neither direction of the move is exercised.
+  const int64_t kCap = 384, kPerStep = 128, kSpace = 3000;
+  Harness h(kCap, kPerStep);
+
+  Dev<float> d_pool(kCap * kRowElems), d_backing(kSpace * kRowElems);
+  const FRows pool{d_pool.p, kRowElems};
+  const FRows backing{d_backing.p, kRowElems};
+  Dev<int64_t> d_new_row(kPerStep), d_victim_row(kPerStep);
+  const int warp_grid = grid_for(kPerStep * kLanesPerRow);
+
+  std::vector<char> history(kSpace, 0);   // does the backing hold this key's row
+  std::vector<int64_t> touches(kSpace, 0);  // steps since the key was last new
+
+  std::mt19937_64 rng(11);
+  std::geometric_distribution<int64_t> hot(0.004);
+  auto draw = [&](int64_t n) {
+    std::vector<int64_t> out;
+    std::vector<char> present(kSpace, 0);
+    while ((int64_t)out.size() < n) {
+      const int64_t k = hot(rng) % kSpace;
+      if (present[k]) continue;
+      present[k] = 1;
+      out.push_back(k);
+    }
+    return out;
+  };
+
+  int64_t total_miss = 0, total_victims = 0, total_loaded = 0;
+  auto step = [&](const std::vector<int64_t>& step_keys) {
+    h.lookup_and_allocate(step_keys);
+    const int64_t n_miss = static_cast<int64_t>(h.miss_count.get()[0]);
+    const auto slots = h.slots.get();
+
+    std::vector<int64_t> new_row(kPerStep, -1), victim_row(kPerStep, -1);
+    for (int64_t s = 0; s < n_miss; ++s) {
+      CHECK(slots[s].node != Map::kNoNode, "the cache is large enough to serve "
+                                           "every miss");
+      new_row[s] = history[slots[s].key] ? slots[s].key : -1;
+      victim_row[s] = slots[s].has_victim ? slots[s].victim_key : -1;
+    }
+    d_new_row.put(new_row);
+    d_victim_row.put(victim_row);
+
+    writeback_kernel<Map, float><<<warp_grid, kBlock>>>(
+        pool, backing, h.slots.p, h.miss_count.p, d_victim_row.p);
+    fill_kernel<Map, float><<<warp_grid, kBlock>>>(
+        pool, backing, h.slots.p, h.miss_count.p, d_new_row.p);
+    init_fresh_kernel<<<warp_grid, kBlock>>>(pool, h.slots.p, h.miss_count.p,
+                                             d_new_row.p);
+    publish_kernel<Map, Node><<<h.grid_slots(), kBlock>>>(h.nodes, h.slots.p,
+                                                          h.miss_count.p);
+    train_kernel<<<warp_grid, kBlock>>>(pool, h.node_ids.p,
+                                        static_cast<int64_t>(step_keys.size()));
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+    h.release();
+
+    // The host's model of what that did.
+    for (int64_t s = 0; s < n_miss; ++s) {
+      if (slots[s].has_victim) {
+        history[slots[s].victim_key] = 1;
+        ++total_victims;
+      }
+      if (new_row[s] >= 0) ++total_loaded;
+    }
+    for (int64_t k : step_keys) ++touches[k];
+    total_miss += n_miss;
+  };
+
+  // The latest value of a key, from wherever it is.
+  auto check_all = [&](const char* when) {
+    const auto cache_rows = d_pool.get();
+    const auto backing_rows = d_backing.get();
+    std::vector<int64_t> all_keys;
+    for (int64_t k = 0; k < kSpace; ++k)
+      if (touches[k] > 0) all_keys.push_back(k);
+    const auto where = h.find(all_keys);
+    int64_t bad = 0, from_cache = 0;
+    for (size_t i = 0; i < all_keys.size(); ++i) {
+      const int64_t k = all_keys[i];
+      const float* row;
+      if (where[i] != Map::kNoNode) {
+        row = &cache_rows[where[i] * kRowElems];
+        ++from_cache;
+      } else {
+        if (!history[k]) { ++bad; continue; }  // neither cached nor written back
+        row = &backing_rows[k * kRowElems];
+      }
+      for (int j = 0; j < kRowElems; ++j) {
+        if (row[j] != start_value(k, j) + float(touches[k])) { ++bad; break; }
+      }
+    }
+    std::printf("  %s: %zu keys touched, %lld read from the cache, %lld wrong\n",
+                when, all_keys.size(), (long long)from_cache, (long long)bad);
+    CHECK(bad == 0, "%lld keys do not hold start + touches (%s)", (long long)bad,
+          when);
+  };
+
+  for (int s = 0; s < scaled(150); ++s) step(draw(kPerStep));
+  std::printf("  %lld misses, %lld victims written back, %lld rows loaded\n",
+              (long long)total_miss, (long long)total_victims,
+              (long long)total_loaded);
+  CHECK(total_victims > 0 && total_loaded > 0,
+        "the run has to exercise both directions");
+  check_all("after the first run of steps");
+
+  // --- evict some cached keys from the system, taking their values off -------
+  //
+  // find_nodes, then fetch, then invalidate: the order the cache runs when the
+  // backing evicts. What is fetched must be the latest value, and afterwards the
+  // key starts over.
+  {
+    const auto cached = h.bound_keys();
+    std::vector<int64_t> evict;
+    for (size_t i = 0; i < cached.size(); i += 4) evict.push_back(cached[i]);
+
+    const auto nodes_found = h.find(evict);
+    Dev<int32_t> d_nodes(nodes_found.size());
+    Dev<float> d_out(evict.size() * kRowElems);
+    d_nodes.put(nodes_found);
+    fetch_rows_kernel<Map, float><<<grid_for(evict.size() * kLanesPerRow),
+                                    kBlock>>>(
+        pool, d_nodes.p, static_cast<int64_t>(evict.size()), d_out.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+    const auto fetched = d_out.get();
+
+    int64_t bad = 0;
+    for (size_t i = 0; i < evict.size(); ++i) {
+      if (nodes_found[i] == Map::kNoNode) { ++bad; continue; }
+      for (int j = 0; j < kRowElems; ++j) {
+        if (fetched[i * kRowElems + j] !=
+            start_value(evict[i], j) + float(touches[evict[i]])) {
+          ++bad;
+          break;
+        }
+      }
+    }
+    std::printf("  fetched %zu rows off nodes about to be invalidated, %lld "
+                "wrong\n", evict.size(), (long long)bad);
+    CHECK(bad == 0, "%lld fetched rows are not the latest value", (long long)bad);
+
+    invalidate_kernel<Map, Node><<<64, 256>>>(
+        h.map_store.map(), h.nodes, d_nodes.p,
+        static_cast<int64_t>(nodes_found.size()));
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+
+    // The key has left the system: no history, and whatever it was is gone.
+    for (int64_t k : evict) {
+      history[k] = 0;
+      touches[k] = 0;
+    }
+    // Ask for them again so they come back as new keys.
+    std::vector<int64_t> again(evict.begin(),
+                               evict.begin() + std::min<int64_t>(kPerStep,
+                                                                 evict.size()));
+    step(again);
+  }
+
+  for (int s = 0; s < scaled(100); ++s) step(draw(kPerStep));
+  check_all("after evicting and more steps");
+
+  CHECK(h.dry.get()[0] == 0ull, "no key went unserved");
+  CHECK(h.map_store.check_bindings() == 0, "bindings stay consistent");
+}
+
 int main() {
   int dev = 0;
   CU(cudaGetDevice(&dev));
@@ -821,6 +1074,7 @@ int main() {
   test_queue_round_trip();
   test_release_overlaps_allocate();
   test_evict_by_key();
+  test_value_cycle();
   // Capacity below the working set on purpose: eviction has to actually happen.
   test_pipeline(/*steps=*/200, /*capacity=*/2048, /*per_step=*/512,
                 /*key_space=*/8192, /*seed=*/1234);
