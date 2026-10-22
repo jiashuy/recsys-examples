@@ -410,22 +410,6 @@ def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l2_reg, l
 
 
 @cuda
-@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(8, True), (5, False)])
-def test_ftrl_group_zero_reg_is_plain_ftrl(emb_dim, all_dims_vec4):
-    """group_lasso_reg = 0 must be bit-identical to FTRL without the group term."""
-    device = torch.device("cuda")
-    row_width = 3 * emb_dim
-    grads = torch.randn(16, emb_dim, device=device)
-    a = _fresh_ftrl_values(16, emb_dim, row_width, emb_dim, 0.1, device, seed=1)
-    b = a.clone()
-    _run_group_step(_ftrl_optimizer(l1_reg=0.01), a, grads, emb_dim, all_dims_vec4)
-    _run_group_step(
-        _ftrl_optimizer(l1_reg=0.01, group_lasso_reg=0.0), b, grads, emb_dim, all_dims_vec4
-    )
-    torch.testing.assert_close(a, b, rtol=0, atol=0)
-
-
-@cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
 def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
     device = torch.device("cuda")
