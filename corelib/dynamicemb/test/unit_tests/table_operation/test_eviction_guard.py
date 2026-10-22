@@ -77,7 +77,9 @@ def _insert(table, kind, keys, device, guard=None, collect=False):
 def _present(table, keys, device):
     tids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
     _, founds, _ = table.lookup(
-        keys, tids, ScoreArg(name="x", value=None, policy=ScorePolicy.CONST)
+        keys,
+        tids,
+        ScoreArg(name=table.score_names_[0], value=None, policy=ScorePolicy.CONST),
     )
     return founds
 

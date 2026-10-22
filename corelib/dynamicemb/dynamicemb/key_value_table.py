@@ -4071,14 +4071,63 @@ def _expand_storage_for_cache_flush_if_needed(
     collect_table_sizes_for_state(st, non_blocking=False)
 
 
+def _flush_by_insert(
+    storage: Storage,
+    keys: torch.Tensor,
+    tid: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Hand rows to a storage that has to be told about them: by insert."""
+    if isinstance(storage, DynamicEmbStorage) and (
+        storage._state.no_eviction_next_index is not None
+    ):
+        st_b = storage._state
+        (
+            _hm_fc,
+            _mk_fc,
+            _mi_fc,
+            _mt_fc,
+            _ms_fc,
+            in_backing,
+            _so_fc,
+            _ix_fc,
+        ) = _find_keys(st_b, keys, tid)
+        if bool(in_backing.all()):
+            storage.insert(keys, tid, values, preserve_existing=True)
+        elif bool((~in_backing).all()):
+            storage.insert(keys, tid, values, preserve_existing=False)
+        else:
+            ex_b = in_backing
+            nw_b = ~in_backing
+            if ex_b.any():
+                storage.insert(
+                    keys[ex_b], tid[ex_b], values[ex_b], preserve_existing=True
+                )
+            if nw_b.any():
+                storage.insert(
+                    keys[nw_b], tid[nw_b], values[nw_b], preserve_existing=False
+                )
+    else:
+        storage.insert(keys, tid, values)
+
+
 def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
     """Write every resident row back to the storage.
 
     Every resident row is written whatever its references: a key that has never
-    left the cache is the one whose storage copy is furthest behind. The cache has
-    no score to hand over, so the storage gives each key its own default one.
+    left the cache is the one whose storage copy is furthest behind.
+
+    A ``DynamicEmbStorage`` already has a row for every cached key (a key enters it
+    when it is admitted), so the rows are written in place and nothing is inserted.
+    The cache has no score to hand over; for a storage that has to be told about a
+    key by insert, the storage gives each key its own default one.
     """
-    if isinstance(storage, DynamicEmbStorage):
+    # Under determinism the storage keeps its own insertion order, and the cache
+    # is driven through insert (see the prefetch).
+    in_place = isinstance(storage, DynamicEmbStorage) and (
+        os.environ.get("DEMB_DETERMINISM_MODE") is None
+    )
+    if not in_place and isinstance(storage, DynamicEmbStorage):
         _expand_storage_for_cache_flush_if_needed(storage, cache)
 
     state = cache._state
@@ -4093,43 +4142,30 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
                 (chunk_keys.numel(),), t, dtype=torch.int64, device=chunk_keys.device
             )
             values = load_from_flat(state, chunk_nodes, tid, copy_mode=CopyMode.VALUE)
-            if isinstance(storage, DynamicEmbStorage) and (
-                storage._state.no_eviction_next_index is not None
-            ):
-                st_b = storage._state
-                (
-                    _hm_fc,
-                    _mk_fc,
-                    _mi_fc,
-                    _mt_fc,
-                    _ms_fc,
-                    in_backing,
-                    _so_fc,
-                    _ix_fc,
-                ) = _find_keys(st_b, chunk_keys, tid)
-                if bool(in_backing.all()):
-                    storage.insert(chunk_keys, tid, values, preserve_existing=True)
-                elif bool((~in_backing).all()):
-                    storage.insert(chunk_keys, tid, values, preserve_existing=False)
-                else:
-                    ex_b = in_backing
-                    nw_b = ~in_backing
-                    if ex_b.any():
-                        storage.insert(
-                            chunk_keys[ex_b],
-                            tid[ex_b],
-                            values[ex_b],
-                            preserve_existing=True,
-                        )
-                    if nw_b.any():
-                        storage.insert(
-                            chunk_keys[nw_b],
-                            tid[nw_b],
-                            values[nw_b],
-                            preserve_existing=False,
-                        )
-            else:
-                storage.insert(chunk_keys, tid, values)
+            if not in_place:
+                _flush_by_insert(storage, chunk_keys, tid, values)
+                continue
+
+            sstate = storage._state
+            (
+                _h,
+                _mk,
+                _mp,
+                _mt,
+                _ms,
+                founds,
+                score_out,
+                slots,
+            ) = _find_keys(sstate, chunk_keys, tid, const_lookup=True)
+            rows = _flat_row_indices_for_value_load(sstate, founds, score_out, slots)
+            if bool(founds.any()):
+                store_to_flat(sstate, rows[founds], tid[founds], values[founds])
+            if not bool(founds.all()):
+                # A cached key the storage no longer holds: the cache copy is the
+                # only one, so it goes in by insert.
+                _expand_storage_for_cache_flush_if_needed(storage, cache)
+                gone = ~founds
+                _flush_by_insert(storage, chunk_keys[gone], tid[gone], values[gone])
 
 
 # ---------------------------------------------------------------------------
