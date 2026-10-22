@@ -81,20 +81,11 @@ def test_export_keys_values_empty_table():
         (EmbOptimType.SGD, {"learning_rate": 0.3}),
     ],
 )
-def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
+def test_multi_table_dump_load(opt_type, opt_params, tmp_path, backend_session):
     """Multi-table dump and load using fused storage."""
-    import torch.distributed as dist
-
     assert torch.cuda.is_available()
     device_id = 0
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
 
     device = torch.device(f"cuda:{device_id}")
 
@@ -167,19 +158,10 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
 
 
 @pytest.mark.parametrize("dist_type", ["roundrobin", "hash_roundrobin"])
-def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path):
-    import torch.distributed as dist
-
+def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path, backend_session):
     assert torch.cuda.is_available()
     device_id = 0
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
 
     device = torch.device(f"cuda:{device_id}")
     dims = [8, 16]
@@ -234,19 +216,10 @@ def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path):
     torch.testing.assert_close(vals0_src[idx0_src], vals0_dst[idx0_dst])
 
 
-def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
-    import torch.distributed as dist
-
+def test_multi_table_load_rejects_dist_type_mismatch(tmp_path, backend_session):
     assert torch.cuda.is_available()
     device_id = 0
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
 
     device = torch.device(f"cuda:{device_id}")
     dims = [8, 16]
@@ -291,19 +264,10 @@ def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
         bdeb_dst.load(save_dir)
 
 
-def test_multi_table_load_legacy_metadata_defaults_to_roundrobin(tmp_path):
-    import torch.distributed as dist
-
+def test_multi_table_load_legacy_metadata_defaults_to_roundrobin(tmp_path, backend_session):
     assert torch.cuda.is_available()
     device_id = 0
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
 
     device = torch.device(f"cuda:{device_id}")
     dims = [8, 16]

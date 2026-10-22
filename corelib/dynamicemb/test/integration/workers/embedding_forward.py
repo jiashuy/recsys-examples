@@ -40,7 +40,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 import torchrec
-from common.cli import str2bool
+from common.cli_args import str2bool
 from common.debug import Debugger
 from common.features import (
     feature_idx_to_name,

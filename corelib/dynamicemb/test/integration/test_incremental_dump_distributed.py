@@ -82,13 +82,6 @@ class CustomizedScore:
         return ret
 
 
-def random_indices(batch, min_index, max_index):
-    result = set({})
-    while len(result) < batch:
-        result.add(random.randint(min_index, max_index))
-    return result
-
-
 def get_planner(
     table_names: List[str],
     eb_configs: List[BaseEmbeddingConfig],

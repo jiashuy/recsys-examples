@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
+import torch.distributed as dist
 from common.bdet_builders import (
     _make_multi_table_bdeb_for_dump_load,
     _train_multi_table_bdeb_once,
@@ -64,25 +65,16 @@ _DUMP_LOAD_OPT_PARAMS = {
     "initial_accumulator_value": 0.0,
 }
 
+pytestmark = pytest.mark.usefixtures("backend_session")
+
 
 def _init_single_rank_pg(device_id: int = 0) -> torch.device:
-    import torch.distributed as dist
-
     assert torch.cuda.is_available()
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
     return torch.device(f"cuda:{device_id}")
 
 
 def _shard_file(save_dir: str, table_name: str, kind: str) -> str:
-    import torch.distributed as dist
-
     return encode_checkpoint_file_path(
         save_dir, table_name, dist.get_rank(), dist.get_world_size(), kind
     )
@@ -318,8 +310,6 @@ def _assert_opt_values_ckpt_row_width(
     opt_type: EmbOptimType,
 ) -> None:
     """``opt_values`` checkpoint uses ``get_ckpt_state_dim`` elements per key row."""
-    import torch.distributed as dist
-
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     keys_path = encode_checkpoint_file_path(
@@ -410,20 +400,11 @@ def test_dump_optimizer_states_ckpt_width(
     opt_params: Dict[str, Any],
 ) -> None:
     """After train + dump(optim=True), ``opt_values`` row width matches checkpoint layout."""
-    import torch.distributed as dist
-
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     device_id = 0
     torch.cuda.set_device(device_id)
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
 
     device = torch.device(f"cuda:{device_id}")
     key_type = torch.int64

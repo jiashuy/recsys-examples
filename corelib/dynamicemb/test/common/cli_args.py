@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Turn a case's option dict into the command line of an argparse/click worker."""
+"""Command-line helpers for the worker scripts: case options -> flags, and a bool parser."""
 
+import argparse
 from typing import Any, List, Mapping
 
 
@@ -35,3 +36,15 @@ def as_flags(options: Mapping[str, Any]) -> List[str]:
         else:
             flags += [flag, str(value)]
     return flags
+
+
+def str2bool(v):
+    """argparse ``type=`` for ``--flag True`` / ``--flag false`` style booleans."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")

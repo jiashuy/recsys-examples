@@ -51,7 +51,7 @@ Cases that need more GPUs than are visible are **skipped**, not failed.
 | `tables.py`, `scores.py`, `incremental.py` | table builders (`lru_lfu_table`), score helpers, incremental-dump helpers |
 | `bdet_builders.py`, `bdet_expansion.py` | `BatchedDynamicEmbeddingTablesV2` builders / FBGEMM reference, expansion helpers |
 | `planner_fixtures.py` | `make_topology` |
-| `cli.py`, `cli_args.py`, `debug.py` | worker argparse helpers, `Debugger` |
+| `cli_args.py`, `debug.py` | worker command-line helpers (`as_flags`, `str2bool`), `Debugger` |
 
 Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine them in a file.
 
