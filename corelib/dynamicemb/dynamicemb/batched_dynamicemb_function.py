@@ -754,6 +754,7 @@ def _prefetch_cache_path_eager(
                     num_evicted,
                     evicted_keys,
                     evicted_tids,
+                    _evicted_slots,
                 ) = sstate.key_index_map.insert(
                     admitted_keys,
                     admitted_tids,
@@ -977,6 +978,7 @@ def _prefetch_hbm_direct_path(
                         num_evicted,
                         evicted_keys,
                         evicted_table_ids,
+                        _evicted_slots,
                     ) = state.key_index_map.insert(
                         admitted_keys,
                         admitted_tids,

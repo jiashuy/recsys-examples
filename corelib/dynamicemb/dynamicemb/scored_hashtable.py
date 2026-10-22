@@ -590,10 +590,12 @@ class LinearBucketTable(ScoredHashTable):
                 guard refuses is never evicted to make room; if every candidate in
                 a bucket is refused the insert of that key fails.
         Returns:
-            indices; or, when ``collect_evicted`` is True, the 4-tuple
-            ``(indices, num_evicted, evicted_keys, evicted_table_ids)`` where the
-            evicted_* tensors are sized at the batch upper bound (slice to
-            ``num_evicted``). Used by the last-tier retain-evicted-keys path.
+            indices; or, when ``collect_evicted`` is True, the 5-tuple
+            ``(indices, num_evicted, evicted_keys, evicted_table_ids,
+            evicted_slots)`` where the evicted_* tensors are sized at the batch
+            upper bound (slice to ``num_evicted``). ``evicted_slots[j]`` is the
+            slot victim j held; its inserter took the slot over, so the victim's
+            value row is still there until that row is written.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
         score_value, policy = self._parse_score(score)
@@ -1643,7 +1645,8 @@ class LinearBucketTable(ScoredHashTable):
         """Deterministic insert: bucketize, insert one wave at a time, then
         lookup to get final indices. With ``collect_evicted`` the evictions of
         every wave are gathered, in wave order, and returned as
-        ``(indices, num_evicted, evicted_keys, evicted_table_ids)``."""
+        ``(indices, num_evicted, evicted_keys, evicted_table_ids,
+        evicted_slots)``."""
         guard_tables, guard_num_tables = guard if guard is not None else (0, 0)
         device = keys.device
         if keys.numel() == 0:
@@ -1655,11 +1658,13 @@ class LinearBucketTable(ScoredHashTable):
                 torch.zeros(1, dtype=torch.int64, device=device),
                 torch.empty_like(keys),
                 torch.empty(0, dtype=torch.int64, device=device),
+                torch.empty(0, dtype=torch.int64, device=device),
             )
 
         if collect_evicted:
             evicted_keys_buf = torch.empty_like(keys)
             evicted_tids_buf = torch.empty(keys.numel(), dtype=torch.int64, device=device)
+            evicted_slots_buf = torch.empty(keys.numel(), dtype=torch.int64, device=device)
             num_evicted_accum = 0
 
         keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
@@ -1675,7 +1680,7 @@ class LinearBucketTable(ScoredHashTable):
                 else None
             )
             if collect_evicted:
-                _, num_ev, ev_keys, ev_tids = table_insert_collect_evicted(
+                _, num_ev, ev_keys, ev_tids, ev_slots = table_insert_collect_evicted(
                     self.table_storage_,
                     self.table_bucket_offsets_,
                     self.bucket_capacity_,
@@ -1693,6 +1698,7 @@ class LinearBucketTable(ScoredHashTable):
                     e = num_evicted_accum + h_num_ev
                     evicted_keys_buf[num_evicted_accum:e].copy_(ev_keys[:h_num_ev])
                     evicted_tids_buf[num_evicted_accum:e].copy_(ev_tids[:h_num_ev])
+                    evicted_slots_buf[num_evicted_accum:e].copy_(ev_slots[:h_num_ev])
                     num_evicted_accum = e
             else:
                 table_insert(
@@ -1725,6 +1731,7 @@ class LinearBucketTable(ScoredHashTable):
             torch.tensor([num_evicted_accum], dtype=torch.int64, device=device),
             evicted_keys_buf,
             evicted_tids_buf,
+            evicted_slots_buf,
         )
 
     def _deterministic_insert_and_evict(

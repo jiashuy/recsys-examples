@@ -89,9 +89,10 @@ at::Tensor table_insert(at::Tensor table_storage,
                         int64_t guard_tables = 0, int64_t guard_num_tables = 0);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
-// (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
-// evicted_* tensors are sized at the batch upper bound -- slice to num_evicted.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+// (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids,
+// evicted_slots); the evicted_* tensors are sized at the batch upper bound --
+// slice to num_evicted. evicted_slots[j] is where victim j's value row is.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_insert_collect_evicted(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,

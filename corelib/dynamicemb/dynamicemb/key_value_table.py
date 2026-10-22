@@ -1557,6 +1557,7 @@ def _insert_key_values(
             num_evicted,
             evicted_keys,
             evicted_table_ids,
+            _evicted_slots,
         ) = state.key_index_map.insert(
             unique_keys,
             table_ids,

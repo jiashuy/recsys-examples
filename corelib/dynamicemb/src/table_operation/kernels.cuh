@@ -340,8 +340,9 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 // never the single-score reduce(). Plain insert drops the evicted key (no
 // evicted-output collection), so cur_ts is the only extra input the ranked
 // evictor needs.
-// CollectEvicted=true additionally writes each evicted victim's (key, table_id)
-// to evicted_keys / evicted_table_ids (compacted; count in evicted_counter) --
+// CollectEvicted=true additionally writes each evicted victim's (key, table_id,
+// slot) to evicted_keys / evicted_table_ids / evicted_indices (compacted; count
+// in evicted_counter) --
 // the "retain evicted keys" hook for a last-tier table. Only InsertResult::Evict
 // (an existing key pushed out) is collected, never Busy. Default false keeps the
 // plain-insert path (drops the victim) byte-for-byte unchanged (if constexpr).
@@ -359,6 +360,7 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             int32_t *__restrict__ counter, uint64_t cur_ts = 0,
             typename Table::KeyType *__restrict__ evicted_keys = nullptr,
             int64_t *__restrict__ evicted_table_ids = nullptr,
+            IndexType *__restrict__ evicted_indices = nullptr,
             CounterType *evicted_counter = nullptr,
             embedding_cache::EvictionGuardView guard =
                 embedding_cache::EvictionGuardView{nullptr, 0}) {
@@ -473,6 +475,9 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
       if (evicted) {
         evicted_keys[out_id] = evict_key;
         evicted_table_ids[out_id] = table_ids[i];
+        // The new key took the victim's slot, so `index` is where the victim's
+        // value row still is until the caller writes the new key's row.
+        if (evicted_indices != nullptr) evicted_indices[out_id] = index;
       }
     }
   }
@@ -494,7 +499,7 @@ __global__ void table_insert_kernel(
   insert_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0, nullptr, nullptr, nullptr, guard);
+      counter, /*cur_ts=*/0, nullptr, nullptr, nullptr, nullptr, guard);
 }
 
 // AoT entry: plain insert that also retains each evicted victim's (key,
@@ -513,12 +518,13 @@ __global__ void table_insert_collect_kernel(
     int32_t *__restrict__ counter, CounterType *evicted_counter,
     typename Table::KeyType *__restrict__ evicted_keys,
     int64_t *__restrict__ evicted_table_ids,
+    IndexType *__restrict__ evicted_indices,
     embedding_cache::EvictionGuardView guard) {
   insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter,
-      guard);
+      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_indices,
+      evicted_counter, guard);
 }
 
 template <typename Table, typename KernelTraits, typename Evictor>
