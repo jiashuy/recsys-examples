@@ -1,0 +1,1209 @@
+# 轻量化 Embedding Cache 设计提案
+
+> 状态：草案（Draft）
+> 适用范围：DynamicEmb **训练**路径的 GPU 侧 embedding 缓存（不覆盖推理部署，见 §2.2）
+> 关联代码：`corelib/dynamicemb/`
+
+---
+
+## 0. 摘要
+
+本文提出一套**重新设计**的 GPU embedding 缓存，而非在现有 `DynamicEmbCache` 上改造。
+
+核心思路是：缓存只做缓存该做的事——把 key 映射到一个 GPU 常驻的定长行池，保证在用的行不被回收，在行被复用时把脏数据换出去。所有与"存储"相关的能力（容量扩展、dump/load、跨层迁移）都不进入缓存，留给 backing 表。
+
+结构上由四组张量构成：**行池（EmbeddingTable）+ 节点元数据（Node）+ 哈希索引 + 可回收节点环（Ring）**。其中 Ring 用 `arange` 初始化，使"首次分配"与"回收复用"合并为同一条代码路径；节点的引用计数与状态打包进单个 32 位字，使"命中时钉住"与"淘汰时占用"通过一次 CAS 天然互斥——这是全部并发安全性的基础。
+
+元数据开销约 **32 B/node**，相对典型行宽（dim=128、fp32、Adam，1536 B）约占 **2%**。
+
+---
+
+## 1. 背景与动机
+
+### 1.1 现有实现
+
+现有 `caching=True` 路径下，`DynamicEmbCache` 与 `DynamicEmbStorage` **共用同一个** `create_table_state()` 构造的 `DynamicEmbTableState`（`dynamicemb/key_value_table.py:1423`）。这带来几个结构性后果：
+
+- 缓存继承了 storage 的全部生命周期能力：容量扩展、`dump` / `load`、`collect_table_sizes`。缓存并不需要这些。
+- 索引结构是 `LinearBucketTable(enable_overflow=True)`：每 slot 携带 key、digest、score，另有覆盖 `capacity + 3 × bucket_capacity × num_tables` 的 int32 引用计数，以及一整块 overflow buffer（`dynamicemb/scored_hashtable.py:410-448`）。overflow 是 storage 语义（不允许插入失败）的产物，缓存本可以直接淘汰。
+- value 行宽取所有表的 `max(emb_dim + optim_state_dim)`（`dynamicemb/key_value_table.py:277-279`），混合维度场景下存在行内碎片。
+- `flush_cache` 需要先把 backing storage 预扩容到 `storage_size + cache_size`（`dynamicemb/key_value_table.py:2562-2640`），产生内存尖峰。
+
+### 1.2 为什么重新设计
+
+上述问题的根因是**缓存被按存储的规格构造**。逐条改造需要把 `DynamicEmbTableState` 拆开，而它同时服务于 storage 路径，改动面会溢出到 hybrid / 单层等所有模式。
+
+重新设计的边界更清晰：新缓存不复用 `DynamicEmbTableState`，只依赖 backing 暴露的两个能力（key→row 查询、host 行的读写）。现有路径保持不动，通过配置项切换，可以并行验证。
+
+---
+
+## 2. 设计目标与非目标
+
+### 2.1 目标
+
+| # | 目标 | 验收方式 |
+|---|---|---|
+| G1 | 元数据开销 ≤ 40 B/node | 静态计算 + 运行期实测 |
+| G2 | 命中路径（lookup + pin）无指针写、无 host 同步 | 代码审查 + nsys 时间线 |
+| G3 | 淘汰不影响任何正在被引用的 key | 不变量断言 + 压力测试 |
+| G4 | 替换策略可配置且对训练结果透明 | FIFO / CLOCK 切换后 loss 逐位一致 |
+| G5 | 无容量扩展路径、无内存尖峰 | checkpoint 期间峰值显存监控 |
+| G6 | E2E step time 不低于现有实现 | HSTU / MovieLens benchmark |
+
+### 2.2 非目标
+
+- **不覆盖推理部署场景。** 本设计的若干前提在纯前向路径下不成立：`ref` 的生命周期绑定在"前向 pin、反向释放"上；行布局包含 optimizer state；"每个被缓存的 key 必然被反向更新"这一前提（INV-9 与无条件回写的依据）不成立；prefetch 依赖 key 在计算前已知。推理侧的 embedding 缓存需要单独设计。文中提到的 eval（§9.4）指训练过程中的周期性验证，不是独立部署的推理服务。
+- 不改动 backing 表（host storage）的内部实现
+- **不做 backing 索引的分层或下沉。** 索引恒常驻 GPU（§3、§10.3），key 总数因此受索引显存预算约束
+- 不做 KV 量化 / 压缩（如需，另立提案）
+- 不做跨 rank 的缓存共享或一致性
+- 不做运行时的跨表容量再平衡（见 §10.1）
+
+---
+
+## 3. 总体架构
+
+```
+┌─────────────────────────── GPU ────────────────────────────┐
+│                                                             │
+│   ┌── 缓存（本文范围）──────────────────────────────┐        │
+│   │  emb_table  [C_t, D_t]   行池                   │        │
+│   │  nodes      key/state/prev/next                 │        │
+│   │  hash_heads [B_t]        key → node             │        │
+│   │  ring       [C_t]        可回收 node 队列       │        │
+│   └─────────────────────────────────────────────────┘        │
+│                                                             │
+│   ┌── backing 索引 ─────────────────────────────────┐        │
+│   │  key → host row id                              │        │
+│   └─────────────────────────────────────────────────┘        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ PCIe（zero-copy）
+┌──────────────────────────────┴──────────────────────────────┐
+│                          Host                               │
+│   backing 行数据：embedding + optimizer state               │
+│   mapped pinned 内存，kernel 直接寻址                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+两条关键的分层决策：
+
+**backing 索引在 GPU，backing 行数据在 host。** miss 路径因此完全没有 CPU 参与——GPU 侧查索引拿到 row id，再由 warp 通过 zero-copy 直接把该行从 host 拉进 `emb_table`。这与现有实现的分层一致（`create_table_state` 中 `key_index_map` 无条件建在 `device`，值缓冲走 `HostExtendableBuffer` / `HostVMMTensor`，见 `dynamicemb/extendable_tensor.py:131-149`）。
+
+**每张逻辑表持有独立的一套结构，但所有表在同一个 kernel 内处理。** 见 §4.3。
+
+---
+
+## 4. 数据结构
+
+### 4.1 每表结构
+
+设表 `t` 的缓存容量为 `C_t`（node 数），行宽 `D_t = emb_dim_t + optim_state_dim_t`。
+
+| 名称 | 类型 / 形状 | 含义 |
+|---|---|---|
+| `emb_table_t` | `[C_t, D_t]` | 行池。行号即 node id；embedding 与 optimizer state **同行连续** |
+| `key_t` | `int64 [C_t]` | 该 node 当前承载的 key |
+| `state_t` | `uint32 [C_t]` | 打包状态字，见 §4.2 |
+| `prev_t` / `next_t` | `int32 [C_t]` | **哈希桶链**的前驱 / 后继 |
+| `hash_heads_t` | `int32 [B_t]`，`B_t = next_pow2(2 C_t)` | 桶头 node id，`-1` 为空 |
+| `ring_t` | `int32 [C_t]` | 可回收 node 队列 |
+| `ring_head_t` / `ring_tail_t` | `uint64` 标量 | 单调递增计数器 |
+
+节点元数据采用 **SoA**：`key` 与 `state` 在不同 kernel 中被独立访问，分离存储才能保证合并访存。
+
+**embedding 与 optimizer state 同行**是刻意的：反向的优化器更新是访存密集型，两者分离会让访存次数翻倍且都退化为非合并访问；同时淘汰回写必须携带整行，同行布局让回写成为一次连续搬运。两者的 dtype 一致，因此 `emb_table_t` 是一个同构的 typed tensor。
+
+**node 中不存 backing 行号。** 淘汰时用 `key_t[n]` 探测一次 backing 索引获得当前行号。这多了一次探测，但换来两件事：省 4 B/node，以及**对 backing 重哈希免疫**——若把行号缓存下来，backing 一旦扩容重哈希，所有存储的行号即变成野指针，回写会写到别的 key 的行上，造成静默的数值损坏。每次探测都取当前值则不存在陈旧问题。
+
+miss 加载所需的行号来自当次 backing 探测，本就无需存储。
+
+### 4.2 状态字位布局
+
+```
+ 31 30 | 29   | 28      | 27   | 26 .......... 0
+ 状态  | 保留 | in_ring | used | ref_counter
+```
+
+| 字段 | 宽度 | 含义 |
+|---|---|---|
+| 状态 | 2 bit | `EMPTY` / `LOADING` / `RESIDENT` / `EVICTING` |
+| `in_ring` | 1 bit | 当前在 ring 中存在一条记录 |
+| `used` | 1 bit | 自上次被表针扫过以来是否被命中（CLOCK 用，见 §8） |
+| `ref_counter` | 27 bit | 当前有多少个 in-flight step 引用该 node（上限 ~1.3 亿） |
+
+**没有 `dirty` 位。** 训练路径下每个被缓存的 key 必然走完反向并被更新，因此 `dirty` 恒为 1，留着只是徒增一类"忘了置位"的缺陷——而这类缺陷的表现是 optimizer state 静默丢失、模型照常训练但收敛变差，极难定位。改为**淘汰时无条件回写**（§9.1），依据是 INV-9。
+
+**打包成单字是必需的，不是优化。** 命中时的"钉住"（ref+1）与淘汰时的"占用"（判定 ref==0 并改状态）必须互斥。若 ref 与状态位分处两个字，就存在"刚 ref+1 完、同时被判定为可淘汰"的窗口。打包后两者 CAS 同一个字，互斥由硬件保证。
+
+顺带的收益：CLOCK 的 `used` 位可以直接合并进 pin 的那次 CAS，**不产生任何额外访存**。
+
+⚠️ 由此推出一个硬化要求：`atomicSub(&state_t[n], 1)` 是对**整个字**减一，仅当 `ref > 0` 时才等价于"ref 减一"。若 INV-6 被破坏、出现多减，`ref` 会从 0 借位到高位，**`used`、`in_ring`、状态位同时被腐蚀**。debug 构建的释放路径应断言 `REF(old) > 0`。
+
+### 4.3 状态机
+
+```
+EMPTY ──分配──> LOADING ──加载完成──> RESIDENT ──被占用──> EVICTING ──> LOADING
+                                          │                              (复用)
+                                          └── ref 在 RESIDENT 内部 0↔N 变化
+```
+
+- `EMPTY`：初始状态，行内无有效数据
+- `LOADING`：已归属某 key，H2D 或初始化未完成，**既不可消费也不可淘汰**
+- `RESIDENT`：数据有效。`ref > 0` 表示在用；`ref == 0` 表示空闲，但**仍然可以命中**
+- `EVICTING`：已被某个分配线程占用，此时 pin 必须失败
+
+### 4.4 kernel 内的多表分派
+
+所有表在同一个 kernel 内处理。device 侧传入指针与参数数组（沿用 `dynamicemb/key_value_table.py:160` 的 `get_table_ptrs` 模式）：
+
+```
+emb_ptrs, key_ptrs, state_ptrs, prev_ptrs, next_ptrs,
+hash_ptrs, ring_ptrs                : 指针数组 [T]
+ring_head, ring_tail                : uint64 [T]
+C, B, D                             : int32  [T]
+```
+
+输入为 `unique_keys[U]` 与 `table_range[T+1]`，后者由 `segmented_unique_cuda` 直接给出（`dynamicemb/batched_dynamicemb_function.py:74`），无需额外计算。
+
+线程到表的映射采用 **block 级快路径**：`unique_keys` 按表分段，因此同一 block 内的线程绝大多数属于同一张表。由 block 的 0 号线程二分出本 block 首尾元素的 table id——若相同，整个 block 走快路径，把该表的全部参数一次读进 shared memory，后续所有线程零间接开销；只有跨越分段边界的 block 需要逐线程二分，这样的 block 至多 `T-1` 个。
+
+**每表独立结构的收益与代价：**
+
+- ✅ `D_t` 逐表独立，不存在行内碎片
+- ✅ 桶链天然按表隔离，node 无需存储 table id，比对时少一次访存
+- ✅ `ring_head` / `ring_tail` 从单一计数器拆成 `T` 个，`atomicAdd` 竞争摊到 T 路
+- ⚠️ 容量无法跨表共享，需要容量规划环节（见 §10.1）
+
+---
+
+## 5. 不变量
+
+以下不变量应在 debug 构建中以断言形式落地。它们是并发正确性的完整依据。
+
+| # | 内容 | 保障手段 |
+|---|---|---|
+| INV-1 | `ref > 0` 的 node 永不被淘汰 | 出队时 CAS 校验 |
+| INV-2 | node 仅在 `ref` 发生 `1→0` 跃迁且 `in_ring == 0` 时入队 | `atomicOr(IN_RING)` 的返回值判定 |
+| INV-3 | 从 ring 弹出后必须重新校验，`CAS(RESIDENT\|ref=0 → EVICTING)` 成功才算占用 | 与并发 pin 互斥 |
+| INV-4 | `tail - head ≤ C_t` | 由 INV-2 推出（每 node 至多一条记录），入队端无需检查 |
+| INV-5 | `head ≤ tail` | 出队越界时必须 `atomicSub` 归还 |
+| INV-6 | 每个 unique key 每步恰好 `+1 / -1` | 前向必须先去重 |
+| INV-7 | 替换策略对训练结果完全透明 | 见下 |
+| INV-8 | pin 成功后必须复查 `key_t[n] == key` | 防 node 被改派（§6.3） |
+| INV-9 | **`RESIDENT` 的行永不旧于 backing 中对应的行** | 见下 |
+
+**关于 INV-6。** 这是最容易在后续迭代中被破坏的一条。一旦某条路径（被 mask 的 token、提前退出的分支、异常路径）漏掉 `-1`，该 node 的 `ref` 将永久大于 0，从此无法被淘汰，表现为缓存有效容量的缓慢泄漏——症状是命中率随训练时长单调下降。更严重的是反向情形：多减一次会因借位腐蚀整个状态字（§4.2）。
+
+校验有两处：debug 构建的释放路径断言 `REF(old) > 0`；以及 checkpoint 排空流水之后，此刻所有 `ref` 必须为 0（§9.5），这是一次精确的全量校验，不需要额外的巡检 kernel。
+
+**关于 INV-7。** 缓存是纯性能设施：被淘汰的 key 会带着完整的行回写 backing，重新加载后值不变。因此 FIFO 与 CLOCK 的切换只影响 PCIe 流量与 step time，不影响 loss 与收敛。
+
+这条不变量决定了该配置项的验收方式——**只测性能，不需要数值对齐测试**。同时它也是一条回归防线：若切换替换策略导致 loss 变化，说明缓存存在真实缺陷（最可能是回写漏了 optimizer state，或 ref 计数泄漏导致行被丢弃）。
+
+**关于 INV-9。** 缓存中的行只有两个来源：从 backing 加载（与 backing 相等），或在缓存内被优化器更新（比 backing 新）。因此回写永远是"用新覆盖旧"。
+
+这条不变量支撑了两个设计决定：
+
+- **淘汰时无条件回写**（§9.1）——不需要 `dirty` 位来判断"这行比 backing 新吗"，答案恒为是
+- **flush 时回写全部 `RESIDENT` 行**（§9.5）——不得因 `ref > 0` 或任何其他条件跳过。一个长期命中、从未被淘汰的热 key，其 backing 副本可能已落后数千步；跳过它意味着丢失这期间的全部更新，而 `ref > 0` 恰好意味着它正在被使用，也就是最热、最不该丢的那批
+
+---
+
+## 6. 运行时流程
+
+### 6.1 前向
+
+| 步 | 操作 | 可复用 |
+|---|---|---|
+| 1 | 去重：`keys[N]` → `unique_keys[U]`、`inverse[N]`、`table_range[T+1]` | `src/unique_op.cu` |
+| 2 | 哈希查找 + pin | 新写 |
+| 3 | miss 压紧后从 ring 弹出 node；探测 backing 取新 key 的行号 | 新写 |
+| 4a | **摘链趟**：所有受害者从桶链摘除；探测 backing 取受害者行号 | 新写 |
+| 4b | **插链趟**：改写 `key_t`，所有新 node 插入桶头 | 新写 |
+| 5 | 双向搬运：受害者行 → host，新行 host → `emb_table`；全新 key 走初始化 | `src/initializer.cu` |
+| 6 | `out[i] = emb_table[node_ids[inverse[i]], :emb_dim]` | `src/lookup_forward.cu` |
+
+**Step 4 必须拆成两趟。** 摘链与插链若同处一个 kernel，就会出现"线程甲正把受害者从桶 b 摘出、线程乙正往桶 b 头部插入"的并发修改——这是无锁双向链表的一般性难题，需要桶级锁或标记删除。而受害者集合与新 key 集合天然不相交，拆成两趟即可把并发问题消解为阶段问题，不引入任何新机制。这与 ring 的读写相分离（§7.2）、pin 的阶段分离（§6.4）是同一套纪律。
+
+**未被准入的 key 走旁路。** 准入判断由 backing 表负责（`dynamicemb/embedding_admission.py`），被拒绝的 key 拿不到 backing 行号，因而不可缓存：它们**不占 node、不进 ring、不计 ref**，前向通过临时 buffer + 初始化产出结果。Step 3 需要把这类 key 从 miss 集合中分离出去。
+
+**Step 2 的查找与 pin：**
+
+```cuda
+h = hash(key) & (B_t - 1);
+n = hash_heads_t[h];
+while (n != -1) {
+    if (key_t[n] == key) {
+        if (try_pin(n)) {                 // CAS: 状态==RESIDENT 且 ref+1
+            node_ids[u] = n; found[u] = 1; return;
+        }
+        break;                            // 撞上 EVICTING，降级为 miss
+    }
+    n = next_t[n];
+}
+node_ids[u] = -1; found[u] = 0;
+```
+
+pin 失败时**降级为 miss，不自旋**。代价仅是多一次 H2D，且发生概率极低；而在 GPU 上自旋等待一个可能夹着 PCIe 传输的操作是死路。
+
+**命中的定义包含"躺在 ring 里的 node"。** `ref` 归零不等于数据失效——只要还没被弹出复用，命中它就是完整的缓存命中。这是 ring 相对"归零即释放"的核心收益。
+
+**Step 1–5 整体提前若干 step 执行（prefetch）**，与之前 step 的 dense 计算重叠，用于掩盖 PCIe 延迟。流水深度见 §6.4。
+
+### 6.2 反向
+
+| 步 | 操作 | 可复用 |
+|---|---|---|
+| 1 | 按 `inverse` 规约梯度 → `[U, emb_dim]` | `src/lookup_backward.cu` |
+| 2 | 原地优化器更新：读整行 → 计算 → 写回原行 | `src/optimizer_kernel.cuh` |
+| 3 | `ref -1`；若发生 `1→0` 且 `in_ring` CAS 成功则入队尾 | 新写 |
+
+Step 3：
+
+```cuda
+uint32_t old = atomicSub(&state_t[n], 1);
+assert(REF(old) > 0);                                   // debug：防借位腐蚀
+if (REF(old) == 1) {                                    // 1 → 0 跃迁
+    if (atomicOr(&state_t[n], IN_RING) & IN_RING) return;  // 已在环中
+    uint64_t pos = atomicAdd(&ring_tail_t, 1ULL);
+    ring_t[pos & MASK] = n;
+}
+```
+
+"由观察到 `1→0` 跃迁的线程负责入队"这一归属规则，配合 `in_ring` 位，共同保证入队恰好一次。
+
+### 6.3 pin 的身份竞态
+
+读到桶链中的 node `n` 之后、CAS pin 之前，`n` 可能已被淘汰并改派给**另一个** key。此时它的状态又是 `RESIDENT`，pin 的 CAS 会**成功**——线程以为拿到了 key K，实际持有的是 K′ 的行。
+
+主防线是**阶段分离**：Step 2（查找 + pin）与 Step 3–4（分配 + 淘汰）处于**不同的 kernel**，由流序保证不并发。兜底是 pin 后复查 `key_t[n] == key`，不符则 `unpin` 并降级为 miss——一次 8 字节读，几乎免费。
+
+### 6.4 prefetch 流水深度
+
+支持深度 `d > 1`。ring 的 MPMC 隐患只有一种形态，且是**单向**的：
+
+- **出队运行中、入队启动** —— 安全。入队写的位置 `p ≥ 出队的 tail 快照`，出队只消费 `< 快照`，二者不相交
+- **入队在飞时、出队启动** —— 危险。入队已 `atomicAdd(tail)` 拿到位置 `p` 但尚未写入 `ring[p]`，出队的快照却已包含 `p`
+
+因此只需要一条单向约束：
+
+> **allocate kernel 启动前，必须等待所有已发起的 release kernel 完成**（一个 stream event wait）。反向不需要——release 可自由地与运行中的 allocate 重叠。
+
+这条约束不限制流水深度，且在稳态下**不产生气泡**：深度 `d` 时，`allocate(N+d)` 大约发生在 step N 的前向期间，而 `release(N-1)` 在 step N-1 反向末尾就已完成，依赖天然满足。
+
+配套要求：**所有 step 的 prefetch 工作走同一条 prefetch stream**，使各 step 的 lookup / allocate kernel 之间天然串行，§6.3 的阶段分离在 `d > 1` 下依然成立。若使用多条 prefetch stream，该保证失效，需要额外设计。
+
+深度的代价体现在容量下界（§10.1）：深度越大，本步释放的 node 越晚可用，`C_t` 需相应放大。`ref_counter` 的 27 位对任何现实深度都绰绰有余。
+
+---
+
+## 7. Ring 协议
+
+### 7.1 表示与初始化
+
+```
+ring_t = arange(C_t);   head = 0;   tail = C_t
+所有 node：state = EMPTY | in_ring=1 | ref=0
+```
+
+`arange` 初始化让**"首次分配"与"回收复用"成为同一条代码路径**。传统实现需要分别维护 free-list（从未使用的槽）与 eviction-queue（用过待回收的槽）；这里两者合一——环中装的一律是"可被占用的 node"，只是有的尚未写过数据（`EMPTY`），有的装着有效但无人引用的数据（`RESIDENT`，命中它即缓存命中）。分配方不关心两者区别，只关心 `ref == 0`。
+
+元素个数为 `tail - head`，空即 `head == tail`。使用无符号单调计数器配合取模索引，比维护独立的 size 变量更好——后者在并发下需要额外原子操作，而 `tail - head` 是免费的。
+
+计数器使用 **uint64**。uint32 在 `C ≤ 2^31` 时靠无符号减法也能正确处理回绕，但那需要额外论证；uint64 在任何真实训练时长内都不会绕，省下的推理成本远大于 8 字节。
+
+### 7.2 核心约束：读写在时间上相分离
+
+> **同一时刻，ring 只被"纯出队 kernel"或"纯入队 kernel"中的一种访问，由流序保证。**
+
+这条约束是整套机制得以保持简单的根本原因。若出队与入队真正并发，就会撞上经典的 MPMC 环形队列问题：入队线程先 `atomicAdd(tail, 1)` 占位 `p`，但尚未把 node id 写入 `ring[p]`；此时出队线程看到 `tail` 已增长，认为 `p` 有效，读到的却是上一轮的陈旧值。修复需要为每个槽引入序列号（Vyukov 方案），复杂度与调试成本陡增。
+
+训练循环天然满足该约束：
+
+```
+step N:   [prefetch / allocate ← 只出队]  forward  backward  [release ← 只入队]
+step N+1: [prefetch / allocate ← 只出队]  ...
+```
+
+启用深度 `d > 1` 的 prefetch 流水时，该约束由一条单向的 stream event 依赖维持，详见 §6.4。代价仅是"本步释放的 node 要过若干步才可用"——这是容量问题而非正确性问题，已被 §10 的容量下界覆盖。
+
+该约束带来一个直接好处：**出队 kernel 中 `tail` 是常量，入队 kernel 中 `head` 是常量**。因此边界检查可以在 kernel 开头读一次快照，全程精确，无需反复读取被高频原子写的变量。
+
+### 7.3 出队
+
+```cuda
+__device__ int ring_pop(uint64_t tail_snapshot, int t) {
+    for (;;) {
+        uint64_t pos = atomicAdd(&ring_head[t], 1ULL);
+        if (pos >= tail_snapshot) {
+            atomicSub(&ring_head[t], 1ULL);   // 归还，维持 INV-5
+            return -1;                        // 环已抽干 → 上层报错 / 反压
+        }
+        int cand = ring_t[pos & MASK];
+        uint32_t st = state_t[cand];
+
+        if (REF(st) != 0) {                   // 陈旧条目：该 node 已被重新命中
+            clear_in_ring(cand);
+            continue;                         // 丢弃，重领
+        }
+        if (try_claim(cand)) {                // INV-3
+            clear_in_ring(cand);
+            return cand;
+        }
+        clear_in_ring(cand);                  // 刚被 pin 走，同样丢弃
+    }
+}
+```
+
+三个易错点：
+
+**陈旧条目是丢弃，而非重新入队。** 直觉上会想"它还有效，放回队尾"，但这会在缓存被 pin 满时造成活锁——所有条目 `ref > 0`，线程将绕环无限循环。丢弃则使环单调收缩，最坏情况是抽干并返回 `-1`，上层立即得到明确错误。丢弃不会泄漏：该 node 会在下次真正归零时重新入队。
+
+**越界时必须把 head 减回去。** 否则多个线程同时撞到空环会把 head 推过 tail，`tail - head` 下溢为巨大的无符号数，后续所有判断全部失效。此缺陷仅在缓存打满时触发，测试极难覆盖，因此需要 INV-5 的断言兜底。
+
+**CAS 失败与陈旧条目走同一处理。** 两者都意味着"该 node 现在不归我"，无需区分。
+
+### 7.4 入队
+
+见 §6.2 Step 3。
+
+**入队无需溢出检查**，由 INV-4 保证：`in_ring` 位使任一 node 在环中至多一条记录，因此环中记录数不超过 `C_t`；而出队只会减少记录数（丢弃陈旧条目亦然）。
+
+### 7.5 `in_ring` 位的必要性
+
+这是整套设计中最容易写错的地方，单独说明：
+
+> node X 的 `ref` 归零 → 入 ring。此后 X 被再次命中，`ref 0→1`（**X 仍留在 ring 中，成为陈旧条目**）。反向释放，`ref 1→0`。若此时无条件再次入队，ring 中就有了 X 的**两条**记录。第一条被弹出、成功淘汰并复用为新 key 后，第二条即成为悬垂引用——会把一个正在服役的新 key 当作垃圾回收。
+
+`in_ring` 位保证任一 node 在环中至多一条记录：入队走 `CAS(in_ring: 0→1)`，出队清零。陈旧条目在 §7.3 被识别并丢弃，该 node 将在下次真正归零时重新入队。
+
+等价方案是为每个 node 维护 generation 计数、ring 中存 `(node_id, gen)` 二元组，出队时比对。两者择一即可，`in_ring` 方案节省一半 ring 内存。
+
+### 7.6 一个 C=4 的完整 trace
+
+初始 `ring=[n0,n1,n2,n3]`，`head=0`，`tail=4`，全部 `EMPTY`。
+
+| 步 | 动作 | 结果 |
+|---|---|---|
+| 1 | key A miss | pop `pos0`→`n0`。A→n0，ref=1。`head=1` |
+| | 反向释放 | ref→0，in_ring 0→1，push `ring[4&3]=n0`，`tail=5` |
+| 2 | key B miss | pop `pos1`→`n1`。`head=2`。释放后 push，`tail=6` |
+| 3 | key C miss | pop `pos2`→`n2`。`head=3`。释放后 push，`tail=7` |
+| 4 | key D miss | pop `pos3`→`n3`。`head=4`。释放后 push，`tail=8` |
+| | | 环内容 = 位置 `[4,8)` = `[n0,n1,n2,n3]` = A,B,C,D |
+| 5 | key A **hit** | ref 0→1，`used(n0)=1`。释放时 in_ring 已置位 → **不重复入队** |
+| 6 | key E miss | pop `head=4` → `n0`（A）。FIFO 下 ref==0 → 淘汰 A |
+
+第 6 步正是 FIFO 的病理点：A 在第 5 步刚被访问，却因"进来得最早"被淘汰。§8 讨论如何用 CLOCK 规避。
+
+---
+
+## 8. 替换策略
+
+### 8.1 FIFO 与 CLOCK 的差别
+
+- **FIFO** 的淘汰依据是：*进来多久了*
+- **CLOCK** 的淘汰依据是：*进来之后有没有被再用过*
+
+CLOCK 只有两条规则：
+
+1. **插入时** `used = 0`；**命中时** `used = 1`
+2. **淘汰时**检查队头：`used == 1` 则清零并放回队尾（给予第二次机会），继续看下一个；`used == 0` 才淘汰
+
+推论：**一个 node 要被淘汰，必须在表针走完一整圈期间一次都没被命中过。** 热 key 每圈都会重新置位，因此永远轮不到它。
+
+对照关系：**`ring_head` 即表针，`ring` 数组即钟面**。
+
+### 8.2 对照 trace
+
+访问序列 `A B C D A E A F`，容量 4，A 为热 key：
+
+| 步 | 访问 | FIFO | CLOCK |
+|---|---|---|---|
+| 1–4 | A B C D | 依次装入，满 `[A B C D]` | 依次装入，`used` 全为 0 |
+| 5 | **A** | **hit**，队列顺序不变 | **hit**，`used(A)=1` |
+| 6 | E | miss → 淘汰队头 **A** ❌ | miss → 队头 A `used=1`，清零并放回队尾；下一个 B `used=0` → 淘汰 B ✓ |
+| 7 | **A** | **miss**（第 6 步刚被扔掉）→ 淘汰 B | **hit** ✓ |
+| 8 | F | miss → 淘汰 C | miss → 队头 C `used=0` → 淘汰 C ✓ |
+
+8 步的例子里差距只有一次 miss，但规模效应显著：**FIFO 的表针每转一圈就会把整个缓存换一遍，热 key 也不例外**。因此 FIFO 的命中率大致等于「缓存容量 ÷ 一圈内出现的 unique key 数」，几乎与 key 的热度分布无关——等于把分布倾斜带来的全部红利浪费掉。推荐场景的 key 分布是重尾的，倾斜越强，浪费越大。
+
+### 8.3 实现
+
+配置项独立于现有的 `EvictStrategy`（后者是 HKV 的 score 语义，本设计不使用）：
+
+```python
+class ReplacementPolicy(Enum):
+    FIFO  = 0    # 默认
+    CLOCK = 1
+```
+
+**采用运行期开关，而非模板参数。** 理由：出队循环不是热路径（每个 miss 走一次，而非每个 key 走一次），一个全 kernel 一致、完美预测的分支开销可忽略；模板化的唯一实质收益是省下 `retry_buf` 显存，而按需分配已解决该问题。运行期开关少一份编译产物、少一条独立测试路径。
+
+作用域为全局而非逐表。逐表混用在技术上几乎免费（kernel 本就在读逐表参数），但缺乏实际需求，且会让命中率回归问题的排查空间乘以 `2^T`。
+
+CLOCK 开启后，出队循环增加一个分支：
+
+```cuda
+if (st & USED) {
+    atomicAnd(&state_t[cand], ~USED);
+    retry_buf[atomicAdd(&retry_cnt, 1)] = cand;   // 攒起来，稍后统一入队尾
+    continue;
+}
+```
+
+配合一个跟随的小 kernel，把 `retry_buf` 顺序追加到 `ring_tail`。**不能在出队 kernel 内直接写 `tail`**，那会破坏 §7.2 的读写相分离约束。
+
+### 8.4 终止性：必须限次回退
+
+上述实现有一个终止性缺陷，必须一并处理：
+
+> 进入 `retry_buf` 的条目在本次出队 kernel 内**不可见**。若 ring 中的活跃条目恰好全部 `used == 1`，它们会被逐个搬进 `retry_buf`，`head` 一路推到 `tail_snapshot`——`ring_pop` 返回 `-1`，报"缓存打满"。但实际上有大量可淘汰 node，只是都躺在 `retry_buf` 里等待下一个 kernel。
+
+这是**误报**，且仅在缓存打满且访问模式突然变均匀时触发，测试极难覆盖。
+
+经典 CLOCK 没有这个问题——它的表针在**固定**环上循环，转一圈清零后第二圈必然找到受害者（上界 2 圈）；而本设计的 ring 是队列，`head` 推进即意味着条目被消费。
+
+修复采用**限次回退**：
+
+```
+每个线程最多授予 k 次第二次机会（k = 1 或 2）；
+超过后无视 used 位，直接 claim 下一个 ref == 0 的条目。
+```
+
+这保证循环有界、不会误报，且降级优雅：**本步退化为 FIFO，下一步恢复 CLOCK 语义**（第一次扫描已把那些 `used` 位清零）。真正触发降级的场景是"缓存中所有内容都是热的"，此时任何替换策略表现都一样差，损失可忽略。
+
+已评估但不推荐的两个替代：让出队 kernel 直接写 `ring_tail`（破坏读写相分离）；把 `retry_buf` 做成可被同一 kernel 消费的第二级环（同样的竞态，只是换了位置）。为一个病理场景引入并发队列的复杂度并不划算。
+
+### 8.5 `used` 位无条件置位：一个免费的在线指标
+
+即便运行在 FIFO 模式，`used` 位也照常置位——它合并进 pin 的 CAS，零额外访存。
+
+> **在出队时统计 `used == 1` 的条目占比，即等于"若启用 CLOCK，有多少次淘汰会被推迟"。**
+
+这个比例可以直接指示是否值得启用 CLOCK，**无需离线模拟、无需 trace dump**，跑一次正常训练即可得到：
+
+- 比例接近 0 → 访问几乎没有复用，CLOCK 无意义
+- 比例 40%+ → 大量热 key 正被 FIFO 误杀，应启用
+
+需要说明它是**筛选指标而非精确预测**：推迟一次淘汰会改变后续的受害者选择，二阶效应无法由此推算。但作为"值不值得试"的判据完全够用。
+
+建议将该指标与命中率、ring 抽干次数一并做成固定的缓存健康度指标组，异步拷出、每数百步读取一次，**热路径上不得有任何 host 同步**。
+
+---
+
+## 9. 写回
+
+### 9.1 触发时机：仅淘汰与 checkpoint
+
+不做后台主动刷。理由比"全双工顺风车"更根本：
+
+> 训练中最热的行，特点是**每步都被更新、但永远不会被淘汰**。它们在缓存中反复累积更新，这正是缓存存在的全部意义——把 N 次更新吸收为最终淘汰时的 1 次回写。后台主动刷会把这些行反复写回 host，而每一次写都会被下一步的更新作废。这是纯粹的带宽浪费，且越热的行浪费越多。
+
+同一逻辑排除了"`ref` 归零时立即回写"的方案。若绑定在 `ref → 0`，则每步 D2H 行数从 `M`（每步 miss / 淘汰数）涨到 `U`（每步 unique key 数），而 `M = U × (1 - 命中率)`——命中率 90% 时流量是 10 倍，**缓存越有效，惩罚越重**。
+
+**淘汰时无条件回写，不设 `dirty` 判断。** 依据是 INV-9：`RESIDENT` 的行永不旧于 backing。训练路径下每个被缓存的 key 必然走完反向并被更新，`dirty` 恒为 1，判断没有意义；去掉它同时消除了"某条路径忘了置位 → optimizer state 静默丢失"这一整类缺陷。
+
+唯一保留的判断是 `EMPTY` 与 `RESIDENT` 的区分——从未装过数据的 node 被弹出时不能把垃圾写进 host。该信息本就在状态位中。
+
+### 9.2 与加载合并为双向 kernel
+
+稳态下每次 miss 恰好触发一次淘汰：
+
+```
+每步 PCIe 流量：H2D = M 行（miss 加载），D2H = M 行（受害者回写）
+```
+
+方向相反、量级相等——这正是全双工的理想输入。合并后每个 warp 处理一对：
+
+```
+warp 处理 (受害者 node n, 新 key 的 backing 行 r_new)：
+  1. emb_table[n] → 寄存器                （device 读）
+  2. host[r_new]  → 寄存器                （PCIe H2D）┐ 同时在飞
+  3. 寄存器(旧行) → host[r_old]           （PCIe D2H）┘
+  4. 新行寄存器   → emb_table[n]          （device 写）
+```
+
+由于回写是无条件的，kernel 内**没有 `if (dirty)` 分支，warp 不产生分化**——每个 warp 都执行完整的双向搬运。`r_old` 由 Step 4a 探测 backing 得到，`r_new` 由 Step 3 得到，两者在进入本 kernel 前均已就绪。
+
+寄存器开销不成问题：`dim=128` fp32 加 Adam 两个 state 为 1536 B/行 = 96 个 `float4`，摊到 32 lane 上是每 lane 3 个 `float4`，两行共 24 个寄存器。可按 chunk 流水以进一步重叠。
+
+由于旧行在第 1 步就已进入寄存器，第 4 步随时可以覆写——**D2H 不阻塞 H2D**，不存在"等待写回"的问题。
+
+**实测结果：链路确实全双工，但我们的访问形态只能拿到其中一部分。** 随机行下双向 1.19×（§12.1），而真实密度下排序几乎无用（§12.2），所以 1.19× 就是可期待的数字——约省 20% 的传输时间。值得做，无需前置工作。
+
+窄行（≤ 512 B）应关闭融合：实测那里双向反而更慢（dim=32 时 0.80×），行太窄时 kernel 受限于延迟与占用率而非带宽，每个 warp 兼顾两个方向反而减少在飞的行数。
+
+### 9.3 准入即在 backing 分配行
+
+> 新 key 进入缓存时，立即在 backing 哈希中执行一次 **find-or-insert**，取得并固定其行号。此时**不写任何值**，仅占位。
+
+代价接近于零——miss 路径**本来就要探测 backing 哈希**（以判断该 key 是已有 key 还是全新 key），find-or-insert 只是同一次探测的自然延伸。
+
+收益是三重的：
+
+| | 惰性分配 | 准入即分配 |
+|---|---|---|
+| 淘汰 | 可能触发 backing 插入与扩容 | **纯值写**，行号可探测得到 |
+| checkpoint flush | 批量插入 + 扩容尖峰 | **纯值 dump**，无分配 |
+| 回写 kernel | 需处理插入失败 / 扩容分支 | 无分支，纯数据搬运 |
+
+这直接消除了 §1.1 中现有实现的内存尖峰问题（G5）。淘汰路径上不再有任何"可能失败、可能触发分配"的操作，使双向 kernel 得以保持为纯粹的数据搬运——无分支、无错误处理、无 host 参与。
+
+配套语义：backing 的行一旦分配即**终身绑定该 key**，缓存淘汰不释放它。因此 backing 表的容量按总 key 数规划，而非活跃 key 数。
+
+注意行号**不缓存在 node 中**（§4.1）：淘汰时现场探测取得。这使设计对 backing 重哈希免疫。
+
+### 9.4 训练内 eval 路径
+
+指训练过程中周期性的验证前向（`module.eval()`），不是独立部署的推理服务——后者已由 §2.2 排除。
+
+**与现有 `eval_lookup` 语义对齐**（`dynamicemb/key_value_table.py:2777`）：
+
+```
+eval：查找 → 命中则直接读；miss 则从 backing zero-copy 直读
+      不插入、不准入、不淘汰、不占用 node
+      不 pin、不置 `used`
+      只拷贝 embedding 列，不触碰 optimizer state
+```
+
+三点说明：
+
+- **不能绕过缓存直读 backing。** 缓存中的行普遍比 backing 新（INV-9），绕过会读到陈旧值。必须先查缓存。
+- **不置 `used`。** eval 是全量遍历，若置位会把所有 `used` 刷成 1，CLOCK 的表针下一轮将对每个条目都给出第二次机会，直接退化为 FIFO 且出队循环变长——扫描污染换了个形式又回来了。
+- **不 pin** 的前提是 eval 期间没有并发的 allocate。eval 本就是独立阶段，该前提成立，但需在实现中确保。
+
+由于不准入，全量遍历不会冲刷热数据；热 key 依然享受命中。相比"先全量 flush 再 bypass"，省掉一整次全量 dump。
+
+### 9.5 checkpoint flush
+
+```
+flush(checkpoint)：
+  1. 排空流水，等所有 in-flight step 完成反向
+  2. assert 所有 node 的 ref == 0
+  3. 回写全部 RESIDENT 的行（EMPTY 跳过）
+```
+
+**Step 1 的排空是必需的。** flush 需要把行读出送往 host，这次读不能与两类 kernel 并发：反向的优化器更新（会读到半新半旧的撕裂行）、以及 allocate 的双向搬运（会读到正被新 key 覆写的行）。排空后两者都不在运行。也可用 event 依赖精确插入而不排空，但 checkpoint 间隔通常数千步，排空的代价是 `d` 个 step 的流水气泡（毫秒级），不值得为此增加复杂度。
+
+**Step 2 是白拿的校验。** 排空之后所有 `ref` 必须为 0，这是 INV-6 的一次精确全量校验。ref 泄漏平时只表现为"命中率随训练时长缓慢下降"，极难定位；把断言放在这里等于给 INV-6 装了周期性哨兵，无需额外的巡检 kernel。
+
+**Step 3 不得有任何跳过条件**（INV-9）。特别是不能跳过 `ref > 0` 的行——一个长期命中、从未被淘汰的热 key，其 backing 副本可能已落后数千步。
+
+成本：最坏情况整个缓存都要写，即 `C_t × D_t` 的 D2H。4M node × 1536 B ≈ 6 GB，按 20 GB/s 约 300 ms。
+
+### 9.6 崩溃一致性
+
+仅在淘汰时回写意味着崩溃会丢失缓存中尚未回写的全部更新。但训练本就依赖周期性 checkpoint 恢复，"丢失上次 checkpoint 以来的进度"是既有语义，缓存并未使其变差。因此不需要 WAL 或额外持久化机制。
+
+### 9.7 回写粒度
+
+整行（embedding + optimizer state）。
+
+**只回写 embedding 会导致 optimizer state 在淘汰时静默丢失**——模型照常训练，只是收敛变差。这类缺陷极难定位，实现时应有针对性测试。
+
+---
+
+## 10. 容量与内存
+
+### 10.1 容量约束
+
+```
+C_t ≥ (表 t 单步 unique key 数) × (prefetch 流水深度) × 安全系数 × 每线程环条目数
+
+其中 每线程环条目数 = 1              （FIFO）
+                    = 1 + k          （CLOCK，k 为 clock_max_second_chances）
+```
+
+应在配置阶段校验并给出明确报错，而非运行时撞到 `ring_pop` 返回 `-1` 才失败。
+
+⚠️ **CLOCK 项容易被漏掉。** 一个线程给出第二次机会时，会消耗掉一个环条目却**不换来 node**——该条目被搬进 retry buffer，要等后续 kernel 才回到环里。所以 CLOCK 下每个分配线程最坏消耗 `k + 1` 个条目，而 FIFO 只消耗 1 个。
+
+按 FIFO 定容量、之后切到 CLOCK，正是这个缺口的典型触发方式：**表现为跑了几百步之后中途抽干**，而不是启动时报错。这一项是实测撞出来的（EOS，容量 4 / 每步 3 key / `k=1`，第 80 步抽干），当时公式和配置校验里都没有它。
+
+由于容量无法跨表共享（§4.4），需要容量分配环节：
+
+- **初版**：按各表预估 key 数或历史访问频次静态按比例分配
+- **P1**：观测每表命中率与 ring 抽干次数，做离线再平衡
+- **不做**：运行时动态再平衡（挪动 node）复杂度过高
+
+现有 `dynamicemb/planner/` 已在做类似的分片规划，可挂靠。
+
+**行宽应作为容量规划的输入之一。** §12.2 实测：随机行访问下 1536 B 的行拿到 39.6 GiB/s，512 B 的行只有 14.0，128 B 的行只有 3.85——每字节的 miss 代价随行变窄急剧恶化（PCIe 事务粒度以下的行，每次传输大部分是浪费）。
+
+所以**窄表需要比按 key 数等比分配更多的容量**：它更依赖高命中率来回避 miss，而不是靠 miss 走得快。§12.2 的密度复测进一步表明，**这个差距在真实密度下无法靠排序弥补**：随机访问带宽与批大小基本无关，1536 B 行恒在 ~39 GiB/s、512 B 行恒在 ~13.9 GiB/s。窄表只能靠更高的命中率回避 miss。
+
+### 10.2 元数据开销
+
+| 项 | 字节/node |
+|---|---|
+| `key` | 8 |
+| `state` | 4 |
+| `prev` + `next` | 8 |
+| `hash_heads`（`B_t = 2 C_t`） | 8 |
+| `ring` | 4 |
+| **合计** | **32** |
+
+对比典型行宽（dim=128、fp32、Adam）1536 B，占比约 **2.1%**，满足 G1。
+
+这一数字同时说明：后续优化的重点不在元数据，而在行宽本身。
+
+### 10.3 backing 索引的显存占用
+
+**backing 索引恒常驻 GPU，这是设计前提，不设下沉 host 的退化路径。** 由此得到一个必须在容量规划阶段处理的约束：**总 key 数 `N` 的上界由索引的显存预算决定。**
+
+每 key 的索引开销：
+
+```
+每槽 = key 8 B + digest 1 B          （槽位即行号，行号本身不占空间）
+槽数 = N / 负载因子
+每 key ≈ 9 B / 负载因子 ≈ 18 B（负载因子 0.5），计对齐后取 20 B
+```
+
+注意 backing 索引**不需要 score 字段**——backing 不做淘汰，key 一旦插入即终身驻留。这比仓库现有的 `LinearBucketTable`（key + digest + score）省下 8 B/槽。
+
+| 索引显存预算 | 可容纳的总 key 数 |
+|---|---|
+| 2 GB | 1.0 × 10⁸ |
+| 4 GB | 2.0 × 10⁸ |
+| 8 GB | 4.0 × 10⁸ |
+| 16 GB | 8.0 × 10⁸ |
+| 32 GB | 1.6 × 10⁹ |
+
+超出预算时的处理方式是**限制可训练的 key 总数**（收紧 backing 的准入门槛，见 §6.1 的旁路路径），而不是改变索引的存放位置。
+
+### 10.4 显存预算的切分：索引 vs 缓存
+
+索引与缓存在同一块 HBM 上竞争，两者的单位成本相差两个数量级：
+
+```
+backing 索引 ：  ~20 B / key        （决定能训练多少 key）
+缓存行池    ： 1536 B / node        （决定命中率，dim=128、fp32、Adam）
+```
+
+即 **1 GB 显存可以换 5000 万个可索引的 key，或者 65 万个缓存行**。索引每 key 便宜约 75 倍。
+
+但两者的**数量级不同**，所以实际占用未必悬殊。以 `N = 4 × 10⁸`、`C = 4M` 为例：
+
+```
+backing 索引 ： 8 GB
+缓存行池    ： 6 GB
+缓存元数据  ： 0.13 GB
+```
+
+二者相当。这意味着容量规划是一个真实的权衡：**多给索引 = 能容纳更多 key；多给缓存 = 更高命中率、更少 PCIe 流量**。建议的做法是先由业务侧的 key 总数定死索引预算（它是硬约束——装不下就训练不了），剩余显存全部给缓存，再用 §12.3 的命中率指标验证缓存容量是否够用。
+
+---
+
+## 11. 接口
+
+### 11.1 配置
+
+```python
+@dataclass
+class LightweightCacheOptions:
+    capacity: int                      # 每表 node 数 C_t
+    replacement: ReplacementPolicy = ReplacementPolicy.FIFO
+    clock_max_second_chances: int = 1  # §8.4 的 k
+    prefetch_depth: int = 1            # 支持 > 1，见 §6.4
+    record_metrics: bool = False
+```
+
+### 11.2 核心 API
+
+```python
+lookup(unique_keys, table_range)            -> node_ids, found
+allocate(miss_keys, table_range)            -> node_ids            # 含淘汰与双向搬运
+release(node_ids, table_range)              -> None
+flush(table_id=None)                        -> None                # checkpoint 用
+metrics()                                   -> CacheMetrics
+```
+
+接口面积刻意保持在 5 个方法以内。缓存不提供 `expand` / `dump` / `load`——这些属于 backing 表。
+
+---
+
+## 12. 待验证事项
+
+### 12.1 PCIe 双向带宽 — 已实测
+
+**结论：链路是全双工的，但我们的访问形态只有在行有序时才吃得到。**
+
+H100（PCIe Gen5 x16）实测，`examples/pcie_bidir_bw/`：
+
+| 形态 | H2D | D2H | 双向 | 增益 |
+|---|---|---|---|---|
+| copy engine，连续 | 51.97 | 51.33 | **94.44** | **1.82×** |
+| kernel，零拷贝，连续 | 47.85 | 49.01 | 78.53 | 1.60× |
+| **gather，随机行，1536 B/行** | 39.56 | 39.03 | **47.08** | **1.19×** |
+| **gather，有序行，1536 B/行** | 52.15 | 49.16 | **83.15** | **1.59×** |
+
+（GiB/s；gather 行即 §9.2 的 warp-per-row 形态，是缓存实际做的事）
+
+copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存走的是随机 gather，**未排序时双向只有 1.19×**——融合两个方向只省 19%，远低于设计时的隐含预期。排序后回到 1.59×。
+
+§12.2 的复测显示排序在真实密度下几乎无收益，因此**真实工作点上的行等同于无序**，融合能拿到的是 **1.19×** 那一行，不是 1.59×。
+
+折算成传输时间约省 20%（两趟串行 `2MB/39.2` 对融合 `2MB/47.1`）。**仍然值得做**——miss 路径的 PCIe 开销是这条链路的主要成本——但远不是原设计隐含的接近一倍，也不需要任何前置工作。
+
+### 12.2 回写行排序 — 已实测，结论是**不做**
+
+初测（`pcie_bidir_gather`）显示排序有 1.32×–3.55× 的收益，据此一度把排序提到融合之前。**复测推翻了这个结论**：那个收益是测量条件的产物，不是真实工作点的性质。
+
+初测排的是 400 万个索引、落在 1120 万行上——**密度 36%**，排完几乎就是顺序扫描。而且它排的是**全部**索引，这是缓存做不到的：缓存只看得见一步的 miss。
+
+复测（`pcie_density_sweep`）改成**只在步内排序**，并走一个大索引池以免同一批页的地址翻译在迭代间保持常驻：
+
+| 表 / 行宽 | 每步行数 | 密度 | 未排序 | 已排序 | 增益 |
+|---|---|---|---|---|---|
+| 64 GiB / 1536 B | 4 096 | 0.0092% | 30.44 | 30.66 | **1.01×** |
+| 64 GiB / 1536 B | 16 384 | 0.037% | 36.59 | 38.64 | **1.06×** |
+| 64 GiB / 1536 B | 262 144 | 0.59% | 37.90 | 47.03 | 1.24× |
+| 64 GiB / 512 B | 16 384 | 0.012% | 13.79 | 14.03 | **1.02×** |
+| 64 GiB / 512 B | 1 048 576 | 0.78% | 13.00 | 22.80 | 1.75× |
+| 16 GiB / 512 B | 1 048 576 | 3.1% | 13.92 | 48.40 | 3.48× |
+
+（GiB/s，H100 PCIe Gen5 x16）
+
+**真实工作点的密度约 1e-4**：每步数万个 miss，对应数亿行的 backing。落在表格最上面几行，**收益 1–6%**。收益要到 0.2% 密度以上才显现，1% 以上才可观。
+
+**结论：不做。** 为 1–6% 去重构 allocate 各趟、外加每步两次排序，不划算。相应地，原 P1.5 里程碑取消。
+
+#### 一个反而被加强的结论
+
+未排序带宽在各密度下**几乎恒定**（1536 B 行 ~39 GiB/s，512 B 行 ~13.9 GiB/s）——这就是随机访问的地板，与批大小无关。
+
+于是行宽的 **2.8 倍**差距在真实密度下**无法靠排序弥补**。§10.1 关于窄表需要更多容量的结论因此比初测时更强，而不是更弱。
+
+另可见每步行数过小（4096）时带宽也会掉（30.4 vs 37.9）——批太小喂不满并行度。这给"prefetch 深度换更大的 miss 批"提供了一个额外理由。
+
+### 12.3 CLOCK 的实际收益
+
+**测什么**：FIFO 模式下 §8.5 的 `used == 1` 占比指标，以及两种策略下的命中率与 E2E step time。
+
+**如何影响设计**：决定 CLOCK 是否作为推荐默认值。注意由 INV-7，此项只需性能测试。
+
+### 12.4 缓存容量是否够用
+
+**测什么**：命中率、ring 抽干次数、以及每步 miss 数 `M` 与 unique key 数 `U` 的比值。
+
+**如何影响设计**：`N` 由业务侧的 key 总数定死索引预算后，剩余显存全部给缓存（§10.4）。若命中率仍不理想，说明工作集超出了可分配的缓存容量，此时的选项是收紧 backing 准入门槛（减少 `N`，把显存从索引挪给缓存），而不是调整缓存本身的结构。
+
+### 12.5 每节点自旋锁 vs 无锁状态字 — 完工后再对比
+
+当前实现是**无锁**的：状态打包进一个 32 位字，`try_pin` / `try_claim` / `release` 各是一个 CAS 循环。备选方案是给每个 node 加一把 32 位自旋锁，锁内用普通读写改状态。**留待整体跑通后实测对比，不在此之前切换。**
+
+**这把锁不占额外内存。** 当前 node 布局是 `key(8) + prev(4) + next(4) + state(4) = 20`，按 8 字节对齐后是 24，浪费 4 字节；加上锁正好是 24，浪费 0。
+
+**它能买到两样东西：**
+
+1. **位打包整体消失**。打包存在的唯一理由是"多字段修改必须原子"。有锁之后 `refs` 可以是完整 32 位、residency 可以是 `uint8_t`、加第五个状态或第二个计数器都是零成本。`node_state.h` 里的掩码、移位、进位借位边界分析和对应的穷举测试都不再需要。
+2. **pin 身份竞态（§6.3）消失**，前提是这把锁同时锁住 `key`。当前流程是"CAS 成功 pin → 再依赖读一次 `key` 复查 → 不符则 unpin 降级为 miss"，因为状态字会回到位模式完全相同的值（ABA），CAS 分辨不出节点是否已改派给别的 key。锁住 key 之后，`residency == RESIDENT && key == wanted` 和 `refs+1` 在同一个临界区里完成。
+
+**性能上不一定更慢，这是需要实测的原因。** `key` 与 `state` 同在一个 24 字节节点、同一条 cache line，而链表遍历本来就已经读过 `node.key`。当前那次身份复查是**排在 CAS 完成之后的依赖读**，是一次真实的串行延迟；锁的版本把它挪进临界区，用的是同一次加载的数据。净差可能只是多一次 release store。
+
+**它的代价：**
+
+- 临界区从"一条 CAS 指令"变宽到"取锁 + 比较 + 写 + 放锁"，争用窗口更大。争用发生在热 key 上的 `pin ∥ release`（§6.4，两者跨 stream 且无序），这正是要测的场景。
+- 桶锁与节点锁并存，`insert` 改 key 时需同时持有两者，必须定死加锁顺序。这一项是复杂度**增加**。
+
+**测什么**：热 key 上 N 线程并发 pin/release 的微基准，两种实现各一遍；以及 E2E step time。
+
+**触发条件（无需实测即可决定切换）**：状态装不进一个 32 位字的时候——需要第五个 residency、第二个计数器、或任何必须与 `refs` 原子地一同修改的每节点元数据。届时"一个 CAS 搞定"不再成立，锁反而更便宜。
+
+---
+
+## 13. 里程碑
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **P0** | 单表、FIFO、链式哈希、深度 1、串行加载 / 回写；单元测试覆盖全部不变量 | INV-1..9 断言通过；与 backing-only 路径 loss 逐位一致 |
+| **P1** | 多表融合 kernel；双向搬运 kernel；prefetch 流水；健康度指标 | HSTU / MovieLens E2E 不低于现有实现（G6） |
+| **P2** | CLOCK 可选；容量规划挂靠 planner（含 §10.1 的行宽项） | 命中率与 step time 对比报告 |
+
+链式哈希在 P0 采用，因其删除逻辑清晰、易于调试。**开放寻址 + digest 列为 P2 优化候选**：可省去 `prev`/`next` 共 8 B/node，且把桶链的"依赖性随机访问"（每跳一次不可掩盖的数百周期延迟）压成一两次连续访存；仓库现有的 `LinearBucketTable` 已验证过该结构。若 profile 显示 lookup 占比显著，这是第一个应替换的部件。
+
+---
+
+## 14. 风险
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| INV-6 被破坏导致 ref 泄漏或状态字腐蚀 | 命中率单调下降；或 node 状态错乱 | 释放路径 `assert(REF(old) > 0)`；checkpoint 排空后全量校验（§9.5） |
+| 桶链并发修改 | 链表结构损坏，查找失效或死循环 | Step 4 摘链 / 插链两趟分离（§6.1） |
+| 多条 prefetch stream 破坏阶段分离 | ring 竞态、pin 身份竞态 | 约束为单条 prefetch stream（§6.4） |
+| 容量规划不当，热表 ring 抽干 | 训练中断 | 配置期校验；ring 抽干计数作为告警指标 |
+| PCIe 非全双工 | §9.2 收益落空 | §12.1 前置验证；退化路径已设计 |
+| key 总数超出索引显存预算 | 无法训练全部 key | 配置期按 §10.3 的公式校验；收紧 backing 准入门槛 |
+| CLOCK 出队循环退化 | 分配延迟抖动 | §8.4 限次回退；默认 FIFO |
+
+---
+
+## 附录 A：可复用的现有代码
+
+| 用途 | 位置 |
+|---|---|
+| 分段去重（含 table_range 输出） | `src/unique_op.cu`、`dynamicemb/batched_dynamicemb_function.py:74` |
+| 全新 key 的初始化 | `src/initializer.cu`、`src/initializer.cuh` |
+| 优化器原地更新 | `src/optimizer_kernel.cuh` |
+| 前 / 反向 gather-scatter | `src/lookup_forward.cu`、`src/lookup_backward.cu` |
+| host 侧可扩展缓冲（mapped pinned） | `dynamicemb/extendable_tensor.py:131`、`src/vmm_tensor.cu` |
+| 逐表指针数组模式 | `dynamicemb/key_value_table.py:160` |
+| PCIe 双向带宽基准 | `examples/pcie_bidir_bw/pcie_bidir_gather.cu` |
+
+需要新写的仅有三部分：链式哈希 kernel（查找 / 插入 / 摘链）、ring 的领取与校验、状态字的原子协议。
+
+## 附录 B：与现有实现的对照
+
+| 维度 | 现有 `DynamicEmbCache` | 本设计 |
+|---|---|---|
+| 索引结构 | `LinearBucketTable`，开放寻址 + digest + score | 链式哈希（P2 考虑换回开放寻址） |
+| 每 slot 元数据 | key + digest + score + ref_counter + overflow 计数 | key + state + prev/next + row |
+| overflow buffer | `3 × bucket_capacity × num_tables` | 无（缓存允许淘汰，不需要） |
+| 替换依据 | score（int64 时间戳 / LFU 频次） | `used` 1 bit（CLOCK）或纯 FIFO |
+| 行宽 | 所有表取 `max(emb_dim + optim_state_dim)` | 逐表独立 `D_t` |
+| 与 storage 的关系 | 共用 `DynamicEmbTableState` | 完全解耦，仅依赖 key→row 查询与 host 行读写 |
+| 容量扩展 | 支持（继承自 storage） | 不支持（缓存定长） |
+| flush 内存尖峰 | backing 需预扩容 | 无（准入即分配行） |
+| 脏位管理 | `dirty` 位，条件回写 | 无（INV-9，淘汰时无条件回写） |
+
+---
+
+## 附录 C：完整示例走查
+
+用一个极小的配置走完三个 training step，覆盖冷启动、命中复用、`in_ring` 防重复入队、陈旧条目丢弃、淘汰与双向回写。
+
+### C.0 例子设定
+
+```
+C = 4           node n0 .. n3
+B = 8           桶 b0 .. b7，hash(k) = k & 7
+D = 6           emb 4 列 + optimizer state 2 列
+单表，prefetch 深度 = 1，替换策略 = FIFO
+```
+
+**初始状态**（`ring = arange(4)`，全部 `EMPTY` 且 `in_ring = 1`）：
+
+```
+nodes                                  ring
+┌────┬─────┬───────┬─────┬────────┐        idx  0    1    2    3
+│ id │ key │ state │ ref │in_ring │            ┌────┬────┬────┬────┐
+├────┼─────┼───────┼─────┼────────┤            │ n0 │ n1 │ n2 │ n3 │
+│ n0 │  -  │ EMPTY │  0  │   1    │            └────┴────┴────┴────┘
+│ n1 │  -  │ EMPTY │  0  │   1    │              ↑head=0        tail=4
+│ n2 │  -  │ EMPTY │  0  │   1    │
+│ n3 │  -  │ EMPTY │  0  │   1    │        hash_heads : b0..b7 全为 -1
+└────┴─────┴───────┴─────┴────────┘        emb_table  : 4 行未初始化
+```
+
+---
+
+### C.1 Step 1 —— 冷启动，三次 miss
+
+**输入** `keys = [10, 18, 3, 10, 18]`
+
+**① 去重**（`segmented_unique_cuda`）
+
+```
+输入 keys : [ 10, 18,  3, 10, 18 ]
+                 ↓  去重
+unique    : [ 10, 18,  3 ]              U = 3
+inverse   : [  0,  1,  2,  0,  1 ]      前向 gather 用它还原到每个位置
+```
+
+**② 查找** —— `hash_heads` 全空，三个 key 全部 miss。
+
+**③ ring pop ×3**
+
+```
+        idx  0    1    2    3
+           ┌────┬────┬────┬────┐
+           │ n0 │ n1 │ n2 │ n3 │
+           └────┴────┴────┴────┘
+             ↑    ↑    ↑
+           pop  pop  pop           head: 0 → 1 → 2 → 3      tail = 4
+
+三个候选都是 EMPTY 且 ref == 0，CAS claim 全部成功
+分配结果：key 10 → n0     key 18 → n1     key 3 → n2
+```
+
+**④ backing find-or-insert**（准入即分配行，§9.3）
+
+```
+key 10 → 行 100        key 18 → 行 205        key 3 → 行 7
+
+行号只在本次分配中使用（决定从哪加载），不写入 node（§4.1）
+```
+
+**⑤ 挂桶链**（Step 4b 的插链趟；本步无受害者，故摘链趟为空）—— `hash(10) = 2`，`hash(18) = 2` **同桶冲突**，`hash(3) = 3`
+
+```
+hash_heads                桶链（头插法，18 后插故在链头）
+┌────┬─────┐
+│ b0 │ -1  │
+│ b1 │ -1  │
+│ b2 │ n1  │──→ ┌────────┐  next  ┌────────┐
+│ b3 │ n2  │    │n1 key18│ ⇄─────→│n0 key10│──→ nil
+│ b4 │ -1  │    └────────┘  prev  └────────┘
+│ .. │ ..  │
+└────┴─────┘    ┌────────┐
+      └────────→│n2 key 3│──→ nil
+                └────────┘
+```
+
+**⑥ 加载**（本例假设三个 key 在 backing 中已存在；全新 key 则走 `initializer` 在 GPU 上直接初始化，不产生 H2D）
+
+```
+host[100] ──── PCIe H2D ────→ emb_table[0]
+host[205] ──── PCIe H2D ────→ emb_table[1]
+host[  7] ──── PCIe H2D ────→ emb_table[2]
+
+状态迁移： EMPTY → LOADING → RESIDENT，  ref = 1
+```
+
+**⑦ 前向** `out[i] = emb_table[node_ids[inverse[i]], :4]` —— 5 个输入位置由 3 行数据供给。
+
+**⑧ 反向** —— 优化器原地更新三行（emb 与 optim state 同行，一次访存拿全），`ref 1→0` 后入队。**没有 `dirty` 置位**——三行现在都比 backing 新（INV-9），将来淘汰时无条件回写：
+
+```
+push n0 → ring[4 & 3] = ring[0] = n0     tail: 4 → 5
+push n1 → ring[5 & 3] = ring[1] = n1     tail: 5 → 6
+push n2 → ring[6 & 3] = ring[2] = n2     tail: 6 → 7
+```
+
+**Step 1 结束**
+
+```
+nodes                                    ring
+┌────┬─────┬──────────┬─────┬───────┐        idx  0    1    2    3
+│ id │ key │  state   │ ref │in_ring│            ┌────┬────┬────┬────┐
+├────┼─────┼──────────┼─────┼───────┤            │ n0 │ n1 │ n2 │ n3 │
+│ n0 │ 10  │ RESIDENT │  0  │   1   │            └────┴────┴────┴────┘
+│ n1 │ 18  │ RESIDENT │  0  │   1   │                        ↑head=3
+│ n2 │  3  │ RESIDENT │  0  │   1   │                              tail=7
+│ n3 │  -  │  EMPTY   │  0  │   1   │
+└────┴─────┴──────────┴─────┴───────┘   node 中不存行号（§4.1）
+
+环的逻辑顺序（从 head 到 tail，含环绕）：
+   idx3  →  idx0  →  idx1  →  idx2
+    n3       n0       n1       n2
+   (空)    (key10)  (key18)  (key3)
+   队头 ←──────────────────────→ 队尾
+```
+
+---
+
+### C.2 Step 2 —— 命中复用 + `in_ring` 防重复入队
+
+**输入** `keys = [10, 25]`
+
+**① 查找**
+
+```
+key 10:  hash = 2 → b2 链
+            ┌────────┐        ┌────────┐
+         →  │n1 key18│  ✗  →  │n0 key10│  ✓ 命中
+            └────────┘        └────────┘
+         pin:  CAS state(n0):  RESIDENT|ref=0  →  RESIDENT|ref=1|used=1
+
+key 25:  hash = 1 → hash_heads[1] = -1  →  miss
+```
+
+> 注意：n0 的 `ref` 归零后一直躺在 ring 里，**数据始终有效**——命中它是完整的缓存命中，不产生任何 PCIe 流量。这是 ring 相对"归零即释放"的核心收益。
+
+**② ring pop ×1**
+
+```
+        idx  0    1    2    3
+           ┌────┬────┬────┬────┐
+           │ n0 │ n1 │ n2 │ n3 │
+           └────┴────┴────┴────┘
+                            ↑ head=3  → pop 得 ring[3&3] = n3
+           校验：ref(n3) == 0 ✓   state == EMPTY ✓   → claim 成功
+           head: 3 → 4
+```
+
+**③ 分配与挂链** —— `key 25 → row 88`，`hash(25) = 1`
+
+```
+hash_heads[1]  →  ┌────────┐
+                  │n3 key25│ ──→ nil
+                  └────────┘
+host[88] ──── PCIe H2D ────→ emb_table[3]     ref = 1
+```
+
+**④ 反向释放** —— 两个 node 都被更新，但入队行为不同：
+
+```
+n0:  ref 1 → 0
+     atomicOr(state, IN_RING) 的返回值中 IN_RING 已置位
+       →  ★ 不重复入队。它在 Step 1 放进 ring 的那条记录（idx0）仍然有效
+
+n3:  ref 1 → 0
+     atomicOr 返回值中 IN_RING 为 0  →  CAS 成功，入队
+       push n3 → ring[7 & 3] = ring[3] = n3     tail: 7 → 8
+```
+
+★ 这正是 §7.5 所述：若此处无条件入队，ring 中会出现 n0 的**两条**记录，第一条被淘汰复用后，第二条即成为悬垂引用。
+
+**Step 2 结束**
+
+```
+        idx  0    1    2    3
+           ┌────┬────┬────┬────┐
+           │ n0 │ n1 │ n2 │ n3 │        head = 4    tail = 8
+           └────┴────┴────┴────┘
+环的逻辑顺序：
+   idx0  →  idx1  →  idx2  →  idx3
+    n0       n1       n2       n3
+  (key10)  (key18)  (key3)  (key25)
+  队头 ←──────────────────────→ 队尾
+
+四个 node 全部 RESIDENT，ref 全为 0，环满（tail - head = 4 = C，满足 INV-4）
+```
+
+---
+
+### C.3 Step 3 —— 陈旧条目丢弃 + 淘汰 + 双向回写
+
+**输入** `keys = [10, 41]`
+
+**① 查找 + pin**
+
+```
+key 10:  b2 链 → [n1 key18] ✗ → [n0 key10] ✓ 命中
+         pin:  ref 0 → 1，used = 1
+
+key 41:  hash = 1 → b1 链 → [n3 key25] ✗ → nil  →  miss
+```
+
+> ★ 关键：n0 此刻 `ref = 1`（正在被本步使用），而它在 ring 的 **idx0 —— 正是 head 指向的位置**。它成了一条陈旧条目。
+
+**② ring pop —— 第一次撞上陈旧条目**
+
+```
+        idx  0    1    2    3
+           ┌────┬────┬────┬────┐
+           │ n0 │ n1 │ n2 │ n3 │
+           └────┴────┴────┴────┘
+             ↑ head=4 → pop 得 ring[4&3] = ring[0] = n0
+
+  校验 ref(n0) = 1  ≠ 0   →  ★ 陈旧条目
+       clear in_ring(n0)，【丢弃该记录，不放回队尾】，head: 4 → 5
+       （n0 会在它下次真正归零时重新入队，不会泄漏）
+
+             ↑ head=5 → pop 得 ring[5&3] = ring[1] = n1  (key=18, ref=0)
+  校验 ref(n1) = 0 ✓
+       CAS(state: RESIDENT|ref=0 → EVICTING) 成功   ← INV-3
+       clear in_ring(n1)，head: 5 → 6
+```
+
+> 丢弃而非回收，是为了避免缓存被 pin 满时线程绕环活锁（§7.3）。
+
+**③ 淘汰 n1：摘链趟（Step 4a）**
+
+```
+改前  hash_heads[2] ──→ ┌────────┐ ⇄ ┌────────┐
+                        │n1 key18│   │n0 key10│ ──→ nil
+                        └────────┘   └────────┘
+
+摘除 n1（借助 prev/next 双向指针，O(1)，无需从桶头遍历）
+
+改后  hash_heads[2] ──→ ┌────────┐
+                        │n0 key10│ ──→ nil        n0.prev = -1
+                        └────────┘
+
+同趟内探测 backing 取受害者行号：key 18 → 行 205
+（node 中不存行号，现场探测，因而对 backing 重哈希免疫，§4.1）
+```
+
+> 摘链与插链必须分属两趟。若同处一个 kernel，就会出现"甲正把 n1 从桶 2 摘出、乙正往桶 2 插入新 node"的并发双向链表修改（§6.1）。本例中 key 41 挂在桶 1，恰好不冲突，但一般情况下会。
+
+**④ 双向搬运**（§9.2）—— `key 41 → find-or-insert → 行 300`
+
+```
+                        一个 warp 内完成
+   ┌──────────────────────────────────────────────────────────┐
+   │ ① emb_table[1] ─────────────→ 寄存器    device 读（旧行）│
+   │                                                          │
+   │ ② host[300]    ──── H2D ────→ 寄存器   ┐                 │
+   │                                        │ PCIe 双向同时在飞 │
+   │ ③ 寄存器(旧行) ──── D2H ────→ host[205]┘                 │
+   │                                                          │
+   │ ④ 寄存器(新行) ─────────────→ emb_table[1]  device 写    │
+   └──────────────────────────────────────────────────────────┘
+
+旧行在 ① 就已进入寄存器，④ 随时可覆写 —— D2H 不阻塞 H2D，不存在"等待写回"
+```
+
+**⑤ 挂新桶：插链趟（Step 4b）** —— `hash(41) = 1`
+
+```
+改前  hash_heads[1] ──→ ┌────────┐ ──→ nil
+                        │n3 key25│
+                        └────────┘
+
+改后  hash_heads[1] ──→ ┌────────┐ ⇄ ┌────────┐
+                        │n1 key41│   │n3 key25│ ──→ nil
+                        └────────┘   └────────┘
+
+n1: key=41, state=RESIDENT, ref=1, in_ring=0
+```
+
+**Step 3 结束**
+
+```
+nodes                                    ring
+┌────┬─────┬──────────┬─────┬───────┐        idx  0    1    2    3
+│ id │ key │  state   │ ref │in_ring│            ┌────┬────┬────┬────┐
+├────┼─────┼──────────┼─────┼───────┤            │ n0 │ n1 │ n2 │ n3 │
+│ n0 │ 10  │ RESIDENT │  0  │   1   │            └────┴────┴────┴────┘
+│ n1 │ 41  │ RESIDENT │  0  │   1   │                   ↑head=6  tail=10
+│ n2 │  3  │ RESIDENT │  0  │   1   │
+│ n3 │ 25  │ RESIDENT │  0  │   1   │        key 18 已被淘汰，
+└────┴─────┴──────────┴─────┴───────┘        其整行已回写至 host[205]
+```
+
+---
+
+### C.4 一个 step 内的时序全貌
+
+```
+   ┌──── prefetch（只出队）─────┐   ┌── fwd/bwd ──┐   ┌─ release（只入队）─┐
+   │ ① 去重                     │   │             │   │                    │
+   │ ② 查找 + pin      ← 独立   │   │ ⑦ gather    │   │ ⑨ ref - 1          │
+   │ ③ ring pop（含校验/丢弃）  │   │             │   │ ⑩ 若 1→0 入队尾    │
+   │ ④a 摘链趟 + 探测受害者行号 │   │ ⑧ 梯度规约  │   │                    │
+   │ ④b 插链趟         ← 独立   │   │    优化器   │   │                    │
+   │ ⑤ 双向搬运（H2D + D2H）    │   │    原地更新 │   │                    │
+   └────────────────────────────┘   └─────────────┘   └────────────────────┘
+
+   ② 与 ④ 必须是不同 kernel（pin 身份竞态，§6.3）
+   ④a 与 ④b 必须是不同 kernel（桶链并发修改，§6.1）
+       写 ring_head                    只读 emb_table      写 ring_tail
+       写 hash / nodes / emb_table      写 emb_table       写 state
+
+   └──────────────── 由流序保证：出队与入队永不并发（§7.2）─────────────┘
+
+   与 step N-1 的 dense 计算重叠 ↗
+```
+
+`ring_head` 只在 prefetch 阶段被写、`ring_tail` 只在 release 阶段被写——这正是 §7.2 那条约束的具体形态，也是出队 kernel 中 `tail` 可被当作常量快照的原因。
+
+---
+
+### C.5 不变量在本例中的落点
+
+| 不变量 | 在哪一步体现 |
+|---|---|
+| INV-1 `ref > 0` 永不被淘汰 | C.3 ② —— n0 因 `ref = 1` 被跳过 |
+| INV-2 仅在 `1→0` 且 `in_ring == 0` 时入队 | C.2 ④ —— n0 因 `in_ring` 已置位而不重复入队 |
+| INV-3 弹出后 CAS 重新校验 | C.3 ② —— n1 经 `CAS(RESIDENT\|ref=0 → EVICTING)` 才被占用 |
+| INV-4 `tail - head ≤ C` | C.2 结束时取等（环满），全程未超 |
+| INV-5 `head ≤ tail` | 本例未触发抽干；若 Step 3 中 n1..n3 也都被 pin，`ring_pop` 将返回 `-1` 并归还 head |
+| INV-6 每 unique key 每步恰好 `+1 / -1` | key 10 在三个 step 中各 `+1/-1` 一次，`ref` 始终回到 0 |
+| INV-7 替换策略对结果透明 | key 18 被淘汰后其整行（emb + optim state）已落 host[205]，再次访问时值不变 |
+| INV-8 pin 后复查 key | C.2 ① 与 C.3 ① —— pin 成功后确认 `key_t[n0] == 10` |
+| INV-9 `RESIDENT` 行永不旧于 backing | C.3 ④ —— n1 无条件回写 host[205]，无需判断是否"脏" |
+
+**若启用 CLOCK**：C.3 ② 中 n0 会先被检查 `used` 位——但 `ref != 0` 的判定在前，仍按陈旧条目丢弃，结果相同。差异出现在另一种情形：若 n0 当时 `ref == 0` 且 `used == 1`，FIFO 会直接淘汰它，而 CLOCK 会清零 `used`、把它送进 `retry_buf` 放回队尾，转而淘汰下一个——key 10 得以留在缓存中。
