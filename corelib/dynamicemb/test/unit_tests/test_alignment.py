@@ -33,6 +33,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
+    align_to_table_size,
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
@@ -191,6 +192,26 @@ def _assert_value_buffer_matches_hashtable(
     )
 
 
+def _assert_cache_pool_matches_capacity(cache: object, table_id: int) -> None:
+    """A cache's row pool is one row per node: the table's capacity rounded up to a
+    multiple of its bucket capacity, and no overflow rows."""
+    state = cache._state
+    opt = state.options_list[table_id]
+    expected_rows = align_to_table_size(
+        int(opt.init_capacity), int(opt.bucket_capacity)
+    )
+    assert cache.capacity(table_id) == expected_rows, (
+        f"table {table_id}: cache capacity {cache.capacity(table_id)} != "
+        f"{expected_rows}"
+    )
+    t = state.tables[table_id].tensor()
+    vd = int(state.table_value_dims_cpu[table_id])
+    assert t.shape == (expected_rows, vd), (
+        f"table {table_id}: cache pool shape {tuple(t.shape)} != "
+        f"expected ({expected_rows}, {vd})"
+    )
+
+
 def assert_cache_and_storage_shapes(
     batched: BatchedDynamicEmbeddingTablesV2,
     eb_configs_by_name: Dict[str, EmbeddingConfig],
@@ -225,9 +246,8 @@ def assert_cache_and_storage_shapes(
     if batched._caching and total_memory > local_hbm:
         assert batched._cache is not None
         assert isinstance(batched._cache, DynamicEmbCache)
-        cstate = batched._cache._state
         for tid in range(len(names)):
-            _assert_value_buffer_matches_hashtable(cstate, tid, include_overflow=True)
+            _assert_cache_pool_matches_capacity(batched._cache, tid)
     else:
         assert batched._cache is None
 

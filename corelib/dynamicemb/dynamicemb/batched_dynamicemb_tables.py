@@ -626,7 +626,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
-        self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
+        # Keys of the steps in flight, per table; only a cache looks at it.
+        self._prefetch_outstanding_keys = torch.zeros(
+            len(self._dynamicemb_options), dtype=torch.int64
+        )
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
@@ -2261,10 +2264,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if stale.numel() == 0:
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self._cache.key_index_map.erase(
-            stale.to(device=device),
-            torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
-        )
+        self._cache.invalidate_keys(stale.to(device=device), table_id)
 
     @staticmethod
     def _drain_retained(

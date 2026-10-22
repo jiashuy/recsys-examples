@@ -410,6 +410,51 @@ __global__ void resident_slots_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Setting up, and reading slots back
+// ---------------------------------------------------------------------------
+
+// A fresh node pool: every node EMPTY and already in the queue, which is what the
+// queue's arange(capacity) says. HashMapStorage cannot do this — it does not know
+// what a state word should hold — so it is the owner's, which is this.
+template <typename NodeT>
+__global__ void init_nodes_kernel(NodeT* nodes, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    nodes[i].state.set(NodeState::make(NodeState::kEmpty, 0u, /*in_ring=*/true,
+                                       /*used=*/false));
+  }
+}
+
+// LOADING -> RESIDENT for a list of nodes, after their rows are written. The same
+// as rows.cuh's publish_kernel, for a caller that holds node ids rather than the
+// slots allocate produced.
+template <typename MapT, typename NodeT>
+__global__ void publish_nodes_kernel(NodeT* nodes,
+                                     const typename MapT::NodeId* node_ids,
+                                     int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const typename MapT::NodeId node = node_ids[i];
+    if (node != MapT::kNoNode) nodes[node].state.publish();
+  }
+}
+
+// AllocSlot array -> plain arrays, for a caller that cannot read the struct: the
+// node each slot got, the key it evicted, and whether there was one.
+template <typename MapT>
+__global__ void unpack_slots_kernel(
+    const AllocSlot<typename MapT::Key, typename MapT::NodeId>* slots, int64_t n,
+    typename MapT::Key* victim_keys, uint8_t* has_victim,
+    typename MapT::NodeId* nodes) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    victim_keys[i] = slots[i].victim_key;
+    has_victim[i] = slots[i].has_victim ? 1 : 0;
+    nodes[i] = slots[i].node;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // release
 // ---------------------------------------------------------------------------
 //

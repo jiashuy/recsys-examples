@@ -326,7 +326,7 @@ def test_caching_backing_retains_every_key(current_device):
         out.sum().backward()  # unpins cache entries so eviction can proceed
         torch.cuda.synchronize()
 
-    cached = int(model._cache._state.key_index_map.size(0))
+    cached = int(model._cache.num_resident(0))
     spilled = int(model._storage._state.key_index_map.size(0))
     # The cache is a fraction of the key set, so it must have evicted...
     assert cached < len(keys), (
