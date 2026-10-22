@@ -337,7 +337,7 @@ pin 失败也不是"多一次 H2D"那么便宜：key 仍绑定在原 node 上，
 4. 对 backing 里缺失的 key 做准入判定（只判定，不插入）。
 5. 缓存对所有需要 node 的 miss（backing 里已有的，加上准入的新 key）做 allocate：FIFO 选受害者，rebind 到新 key，此时这些 node 的 ref 已是 1。
 6. 搬运：受害者行写回 backing，backing 已有的 key 从 backing 加载，新 key 初始化。
-7. **backing 插入本步准入的新 key**，判定函数保护 ref 不为 0 的缓存 key；得到被淘汰的 key 列表。插入失败的 key 视同未准入（缓存解绑，按非准入处理）。
+7. **backing 插入本步准入的新 key**，判定函数保护 ref 不为 0 的缓存 key；得到被淘汰的 key 列表。插入失败（一个桶里所有可淘汰的 key 都被守卫保护）时抛出容量错误，不降级为未准入（见 §17.5）。
 8. **缓存处理被淘汰的 key，与 backing 同时淘汰**：key 若在缓存里，必然是 ref 为 0 的空闲 node。先取下它最新的 embedding 与 optimizer state，交给保留逻辑（见下），再从桶链摘除并把 node 置为 EMPTY，**不写回 backing**（它的行正被新 key 占用）。
 9. 反向：缓存 refs 减一。
 
@@ -892,7 +892,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | 多条 prefetch stream 破坏阶段分离 | ring 竞态、pin 身份竞态 | 约束为单条 prefetch stream（§6.4） |
 | 读 backing 的 kernel 与 backing 扩容并发 | 读到被搬动的索引或行，静默数值损坏 | 现有后端已满足（§4.5 规则 2）；缓存 kernel 须与 `expand_if_need` 在同一条 prefetch 流 |
 | backing 淘汰了仍在 in-flight 的缓存 key | 行被重新分配，反向写到别人的行上 | §6.5 的保护：backing 选 victim 时先查缓存，ref 不为 0 则跳过 |
-| 一个桶里的 key 全部受保护，backing 插入失败 | 新 key 无法准入 | 失败视同未准入（§6.5 第 7 步）；容量规划保证 backing 远大于缓存与 in-flight 的 key 数 |
+| 一个桶里的 key 全部受保护，backing 插入失败 | 新 key 无法准入 | 抛出容量错误（§6.5 第 7 步、§17.5）；容量规划保证 backing 远大于缓存与 in-flight 的 key 数 |
 | 容量规划不当，热表 ring 抽干 | 训练中断 | 配置期校验；ring 抽干计数作为告警指标 |
 | PCIe 非全双工 | §9.2 收益落空 | §12.1 前置验证；退化路径已设计 |
 | key 总数超出索引显存预算 | 无法训练全部 key | 配置期按 §10.3 的公式校验；收紧 backing 准入门槛 |
@@ -978,7 +978,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 - **两种驱动方式，按后端选**（`_prefetch_cache_path`）：
   - 后端是 `DynamicEmbStorage` 且未设 `DEMB_DETERMINISM_MODE`：**急切流程**（§6.5）。每个 key 先过后端（`_find_keys`，更新 score），新 key 准入后立刻插入后端（带守卫、收集被淘汰的 key），缓存再据此作废。LFU/LRU 的 score 因此对每次访问都准确，不论缓存是否命中。
   - 其他（外部 PS、确定性模式）：**通用流程**。后端只在缓存淘汰时被 `Storage.insert`，缓存命中不更新后端 score。PS 的淘汰由它自己决定；确定性模式下后端的 `insert` 不能报告淘汰了哪些 key，而缓存需要知道，所以不走急切流程。
-- **急切流程里后端插入失败**（一个桶里所有可淘汰的 key 都被守卫保护）：抛出明确的容量错误，不降级为"未准入"。这是容量规划错误，与缓存装不下一个 step 的 key 同类。待定：是否应降级。
+- **急切流程里后端插入失败**（一个桶里所有可淘汰的 key 都被守卫保护）：抛出明确的容量错误，不降级为"未准入"。这是容量规划错误，与缓存装不下一个 step 的 key 同类。已定：保持报错；降级路径目前没有调用方，需要时再加。
 - **`flush`**：`DynamicEmbStorage` 后端下原地写行（每个缓存里的 key 在后端都有行），不再 `insert`，也不再预先扩容后端；若发现缓存里有后端已没有的 key（理论上不该有），回退到 `insert`。
 - **取值交给保留逻辑**（§6.5 第 8 步）：目前 `EvictedItemMode` 只有 `RETAIN_KEY`，只需要 key，所以急切流程里只把被后端淘汰的 key 交给 `_append_evicted`，没有取值。`rows.cuh` 的 `fetch_rows_kernel` 已备好，但没有任何调用者，所以没有暴露到绑定里；等 `EvictedItemMode` 增加保留值的标志时再接。
 - **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的；通用流程下后端插入的时机由缓存的淘汰顺序决定，确定性不保证。
