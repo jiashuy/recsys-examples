@@ -24,7 +24,7 @@ Covers: ``DynamicEmbDump`` on one world size and ``DynamicEmbLoad`` on the same
     timestamp/step order), the admission counters must match, the dist_type must
     reach the sharding and input-dist, and the forward output (and a further
     training step when optimizer state was dumped) must equal the reference
-    model's. Also hash_roundrobin dumped and reloaded at the same world size.
+    model's. Also hash_roundrobin and continuous dumped and reloaded at the same world size.
 Does not cover (see unit/table/test_table_dump_load.py): dump/load of a bare
     table, without the model stack; (see test_table_row_wise.py): checkpoints
     of table-row-wise tables.
@@ -129,14 +129,16 @@ def test_dump_load_across_world_sizes(
     _dump_then_load(path, dump_gpus, load_gpus, options)
 
 
-# hash_roundrobin, dumped and reloaded at the same world size. Multi-rank is
+# hash_roundrobin and continuous, dumped and reloaded at the same world size.
+# For hash_roundrobin multi-rank is
 # the point: a rank's checkpoint file holds the keys with murmur(k) % ws == r,
 # so a loader applying the roundrobin rule instead keeps only the ~1/ws of them
 # that also satisfy k % ws == r and silently drops the rest. Single rank cannot
 # see that -- there is no filtering to get wrong.
+@pytest.mark.parametrize("dist_type", ("hash_roundrobin", "continuous"))
 @pytest.mark.parametrize("num_gpus", (1, 2), ids=lambda n: f"{n}gpu")
-def test_hash_roundrobin_same_world_size(tmp_path, num_gpus):
-    """A hash_roundrobin checkpoint reloads without silently dropping keys."""
+def test_dist_type_same_world_size(tmp_path, dist_type, num_gpus):
+    """A hash_roundrobin / continuous checkpoint reloads without silently dropping keys."""
     options = {
         "num_embedding_collections": 1,
         "num_embeddings": "1000000",
@@ -144,7 +146,7 @@ def test_hash_roundrobin_same_world_size(tmp_path, num_gpus):
         "embedding_dim": 16,
         "optimizer_type": "sgd",
         "score_strategy": "step",
-        "dist_type": "hash_roundrobin",
+        "dist_type": dist_type,
         "optim": "False",
         "counter": "False",
         "save_path": str(tmp_path / "ckpt"),

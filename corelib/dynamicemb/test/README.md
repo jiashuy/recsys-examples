@@ -98,7 +98,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `integration/test_embedding_forward_backward.py` (`workers/embedding_forward.py`) | sharded pooled / sequence / multi-collection forward vs reference | dim, dedup, dtype, #tables, multi-hot, 2/4/8 GPUs |
 | `integration/test_twin_module.py` | sharded dynamicemb model trains identically to plain TorchRec | optimizer, pooling, weighted; 1 and 8 ranks |
 | `integration/test_alignment.py` | planner + DMP table capacity / HBM alignment | 1, 4, 8 ranks |
-| `integration/test_model_dump_load.py` (`workers/model_dump_load.py`) | dump a sharded model and load it back, incl. resharding 1↔8, hash_roundrobin | optimizer × optim-state × counter × score × world sizes (`load_dump`) |
+| `integration/test_model_dump_load.py` (`workers/model_dump_load.py`) | dump a sharded model and load it back, incl. resharding 1↔8, hash_roundrobin / continuous | optimizer × optim-state × counter × score × world sizes (`load_dump`) |
 | `integration/test_lfu_scores.py` (`workers/lfu_scores.py`) | LFU scores of a sharded model | dedup × storage mode × GPUs × optimizer |
 | `integration/test_embedding_admission.py` (`workers/embedding_admission.py`) | frequency admission end to end | storage × optimizer × score × GPUs (`load_dump`) |
 | `integration/test_table_row_wise.py` (`workers/table_row_wise.py`) | table-row-wise: plan, parity, jagged, pooling, grad, checkpoints | topology × dist_type; checkpoints are `load_dump` |
@@ -130,12 +130,10 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 
 * Table-level `HybridStorage` dump/load; `ScorePolicy.CONST` as a table's own (not per-call) policy; compound LRU_LFU at table-level dump/load.
 * Overflow-bucket behaviour with eviction / caching beyond one counter case.
-* `replay_increment` on multi-rank models; incremental dump with per-table differing score strategies.
+* Incremental dump with per-table differing score strategies.
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
-* Backward with optimizers other than SGD at module level (pooled SUM / MEAN and sequence backward are value-checked).
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` for pooled / sequence; `data_parallel_embeddings`; sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw entries exist but are not parametrized.
-* Dump/load: `dist_type=continuous`, `adagrad`, cross-world-size hash_roundrobin, 4-GPU resharding.
+* Dump/load: `adagrad`, cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
 * LFU / admission with compound LRU_LFU on cache or hybrid storage.
-* `DynamicEmbeddingShardingPlanner` end to end through DMP.
