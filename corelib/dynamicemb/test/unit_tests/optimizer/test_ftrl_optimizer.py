@@ -228,8 +228,14 @@ def test_ftrl_skipped_rows_are_untouched():
         {"learning_rate": 0.1, "l1_reg": 0.02},
         {"learning_rate": 0.1, "learning_rate_power": -0.25},
         {"learning_rate": 0.1, "initial_accumulator_value": 0.1},
+        {
+            "learning_rate": 0.1,
+            "l1_reg": 0.005,
+            "l2_reg": 0.02,
+            "group_lasso_reg": 2.0,
+        },
     ],
-    ids=["plain", "beta_l2", "l1", "power", "seeded_accum"],
+    ids=["plain", "beta_l2", "l1", "power", "seeded_accum", "group"],
 )
 def test_ftrl_backward_matches_reference(emb_dim, opt_params):
     """FTRL has no FBGEMM twin, so check it against a transcription of the paper.
@@ -685,101 +691,3 @@ def test_ftrl_group_large_dim_matches_reference(emb_dim, all_dims_vec4):
     torch.testing.assert_close(
         values[:, emb_dim : 2 * emb_dim].cpu().double(), ref_l, rtol=1e-4, atol=1e-5
     )
-
-
-@cuda
-@pytest.mark.parametrize("emb_dim", [8, 6], ids=["vec4", "unaligned"])
-def test_ftrl_group_backward_duplicate_keys_update_once_with_summed_gradient(emb_dim):
-    """A key looked up several times in one step is updated once, with the summed gradient.
-
-    (g1 + g2)^2 is not g1^2 + g2^2, so applying the optimizer once per lookup
-    would accumulate a different ``accum`` than aggregating first. With
-    ``loss = embs.sum()`` a key looked up ``c`` times receives a gradient of
-    ``c`` on every element, so the reference steps each row once with ``c``.
-    """
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-    key_type = torch.int64
-    value_type = torch.float32
-    num_keys = 12
-    opt_params = dict(
-        learning_rate=0.1, l1_reg=0.005, l2_reg=0.02, group_lasso_reg=0.5
-    )
-
-    options = DynamicEmbTableOptions(
-        dim=emb_dim,
-        max_capacity=2048,
-        index_type=key_type,
-        embedding_dtype=value_type,
-        device_id=device_id,
-        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-        caching=False,
-        local_hbm_for_values=1024**3,
-    )
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=["table0"],
-        table_options=[options],
-        feature_table_map=[0],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=DynamicEmbOptimType.FTRL,
-        **opt_params,
-    )
-    optimizer = bdeb.optimizer
-    storage = bdeb.tables
-    state_dim = optimizer.get_state_dim(emb_dim)
-    max_emb_dim = storage.max_embedding_dim()
-    max_value_dim = storage.max_value_dim()
-
-    generator = torch.Generator(device="cpu").manual_seed(19)
-    weights = torch.rand(num_keys, emb_dim, generator=generator).to(device)
-    values = torch.zeros(num_keys, max_value_dim, dtype=value_type, device=device)
-    values[:, :emb_dim] = weights
-    optimizer.reset_optimizer_states(
-        values[:, max_emb_dim : max_emb_dim + state_dim], emb_dims=emb_dim
-    )
-    all_keys = torch.arange(num_keys, device=device, dtype=key_type)
-    storage.set_score(1)
-    storage.insert(all_keys, torch.zeros_like(all_keys), values)
-
-    # Key k is looked up (k % 3) + 1 times in every step.
-    counts = (torch.arange(num_keys) % 3) + 1
-    keys = all_keys.cpu().repeat_interleave(counts).to(device)
-    offsets = torch.arange(keys.numel() + 1, device=device).to(key_type)
-
-    ref_w = weights.double().cpu()
-    ref_l = torch.zeros(num_keys, emb_dim, dtype=torch.float64)
-    ref_a = torch.zeros(num_keys, emb_dim, dtype=torch.float64)
-    grad = counts.double().unsqueeze(1).expand(num_keys, emb_dim)
-    for _ in range(3):
-        embs = bdeb(keys, offsets)
-        embs.sum().backward()
-        torch.cuda.synchronize()
-        ref_w, ref_l, ref_a = ftrl_step(ref_w, ref_l, ref_a, grad, **opt_params)
-
-    seen = 0
-    for keys_b, emb_b, opt_b, _ in export_keys_values_iter(
-        storage._state, device, table_id=0
-    ):
-        if keys_b.numel() == 0:
-            continue
-        seen += keys_b.numel()
-        idx = keys_b.cpu()
-        zero_rows = (ref_w[idx] == 0).all(dim=1)
-        assert bool((emb_b.cpu()[zero_rows] == 0).all())
-        torch.testing.assert_close(
-            emb_b.cpu().double(), ref_w[idx], rtol=1e-4, atol=1e-5, msg="weight"
-        )
-        torch.testing.assert_close(
-            opt_b[:, emb_dim:].cpu().double(),
-            ref_a[idx],
-            rtol=1e-5,
-            atol=1e-6,
-            msg="accum",
-        )
-    assert seen == num_keys
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
