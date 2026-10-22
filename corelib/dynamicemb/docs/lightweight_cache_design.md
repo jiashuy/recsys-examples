@@ -932,6 +932,60 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 
 ---
 
+## 17. 接入现有系统：方案、假设与待定项
+
+目标：用 `src/embedding_cache/` 替换现有的 `DynamicEmbCache`。这一节记录接入的方案、做出的假设，以及目前不确定、先按假设推进的点。每完成一个阶段就更新状态。
+
+### 17.1 现有系统里缓存是怎么被使用的（读代码得到）
+
+- `forward/backward` 只通过三样东西使用缓存：`cache._state`（各表行池的指针 `table_ptrs_dev`、各表维度、`optimizer`）、`value_row_indices`（就是缓存里的行号）、反向里的 `cache.decrement_counter(slot_indices, table_ids)`。所以新缓存的行池只要仍以"每表一个张量加 `table_ptrs_dev`"的形式暴露，前向与反向几乎不用改；`decrement_counter` 换成 `release`。
+- `dynamicemb_prefetch` 里 `storage.expand_if_need(...)` 在缓存路径之前（§4.5 已核对）。
+- 缓存还被这些地方用到：显存报告（`_print_memory_consume` 读 `cache._state`）、`flush`/`flush_cache`、`reset_cache_states`、`cache_metrics`、eval 路径（`_eval_lookup_cached`）、增量回放后的失效（`_invalidate_cache` 调 `cache.key_index_map.erase`）、`outstanding_keys` 的容量检查（全局，对比缓存容量）。
+- **后端有两类**：`DynamicEmbStorage`（行可寻址，有 `key_index_map`），以及外部存储 PS（只实现 `Storage` 接口：按 key 的 `find`/`insert`，拷贝值）。测试里 `caching` 与 `PS` 是两个组合的参数。
+
+### 17.2 方案
+
+- 保留类名与导入路径：`DynamicEmbCache` 仍在 `dynamicemb.key_value_table`，只换内部实现。这样 `isinstance(cache, DynamicEmbCache)` 一类的检查不变。
+- 新增 C++ 绑定 `EmbeddingCacheCore`（`src/embedding_cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
+- 按两种后端分两阶段做：
+  - **阶段 1：通用流程（拷贝式）。** 适用于任何 `Storage`（含 PS）。数据搬运沿用现有的 `storage.find` / `storage.insert` / `load_from_flat` / `store_to_flat`，只把"缓存的索引与淘汰"换成新缓存。后端在缓存淘汰时才被插入（惰性）。不需要改后端的 kernel，先验证绑定与编排，并让现有测试能跑。
+  - **阶段 2：行可寻址流程（§6.5）。** 仅适用于 `DynamicEmbStorage`：每步所有 key 先过 backing（更新 score），新 key 准入后立刻插入 backing，搬运用 `rows.cuh` 的零拷贝 kernel，淘汰前用 `EvictionGuard` 保护。需要改后端的 `insert` kernel 与 LruLfu cubin（§17.4）。
+
+### 17.3 假设与待定项
+
+不确定的点先按下面的假设推进，之后如果证明不对再回来改。
+
+1. **PS 后端只走阶段 1 的流程**，不走急切插入与守卫。PS 的淘汰由它自己决定，缓存副本是权威，淘汰时回写即可。待定：PS 是否需要缓存回写时带 score。
+2. **缓存没有 score，`training` 与 `set_score` 变成空操作**，只为兼容调用方保留。待定：阶段 1 下回写后端时的 score 如何给（先传 `None`，由后端按当前 step 的默认值处理；LFU 策略下频率信息会丢失，这是阶段 1 的已知缺口，阶段 2 才补上）。
+3. **`cache_metrics` 保留四个槽位的含义**：`[0]` 本步 unique 数，`[1]` 命中数，`[2]` 插入数，`[3]` 淘汰数。
+4. **`key_index_map` 属性不再存在**，测试里直接读它的地方要改；`size()` 用统计 RESIDENT 节点数实现。
+5. **容量**：每表缓存容量仍是 `int(max_capacity * cap_scale)`，但现在恰好是节点数 `C_t`，不再有桶容量取整和 overflow 区，显存报告与对齐测试里关于 overflow 的断言要改。
+6. **`outstanding_keys` 的容量检查改成每表一份**，用 host 已有的 `unique_size_per_table`。
+7. **每步一次 D2H 同步**（读各表的 miss 数）。现有路径本来就有多处同步，先接受，等有 profile 再去。
+8. **多流**：allocate 在 prefetch 流上，release 在反向所在的流上。§6.4 要求的 tail 快照屏障（快照前 allocate 的流等已发起的 release，快照后发起的 release 等"快照已取"事件）在绑定里用 CUDA event 实现。这是阶段 1 就必须正确的部分，因为旧缓存靠原子计数，没有这条要求。
+9. **eval 路径**：缓存里只读（`find_nodes`，不 pin、不准入），不在缓存里的从 backing 取，不插入。
+10. **增量回放后的失效**（`_invalidate_cache`）：`find_nodes` 加 `invalidate`，不回写。这正是"缓存副本比后端新"的反面（后端刚被写成新值，缓存副本过期），语义与淘汰时的作废一致。
+11. **dtype**：阶段 1 搬运全部沿用现有按 dtype 的 kernel，缓存自己的 kernel 不接触值。阶段 2 的零拷贝搬运按字节拷贝，不按元素类型实例化（先按 4 字节对齐，向量化等 profile）。
+12. **旧实现的删除**：新实现通过现有测试之后，删除旧 `DynamicEmbCache` 内部用到的、不再被任何路径使用的 kernel 与代码。哪些算"不再使用"在删除时逐一核对。
+
+### 17.4 阶段 2 对后端的改动（待做）
+
+后端的普通 `insert` 在选 victim 的两处检查计数：选候选时（`reduce`、`reduce_ranked`），以及锁住之后再检查一次。改动是把"计数是否大于零"泛化成一个判定对象，计数仍是默认行为，缓存模式下再加一条"缓存是否允许淘汰这个 key"。只改普通 `insert` 与带收集的 `insert`（缓存模式下急切插入用的）及其在 LruLfu cubin 里的对应入口；`insert_and_evict` 不动。判定对象是不含指针以外成员的 POD，放在 cubin 与 AoT 共用的小头文件里，因此 `embedding_cache` 里的视图类型要拆成"只含视图"和"含存储"两部分，前者才能被 cubin 包含。
+
+### 17.5 进度
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 0 | 在 EOS 上建立构建与测试流程，记录基线 | 待做 |
+| 1a | C++ 绑定 `EmbeddingCacheCore` | 待做 |
+| 1b | Python：新 `DynamicEmbCache`，通用流程的 prefetch、release、flush、eval、失效 | 待做 |
+| 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 待做 |
+| 2a | 后端 `insert` 的判定对象与 cubin 入口 | 待做 |
+| 2b | 行可寻址流程与零拷贝搬运，`DynamicEmbStorage` 后端切换过去 | 待做 |
+| 3 | 删除旧实现，更新文档与示例 | 待做 |
+
+---
+
 ## 附录 A：可复用的现有代码
 
 | 用途 | 位置 |
