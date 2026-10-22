@@ -983,6 +983,8 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 - **取值交给保留逻辑**（§6.5 第 8 步）：目前 `EvictedItemMode` 只有 `RETAIN_KEY`，只需要 key，所以急切流程里只把被后端淘汰的 key 交给 `_append_evicted`，没有取值。`rows.cuh` 的 `fetch_rows_kernel` 已备好，但没有任何调用者，所以没有暴露到绑定里；等 `EvictedItemMode` 增加保留值的标志时再接。
 - **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的；通用流程下后端插入的时机由缓存的淘汰顺序决定，确定性不保证。
 
+- **事件接线没有测试证明**：绑定里用两个 CUDA event 实现 §6.4 的快照屏障（allocate 等已发起的 release，release 等已取的快照）。`test_embedding_cache_core.py` 里的两流压力测试检查了"被持有的节点没有被复用"和"静止时队列条目数等于带标志的节点数"，但**去掉这两个事件后它仍然通过**（五次），因为那个窗口只有几条指令宽。所以事件是否必要，只有 `test/embedding_cache/gpu` 里显式控制流序的设备测试在覆盖；绑定层的接线是按设计写的，没有被变异检验证明。
+
 ### 17.6 后端的守卫（已完成）
 
 后端普通 `insert` 的两处计数检查（`reduce`、`reduce_ranked`）和锁后复查，都增加了对 `EvictionGuardView`（`embedding_cache/guard.h`）的询问；AoT 的 `table_insert_kernel`、`table_insert_collect_kernel` 与 LruLfu cubin 的 `dyn_emb_insert_entry`、`dyn_emb_insert_collect_entry` 都接上了。`ScoredHashTable.insert(..., guard=...)` 与两个绑定函数多了两个默认为 0 的参数（守卫的设备指针与表数），不传即与原来一致。测试：`test/unit_tests/table_operation/test_eviction_guard.py`，覆盖两条淘汰路径、带与不带 `collect_evicted`、"没有守卫时这些 key 会被淘汰"的对照，以及一个桶里全是受保护 key 时插入被拒。

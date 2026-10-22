@@ -154,7 +154,15 @@ def test_two_streams_never_reuse_a_held_node(device, depth, keys_per_step):
     reclaimed while a step still holds it is rebound to another key and stamped
     with that one, so reading each step's rows back just before it releases them
     says whether any held node was ever taken. The cache is smaller than the
-    working set, so it is evicting all the time.
+    working set, so it is evicting all the time. At rest, every node that says it
+    is queued must be, which catches a row lost between a pop and a push.
+
+    What this does NOT show is that the events ordering the two streams are
+    needed. With them removed from the binding it still passes (checked, five runs):
+    the window they close is a few instructions wide, and kernels of this size
+    from a Python loop do not land in it. The ordering itself is exercised, with
+    the stream order explicit, by the device tests in test/embedding_cache/gpu;
+    this checks the invariants a correct ordering has to preserve.
     """
     torch.manual_seed(0)
     k = keys_per_step
