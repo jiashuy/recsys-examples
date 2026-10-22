@@ -144,13 +144,16 @@ def _fresh_ftrl_values(
 
 @cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
-def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
+@pytest.mark.parametrize("group_lasso_reg", [0.0, 0.2], ids=["plain", "group"])
+def test_ftrl_flat_table_matches_padded_buffer(
+    emb_dim, all_dims_vec4, group_lasso_reg
+):
     """The two kernels differ only in how they find a row, not in the update."""
     device = torch.device("cuda")
     num_rows = 32
     row_width = 3 * emb_dim
     accum_seed = 0.1
-    optimizer = _ftrl_optimizer()
+    optimizer = _ftrl_optimizer(group_lasso_reg=group_lasso_reg)
 
     padded = _fresh_ftrl_values(
         num_rows, emb_dim, row_width, emb_dim, accum_seed, device, seed=3
@@ -407,34 +410,6 @@ def test_ftrl_group_sparsity_matches_reference(emb_dim, all_dims_vec4, l2_reg, l
     torch.testing.assert_close(
         values[:, 2 * emb_dim :].cpu().double(), ref_a, rtol=1e-5, atol=1e-6
     )
-
-
-@cuda
-@pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
-def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
-    device = torch.device("cuda")
-    num_rows = 32
-    row_width = 3 * emb_dim
-    optimizer = _ftrl_optimizer(group_lasso_reg=0.2)
-    padded = _fresh_ftrl_values(num_rows, emb_dim, row_width, emb_dim, 0.0, device)
-    flat = padded.clone()
-    grads = torch.randn(num_rows, emb_dim, device=device)
-    table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
-    table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
-
-    _run_group_step(optimizer, padded, grads, emb_dim, all_dims_vec4)
-    optimizer.fused_update_for_flat_table(
-        grads,
-        torch.arange(num_rows, dtype=torch.int64, device=device),
-        torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
-        table_ids,
-        torch.tensor([row_width], dtype=torch.int64, device=device),
-        table_emb_dims,
-        emb_dim,
-        all_dims_vec4,
-        torch.float32,
-    )
-    torch.testing.assert_close(flat, padded, rtol=0, atol=0)
 
 
 # Rounding the state through the table dtype is part of what the group-sparse
