@@ -42,6 +42,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   ---- backing insert ----
 //   find_nodes          which of the evicted keys are cached
 //   fetch_rows          in rows.cuh: takes the latest values off those nodes
+//
+// A checkpoint, with the pipeline drained:
+//
+//   resident_slots      one slot per resident node, shaped like an eviction's
+//   writeback           in rows.cuh, unchanged: the copy is the same
 //   invalidate          drop those bindings; the node is empty, nothing to write back
 //
 // Two boundaries here are correctness requirements rather than launch-
@@ -357,6 +362,50 @@ __global__ void invalidate_kernel(const MapT* tables,
     MapT map = tables[table_ids[i]];
     map.remove(node);
     map.nodes[node].state.invalidate();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Flush
+// ---------------------------------------------------------------------------
+//
+// Writing every resident row back, for a checkpoint or any time the backing has to
+// hold the latest of everything. The copy is writeback_kernel's and is not
+// repeated: this builds what that takes for an eviction, one slot per resident
+// node with the node's own key as the victim, and the caller looks those keys up
+// in the backing for their row numbers exactly as it does for real victims.
+//
+// Every resident node is written, whatever its references. A hot key that never
+// leaves the cache is the one whose backing copy is furthest behind, and a filter
+// on references would skip precisely it. But none should hold one: a flush runs
+// with the pipeline drained, so every reference has been released, and
+// `referenced` counts the nodes that still hold one. Zero is a free exact check of
+// the whole reference protocol; anything else is a leak, which otherwise shows up
+// only as a hit rate that sags over hours.
+//
+// Both counters must be zero on entry. Not block-collective: warp_reserve, like
+// lookup_pin's compaction.
+
+template <typename MapT, typename NodeT>
+__global__ void resident_slots_kernel(
+    const NodeT* nodes, int64_t capacity,
+    AllocSlot<typename MapT::Key, typename MapT::NodeId>* out,
+    unsigned long long* count, unsigned long long* referenced) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < capacity;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const NodeState state = nodes[i].state.load();
+    if (state.has_refs()) atomicAdd(referenced, 1ull);
+
+    const bool resident = state.residency() == NodeState::kResident;
+    const unsigned long long j = warp_reserve(resident, count);
+    if (resident) {
+      AllocSlot<typename MapT::Key, typename MapT::NodeId> slot;
+      slot.node = static_cast<typename MapT::NodeId>(i);
+      slot.key = nodes[i].key;
+      slot.victim_key = slot.key;
+      slot.has_victim = true;
+      out[j] = slot;
+    }
   }
 }
 

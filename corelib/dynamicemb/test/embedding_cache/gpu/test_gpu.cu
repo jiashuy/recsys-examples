@@ -985,6 +985,56 @@ struct ValueTable {
     total_miss += n_miss;
   }
 
+  // A checkpoint: every resident row written back. The row numbers are looked up
+  // on the host, as they are for victims. Returns how many nodes held a
+  // reference, which must be none.
+  int64_t flush() {
+    const int64_t cap = h.capacity;
+    Dev<Slot> d_slots(cap);
+    Dev<unsigned long long> d_count(1), d_referenced(1);
+    Dev<int64_t> d_row(cap);
+    resident_slots_kernel<Map, Node><<<grid_for(cap), kBlock>>>(
+        h.nodes, cap, d_slots.p, d_count.p, d_referenced.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+
+    const int64_t n = static_cast<int64_t>(d_count.get()[0]);
+    const auto slots = d_slots.get();
+    std::vector<int64_t> row(cap, -1);
+    for (int64_t s = 0; s < n; ++s) row[s] = slots[s].victim_key;
+    d_row.put(row);
+
+    writeback_kernel<Map, float><<<grid_for(cap * kLanesPerRow), kBlock>>>(
+        pool(), backing(), d_slots.p, d_count.p, d_row.p);
+    CU(cudaGetLastError());
+    CU(cudaDeviceSynchronize());
+    for (int64_t s = 0; s < n; ++s) history[slots[s].key] = 1;
+    return static_cast<int64_t>(d_referenced.get()[0]);
+  }
+
+  // After a flush the backing alone holds the latest of every key touched — or
+  // of just `only`, when given.
+  int64_t check_backing(const char* when,
+                        const std::vector<int64_t>* only = nullptr) {
+    const auto backing_rows = d_backing.get();
+    std::set<int64_t> wanted;
+    if (only) wanted.insert(only->begin(), only->end());
+    int64_t bad = 0, checked = 0;
+    for (int64_t k = 0; k < space; ++k) {
+      if (touches[k] == 0 || (only && !wanted.count(k))) continue;
+      ++checked;
+      if (!history[k]) { ++bad; continue; }
+      for (int j = 0; j < row_elems; ++j) {
+        if (backing_rows[k * row_elems + j] != expected(k, j)) { ++bad; break; }
+      }
+    }
+    std::printf("  %s: %lld keys, read from the backing only, %lld wrong\n", when,
+                (long long)checked, (long long)bad);
+    CHECK(bad == 0, "%lld keys are behind in the backing (%s)", (long long)bad,
+          when);
+    return bad;
+  }
+
   // The latest value of every key touched, from wherever it is.
   int64_t check_all(const char* when) {
     const auto cache_rows = d_pool.get();
@@ -1121,6 +1171,22 @@ static void test_value_cycle() {
         "the run has to exercise both directions");
   t.check_all("after the first run of steps");
 
+  // A flush with a step still in flight must notice: hold some cached keys, count.
+  {
+    const auto cached_now = t.h.bound_keys();
+    const std::vector<int64_t> held_keys(cached_now.begin(), cached_now.begin() + 20);
+    t.h.lookup_and_allocate(held_keys);  // all hits: pins, binds nothing
+    const int64_t referenced = t.flush();
+    CHECK(referenced == 20, "flush should count the 20 nodes still referenced, "
+                            "got %lld", (long long)referenced);
+    // And it must still have written them: a hot key that never leaves the cache
+    // is the one whose backing copy is furthest behind.
+    t.check_backing("held keys, flushed while referenced", &held_keys);
+    t.h.release();
+  }
+  CHECK(t.flush() == 0, "with every step released, no node holds a reference");
+  t.check_backing("after a flush");
+
   // Evict some cached keys from the system, taking their values off, then ask for
   // them again so they come back as new keys.
   std::vector<KeyOf> evict;
@@ -1249,6 +1315,8 @@ static void test_multi_table() {
   for (int i = 0; i < kTables; ++i) {
     tables[i]->check_all("after evicting and more steps");
     tables[i]->h.check_at_rest("multi table");
+    CHECK(tables[i]->flush() == 0, "table %d: no node should hold a reference", i);
+    tables[i]->check_backing("after a flush");
   }
 }
 

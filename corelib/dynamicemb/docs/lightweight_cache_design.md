@@ -653,6 +653,8 @@ flush(checkpoint)：
 
 成本：最坏情况整个缓存都要写，即 `C_t × D_t` 的 D2H。4M node × 1536 B ≈ 6 GB，按 20 GB/s 约 300 ms。
 
+**实现。** `resident_slots_kernel` 为每个 RESIDENT 节点生成一个槽位，节点自己的 key 当作受害者，格式与淘汰产生的槽位一致；调用方像对真正的受害者一样去 backing 查这些 key 的行号，然后直接交给 `writeback_kernel`，写回的拷贝不重复实现。同一个 kernel 数出仍持有引用的节点数（`referenced`），排空之后它必须为零，这就是上面的 Step 2。节点不论有没有引用都会被写，测试里专门核对了带着引用 flush 时被持有的 key 在 backing 里是最新的。
+
 ### 9.6 崩溃一致性
 
 仅在淘汰时回写意味着崩溃会丢失缓存中尚未回写的全部更新。但训练本就依赖周期性 checkpoint 恢复，"丢失上次 checkpoint 以来的进度"是既有语义，缓存并未使其变差。因此不需要 WAL 或额外持久化机制。
@@ -670,17 +672,12 @@ flush(checkpoint)：
 ### 10.1 容量约束
 
 ```
-C_t ≥ (表 t 单步 unique key 数) × (prefetch 流水深度) × 安全系数 × 每线程环条目数
-
-其中 每线程环条目数 = 1              （FIFO）
-                    = 1 + k          （CLOCK，k 为 clock_max_second_chances）
+C_t ≥ (表 t 单步 unique key 数) × (prefetch 流水深度) × 安全系数
 ```
 
-应在配置阶段校验并给出明确报错，而非运行时撞到 `ring_pop` 返回 `-1` 才失败。
+否则 `ring_pop` 返回 `-1`，即缓存里每个 node 都被 in-flight 的 step 占着，训练无法继续。（FIFO 下每个分配线程只消耗一个环条目。CLOCK 每个线程最坏消耗 `1 + k` 个，容量要乘上这个因子，见 §16。）
 
-⚠️ **CLOCK 项容易被漏掉。** 一个线程给出第二次机会时，会消耗掉一个环条目却**不换来 node**——该条目被搬进 retry buffer，要等后续 kernel 才回到环里。所以 CLOCK 下每个分配线程最坏消耗 `k + 1` 个条目，而 FIFO 只消耗 1 个。
-
-按 FIFO 定容量、之后切到 CLOCK，正是这个缺口的典型触发方式：**表现为跑了几百步之后中途抽干**，而不是启动时报错。这一项是实测撞出来的（EOS，容量 4 / 每步 3 key / `k=1`，第 80 步抽干），当时公式和配置校验里都没有它。
+**这个约束在哪里检查。** 公式里"每表单步 unique 数"是随数据变的，配置期并不知道，所以真正起作用的保护是**运行时的每表检查**：每次 prefetch，对每张表累计 in-flight 的 key 数，超过 `C_t` 就报明确的错误，而不是等到 `ring_pop` 抽干。现有 `dynamicemb_prefetch` 里已经有一个全局的同类检查（`outstanding_keys` 与缓存容量比较），新缓存把它改成每表一份即可。每表的 unique 数 host 本来就有（`unique_size_per_table` 是 CPU 张量），不需要同步。这是 Python 编排层的算术，缓存的 C++ 部分不需要一个对应的校验组件。
 
 由于容量无法跨表共享（§4.4），需要容量分配环节：
 
