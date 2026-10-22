@@ -999,7 +999,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 主测试文件与大部分单测通过，见下 |
 | 2a | 后端 `insert` 的守卫与 cubin 入口 | 完成 |
 | 2b | 急切流程，`DynamicEmbStorage` 后端切换过去 | 完成，LFU 测试脚本通过 |
-| 3 | 删除旧实现，更新文档与示例 | 待做 |
+| 3 | 删除旧实现，更新文档与示例 | 完成：旧缓存代码已无引用；多卡脚本（dump/load 全矩阵、pooled、sequence、twin、table_row_wise、LFU）在 EOS 上全部 exit=0 |
 
 性能（EOS H100，`TestCaching and adam`，10 表，D=128，每步约 43 万唯一 key；单位 ms，旧实现 → 新实现）：
 
