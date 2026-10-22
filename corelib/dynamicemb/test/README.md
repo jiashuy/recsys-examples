@@ -95,7 +95,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 
 | File (worker) | Purpose | Matrix |
 |---|---|---|
-| `integration/test_embedding_forward_backward.py` (`workers/embedding_forward.py`) | sharded pooled / sequence / multi-collection forward vs reference | dim, dedup, dtype, #tables, multi-hot, 2/4/8 GPUs |
+| `integration/test_embedding_forward_backward.py` (`workers/embedding_forward.py`) | sharded pooled / sequence / multi-collection forward vs reference | dim, dedup, dtype, #tables, multi-hot, one data-parallel table, 2/4/8 GPUs |
 | `integration/test_twin_module.py` | sharded dynamicemb model trains identically to plain TorchRec | optimizer, pooling, weighted; 1 and 8 ranks |
 | `integration/test_alignment.py` | planner + DMP table capacity / HBM alignment | 1, 4, 8 ranks |
 | `integration/test_model_dump_load.py` (`workers/model_dump_load.py`) | dump a sharded model and load it back, incl. resharding 1↔8, hash_roundrobin / continuous | optimizer × optim-state × counter × score × world sizes (`load_dump`) |
@@ -133,7 +133,7 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 * Incremental dump with per-table differing score strategies.
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
-* `use_torch_opt` for pooled / sequence; `data_parallel_embeddings`; sharding types other than row-wise (outside table-row-wise).
+* `use_torch_opt` for pooled / sequence; sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw entries exist but are not parametrized.
 * Dump/load: `adagrad`; `continuous` on several ranks is unsupported by the library (raises `NotImplementedError`), so it has no test; cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
 * LFU / admission with compound LRU_LFU on cache or hybrid storage.
