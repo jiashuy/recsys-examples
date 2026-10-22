@@ -471,6 +471,9 @@ struct FTRLVecOptimizer {
   // lambda1 and lambda2 in the paper.
   const float l1_reg;
   const float l2_reg;
+  // tau_g = group_lasso_reg * sqrt(d) is the threshold on a row's L2 norm (see
+  // the update below). Zero is plain FTRL and takes the single-pass path.
+  const float group_lasso_reg;
 
   DEVICE_INLINE float accum_pow(const float accum) const {
     return use_sqrt ? sqrtf(accum) : powf(accum, -learning_rate_power);
@@ -494,6 +497,144 @@ struct FTRLVecOptimizer {
     }
   }
 
+  // Group-sparse FTRL. Each step rebuilds a row (the group g, width d) from
+  // its FTRL state (z = linear, n = accum). The reference objective is
+  //   min_w  z.w + 1/2 sum_i a_i w_i^2 + l1 |w|_1 + l2/2 |w|_2^2 + tau |w|_2
+  //   a_i = (beta + n_i^(-p)) / lr,   tau = group_lasso_reg * sqrt(d)
+  // and the update is the common-shrink form of G-FTRL (Ni et al., CIKM 2019,
+  // Algorithm 1 and Eq. 3) with the L1 term of the sparse group lasso of Yue
+  // et al., arXiv:2107.14432, Algorithm 3. With
+  // s_i = sign(z_i) * max(|z_i| - l1, 0) and h_i = a_i + l2:
+  //   zero the row            if ||s||_2 <= tau        (exact)
+  //   w_i = -(1 - tau / ||s||_2) * s_i / h_i           otherwise
+  // This is not the exact minimizer of the objective: the shrink factor is
+  // common to the row, which is exact only when every h_i in the row is equal
+  // and an approximation, with no error bound, when they differ. l1 = 0 is the
+  // paper's closed form, group_lasso_reg = 0 is plain FTRL. The row norm is needed before any weight can be written, so a
+  // row is two passes: pass one advances (linear, accum) and sums s_i^2; pass
+  // two re-solves the weights. The same thread owns the same elements in both,
+  // so the second pass reads back its own stores without a barrier.
+
+  // Advance one coordinate's state, leaving the weight alone: the linear term
+  // needs the weight from before this step. Returns s_i^2 for the row norm,
+  // taken from the state as it will be stored so the two passes agree.
+  DEVICE_INLINE float advance_one(const float weight, float &linear,
+                                  float &accum, const float grad) const {
+    const float new_accum = accum + grad * grad;
+    linear += grad - (accum_pow(new_accum) - accum_pow(accum)) / lr * weight;
+    accum = new_accum;
+    linear = TypeConvertFunc<float, weight_t>::convert(
+        TypeConvertFunc<weight_t, float>::convert(linear));
+    accum = TypeConvertFunc<float, weight_t>::convert(
+        TypeConvertFunc<weight_t, float>::convert(accum));
+    const float s = fmaxf(fabsf(linear) - l1_reg, 0.0f);
+    return s * s;
+  }
+
+  // 1 - lambda * sqrt(d) / ||s||_2, or 0 when the row does not clear the
+  // threshold. `width` is the row's embedding width, the paper's d_g.
+  DEVICE_INLINE float group_scale(const float sum_sq, const uint32_t width) const {
+    const float norm = sqrtf(sum_sq);
+    const float threshold = group_lasso_reg * sqrtf(static_cast<float>(width));
+    return norm > threshold ? 1.0f - threshold / norm : 0.0f;
+  }
+
+  DEVICE_INLINE float solve_one(const float linear, const float accum,
+                                const float scale) const {
+    // A zero here also keeps a 0/0 out of the arithmetic when the learning
+    // rate's denominator is still zero.
+    const float s = fmaxf(fabsf(linear) - l1_reg, 0.0f);
+    if (scale == 0.0f || s == 0.0f)
+      return 0.0f;
+    const float sign_linear = (0.0f < linear) - (linear < 0.0f);
+    return -scale * sign_linear * s /
+           ((beta + accum_pow(accum)) / lr + l2_reg);
+  }
+
+  DEVICE_INLINE void update4_group(const OptimizierInput<wgrad_t, weight_t> &input) {
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x % kWarpSize;
+    const wgrad_t *wgrad_ptr = input.wgrad_ptr;
+    weight_t *weight_ptr = input.weight_ptr;
+    weight_t *linear_ptr = weight_ptr + input.state_offset;
+    weight_t *accum_ptr = linear_ptr + input.dim;
+
+    Vec4T<float> weight_vec, linear_vec, accum_vec, grad_vec;
+    float sum_sq = 0.0f;
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      weight_vec.load(weight_ptr + idx4);
+      linear_vec.load(linear_ptr + idx4);
+      accum_vec.load(accum_ptr + idx4);
+      grad_vec.load(wgrad_ptr + idx4);
+      sum_sq += advance_one(weight_vec.val.x, linear_vec.val.x, accum_vec.val.x,
+                            grad_vec.val.x);
+      sum_sq += advance_one(weight_vec.val.y, linear_vec.val.y, accum_vec.val.y,
+                            grad_vec.val.y);
+      sum_sq += advance_one(weight_vec.val.z, linear_vec.val.z, accum_vec.val.z,
+                            grad_vec.val.z);
+      sum_sq += advance_one(weight_vec.val.w, linear_vec.val.w, accum_vec.val.w,
+                            grad_vec.val.w);
+      linear_vec.store(linear_ptr + idx4);
+      accum_vec.store(accum_ptr + idx4);
+    }
+    const float scale = group_scale(warp_reduce_sum_xor(sum_sq, kWarpSize), input.dim);
+
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      linear_vec.load(linear_ptr + idx4);
+      accum_vec.load(accum_ptr + idx4);
+      weight_vec.val.x = solve_one(linear_vec.val.x, accum_vec.val.x, scale);
+      weight_vec.val.y = solve_one(linear_vec.val.y, accum_vec.val.y, scale);
+      weight_vec.val.z = solve_one(linear_vec.val.z, accum_vec.val.z, scale);
+      weight_vec.val.w = solve_one(linear_vec.val.w, accum_vec.val.w, scale);
+      weight_vec.store(weight_ptr + idx4);
+    }
+  }
+
+  DEVICE_INLINE void update_group(const OptimizierInput<wgrad_t, weight_t> &input) {
+    extern __shared__ float sdata[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t blockSize = blockDim.x;
+    const unsigned int pow2_size = nextPow2(blockSize) >> 1;
+
+    const wgrad_t *wgrad_ptr = input.wgrad_ptr;
+    weight_t *weight_ptr = input.weight_ptr;
+    weight_t *linear_ptr = weight_ptr + input.state_offset;
+    weight_t *accum_ptr = linear_ptr + input.dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < input.dim; i += blockSize) {
+      float tmp_grad = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
+      float tmp_linear =
+          TypeConvertFunc<float, weight_t>::convert(linear_ptr[i]);
+      float tmp_accum = TypeConvertFunc<float, weight_t>::convert(accum_ptr[i]);
+      float tmp_weight =
+          TypeConvertFunc<float, weight_t>::convert(weight_ptr[i]);
+      sum_sq += advance_one(tmp_weight, tmp_linear, tmp_accum, tmp_grad);
+      linear_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_linear);
+      accum_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_accum);
+    }
+
+    sdata[tid] = sum_sq;
+    __syncthreads();
+    for (unsigned s = pow2_size; s > 0; s >>= 1) {
+      if (tid < s && (tid + s) < blockSize) {
+        sdata[tid] += sdata[tid + s];
+      }
+      __syncthreads();
+    }
+    const float scale = group_scale(sdata[0], input.dim);
+
+    for (int i = tid; i < input.dim; i += blockSize) {
+      float tmp_linear =
+          TypeConvertFunc<float, weight_t>::convert(linear_ptr[i]);
+      float tmp_accum = TypeConvertFunc<float, weight_t>::convert(accum_ptr[i]);
+      weight_ptr[i] = TypeConvertFunc<weight_t, float>::convert(
+          solve_one(tmp_linear, tmp_accum, scale));
+    }
+  }
+
   DEVICE_INLINE void update4(const OptimizierInput<wgrad_t, weight_t> &input) {
 
     constexpr int VecSize = 4;
@@ -502,6 +643,10 @@ struct FTRLVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
+    if (group_lasso_reg > 0.0f) {
+      update4_group(input);
+      return;
+    }
     weight_t *linear_ptr = weight_ptr + input.state_offset;
     weight_t *accum_ptr = linear_ptr + input.dim;
 
@@ -538,6 +683,10 @@ struct FTRLVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
+    if (group_lasso_reg > 0.0f) {
+      update_group(input);
+      return;
+    }
     weight_t *linear_ptr = weight_ptr + input.state_offset;
     weight_t *accum_ptr = linear_ptr + input.dim;
 
