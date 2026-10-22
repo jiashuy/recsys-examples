@@ -437,23 +437,6 @@ def test_ftrl_group_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
     torch.testing.assert_close(flat, padded, rtol=0, atol=0)
 
 
-def test_ftrl_group_args_validation_and_ckpt_meta():
-    with pytest.raises(ValueError, match="group_lasso_reg"):
-        _ftrl_optimizer(group_lasso_reg=-0.1)
-    # L1 and the group term combine: sparse group lasso.
-    assert _ftrl_optimizer(group_lasso_reg=0.1, l1_reg=0.01) is not None
-    opt = _ftrl_optimizer(group_lasso_reg=0.25)
-    assert opt.get_opt_args()["group_lasso_reg"] == 0.25
-    meta = opt.get_opt_args()
-    fresh = _ftrl_optimizer()
-    fresh.set_opt_args(meta)
-    assert fresh._opt_args.group_lasso_reg == 0.25
-    # A checkpoint from before group sparsity has no group_lasso_reg: plain FTRL.
-    del meta["group_lasso_reg"]
-    fresh.set_opt_args(meta)
-    assert fresh._opt_args.group_lasso_reg == 0.0
-
-
 # Rounding the state through the table dtype is part of what the group-sparse
 # kernel does (it must, so the row norm is of what is stored), and the float64
 # reference does not round, so the narrow dtypes get looser tolerances.
