@@ -135,5 +135,5 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` for pooled / sequence; `data_parallel_embeddings`; sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw entries exist but are not parametrized.
-* Dump/load: `adagrad`, cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
+* Dump/load: `adagrad`; `continuous` on several ranks is unsupported by the library (raises `NotImplementedError`), so it has no test; cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
 * LFU / admission with compound LRU_LFU on cache or hybrid storage.

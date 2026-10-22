@@ -24,7 +24,8 @@ Covers: ``DynamicEmbDump`` on one world size and ``DynamicEmbLoad`` on the same
     timestamp/step order), the admission counters must match, the dist_type must
     reach the sharding and input-dist, and the forward output (and a further
     training step when optimizer state was dumped) must equal the reference
-    model's. Also hash_roundrobin and continuous dumped and reloaded at the same world size.
+    model's. Also hash_roundrobin (1, 2 ranks) and continuous (1 rank) dumped and
+    reloaded at the same world size.
 Does not cover (see unit/table/test_table_dump_load.py): dump/load of a bare
     table, without the model stack; (see test_table_row_wise.py): checkpoints
     of table-row-wise tables.
@@ -135,8 +136,17 @@ def test_dump_load_across_world_sizes(
 # so a loader applying the roundrobin rule instead keeps only the ~1/ws of them
 # that also satisfy k % ws == r and silently drops the rest. Single rank cannot
 # see that -- there is no filtering to get wrong.
-@pytest.mark.parametrize("dist_type", ("hash_roundrobin", "continuous"))
-@pytest.mark.parametrize("num_gpus", (1, 2), ids=lambda n: f"{n}gpu")
+# continuous maps a key to a rank by range, so loading it on several ranks raises
+# NotImplementedError by design (key_ownership.owning_shard): one rank only.
+@pytest.mark.parametrize(
+    "dist_type,num_gpus",
+    [
+        ("hash_roundrobin", 1),
+        ("hash_roundrobin", 2),
+        ("continuous", 1),
+    ],
+    ids=lambda v: str(v),
+)
 def test_dist_type_same_world_size(tmp_path, dist_type, num_gpus):
     """A hash_roundrobin / continuous checkpoint reloads without silently dropping keys."""
     options = {
