@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-import os
 from enum import Enum, auto
 from typing import List, Optional, Tuple
 
@@ -526,11 +525,7 @@ def _prefetch_cache_path(
     cache can guard, so every key of the step goes through it. Anything else is
     reached only through ``find`` and ``insert``.
     """
-    eager = isinstance(storage, DynamicEmbStorage) and (
-        # Under determinism the storage's insert cannot report which keys it
-        # evicted, and the cache has to know.
-        os.environ.get("DEMB_DETERMINISM_MODE") is None
-    )
+    eager = isinstance(storage, DynamicEmbStorage)
     path = _prefetch_cache_path_eager if eager else _prefetch_cache_path_lazy
     return path(
         cache,

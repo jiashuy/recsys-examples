@@ -1551,7 +1551,7 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
 
 - **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
-- **Cache write-back** (external storage, or `DEMB_DETERMINISM_MODE`): before writing evicted keys back to storage. With a `DynamicEmbStorage` backing the keys are inserted at admission, which is the prefetch path above.
+- **Cache write-back** (external storage): before writing evicted keys back to storage. With a `DynamicEmbStorage` backing the keys are inserted at admission, which is the prefetch path above.
 - **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
 - **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
 

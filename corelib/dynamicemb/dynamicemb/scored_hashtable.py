@@ -600,16 +600,11 @@ class LinearBucketTable(ScoredHashTable):
         num_scores = self.num_scores_
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
-            if collect_evicted:
-                raise RuntimeError(
-                    "collect_evicted (evicted_item_mode=RETAIN_KEY) is not supported under "
-                    "DEMB_DETERMINISM_MODE."
-                )
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert(
-                keys, table_ids, score_value, policy, guard
+                keys, table_ids, score_value, policy, guard, collect_evicted
             )
 
         guard_tables, guard_num_tables = guard if guard is not None else (0, 0)
@@ -1643,12 +1638,29 @@ class LinearBucketTable(ScoredHashTable):
         score_value: Optional[torch.Tensor],
         policy: ScorePolicy,
         guard: Optional[Tuple[int, int]] = None,
-    ) -> torch.Tensor:
+        collect_evicted: bool = False,
+    ):
         """Deterministic insert: bucketize, insert one wave at a time, then
-        lookup to get final indices."""
+        lookup to get final indices. With ``collect_evicted`` the evictions of
+        every wave are gathered, in wave order, and returned as
+        ``(indices, num_evicted, evicted_keys, evicted_table_ids)``."""
         guard_tables, guard_num_tables = guard if guard is not None else (0, 0)
+        device = keys.device
         if keys.numel() == 0:
-            return torch.empty(0, dtype=torch.int64, device=keys.device)
+            indices = torch.empty(0, dtype=torch.int64, device=device)
+            if not collect_evicted:
+                return indices
+            return (
+                indices,
+                torch.zeros(1, dtype=torch.int64, device=device),
+                torch.empty_like(keys),
+                torch.empty(0, dtype=torch.int64, device=device),
+            )
+
+        if collect_evicted:
+            evicted_keys_buf = torch.empty_like(keys)
+            evicted_tids_buf = torch.empty(keys.numel(), dtype=torch.int64, device=device)
+            num_evicted_accum = 0
 
         keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
         for i in range(keys_t.size(0)):
@@ -1662,19 +1674,40 @@ class LinearBucketTable(ScoredHashTable):
                 if scores_t is not None
                 else None
             )
-            table_insert(
-                self.table_storage_,
-                self.table_bucket_offsets_,
-                self.bucket_capacity_,
-                self.bucket_sizes,
-                vk,
-                vt,
-                vs,
-                policy,
-                self._ref_counter,
-                guard_tables=guard_tables,
-                guard_num_tables=guard_num_tables,
-            )
+            if collect_evicted:
+                _, num_ev, ev_keys, ev_tids = table_insert_collect_evicted(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity_,
+                    self.bucket_sizes,
+                    vk,
+                    vt,
+                    vs,
+                    policy,
+                    self._ref_counter,
+                    guard_tables=guard_tables,
+                    guard_num_tables=guard_num_tables,
+                )
+                h_num_ev = int(num_ev.item())
+                if h_num_ev > 0:
+                    e = num_evicted_accum + h_num_ev
+                    evicted_keys_buf[num_evicted_accum:e].copy_(ev_keys[:h_num_ev])
+                    evicted_tids_buf[num_evicted_accum:e].copy_(ev_tids[:h_num_ev])
+                    num_evicted_accum = e
+            else:
+                table_insert(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity_,
+                    self.bucket_sizes,
+                    vk,
+                    vt,
+                    vs,
+                    policy,
+                    self._ref_counter,
+                    guard_tables=guard_tables,
+                    guard_num_tables=guard_num_tables,
+                )
 
         _, _, indices = table_lookup(
             self.table_storage_,
@@ -1685,7 +1718,14 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
         )
-        return indices
+        if not collect_evicted:
+            return indices
+        return (
+            indices,
+            torch.tensor([num_evicted_accum], dtype=torch.int64, device=device),
+            evicted_keys_buf,
+            evicted_tids_buf,
+        )
 
     def _deterministic_insert_and_evict(
         self,

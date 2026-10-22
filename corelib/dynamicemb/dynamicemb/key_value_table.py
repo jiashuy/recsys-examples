@@ -4081,11 +4081,7 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
     The cache has no score to hand over; for a storage that has to be told about a
     key by insert, the storage gives each key its own default one.
     """
-    # Under determinism the storage keeps its own insertion order, and the cache
-    # is driven through insert (see the prefetch).
-    in_place = isinstance(storage, DynamicEmbStorage) and (
-        os.environ.get("DEMB_DETERMINISM_MODE") is None
-    )
+    in_place = isinstance(storage, DynamicEmbStorage)
     if not in_place and isinstance(storage, DynamicEmbStorage):
         _expand_storage_for_cache_flush_if_needed(storage, cache)
 
