@@ -35,7 +35,6 @@ import warnings
 
 import pytest
 import torch
-import torch.distributed as dist
 from dynamicemb import (
     DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
@@ -199,18 +198,8 @@ def _table(probability):
     )
 
 
-@pytest.fixture
-def single_process_group(tmp_path):
-    """Dumping needs a process group for its rank and barrier; one of one."""
-    dist.init_process_group(
-        "gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1
-    )
-    yield
-    dist.destroy_process_group()
-
-
 def test_a_checkpoint_round_trip_has_no_counter_to_warn_about(
-    tmp_path, single_process_group
+    tmp_path, backend_session
 ):
     """Asking to dump and load the counter -- what saving everything does --
     is not a mistake when there is none to save, so neither side warns."""
