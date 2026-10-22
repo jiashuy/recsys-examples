@@ -75,7 +75,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `unit/incremental_dump/test_batched_dynamicemb_tables.py` | which keys each incremental-dump window returns (`load_dump`) |
 | `unit/incremental_dump/test_replay_increment.py` | `replay_increment`: apply a delta to another model + validation (`load_dump`) |
 | `unit/module/test_forward_backward.py` | `BatchedDynamicEmbeddingTablesV2` fwd/bwd vs FBGEMM; deterministic insert; empty batch; mixed dims; admission |
-| `unit/module/test_batched_table_backward.py` | one-GPU backward, pooled and sequence |
+| `unit/module/test_batched_table_backward.py` | one-GPU backward, pooled and sequence: each key updated by its occurrence count |
 | `unit/module/test_weighted_pooled_embedding_v2.py` | weighted SUM pooling vs unsharded EBC |
 | `unit/module/test_cache_flush.py` | cache prefetch and flush |
 | `unit/module/test_capacity_expansion.py` | capacity growth while inserting |
@@ -105,6 +105,17 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `integration/test_incremental_dump_distributed.py` | `incremental_dump` / `replay_increment` on sharded models | 1 and 8 ranks (`load_dump`) |
 | `integration/test_pop_evicted_keys_distributed.py` | `pop_evicted_keys` on a sharded model | 1 and 8 ranks |
 
+## Runtime
+
+A full run on one 8xH100 node takes about 2 h 10 min (1654 passed, 4 skipped, 0 failed).
+Nearly all of it is integration cases that start one `torchrun` each, because a case is
+one worker configuration: `test_model_dump_load` (144 loads + 72 dumps, ~37 s per 8-rank
+load), `test_lfu_scores`, `test_embedding_admission`, `test_twin_module`. Unit tests total
+a few minutes; `unit/table/test_table_dump_load.py` (1 and 8 ranks) is the slowest unit file
+at ~80-105 s per item. To iterate fast, run `-m unit` or select one file / `-k`.
+Folding several configurations into one launch is possible only for workers that are made
+rank-aware pytest files; that needs proof that several DMP models in one process are safe.
+
 ## Adding a test
 
 1. Does it need only one component? → `unit/<area>/`. Does it need a DMP / sharder /
@@ -121,7 +132,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 * Overflow-bucket behaviour with eviction / caching beyond one counter case.
 * `replay_increment` on multi-rank models; incremental dump with per-table differing score strategies.
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
-* Pooled MEAN backward; backward with optimizers other than SGD at module level.
+* Pooled MEAN backward; backward with optimizers other than SGD at module level (SUM and sequence backward are value-checked).
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` for pooled / sequence; `data_parallel_embeddings`; sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw entries exist but are not parametrized.
