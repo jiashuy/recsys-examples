@@ -425,8 +425,6 @@ class DynamicEmbTableState:
     threads_in_wave: int
     score: Optional[int] = None
     training: bool = False
-    # Overflow region fields (per-table, only set when overflow is enabled)
-    overflow_caps: Optional[List[int]] = None
     # NO_EVICTION: per-table auto-increment index used as insert score (internal only).
     # no_eviction_next_index: CPU pinned tensor (num_tables,); no_eviction_next_index_dev: same on state.device.
     no_eviction_next_index: Optional[torch.Tensor] = None
@@ -460,20 +458,12 @@ class DynamicEmbTableState:
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
-    enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
 
     base_opt = options[0]
-    if (
-        base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
-        and enable_overflow
-    ):
-        raise ValueError(
-            "enable_overflow is not supported when score_strategy is NO_EVICTION"
-        )
     num_tables = len(options)
 
     device_idx = torch.cuda.current_device()
@@ -525,7 +515,6 @@ def create_table_state(
         key_type=base_opt.index_type,
         score_specs=[score_policy],
         device=device,
-        enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
     )
     capacity = key_index_map.capacity()
@@ -562,18 +551,9 @@ def create_table_state(
     else:
         table_caps = list(key_index_map_caps)
 
-    overflow_caps_list: Optional[List[int]] = None
-
-    if enable_overflow:
-        ovf_cap = key_index_map.overflow_bucket_capacity_
-        overflow_caps_list = [ovf_cap] * num_tables
-
     tables: List[ExtendableBuffer] = []
     for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
-        total_cap = cap
-        if enable_overflow:
-            total_cap += overflow_caps_list[i]
-        shape = (total_cap, vd)
+        shape = (cap, vd)
         if base_opt.local_hbm_for_values == 0:
             tables.append(HostExtendableBuffer(shape, emb_dtype, device))
         else:
@@ -609,7 +589,6 @@ def create_table_state(
         threads_in_wave=threads_in_wave,
         score=None,
         training=False,
-        overflow_caps=overflow_caps_list,
         no_eviction_next_index=(
             torch.zeros(num_tables, dtype=torch.int64, pin_memory=True)
             if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
@@ -750,7 +729,6 @@ def _expand_tables_impl(
     does not change the key set). Mutates state."""
     base_opt = state.options_list[0]
     device = state.device
-    enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
     key_caps = state.key_index_map.per_table_capacity_
     new_caps = []
     for i in range(state.num_tables):
@@ -771,7 +749,6 @@ def _expand_tables_impl(
         key_type=base_opt.index_type,
         score_specs=[state.score_policy],
         device=device,
-        enable_overflow=enable_overflow,
         # Preserve the eviction routing (default Lex or custom score_function)
         # across rehash.
         score_fn_key=state.key_index_map.score_fn_key_,
@@ -1443,13 +1420,9 @@ def _find_keys(
             torch.empty(batch, dtype=torch.int64, device=device),
         )
 
-    km = state.key_index_map
-    if getattr(km, "enable_overflow_", False):
-        score_out, founds, indices = km.lookup_with_overflow(
-            unique_keys, table_ids, score_arg
-        )
-    else:
-        score_out, founds, indices = km.lookup(unique_keys, table_ids, score_arg)
+    score_out, founds, indices = state.key_index_map.lookup(
+        unique_keys, table_ids, score_arg
+    )
 
     missing = torch.logical_not(founds)
     (
@@ -2395,7 +2368,7 @@ def _erase_state_keys(
 
 
 # ---------------------------------------------------------------------------
-# DynamicEmbCache – Cache interface (key-only find / insert_and_evict)
+# DynamicEmbCache – Cache interface (placement and reference protection)
 # ---------------------------------------------------------------------------
 
 

@@ -333,12 +333,14 @@ def test_caching_backing_retains_every_key(current_device):
         f"cache holds all {len(keys)} keys -- it never evicted, so this test "
         "says nothing about the backing store"
     )
-    # ...and everything it evicted landed in the backing store rather than being
-    # dropped. The rest is still cache-resident and has not spilled yet.
-    assert spilled + cached == len(keys), (
-        f"{spilled} spilled + {cached} cached != {len(keys)} keys -- some key was "
-        "dropped between the tiers"
+    # ...and the backing store holds every key, evicted from the cache or not: a key
+    # is inserted into it when it is admitted, and the cache holds copies of some
+    # of them. A dropped key would show here as a count below the key set.
+    assert spilled == len(keys), (
+        f"the backing store holds {spilled} of {len(keys)} keys -- some key was "
+        "dropped"
     )
+    assert cached <= spilled
 
     # Push the cache down so the backing store must hold the complete key set.
     model.flush()

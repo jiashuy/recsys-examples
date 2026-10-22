@@ -346,6 +346,20 @@ class EmbeddingCacheCore {
     return std::get<0>(resident(table)).numel();
   }
 
+  // For a test, with nothing in flight: how many entries the reclaim queue holds,
+  // and how many nodes say they have one. The two have to be equal. A node that
+  // says so with no entry is one the queue will never hand out again, which is
+  // what going wrong between a pop and a push looks like.
+  std::pair<int64_t, int64_t> queue_audit(int64_t table) {
+    TORCH_CHECK(table >= 0 && table < num_tables(), "no such table");
+    const c10::cuda::CUDAGuard guard(device_);
+    DEMB_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto nodes = maps_[table]->download_nodes();
+    int64_t flagged = 0;
+    for (const Node& n : nodes) flagged += n.state.get().in_ring() ? 1 : 0;
+    return {queues_[table]->size(), flagged};
+  }
+
  private:
   void check_offsets(const std::vector<int64_t>& offsets, int64_t total) const {
     TORCH_CHECK(static_cast<int64_t>(offsets.size()) == num_tables() + 1,
@@ -405,5 +419,6 @@ void bind_embedding_cache(py::module& m) {
       .def("invalidate", &EmbeddingCacheCore::invalidate, py::arg("nodes"),
            py::arg("table_ids"))
       .def("resident", &EmbeddingCacheCore::resident, py::arg("table"))
-      .def("num_resident", &EmbeddingCacheCore::num_resident, py::arg("table"));
+      .def("num_resident", &EmbeddingCacheCore::num_resident, py::arg("table"))
+      .def("queue_audit", &EmbeddingCacheCore::queue_audit, py::arg("table"));
 }

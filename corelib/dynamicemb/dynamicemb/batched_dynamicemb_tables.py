@@ -805,8 +805,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
-                # NO_EVICTION is incompatible with cache overflow (see create_table_state).
-                # Match HybridStorage: GPU cache uses TIMESTAMP/LRU; backing keeps NO_EVICTION.
+                # The cache holds no score and does no eviction of its own, so
+                # NO_EVICTION means nothing to it: its options carry TIMESTAMP/LRU,
+                # as HybridStorage's HBM tier does, and the backing keeps NO_EVICTION.
                 if (
                     self._dynamicemb_options[0].score_strategy
                     == DynamicEmbScoreStrategy.NO_EVICTION

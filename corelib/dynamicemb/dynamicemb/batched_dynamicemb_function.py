@@ -1140,9 +1140,9 @@ def dynamicemb_prefetch(
                 lfu_accumulated_frequency,
                 admitter,
             )
-            # The cache addresses its own value buffer by cache slot: a cache is
-            # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
-            # at construction), so the two index spaces coincide here.
+            # The cache addresses its own value buffer by node, which is the row.
+            # There is no separate hash slot to tell apart from it: the cache keeps
+            # no ref counter beside a hash table, so the two index spaces coincide.
             value_row_indices = slot_indices
         elif storage_mode == StorageMode.HBM_DIRECT:
             (

@@ -959,7 +959,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 2. **缓存没有 score，`training` 与 `set_score` 变成空操作**，只为兼容调用方保留。待定：阶段 1 下回写后端时的 score 如何给（先传 `None`，由后端按当前 step 的默认值处理；LFU 策略下频率信息会丢失，这是阶段 1 的已知缺口，阶段 2 才补上）。
 3. **`cache_metrics` 保留四个槽位的含义**：`[0]` 本步 unique 数，`[1]` 命中数，`[2]` 插入数，`[3]` 淘汰数。
 4. **`key_index_map` 属性不再存在**，测试里直接读它的地方要改；`size()` 用统计 RESIDENT 节点数实现。
-5. **容量**：每表缓存容量仍是 `int(max_capacity * cap_scale)`，但现在恰好是节点数 `C_t`，不再有桶容量取整和 overflow 区，显存报告与对齐测试里关于 overflow 的断言要改。
+5. **容量**：每表缓存容量仍是 `int(max_capacity * cap_scale)`，不再有 overflow 区，显存报告与对齐测试里关于 overflow 的断言要改。（实现时改为仍向上取整到桶容量，见 17.5。）
 6. **`outstanding_keys` 的容量检查改成每表一份**，用 host 已有的 `unique_size_per_table`。
 7. **每步一次 D2H 同步**（读各表的 miss 数）。现有路径本来就有多处同步，先接受，等有 profile 再去。
 8. **多流**：allocate 在 prefetch 流上，release 在反向所在的流上。§6.4 要求的 tail 快照屏障（快照前 allocate 的流等已发起的 release，快照后发起的 release 等"快照已取"事件）在绑定里用 CUDA event 实现。这是阶段 1 就必须正确的部分，因为旧缓存靠原子计数，没有这条要求。
@@ -968,20 +968,35 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 11. **dtype**：阶段 1 搬运全部沿用现有按 dtype 的 kernel，缓存自己的 kernel 不接触值。阶段 2 的零拷贝搬运按字节拷贝，不按元素类型实例化（先按 4 字节对齐，向量化等 profile）。
 12. **旧实现的删除**：新实现通过现有测试之后，删除旧 `DynamicEmbCache` 内部用到的、不再被任何路径使用的 kernel 与代码。哪些算"不再使用"在删除时逐一核对。
 
-### 17.4 阶段 2 对后端的改动（待做）
+### 17.4 阶段 2 对后端的改动（设计，已完成，见 17.6）
 
 后端的普通 `insert` 在选 victim 的两处检查计数：选候选时（`reduce`、`reduce_ranked`），以及锁住之后再检查一次。改动是把"计数是否大于零"泛化成一个判定对象，计数仍是默认行为，缓存模式下再加一条"缓存是否允许淘汰这个 key"。只改普通 `insert` 与带收集的 `insert`（缓存模式下急切插入用的）及其在 LruLfu cubin 里的对应入口；`insert_and_evict` 不动。判定对象是不含指针以外成员的 POD，放在 cubin 与 AoT 共用的小头文件里，因此 `embedding_cache` 里的视图类型要拆成"只含视图"和"含存储"两部分，前者才能被 cubin 包含。
 
-### 17.5 进度
+### 17.5 实现中做出的决定（与 17.3 的假设对照）
+
+- **缓存容量取整**：每表 `C_t` 向上取到桶容量（缓存是 1024）的整数倍，与旧缓存的索引一致，只是不再有 overflow 区。原因：缓存必须同时装下一个 step 的全部 key，极小的配置（几百行）原来靠取整才能跑，新实现若恰好取配置值，现有测试里一批这样的配置会直接报容量错误。17.3 里"恰好是 `C_t`"的假设作废。
+- **两种驱动方式，按后端选**（`_prefetch_cache_path`）：
+  - 后端是 `DynamicEmbStorage` 且未设 `DEMB_DETERMINISM_MODE`：**急切流程**（§6.5）。每个 key 先过后端（`_find_keys`，更新 score），新 key 准入后立刻插入后端（带守卫、收集被淘汰的 key），缓存再据此作废。LFU/LRU 的 score 因此对每次访问都准确，不论缓存是否命中。
+  - 其他（外部 PS、确定性模式）：**通用流程**。后端只在缓存淘汰时被 `Storage.insert`，缓存命中不更新后端 score。PS 的淘汰由它自己决定；确定性模式下后端的 `insert` 不能报告淘汰了哪些 key，而缓存需要知道，所以不走急切流程。
+- **急切流程里后端插入失败**（一个桶里所有可淘汰的 key 都被守卫保护）：抛出明确的容量错误，不降级为"未准入"。这是容量规划错误，与缓存装不下一个 step 的 key 同类。待定：是否应降级。
+- **`flush`**：`DynamicEmbStorage` 后端下原地写行（每个缓存里的 key 在后端都有行），不再 `insert`，也不再预先扩容后端；若发现缓存里有后端已没有的 key（理论上不该有），回退到 `insert`。
+- **取值交给保留逻辑**（§6.5 第 8 步）：目前 `EvictedItemMode` 只有 `RETAIN_KEY`，只需要 key，所以急切流程里只把被后端淘汰的 key 交给 `_append_evicted`，没有取值。`rows.cuh` 的 `fetch_rows_kernel` 已备好，但没有任何调用者，所以没有暴露到绑定里；等 `EvictedItemMode` 增加保留值的标志时再接。
+- **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的；通用流程下后端插入的时机由缓存的淘汰顺序决定，确定性不保证。
+
+### 17.6 后端的守卫（已完成）
+
+后端普通 `insert` 的两处计数检查（`reduce`、`reduce_ranked`）和锁后复查，都增加了对 `EvictionGuardView`（`embedding_cache/guard.h`）的询问；AoT 的 `table_insert_kernel`、`table_insert_collect_kernel` 与 LruLfu cubin 的 `dyn_emb_insert_entry`、`dyn_emb_insert_collect_entry` 都接上了。`ScoredHashTable.insert(..., guard=...)` 与两个绑定函数多了两个默认为 0 的参数（守卫的设备指针与表数），不传即与原来一致。测试：`test/unit_tests/table_operation/test_eviction_guard.py`，覆盖两条淘汰路径、带与不带 `collect_evicted`、"没有守卫时这些 key 会被淘汰"的对照，以及一个桶里全是受保护 key 时插入被拒。
+
+### 17.7 进度
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| 0 | 在 EOS 上建立构建与测试流程，记录基线 | 待做 |
-| 1a | C++ 绑定 `EmbeddingCacheCore` | 待做 |
-| 1b | Python：新 `DynamicEmbCache`，通用流程的 prefetch、release、flush、eval、失效 | 待做 |
-| 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 待做 |
-| 2a | 后端 `insert` 的判定对象与 cubin 入口 | 待做 |
-| 2b | 行可寻址流程与零拷贝搬运，`DynamicEmbStorage` 后端切换过去 | 待做 |
+| 0 | 在 EOS 上建立构建与测试流程，记录基线 | 完成 |
+| 1a | C++ 绑定 `EmbeddingCacheCore` | 完成 |
+| 1b | Python：新 `DynamicEmbCache`，通用流程 | 完成 |
+| 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 主测试文件与大部分单测通过，见下 |
+| 2a | 后端 `insert` 的守卫与 cubin 入口 | 完成 |
+| 2b | 急切流程，`DynamicEmbStorage` 后端切换过去 | 完成，LFU 测试脚本验证中 |
 | 3 | 删除旧实现，更新文档与示例 | 待做 |
 
 ---
