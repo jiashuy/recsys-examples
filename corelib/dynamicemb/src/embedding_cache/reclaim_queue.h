@@ -49,13 +49,63 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   push in flight, pop starts — unsafe. Exactly the window above.
 //
 // So an allocating kernel must wait for every already-issued releasing kernel.
-// The reverse costs nothing and is not required. This holds at any prefetch
+// The reverse costs nothing for the kernel itself: a release that starts after
+// the popper's bound is fixed writes above it. This holds at any prefetch
 // depth; a deeper pipeline only means a released node becomes available later,
 // which is a capacity question rather than a correctness one.
 //
-// Because pushes cannot begin mid-pop, `tail` does not move for the duration of
-// a popping kernel: read it once into a snapshot and the bound check is exact
-// and free for the rest of the kernel.
+// The bound a popper honours is therefore a snapshot of `tail`, and it has to be
+// one value for the whole kernel. Reading `tail` inside the kernel does not give
+// that: blocks start at different times, and a block that starts after a pusher
+// has begun would read a `tail` covering slots reserved but not yet written —
+// the unsafe window above, reached through the safe direction. So the snapshot
+// is taken before the kernel exists, by a copy ordered on the stream, and the
+// kernel only reads it.
+//
+// That copy is itself a boundary between the two phases, and it has to be ordered
+// on both sides. A release issued before it must have finished, or the copy can
+// read a `tail` that includes reserved-but-unwritten slots. A release issued
+// after it must not have started, for the same reason: "issued" is the host's
+// order, not the device's, and nothing stops a release launched later from
+// running earlier than a copy that is queued behind other work. In stream terms,
+// the allocating stream waits for the releasing stream, takes the snapshot, and
+// records an event the releasing stream then waits on. Releases that wait on
+// that event run freely alongside the popping kernel. See
+// ReclaimQueueStorage::take_snapshot.
+//
+// ---------------------------------------------------------------------------
+// Why there are twice as many slots as nodes
+// ---------------------------------------------------------------------------
+//
+// Position p lives in slot p & mask, so it is overwritten when a pusher reaches
+// position p + slots. The in_ring bit keeps the number of live entries at or
+// below the node count C, and it is tempting to stop there and size the slot
+// array to C. It is not enough, because live entries are not what a push has to
+// stay clear of — the span from the oldest unread position to `tail` is.
+//
+// A popper takes a ticket and reads its slot a little later. In between, other
+// poppers drop or claim entries behind it, and those entries leave holes in the
+// middle of the span; a push goes to `tail`, never into a hole. So the span can
+// be wider than the live count, and with only C slots a push can wrap onto a
+// position whose popper has its ticket but has not yet read it. That popper then
+// reads somebody else's node, and the node whose entry was overwritten still
+// carries in_ring, so it is never queued again: a slot lost for the rest of the
+// run.
+//
+// This is not a corner. A releasing kernel overlapping the next allocate is the
+// pipeline working as intended, and the case needs only a full queue and one
+// slow popper.
+//
+// The span has a hard bound. At the start of a popping kernel it is at most C,
+// the live count. A pusher that starts mid-pop writes at positions at or above
+// the popper's tail snapshot, and it can push each node at most once — a pushed
+// node holds in_ring, and its new entry is above the snapshot, so no popper
+// clears it. That adds at most C more. The span never exceeds 2C, so 2C slots
+// cannot be overwritten before they are read.
+//
+// Rounded up to a power of two so that indexing is a mask rather than a 64-bit
+// division, which has no native instruction. The cost is four bytes per slot,
+// and the slot array is the only thing here that grows with the node count.
 //
 // ---------------------------------------------------------------------------
 // FIFO only
@@ -127,28 +177,19 @@ struct ReclaimQueue {
 
   // -- state, all borrowed --------------------------------------------------
 
-  NodeId* slots;  // [capacity]
+  NodeId* slots;  // [mask + 1]
 
   // Monotonic, and 64-bit so they never wrap in any real run. Counters rather
   // than wrapped indices, because then `tail - head` is the live count with no
   // ambiguity between full and empty.
   uint64_t* head;
   uint64_t* tail;
+  uint64_t* snapshot;  // written only by ReclaimQueueStorage::take_snapshot
 
-  // The node count, and the length of `slots`. Not required to be a power of
-  // two — it is whatever the cache was configured with — so indexing is a
-  // modulo rather than a mask. That costs a 64-bit division, which has no
-  // native instruction on any of these architectures, on every push and on
-  // every iteration of a pop.
-  //
-  // Worth it for what it avoids: rounding the slot array up to a power of two
-  // would mean storing the rounded length as well, and two fields that have to
-  // agree are two fields that can disagree. The division lands next to an
-  // atomic that costs a trip to L2, and the whole operation runs once per
-  // unique key per step. If a profile ever says otherwise, the answer is a
-  // precomputed reciprocal, and that is the point at which a second field earns
-  // its place.
-  int64_t capacity;
+  // The slot count minus one. The slot count is a power of two, at least twice
+  // the node count; see the header for why it is that large. Holding the mask
+  // and not the count means there is one field to keep right rather than two.
+  uint64_t mask;
 
   // -- block-collective scratch ---------------------------------------------
   //
@@ -194,13 +235,14 @@ struct ReclaimQueue {
   __forceinline__ __device__ void push(bool want, NodeId node, Scratch& s) {
     const uint64_t pos = BlockReserve::reserve(
         want, reinterpret_cast<unsigned long long*>(tail), s);
-    if (want) slots[pos % static_cast<uint64_t>(capacity)] = node;
+    if (want) slots[pos & mask] = node;
   }
 
-  // Read the bound for a popping kernel. Valid for the whole kernel; see the
-  // header comment for why.
+  // The bound for a popping kernel: `tail` as it was when take_snapshot ran,
+  // the same for every thread. A plain load is enough — the copy that wrote it
+  // finished before this kernel started.
   [[nodiscard]] __forceinline__ __device__ uint64_t snapshot_tail() const {
-    return *reinterpret_cast<const volatile uint64_t*>(tail);
+    return *snapshot;
   }
 
   // Take a node for reuse, or report the queue exhausted.
@@ -258,7 +300,7 @@ struct ReclaimQueue {
         }
         settled = true;  // exhausted, and kNoNode is the answer
       } else {
-        const NodeId candidate = slots[pos % static_cast<uint64_t>(capacity)];
+        const NodeId candidate = slots[pos & mask];
         if (try_take(candidate)) {
           node = candidate;
           settled = true;
@@ -274,20 +316,13 @@ struct ReclaimQueue {
         atomicAdd(reinterpret_cast<unsigned long long*>(head), ~0ULL);
         break;
       }
-      const NodeId candidate = slots[pos % static_cast<uint64_t>(capacity)];
+      const NodeId candidate = slots[pos & mask];
       if (try_take(candidate)) {
         node = candidate;
         break;
       }
     }
     return node;
-  }
-
-  // How many entries are live. A hint: with pushes in flight on another stream
-  // it is stale by the time it is read. For metrics, never for a decision.
-  [[nodiscard]] __forceinline__ __host__ __device__ int64_t size_hint(
-      uint64_t h, uint64_t t) const {
-    return static_cast<int64_t>(t - h);
   }
 };
 
@@ -318,8 +353,10 @@ __global__ void queue_arange_kernel(NodeIdT* slots, int64_t capacity) {
 // Owns the slot array and the two counters.
 //
 // Unlike the node pool there is nothing here belonging to another component, so
-// this one can initialise everything it allocates: arange for the slots, zero
-// for head, capacity for tail. A freshly built queue is a complete queue.
+// this one can initialise everything it allocates: arange for the first
+// `capacity` slots, zero for head, capacity for tail. The rest of the slots are
+// not touched; a position is only ever read after a push has written it, or
+// after the arange has. A freshly built queue is a complete queue.
 
 template <typename NodeIdT = int32_t,
           NodeIdT kNoNodeV = static_cast<NodeIdT>(-1),
@@ -350,10 +387,12 @@ class ReclaimQueueStorage {
       throw std::invalid_argument(
           "ReclaimQueueStorage: capacity exceeds the 32-bit node id range");
     }
-    slots_ = alloc_.allocate(sizeof(NodeId) * size_t(capacity_));
-    // Head and tail in one allocation: they are read together by every kernel
-    // that touches the queue, and two four-byte-apart counters share a line.
-    counters_ = alloc_.allocate(sizeof(uint64_t) * 2u);
+    slot_count_ = round_up_pow2(2 * capacity_);
+    slots_ = alloc_.allocate(sizeof(NodeId) * size_t(slot_count_));
+    // Head, tail and the snapshot in one allocation: they are read together by
+    // every kernel that touches the queue, and neighbouring counters share a
+    // line.
+    counters_ = alloc_.allocate(sizeof(uint64_t) * 3u);
     reset();
   }
 
@@ -361,7 +400,8 @@ class ReclaimQueueStorage {
   ReclaimQueueStorage& operator=(const ReclaimQueueStorage&) = delete;
 
   [[nodiscard]] Queue queue() const {
-    return Queue{d_slots(), d_head(), d_tail(), capacity_};
+    return Queue{d_slots(), d_head(), d_tail(), d_snapshot(),
+                 static_cast<uint64_t>(slot_count_ - 1)};
   }
 
   // Every node queued, in order, nothing taken yet.
@@ -375,11 +415,32 @@ class ReclaimQueueStorage {
         d_slots(), capacity_);
     check(cudaGetLastError(), "arange launch");
 
-    const uint64_t counters[2] = {0u, static_cast<uint64_t>(capacity_)};
+    const uint64_t counters[3] = {0u, static_cast<uint64_t>(capacity_),
+                                  static_cast<uint64_t>(capacity_)};
     check(cudaMemcpyAsync(d_head(), counters, sizeof(counters),
                           cudaMemcpyHostToDevice, stream_),
           "counter upload");
     check(cudaStreamSynchronize(stream_), "counter upload sync");
+  }
+
+  // Fix the bound the next popping kernel will honour: copy `tail` into the
+  // snapshot, on `stream`.
+  //
+  // This is the boundary between the push phase and the pop phase, and it is
+  // ordered on both sides by the caller:
+  //
+  //   before   `stream` has waited for every release issued so far
+  //   after    every release issued from here on waits for an event recorded on
+  //            `stream` right after this call
+  //
+  // Between the two, a release may overlap the popping kernel freely: it writes
+  // above the snapshot, which that kernel never reads. Skip either wait and the
+  // copy can read a `tail` that covers slots a running release has reserved but
+  // not yet written.
+  void take_snapshot(cudaStream_t stream) {
+    check(cudaMemcpyAsync(d_snapshot(), d_tail(), sizeof(uint64_t),
+                          cudaMemcpyDeviceToDevice, stream),
+          "snapshot");
   }
 
   [[nodiscard]] int64_t capacity() const { return capacity_; }
@@ -387,13 +448,15 @@ class ReclaimQueueStorage {
   [[nodiscard]] const Allocator& allocator() const { return alloc_; }
 
   [[nodiscard]] size_t bytes() const {
-    return sizeof(NodeId) * size_t(capacity_) + sizeof(uint64_t) * 2u;
+    return sizeof(NodeId) * size_t(slot_count_) + sizeof(uint64_t) * 3u;
   }
 
   // -- inspection -----------------------------------------------------------
 
+  // Every slot, including those no live position maps to. Only the positions
+  // in [head, tail) mean anything, at slot (position & mask).
   [[nodiscard]] std::vector<NodeId> download_slots() const {
-    return download(d_slots(), size_t(capacity_));
+    return download(d_slots(), size_t(slot_count_));
   }
 
   // {head, tail}.
@@ -408,6 +471,11 @@ class ReclaimQueueStorage {
   }
 
  private:
+  static int64_t round_up_pow2(int64_t v) {
+    int64_t p = 1;
+    while (p < v) p <<= 1;
+    return p;
+  }
   static void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
       throw std::runtime_error(std::string("ReclaimQueueStorage: ") + what +
@@ -428,8 +496,10 @@ class ReclaimQueueStorage {
   NodeId* d_slots() const { return static_cast<NodeId*>(slots_.data()); }
   uint64_t* d_head() const { return static_cast<uint64_t*>(counters_.data()); }
   uint64_t* d_tail() const { return d_head() + 1; }
+  uint64_t* d_snapshot() const { return d_head() + 2; }
 
   int64_t capacity_ = 0;
+  int64_t slot_count_ = 0;
   cudaStream_t stream_ = nullptr;
   AllocT alloc_;
   Buffer slots_, counters_;

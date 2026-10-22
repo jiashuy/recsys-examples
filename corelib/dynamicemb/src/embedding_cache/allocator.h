@@ -165,23 +165,12 @@ struct CudaAllocator {
 // allocator takes that stream and makes it current for the at::empty, and the
 // tag is right from the start.
 //
-// record_stream() below is the other half of torch's answer to the same
-// problem. It covers a block being freed while another stream still has work
-// queued against it: it tells the allocator that a second stream touches this
-// block, so freeing it records an event on that stream instead of returning the
-// memory to the pool straight away.
-//
-// The structural allocations do not need it — bucket heads, the node array, the
-// row pool are taken once when the cache is built and released once when it is
-// destroyed, so nothing is freed mid-flight. What needs it is per-step scratch:
-// a miss list, a compaction buffer, anything a component allocates and releases
-// inside a step while other streams are still running. This allocator is not
-// the hash map's; every component that owns device memory takes one.
-//
-// It is on TorchBuffer and not in the Buffer contract at the top of this file.
-// Putting it there would oblige every allocator to carry a no-op, and nothing
-// generic calls it yet — a component that allocates scratch through a template
-// parameter will be the thing that makes it worth widening.
+// The structural allocations need nothing more — bucket heads, the node array,
+// the row pool are taken once when the cache is built and released once when it
+// is destroyed, so nothing is freed mid-flight. Per-step scratch that is freed
+// while another stream still has work queued against it would also need
+// at::Tensor::record_stream; nothing allocates that way yet, so there is no hook
+// for it here.
 
 #ifdef EMBEDDING_CACHE_HAS_TORCH
 
@@ -211,25 +200,6 @@ class TorchBuffer {
 
   void* data() const { return t_.defined() ? t_.data_ptr() : nullptr; }
   size_t bytes() const { return bytes_; }
-
-  // Declare that `stream` also reads or writes this block.
-  //
-  // Needed once for every stream that touches the memory beyond the one it was
-  // allocated on, and only worth calling for a buffer that is actually freed
-  // while work may still be outstanding — per-step scratch, not the structural
-  // arrays. Without it the allocator is free to reissue the block on free while
-  // that stream still has kernels queued against it.
-  //
-  // Sticky: once recorded, every later free of this block waits on that stream.
-  void record_stream(cudaStream_t stream) const {
-    if (!t_.defined() || stream == nullptr) return;
-    t_.record_stream(c10::cuda::getStreamFromExternal(
-        stream, static_cast<c10::DeviceIndex>(t_.get_device())));
-  }
-
-  // The underlying tensor, for callers that want to hand the memory to torch —
-  // exposing a row pool as a tensor, say, without copying.
-  const at::Tensor& tensor() const { return t_; }
 
  private:
   at::Tensor t_;   // reference counted, so this type is copyable as well

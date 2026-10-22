@@ -25,8 +25,7 @@ static int failures = 0;
   } while (0)
 
 static const R kAllResidencies[] = {NodeState::kEmpty, NodeState::kLoading,
-                                    NodeState::kResident,
-                                    NodeState::kEvicting};
+                                    NodeState::kResident};
 
 int main() {
   // --- the type is what a node can hold -----------------------------------
@@ -43,7 +42,7 @@ int main() {
   // --- the fields tile the word, and none of them bleeds -------------------
   //
   // Setting one field must leave the other three alone. That is the whole
-  // correctness question for a packed word, and it is exhaustible: four
+  // correctness question for a packed word, and it is exhaustible: three
   // residencies x in_ring x used x a set of refs that covers both ends and the
   // boundaries.
   {
@@ -110,7 +109,7 @@ int main() {
       }
     }
     CHECK(collisions == 0, "every distinct setting has its own word");
-    CHECK(seen.size() == 4u * 4u * 2u * 2u, "and all of them were reachable");
+    CHECK(seen.size() == 3u * 4u * 2u * 2u, "and all of them were reachable");
   }
 
   // --- pin and release are inverses, and carry nothing across fields -------
@@ -160,10 +159,10 @@ int main() {
   // --- residency values are the two low bits, in order --------------------
   {
     CHECK(NodeState::kEmpty == 0u && NodeState::kLoading == 1u &&
-              NodeState::kResident == 2u && NodeState::kEvicting == 3u,
-          "the four residencies fit two bits");
-    CHECK(NodeState::make(NodeState::kEvicting, 0, false, false).raw() ==
-              0xC0000000u,
+              NodeState::kResident == 2u,
+          "the three residencies fit two bits");
+    CHECK(NodeState::make(NodeState::kResident, 0, false, false).raw() ==
+              0x80000000u,
           "residency occupies the top two bits");
     CHECK(NodeState::make(NodeState::kEmpty, 0, true, false).raw() ==
               0x10000000u,
@@ -174,7 +173,7 @@ int main() {
     CHECK(NodeState::make(NodeState::kEmpty, NodeState::kMaxRefs, false, false)
                   .raw() == 0x07FFFFFFu,
           "refs is the low 27 bits");
-    CHECK((NodeState::make(NodeState::kEvicting, NodeState::kMaxRefs, true, true)
+    CHECK((NodeState::make(NodeState::kResident, NodeState::kMaxRefs, true, true)
                .raw() &
            NodeState::kReservedMask) == 0u,
           "bit 29 stays reserved even with every field at its maximum");
@@ -257,17 +256,19 @@ int main() {
     for (R r : kAllResidencies) {
       AtomicNodeState a;
       a.set(NodeState::make(r, 0u, /*in_ring=*/true, /*used=*/true));
-      NodeState was = NodeState::make(NodeState::kEvicting, 0, false, false);
+      NodeState was = NodeState::make(NodeState::kLoading, 0, false, false);
       const bool ok = a.try_claim(&was);
       const bool claimable =
           (r == NodeState::kEmpty || r == NodeState::kResident);
       CHECK(ok == claimable,
             "an unreferenced node is claimable when empty or resident, and "
-            "not while loading or already being evicted");
+            "not while loading");
       if (ok) {
         CHECK(was.residency() == r,
               "the reported state says whether there is a row to write back");
-        CHECK(a.get().residency() == NodeState::kEvicting, "claimed");
+        CHECK(a.get().residency() == NodeState::kLoading,
+              "claimed, and straight into the state nothing can pin or claim");
+        CHECK(!a.try_pin(), "so a pin arriving now is refused");
         CHECK(a.get().refs() == 1u, "and held for the step that claimed it");
         CHECK(!a.get().used(), "and recency does not carry into a new key");
       } else {
@@ -320,8 +321,9 @@ int main() {
     NodeState was = NodeState::make(NodeState::kResident, 0, false, false);
     CHECK(a.try_claim(&was), "claimed off the ring");
     CHECK(was.residency() == NodeState::kEmpty, "nothing to write back");
-
-    a.set(a.get().with_residency(NodeState::kLoading));
+    CHECK(a.get().residency() == NodeState::kLoading &&
+              a.get().refs() == 1u && !a.get().in_ring() && !a.get().used(),
+          "claim alone leaves the node bound and held: nothing to set after");
     CHECK(!a.try_pin(), "a loading row cannot be handed to anybody");
 
     a.publish();

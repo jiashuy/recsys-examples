@@ -74,20 +74,22 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // What a caller must guarantee
 // ---------------------------------------------------------------------------
 //
-//   1. insert and remove must not run concurrently with each other
-//   2. lookup must not run concurrently with anything at all
-//   3. node.key is written only by insert()
+//   1. lookup must not run concurrently with anything at all
+//   2. node.key is written only by insert()
 //
-// The first two are properties of *this* implementation, not universal truths.
-// Removal and insertion interleaving on one bucket is the general lock-free
-// doubly-linked list problem, which this sidesteps by asking the caller to
-// separate them into phases rather than solving it. A different implementation
-// — open addressing, say — may relax either.
+// Rule 1 is a property of *this* implementation, not a universal truth. A
+// different one — open addressing, say — may relax it.
 //
-// Within a phase, concurrency is fine and expected: many threads may insert at
-// once, or remove at once, or look up at once.
+// Everything else may overlap freely: many threads may insert, remove or both
+// at once, which is what an allocating kernel does when one thread rebinds a
+// victim out of one bucket while another binds a new key into it. insert and
+// remove hold the same bucket lock across the whole mutation, and every node a
+// mutation touches — the victim's neighbours, the incumbent head — is in the
+// bucket being locked, because a chain never spans buckets. That is what turns
+// the general lock-free doubly-linked list problem into a short critical
+// section, and why the two do not have to be put in separate phases.
 //
-// Rule 2 is the load-bearing one, and the reason is worth stating: a lookup
+// Rule 1 is the load-bearing one, and the reason is worth stating: a lookup
 // that races a mutation does not merely return a stale answer, it returns
 // kNoNode for a key that is present. remove() clears the victim's next pointer,
 // so a walk standing on that node stops there and never sees the rest of the
@@ -97,20 +99,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // its own row, and they diverge silently — whichever is written back last wins.
 // A missed lookup is not a lost lookup; it is a duplicated key.
 //
-// Rule 2 says "anything at all", not "insert or remove", and the extra breadth
+// Rule 1 says "anything at all", not "insert or remove", and the extra breadth
 // is deliberate. It is what lets lookup() read bucket heads as plain NodeId
 // while lock() reads them as atomics: two access kinds on one object, legal
 // only because they never overlap. Weaken the rule to cover just this
 // component's mutators and the read path has to go back to atomics, which costs
 // an L1 bypass per hop on the hottest path there is.
-//
-// Rule 1 is more conservative than this implementation needs. insert and remove
-// hold the same bucket lock across the whole mutation, and every node a
-// mutation touches — the victim's neighbours, the incumbent head — is in the
-// bucket being locked, because a chain never spans buckets. It is kept because
-// it is a contract for callers rather than a description of this code, it costs
-// callers nothing (a rebind is naturally one thread, one node, sequential), and
-// it is genuinely required by implementations a caller might be swapped onto.
 //
 // ---------------------------------------------------------------------------
 // Requires sm_70+
@@ -341,14 +335,8 @@ struct HashMap {
   // relaxed-atomic read bypasses L1, and this walk would pay that on the head
   // and again on every hop, for an ordering guarantee that has nothing to
   // order.
-  //
-  // The kLocked check is not part of that contract, it is a net under it: if
-  // the phases do get crossed, a locked head reads as a miss rather than
-  // sending the walk off a sentinel and into the node array out of bounds. One
-  // comparison, and it costs nothing when the contract holds.
   __forceinline__ __device__ NodeId lookup(Key key) const {
     NodeId n = heads[bucket_of(key)];
-    if (n == kLocked) return kNoNode;
     while (n != kNoNode) {
       const Node& node = nodes[n];
       if (node.key == key) return n;
@@ -452,7 +440,7 @@ struct HashMap {
   // touched only by device threads.
   //
   // lookup() reads these same words as plain NodeId, which would be a data race
-  // if the two could overlap. They cannot — that is exactly what rule 2 of the
+  // if the two could overlap. They cannot — that is exactly what rule 1 of the
   // caller contract buys, and it is the reason the read path costs nothing.
   using AtomicHead = cuda::atomic_ref<NodeId, cuda::thread_scope_device>;
 

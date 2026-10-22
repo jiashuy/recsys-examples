@@ -118,19 +118,22 @@ class NodeState {
   // it; naming the type here is what says which component owns that field.
   using Raw = uint32_t;
 
-  // What the node's row is doing. Two bits, four values, and no room for a
-  // fifth — adding one means taking a bit from refs.
+  // What the node's row is doing. Two bits, three values in use; the fourth is
+  // free, and a fifth would mean taking a bit from refs.
   enum Residency : Raw {
     // Never held data. Claimable, and nothing to write back when claimed.
     kEmpty = 0u,
     // Bound to a key, contents not yet valid — a transfer or an initializer is
     // in flight. Neither readable nor claimable.
+    //
+    // This is also what a node becomes the instant it is claimed. Claiming and
+    // rebinding are one thread in one kernel, so nobody can observe the gap
+    // between them, and a separate state for it would be one nothing reads: a
+    // pin and a claim refuse a LOADING node exactly as they would refuse that.
     kLoading = 1u,
     // Contents valid. refs > 0 means in use by an in-flight step; refs == 0
     // means idle, and still a cache hit.
     kResident = 2u,
-    // Claimed by an allocating thread. Pins must fail.
-    kEvicting = 3u,
   };
 
   //   31 30 | 29       | 28      | 27   | 26 ................ 0
@@ -344,15 +347,19 @@ class AtomicNodeState {
   // Take a reference on a cache hit: refs+1, and `used` set.
   //
   // Fails, rather than waiting, if the node is not RESIDENT — an allocator got
-  // there first, or the row is still loading. The caller treats the key as a
-  // miss. Spinning here would mean spinning on an operation that may contain a
-  // PCIe transfer.
+  // there first, or the row is still loading. Spinning here would mean spinning
+  // on an operation that may contain a PCIe transfer.
   //
-  // A successful pin does not mean the node still holds the key the caller
-  // looked up. It may have been evicted and rebound between the lookup and this
-  // call, and the state would read RESIDENT either way — the word cannot tell
-  // them apart, because it can return to a bit-identical value. The caller
-  // re-reads node.key afterwards; that check is what closes it.
+  // What a failed pin means for the caller is not "miss, and one extra
+  // transfer". The node is bound to the key, so treating the key as a miss makes
+  // the allocator bind it to a second node. That cannot happen while pinning and
+  // rebinding stay in separate kernels, and it is what that separation is for.
+  //
+  // For the same reason a successful pin needs no check that the node still
+  // holds the key that was looked up: the word cannot tell a node that was
+  // evicted and rebound from one that was not, because it can return to a
+  // bit-identical value, so the only protection is that no rebind runs between
+  // the lookup and this call.
   [[nodiscard]] __forceinline__ __device__ bool try_pin() {
     auto a = ref();
     Raw cur = a.load(cuda::std::memory_order_relaxed);
@@ -396,16 +403,16 @@ class AtomicNodeState {
   }
 
   // Take the node for reuse: EMPTY or RESIDENT with no references becomes
-  // EVICTING, held by this thread.
+  // LOADING, with one reference held by this thread.
   //
   // `*was` receives the state at the instant of the claim, which is what tells
   // the caller whether there is anything to write back — an EMPTY node never
   // held data, a RESIDENT one is by construction newer than the backing copy.
   //
   // Fails on a node that has references (it was hit again after being enqueued,
-  // so the entry that led here is stale), and on one that is LOADING or already
-  // EVICTING. `used` is cleared on success: the node is about to hold something
-  // else, and carries no recency into that.
+  // so the entry that led here is stale), and on one that is LOADING. `used` is
+  // cleared on success: the node is about to hold something else, and carries
+  // no recency into that.
   //
   // CALL THIS ONLY ON A NODE JUST TAKEN OFF THE RECLAIM QUEUE, because it
   // clears in_queue WHETHER OR NOT THE CLAIM SUCCEEDS. The entry that led here
@@ -439,7 +446,7 @@ class AtomicNodeState {
         continue;
       }
 
-      const NodeState next = s.with_residency(NodeState::kEvicting)
+      const NodeState next = s.with_residency(NodeState::kLoading)
                                  .with_in_ring(false)
                                  .with_used(false)
                                  .with_refs(1u);

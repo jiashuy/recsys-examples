@@ -231,6 +231,7 @@ static void test_queue_round_trip() {
   CHECK(qs.size() == kNodes, "a fresh queue holds every node, got %lld",
         (long long)qs.size());
 
+  qs.take_snapshot(nullptr);
   drain_kernel<<<32, 256>>>(qs.queue(), nodes.p, kNodes, got.p);
   CU(cudaGetLastError());
   CU(cudaDeviceSynchronize());
@@ -330,6 +331,7 @@ static void test_pipeline(int steps, int64_t capacity, int64_t per_step,
         miss_src.p, miss_count.p);
     CU(cudaGetLastError());
 
+    qs.take_snapshot(nullptr);
     allocate_kernel<Queue, Map, Node><<<grid, kBlock>>>(
         qs.queue(), map_store.map(), nodes, miss_keys.p, miss_src.p,
         miss_count.p, slots.p, node_ids.p);
@@ -392,6 +394,134 @@ static void test_pipeline(int steps, int64_t capacity, int64_t per_step,
         (long long)queued, (long long)qs.size());
 }
 
+// ---------------------------------------------------------------------------
+// 5. A release overlapping an allocate
+// ---------------------------------------------------------------------------
+//
+// The pipeline's one deliberate overlap: step N's release pushes the queue while
+// step N+1's allocate pops it. The queue is only safe under that if no push can
+// reach a slot a popper has yet to read, and the way to find out is to make it
+// likely — a full queue, so any push wraps onto the oldest unread slot, and half
+// the entries stale, so that pops are dropping entries while pushes land.
+//
+// Even nodes are held by a step that has not released yet. They were pinned after
+// they were enqueued, so each has a stale entry. Odd nodes are idle. The popper
+// asks for as many nodes as there are odd ones; the pusher releases the even
+// ones. Whichever order a given node's drop and release fall in, the protocol
+// has to come out consistent, and consistency is checkable at rest:
+//
+//   * a node is flagged in_ring exactly when it has one live entry
+//   * no node has two
+//   * every node a popper was handed is held, and has no entry
+//
+// A push that wrapped onto an unread slot shows up as a flagged node with no
+// entry, and a popper that read the wrong slot as a node handed out that is also
+// still queued. The snapshot is taken and synchronised before the pusher is
+// launched, which is the ordering the queue asks of its caller; this checks the
+// queue given that ordering, not the ordering.
+
+__global__ void init_overlap_states_kernel(Node* nodes, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    nodes[i].state.set(NodeState::make(NodeState::kResident,
+                                       (i % 2 == 0) ? 1u : 0u,
+                                       /*in_ring=*/true, /*used=*/false));
+  }
+}
+
+// One thread per even node: drop the reference, push if it owns the enqueue.
+__global__ void release_even_kernel(Queue q, Node* nodes, int64_t n_even) {
+  __shared__ Queue::Scratch s;
+  const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+  for (int64_t base = int64_t(blockIdx.x) * blockDim.x; base < n_even;
+       base += stride) {
+    const int64_t i = base + threadIdx.x;
+    const int32_t node = (i < n_even) ? int32_t(2 * i) : Queue::kNoNode;
+    const bool owns = (node != Queue::kNoNode) && nodes[node].state.release();
+    q.push(owns, node, s);
+  }
+}
+
+static void test_release_overlaps_allocate() {
+  std::printf("=== a release overlapping an allocate ===\n");
+  const int64_t kNodes = 1 << 18;
+  const int64_t n_even = kNodes / 2;
+  const int kIters = 100;
+
+  Dev<Node> nodes(kNodes);
+  Dev<int32_t> got(n_even);
+  QStore qs(kNodes);
+
+  cudaStream_t pop_stream, push_stream;
+  CU(cudaStreamCreateWithFlags(&pop_stream, cudaStreamNonBlocking));
+  CU(cudaStreamCreateWithFlags(&push_stream, cudaStreamNonBlocking));
+  const int grid = grid_for(n_even);
+
+  int64_t bad_iters = 0;
+  for (int it = 0; it < kIters; ++it) {
+    qs.reset();
+    init_overlap_states_kernel<<<64, 256>>>(nodes.p, kNodes);
+    CU(cudaDeviceSynchronize());
+
+    qs.take_snapshot(pop_stream);
+    CU(cudaStreamSynchronize(pop_stream));
+
+    drain_kernel<<<grid, kBlock, 0, pop_stream>>>(qs.queue(), nodes.p, n_even,
+                                                  got.p);
+    release_even_kernel<<<grid, kBlock, 0, push_stream>>>(qs.queue(), nodes.p,
+                                                          n_even);
+    CU(cudaGetLastError());
+    CU(cudaStreamSynchronize(pop_stream));
+    CU(cudaStreamSynchronize(push_stream));
+
+    const auto h_nodes = nodes.get();
+    const auto ids = got.get();
+    const auto counters = qs.download_counters();
+    const auto slots = qs.download_slots();
+    const uint64_t mask = qs.queue().mask;
+
+    std::vector<int> entries(kNodes, 0);
+    for (uint64_t p = counters[0]; p < counters[1]; ++p) {
+      const int32_t n = slots[p & mask];
+      if (n < 0 || n >= kNodes) {
+        entries.assign(kNodes, -1);  // an entry that names no node
+        break;
+      }
+      ++entries[n];
+    }
+
+    int64_t wrong = 0;
+    for (int64_t i = 0; i < kNodes; ++i) {
+      const NodeState s = h_nodes[i].state.get();
+      if (entries[i] < 0 || entries[i] > 1) ++wrong;               // duplicated
+      else if (s.in_ring() != (entries[i] == 1)) ++wrong;          // flag != entry
+    }
+    std::vector<char> handed(kNodes, 0);
+    for (int32_t id : ids) {
+      if (id == Queue::kNoNode) { ++wrong; continue; }             // ran dry
+      if (handed[id]++) ++wrong;                                   // handed twice
+      const NodeState s = h_nodes[id].state.get();
+      if (s.residency() != NodeState::kLoading || s.refs() != 1u) ++wrong;
+      if (entries[id] != 0) ++wrong;                               // handed out and queued
+    }
+    if (wrong != 0) {
+      ++bad_iters;
+      if (bad_iters <= 3) {
+        std::printf("  iteration %d: %lld inconsistencies\n", it,
+                    (long long)wrong);
+      }
+    }
+  }
+  std::printf("  %d iterations, %lld inconsistent\n", kIters,
+              (long long)bad_iters);
+  CHECK(bad_iters == 0,
+        "%lld iterations left the queue and the node flags disagreeing",
+        (long long)bad_iters);
+
+  CU(cudaStreamDestroy(pop_stream));
+  CU(cudaStreamDestroy(push_stream));
+}
+
 int main() {
   int dev = 0;
   CU(cudaGetDevice(&dev));
@@ -403,6 +533,7 @@ int main() {
   test_state_contention();
   test_claim_exclusivity();
   test_queue_round_trip();
+  test_release_overlaps_allocate();
   // Capacity below the working set on purpose: eviction has to actually happen.
   test_pipeline(/*steps=*/200, /*capacity=*/2048, /*per_step=*/512,
                 /*key_space=*/8192, /*seed=*/1234);

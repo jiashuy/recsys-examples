@@ -39,14 +39,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // Two boundaries here are correctness requirements rather than launch-
 // granularity choices:
 //
-//   * lookup_pin must not overlap allocate. HashMap's rule 2 — a lookup runs
-//     concurrently with nothing — and the identity race below both depend on
-//     it.
-//   * allocate must not start until every already-issued release has finished.
-//     A releasing kernel pushes; an allocating one pops; and a pop whose tail
-//     snapshot covers a slot a pusher has reserved but not yet written reads
-//     the previous occupant. One stream event, one direction — the reverse is
-//     free. See reclaim_queue.h.
+//   * lookup_pin must not overlap allocate. HashMap's rule 1 — a lookup runs
+//     concurrently with nothing — depends on it, and so does pinning: a node
+//     found by lookup that is evicted and rebound before the pin lands reads
+//     RESIDENT again, and the pin would succeed onto the wrong key. Nothing in
+//     the word can tell the two apart, so the separation is the whole defence.
+//   * allocate must not start until every already-issued release has finished,
+//     and a release issued later must not start until allocate's tail snapshot
+//     has been taken (ReclaimQueueStorage::take_snapshot). A releasing kernel
+//     pushes; an allocating one pops; and a pop whose bound covers a slot a
+//     pusher has reserved but not yet written reads the previous occupant. Once
+//     the snapshot is taken, a release may overlap the allocate kernel freely.
+//     See reclaim_queue.h.
 //
 // What is NOT a requirement any more: splitting the rebind into an unlinking
 // pass and a linking pass. That existed because removal and insertion racing on
@@ -72,7 +76,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "ec_assert.h"
 #include "hashmap.h"
 #include "node_state.h"
 #include "reclaim_queue.h"
@@ -92,12 +95,10 @@ struct AllocSlot {
   NodeIdT node;  // kNoNode when the queue ran dry and the key was not admitted
   KeyT key;      // what the node holds now
 
-  // What it held before. Meaningful only when victim_state.residency() is
-  // kResident: a node that was kEmpty never held anything, and there is
-  // nothing to write back. Reading the residency rather than a separate flag
-  // keeps one fact in one place.
+  // What it held before, meaningful only when has_victim: a node that was empty
+  // never held anything, and there is nothing to write back.
   KeyT victim_key;
-  NodeState victim_state;
+  bool has_victim;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,10 +119,12 @@ struct AllocSlot {
 // middle of the prefetch pipeline, which is the one thing the whole design is
 // arranged to avoid.
 //
-// A miss is not necessarily an absent key. try_pin refuses a node that is
-// loading or already claimed, and this treats that as a miss rather than
-// waiting — spinning would mean spinning on an operation that may contain a
-// PCIe transfer, and the cost of being wrong is one extra transfer.
+// A pin that is refused is reported as a miss rather than waited for, because
+// spinning would mean spinning on an operation that may contain a PCIe
+// transfer. That is only safe because the refusal cannot happen here: a node is
+// loading or claimed only inside an allocate, and every row it loads is
+// published before the next lookup runs. Were it to happen, the allocator would
+// bind the key to a second node while the first still holds it.
 //
 // Compaction here rather than in a kernel of its own: the answer is already in
 // a register, so it costs one aggregated atomic and two stores instead of a
@@ -147,32 +150,10 @@ __global__ void lookup_pin_kernel(MapT map, NodeT* nodes,
     const typename MapT::Key key = keys[i];
     NodeId result = MapT::kNoNode;
 
+    // The node found is the node pinned: rebinding lives in the allocate
+    // kernel, which does not overlap this one. See the launch order above.
     const NodeId node = map.lookup(key);
-    if (node != MapT::kNoNode && nodes[node].state.try_pin()) {
-      // The node was resolved before it was held, so in principle it could have
-      // been evicted and rebound in between — and the state word cannot tell,
-      // because it returns to bit-identical values. Re-reading the key is what
-      // settles identity.
-      //
-      // Under the launch order above this cannot happen: rebinding lives in the
-      // allocate kernel, and that does not overlap this one. The check is here
-      // for the two futures that would revive it — a fused lookup-and-allocate
-      // kernel, or more than one prefetch stream — and costs one read of a line
-      // the chain walk has already touched.
-      if (nodes[node].key == key) {
-        result = node;
-      } else {
-        // Hand the reference straight back. This can never be the release that
-        // owns a re-queue: the node was reachable and resident, so either
-        // somebody else holds it too (the count does not reach zero) or it is
-        // sitting in the queue already (in_queue is set).
-        const bool owns_enqueue = nodes[node].state.release();
-        EC_ASSERT(!owns_enqueue &&
-                  "lookup_pin: undoing a pin should never make a node newly "
-                  "reclaimable");
-        (void)owns_enqueue;
-      }
-    }
+    if (node != MapT::kNoNode && nodes[node].state.try_pin()) result = node;
     out_nodes[i] = result;
 
     const bool is_miss = (result == MapT::kNoNode);
@@ -191,10 +172,10 @@ __global__ void lookup_pin_kernel(MapT map, NodeT* nodes,
 // For each miss: take a node off the reclaim queue and rebind it to the key.
 //
 // Claiming and rebinding are one kernel because nothing separates them. The
-// node is exclusively this thread's from the moment try_claim succeeds — the
-// residency is kEvicting, so no pin can take it and no other claim can either —
-// and the bucket lock handles the chain. Keeping them together also keeps the
-// victim's state in a register instead of in a buffer.
+// node is exclusively this thread's from the moment try_claim succeeds — it is
+// LOADING with a reference held, so no pin can take it and no other claim can
+// either — and the bucket lock handles the chain. Keeping them together also
+// keeps the victim's state in a register instead of in a buffer.
 //
 // A node that cannot be had (the queue ran dry) yields kNoNode in the slot. It
 // means every node is held by an in-flight step, which is a capacity planning
@@ -238,9 +219,9 @@ __global__ void allocate_kernel(
   // full flush. Read once; nothing in this kernel changes it.
   const int64_t n = static_cast<int64_t>(*miss_count);
 
-  // One snapshot for the whole kernel. `tail` cannot move while this runs: the
-  // only thing that advances it is a pushing kernel, and the stream event above
-  // keeps those from overlapping.
+  // One value for the whole kernel, fixed before it launched. `tail` itself may
+  // be moving under a release that started later; that release writes above this
+  // bound, and nothing here reads above it.
   const uint64_t tail_snapshot = queue.snapshot_tail();
 
   const int64_t stride = int64_t(gridDim.x) * blockDim.x;
@@ -260,22 +241,21 @@ __global__ void allocate_kernel(
     Slot slot;
     slot.node = node;
     slot.key = miss_keys[i];
-    slot.victim_state = victim;
     slot.victim_key = Key{};
+    slot.has_victim = false;
 
     if (node != QueueT::kNoNode) {
       // Read the outgoing key before insert() overwrites it. Only a resident
       // victim has one worth carrying; an empty node has never held anything.
       if (victim.residency() == NodeState::kResident) {
         slot.victim_key = nodes[node].key;
+        slot.has_victim = true;
         map.remove(node);
       }
+      // Bound, and not yet readable: try_claim left the node LOADING with the
+      // reference this step holds. The row lands later, and publish() is what
+      // advertises it, with a release store for exactly that reason.
       map.insert(node, slot.key);
-      // Bound, and not yet readable. The row lands later; publish() is what
-      // advertises it, and it is a release store for exactly that reason.
-      nodes[node].state.set(
-          victim.with_residency(NodeState::kLoading).with_refs(1u).with_used(
-              false).with_in_ring(false));
     }
     out_slots[i] = slot;
 
