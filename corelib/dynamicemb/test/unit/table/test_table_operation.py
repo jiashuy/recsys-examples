@@ -19,7 +19,8 @@ Level: unit.   Needs: 1 GPU.
 Covers: table_partition memory layout and capacity rounding; bucketize_keys
 ordering; ScoredHashTable insert / lookup / erase / reclaim / insert_and_evict
 under ASSIGN, ACCUMULATE and GLOBAL_TIMER score policies with 1 to 4 tables
-(including zero-capacity tables); the counter + overflow-bucket path.
+(including zero-capacity tables); a per-call CONST override keeping resident
+scores; the counter + overflow-bucket path.
 Does not cover (see unit/table/test_lru_lfu.py): the compound LRU_LFU policy
 and custom score functions; (see test_table_dump_load.py): dump / load.
 """
@@ -953,3 +954,40 @@ def test_overflow_with_counter(key_type, table_config):
 
     print("Phase 7 passed: reset verified")
     print("test_overflow_with_counter PASSED")
+
+
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+def test_const_policy_keeps_existing_scores(key_type):
+    """A per-call ``ScorePolicy.CONST`` override leaves a resident key's score as it was.
+
+    Keys inserted under ASSIGN carry the assigned score; re-inserting them with a
+    CONST override and a different value must not change it (this is how eval and
+    ``preserve_existing`` inserts avoid disturbing the eviction order).
+    """
+    device = torch.cuda.current_device()
+    batch = 64
+    table = get_scored_table(
+        capacity=[8 * 128],
+        bucket_capacity=128,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name="score1", policy=ScorePolicy.ASSIGN)],
+    )
+    keys = torch.randperm(batch, device=device, dtype=torch.int64).to(key_type)
+    table_ids = torch.zeros(batch, dtype=torch.int64, device=device)
+    assigned = torch.full((batch,), 7, dtype=torch.uint64, device=device)
+    table.insert(keys, table_ids, ScoreArg(name="score1", value=assigned))
+
+    other = torch.full((batch,), 99, dtype=torch.uint64, device=device)
+    table.insert(
+        keys,
+        table_ids,
+        ScoreArg(name="score1", value=other, policy=ScorePolicy.CONST),
+    )
+
+    score_out, founds, _ = table.lookup(
+        keys,
+        table_ids,
+        ScoreArg(name="score1", value=other, policy=ScorePolicy.CONST),
+    )
+    assert founds.all()
+    assert (score_out == 7).all()

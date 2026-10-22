@@ -18,13 +18,13 @@
 Level: unit.   Needs: 1 GPU.
 Covers: the module alone (no sharding, no TorchRec model) trained with SGD
 (lr 1.0) on a gradient of ones, over embedding dim (aligned or not), batch size
-(odd or not) and per-feature bag-size profile. Pooled (SUM): output shape, and each
-bag's sum falls by the occurrence counts of its keys.
+(odd or not) and per-feature bag-size profile. Pooled (SUM and MEAN): output shape,
+and each bag falls by what the occurrence counts of its keys imply.
 Sequence (pooling NONE), with and without index dedup: the update each key
 received equals its occurrence count in the batch (checked by re-reading the
 rows in eval mode and comparing with the pre-update output).
 Does not cover (see test_forward_backward.py): other optimizers, caching,
-deterministic mode; MEAN pooling backward.
+deterministic mode.
 """
 
 import gc
@@ -107,34 +107,48 @@ SHAPES = [
 ]
 
 
-def _expected_pooled_drop(sparse_feature, batch_size: int) -> torch.Tensor:
-    """[batch, tables]: how far each bag's SUM must fall after SGD(lr=1) on ones.
+def _expected_pooled_drop(
+    sparse_feature, batch_size: int, pooling_mode: DynamicEmbPoolingMode
+) -> torch.Tensor:
+    """[batch, tables]: how far each pooled bag must fall after SGD(lr=1) on ones.
 
-    Every occurrence of a key, in any bag, subtracts 1 from each element of its
-    row, so a bag containing keys k1..kn falls by count(k1) + ... + count(kn),
-    counts taken over the whole batch of that table.
+    An occurrence of a key in a bag of ``L`` keys receives gradient ``w`` (1 for
+    SUM, 1/L for MEAN) and subtracts it from every element of the key's row, so a
+    key's row falls by the sum of ``w`` over all its occurrences in the batch. A
+    bag's pooled value is ``w`` times the sum of its keys' rows, so it falls by
+    ``w`` times the sum of its keys' row drops.
     """
     table_num = len(NUM_EMBEDDINGS)
     device = sparse_feature.values().device
     lengths = sparse_feature.lengths().view(table_num, batch_size)
     drop = torch.zeros(batch_size, table_num, device=device)
     for t, keys in enumerate(x.values() for x in sparse_feature.split([1] * table_num)):
-        _, inverse, counts = torch.unique(keys, return_inverse=True, return_counts=True)
         bag_of_key = torch.repeat_interleave(
             torch.arange(batch_size, device=device), lengths[t]
         )
-        drop[:, t].index_add_(0, bag_of_key, counts[inverse].float())
+        weight = torch.ones(keys.numel(), device=device)
+        if pooling_mode == DynamicEmbPoolingMode.MEAN:
+            weight = 1.0 / lengths[t][bag_of_key].float()
+        _, inverse = torch.unique(keys, return_inverse=True)
+        row_drop = torch.zeros(int(inverse.max()) + 1 if keys.numel() else 0, device=device)
+        row_drop.index_add_(0, inverse, weight)
+        drop[:, t].index_add_(0, bag_of_key, weight * row_drop[inverse])
     return drop
 
 
+@pytest.mark.parametrize(
+    "pooling_mode",
+    [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.MEAN],
+    ids=["sum", "mean"],
+)
 @pytest.mark.parametrize("dim,batch_size,multi_hot_sizes", SHAPES)
 def test_pooled_backward_updates_each_key_by_its_count(
-    backend_session, dim, batch_size, multi_hot_sizes
+    backend_session, pooling_mode, dim, batch_size, multi_hot_sizes
 ):
-    """Pooled SUM is [batch, tables * dim]; after SGD(lr=1, grad=1) each bag's
-    sum fell by the occurrence counts of its keys."""
+    """Pooled output is [batch, tables * dim]; after SGD(lr=1, grad=1) each bag
+    fell by what its keys' occurrences (weighted 1 for SUM, 1/bag-size for MEAN) imply."""
     table_num = len(NUM_EMBEDDINGS)
-    var = _make_tables(dim, DynamicEmbPoolingMode.SUM)
+    var = _make_tables(dim, pooling_mode)
     for iteration in range(NUM_ITERATIONS):
         sparse_feature = _make_batch(batch_size, multi_hot_sizes)
         res = var(sparse_feature.values(), sparse_feature.offsets())
@@ -149,7 +163,7 @@ def test_pooled_backward_updates_each_key_by_its_count(
             # Column 0 of each table's block: every column moves alike.
             before = res.view(batch_size, table_num, dim)[:, :, 0]
             after = updated.view(batch_size, table_num, dim)[:, :, 0]
-            expected = _expected_pooled_drop(sparse_feature, batch_size)
+            expected = _expected_pooled_drop(sparse_feature, batch_size, pooling_mode)
             torch.testing.assert_close(
                 before - after,
                 expected,

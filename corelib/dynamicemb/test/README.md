@@ -75,7 +75,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `unit/incremental_dump/test_batched_dynamicemb_tables.py` | which keys each incremental-dump window returns (`load_dump`) |
 | `unit/incremental_dump/test_replay_increment.py` | `replay_increment`: apply a delta to another model + validation (`load_dump`) |
 | `unit/module/test_forward_backward.py` | `BatchedDynamicEmbeddingTablesV2` fwd/bwd vs FBGEMM; deterministic insert; empty batch; mixed dims; admission |
-| `unit/module/test_batched_table_backward.py` | one-GPU backward, pooled and sequence: each key updated by its occurrence count |
+| `unit/module/test_batched_table_backward.py` | one-GPU backward, pooled (SUM, MEAN) and sequence: each key updated by its occurrence count |
 | `unit/module/test_weighted_pooled_embedding_v2.py` | weighted SUM pooling vs unsharded EBC |
 | `unit/module/test_cache_flush.py` | cache prefetch and flush |
 | `unit/module/test_capacity_expansion.py` | capacity growth while inserting |
@@ -128,11 +128,11 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 
 ## Known gaps (not covered by any test)
 
-* Table-level `HybridStorage` dump/load; `ScorePolicy.CONST`; compound LRU_LFU at table-level dump/load.
+* Table-level `HybridStorage` dump/load; `ScorePolicy.CONST` as a table's own (not per-call) policy; compound LRU_LFU at table-level dump/load.
 * Overflow-bucket behaviour with eviction / caching beyond one counter case.
 * `replay_increment` on multi-rank models; incremental dump with per-table differing score strategies.
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
-* Pooled MEAN backward; backward with optimizers other than SGD at module level (SUM and sequence backward are value-checked).
+* Backward with optimizers other than SGD at module level (pooled SUM / MEAN and sequence backward are value-checked).
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` for pooled / sequence; `data_parallel_embeddings`; sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw entries exist but are not parametrized.
