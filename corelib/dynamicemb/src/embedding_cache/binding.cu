@@ -128,7 +128,6 @@ class EmbeddingCacheCore {
   void reset() {
     const c10::cuda::CUDAGuard guard(device_);
     DEMB_CUDA_CHECK(cudaDeviceSynchronize());
-    const cudaStream_t stream = current_stream();
     for (size_t t = 0; t < maps_.size(); ++t) {
       maps_[t]->clear_buckets();
       maps_[t]->clear_links();
@@ -137,7 +136,6 @@ class EmbeddingCacheCore {
                                                       capacities_[t]);
       queues_[t]->reset();
     }
-    (void)stream;
     DEMB_CUDA_CHECK(cudaDeviceSynchronize());
   }
 

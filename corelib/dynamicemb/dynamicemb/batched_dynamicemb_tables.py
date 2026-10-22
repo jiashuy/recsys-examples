@@ -1248,9 +1248,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
-            if isinstance(self._cache, DynamicEmbCache):
-                self._cache.training = False
-                self._cache.set_score(fused_score)
             if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
@@ -1291,8 +1288,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.training = False
 
@@ -1320,9 +1315,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.training = True
-            self._cache.set_score(fused_score)
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.training = True
             self._storage.set_score(fused_score)

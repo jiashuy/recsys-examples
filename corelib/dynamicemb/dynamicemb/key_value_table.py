@@ -2472,20 +2472,6 @@ class DynamicEmbCache(Cache):
     def set_record_cache_metrics(self, record: bool) -> None:
         self._record_cache_metrics = record
 
-    # The cache holds no score. These stay so the module can set them on whatever
-    # cache it has, and they do nothing.
-
-    def set_score(self, score: int) -> None:
-        pass
-
-    @property
-    def training(self) -> bool:
-        return self._state.training
-
-    @training.setter
-    def training(self, value: bool) -> None:
-        self._state.training = value
-
     # -- Convenience accessors --
 
     @property

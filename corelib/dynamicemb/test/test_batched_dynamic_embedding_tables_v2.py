@@ -683,9 +683,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
         return
 
     saved_st = storage.training
-    saved_ca = cache.training
     storage.training = False
-    cache.training = False
     try:
         storage_dict = _kim_scan_keys_embeddings_dict(
             storage._state, device, batch_size=batch_size
@@ -755,7 +753,6 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 torch.testing.assert_close(ref, emb_live, rtol=1e-5, atol=1e-5)
     finally:
         storage.training = saved_st
-        cache.training = saved_ca
 
 
 def _compare_bdebt_export_to_stbe_weights(

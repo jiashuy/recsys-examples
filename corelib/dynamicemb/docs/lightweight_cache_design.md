@@ -1,6 +1,6 @@
 # 轻量化 Embedding Cache 设计提案
 
-> 状态：草案（Draft）
+> 状态：已实现并接入 `DynamicEmbCache`（见 §17）；其余章节是设计依据，与实现不一致处以 §17 和各节顶部的说明为准
 > 适用范围：DynamicEmb **训练**路径的 GPU 侧 embedding 缓存（不覆盖推理部署，见 §2.2）
 > 关联代码：`corelib/dynamicemb/`
 > 实现：`src/embedding_cache/`。与本文的差异，以实现为准，已回写到各节：
