@@ -45,6 +45,9 @@ from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 NUM_EMBEDDINGS = [196608, 131072, 9437184, 851968]
 DEFAULT_MULTI_HOT = [20, 17, 101, 49]
 NUM_ITERATIONS = 32
+# Pooled backward uses a gradient of GRAD instead of 1: the initial rows are large, so a
+# bag's drop would otherwise sit at the fp32 resolution of the pooled value.
+GRAD = 4096.0
 
 
 def _make_tables(dim, pooling_mode, use_index_dedup=None):
@@ -145,14 +148,14 @@ def _expected_pooled_drop(
 def test_pooled_backward_updates_each_key_by_its_count(
     backend_session, pooling_mode, dim, batch_size, multi_hot_sizes
 ):
-    """Pooled output is [batch, tables * dim]; after SGD(lr=1, grad=1) each bag
+    """Pooled output is [batch, tables * dim]; after SGD(lr=1, grad=GRAD) each bag
     fell by what its keys' occurrences (weighted 1 for SUM, 1/bag-size for MEAN) imply."""
     table_num = len(NUM_EMBEDDINGS)
     var = _make_tables(dim, pooling_mode)
     for iteration in range(NUM_ITERATIONS):
         sparse_feature = _make_batch(batch_size, multi_hot_sizes)
         res = var(sparse_feature.values(), sparse_feature.offsets())
-        res.backward(torch.ones_like(res))
+        res.backward(torch.full_like(res, GRAD))
         with torch.no_grad():
             assert res.dim() == 2
             assert res.size() == (batch_size, table_num * dim)
@@ -163,13 +166,19 @@ def test_pooled_backward_updates_each_key_by_its_count(
             # Column 0 of each table's block: every column moves alike.
             before = res.view(batch_size, table_num, dim)[:, :, 0]
             after = updated.view(batch_size, table_num, dim)[:, :, 0]
-            expected = _expected_pooled_drop(sparse_feature, batch_size, pooling_mode)
-            torch.testing.assert_close(
-                before - after,
-                expected,
-                rtol=1e-4,
-                atol=1e-3,
-                msg=lambda m: f"iteration {iteration}: {m}",
+            expected = GRAD * _expected_pooled_drop(
+                sparse_feature, batch_size, pooling_mode
+            )
+            # The pooled values are fp32 sums of large rows, so the difference of two of
+            # them carries a few ulps of rounding: 1% of the drop, which a wrong weight
+            # (1 instead of 1/bag-size, a missed duplicate) exceeds many times over.
+            ulp = torch.finfo(torch.float32).eps * before.abs()
+            tolerance = 0.01 * expected + 8 * ulp + 1e-3
+            error = ((before - after) - expected).abs()
+            assert (error <= tolerance).all(), (
+                f"iteration {iteration}: max error {error.max().item()} at "
+                f"{(error - tolerance).argmax().item()} (expected drop there "
+                f"{expected.flatten()[(error - tolerance).argmax()].item()})"
             )
     _release(var)
 
