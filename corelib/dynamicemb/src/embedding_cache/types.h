@@ -25,7 +25,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "hashmap.h"
+#include "hashmap_view.h"
 #include "node_state.h"
 
 namespace embedding_cache {

@@ -47,6 +47,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <memory>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "../torch_utils.h"
@@ -113,6 +114,13 @@ class EmbeddingCacheCore {
   EmbeddingCacheCore& operator=(const EmbeddingCacheCore&) = delete;
 
   int64_t num_tables() const { return static_cast<int64_t>(maps_.size()); }
+
+  // The eviction guard, in the form the backing's insert takes: a device pointer
+  // to the per-table maps, and how many there are. It stays valid as long as this
+  // object does.
+  std::pair<int64_t, int64_t> guard() const {
+    return {reinterpret_cast<int64_t>(d_views_.data_ptr()), num_tables()};
+  }
   int64_t capacity(int64_t table) const { return capacities_.at(table); }
 
   // Every table back to a fresh, empty cache. Not for use while a step is in
@@ -381,6 +389,7 @@ void bind_embedding_cache(py::module& m) {
   py::class_<EmbeddingCacheCore>(m, "EmbeddingCacheCore")
       .def(py::init<std::vector<int64_t>>(), py::arg("capacities"))
       .def("num_tables", &EmbeddingCacheCore::num_tables)
+      .def("guard", &EmbeddingCacheCore::guard)
       .def("capacity", &EmbeddingCacheCore::capacity, py::arg("table"))
       .def("reset", &EmbeddingCacheCore::reset)
       .def("lookup_pin", &EmbeddingCacheCore::lookup_pin, py::arg("keys"),

@@ -109,7 +109,8 @@ void bind_table_operation(py::module &m) {
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("guard_tables") = 0,
+        py::arg("guard_num_tables") = 0);
 
   m.def("table_insert_collect_evicted", &dyn_emb::table_insert_collect_evicted,
         "insert into the table, retaining evicted (key, table_id)",
@@ -118,7 +119,8 @@ void bind_table_operation(py::module &m) {
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("guard_tables") = 0,
+        py::arg("guard_num_tables") = 0);
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),

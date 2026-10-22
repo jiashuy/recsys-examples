@@ -311,7 +311,8 @@ __global__ void allocate_kernel(
 // the cache is not being modified. That holds: the backing inserts after the
 // cache has bound this step's nodes and before it does anything else.
 //
-// A view, passed to the backing's kernel by value, like the others.
+// guard.h has the same rule as a plain struct the backing's kernels can include;
+// this one is for code in this directory that is generic over the map type.
 
 template <typename MapT>
 struct EvictionGuard {

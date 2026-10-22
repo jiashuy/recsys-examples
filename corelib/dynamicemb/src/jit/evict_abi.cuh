@@ -69,6 +69,12 @@ struct EvictParams {
   int *ovf_bucket_sizes;
   int32_t *ovf_counter;
   const int64_t *ovf_output_offsets;
+
+  // --- the cache's eviction guard (plain insert only; null/0 for no guard) ---
+  // Layout-compatible with embedding_cache::EvictionGuardView, which this header
+  // cannot include: the host-side launcher includes it too.
+  const void *guard_tables;
+  int32_t guard_num_tables;
 };
 
 } // namespace dyn_emb

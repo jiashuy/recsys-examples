@@ -82,7 +82,11 @@ at::Tensor table_insert(at::Tensor table_storage,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
-                        int64_t num_scores = 1, int64_t score_fn_key = 0);
+                        int64_t num_scores = 1, int64_t score_fn_key = 0,
+                        // The cache's eviction guard: a device pointer to its
+                        // per-table maps and how many, or 0 for none. See
+                        // embedding_cache/guard.h.
+                        int64_t guard_tables = 0, int64_t guard_num_tables = 0);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
 // (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
@@ -95,7 +99,8 @@ table_insert_collect_evicted(
     ScorePolicyType policy_type, at::Tensor counter,
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
-    int64_t num_scores = 1, int64_t score_fn_key = 0);
+    int64_t num_scores = 1, int64_t score_fn_key = 0, int64_t guard_tables = 0,
+    int64_t guard_num_tables = 0);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>

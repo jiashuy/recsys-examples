@@ -579,11 +579,16 @@ class LinearBucketTable(ScoredHashTable):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         collect_evicted: bool = False,
+        guard: Optional[Tuple[int, int]] = None,
     ):
         """
         Keys have to be unique.
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
+            guard: ``(device pointer, number of tables)`` of a cache's eviction
+                guard (``DynamicEmbCache.eviction_guard``), or ``None``. A key the
+                guard refuses is never evicted to make room; if every candidate in
+                a bucket is refused the insert of that key fails.
         Returns:
             indices; or, when ``collect_evicted`` is True, the 4-tuple
             ``(indices, num_evicted, evicted_keys, evicted_table_ids)`` where the
@@ -603,7 +608,11 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            return self._deterministic_insert(keys, table_ids, score_value, policy)
+            return self._deterministic_insert(
+                keys, table_ids, score_value, policy, guard
+            )
+
+        guard_tables, guard_num_tables = guard if guard is not None else (0, 0)
 
         if collect_evicted:
             return table_insert_collect_evicted(
@@ -620,6 +629,8 @@ class LinearBucketTable(ScoredHashTable):
                 score_out,
                 num_scores=num_scores,
                 score_fn_key=self.score_fn_key_,
+                guard_tables=guard_tables,
+                guard_num_tables=guard_num_tables,
             )
 
         indices = table_insert(
@@ -636,6 +647,8 @@ class LinearBucketTable(ScoredHashTable):
             score_out,
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
+            guard_tables=guard_tables,
+            guard_num_tables=guard_num_tables,
         )
         return indices
 
@@ -1629,9 +1642,11 @@ class LinearBucketTable(ScoredHashTable):
         table_ids: torch.Tensor,
         score_value: Optional[torch.Tensor],
         policy: ScorePolicy,
+        guard: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """Deterministic insert: bucketize, insert one wave at a time, then
         lookup to get final indices."""
+        guard_tables, guard_num_tables = guard if guard is not None else (0, 0)
         if keys.numel() == 0:
             return torch.empty(0, dtype=torch.int64, device=keys.device)
 
@@ -1657,6 +1672,8 @@ class LinearBucketTable(ScoredHashTable):
                 vs,
                 policy,
                 self._ref_counter,
+                guard_tables=guard_tables,
+                guard_num_tables=guard_num_tables,
             )
 
         _, _, indices = table_lookup(

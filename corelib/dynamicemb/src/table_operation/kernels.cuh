@@ -234,9 +234,12 @@ struct DefaultEvictor {
   operator()(Bucket &bucket, typename Bucket::Iterator &iter,
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
-             int64_t counter_offset, uint64_t /*cur_ts*/) const {
+             int64_t counter_offset, uint64_t /*cur_ts*/,
+             embedding_cache::EvictionGuardView guard,
+             int64_t table_id) const {
     return bucket.template reduce<ReductionGroupSize, BufferDim>(
-        iter, evict_key, evict_score, sm_scores, counter, counter_offset);
+        iter, evict_key, evict_score, sm_scores, counter, counter_offset, guard,
+        table_id);
   }
 };
 
@@ -246,11 +249,13 @@ template <typename Comparator> struct RankedEvictor {
   operator()(Bucket &bucket, typename Bucket::Iterator &iter,
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
-             int64_t counter_offset, uint64_t cur_ts) const {
+             int64_t counter_offset, uint64_t cur_ts,
+             embedding_cache::EvictionGuardView guard,
+             int64_t table_id) const {
     return bucket.template reduce_ranked<Comparator, ReductionGroupSize,
                                          BufferDim>(
         iter, evict_key, evict_score, sm_scores, counter, counter_offset,
-        cur_ts);
+        cur_ts, guard, table_id);
   }
 };
 
@@ -263,7 +268,10 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
        InsertResult result_in, typename Bucket::Iterator *iter_out,
        InsertResult *result_out, KeyType *evict_key_out,
        ScoreType *evict_score_out, int32_t *__restrict__ counter,
-       int64_t counter_offset, uint64_t cur_ts = 0) {
+       int64_t counter_offset, uint64_t cur_ts = 0,
+       embedding_cache::EvictionGuardView guard =
+           embedding_cache::EvictionGuardView{nullptr, 0},
+       int64_t table_id = 0) {
   auto iter = iter_in;
   auto result = result_in;
   Evictor evictor;
@@ -273,13 +281,16 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 
     bool succeed = evictor.template operator()<ReductionGroupSize, BufferDim>(
         bucket, iter, evict_key, evict_score, sm_scores, counter,
-        counter_offset, cur_ts);
+        counter_offset, cur_ts, guard, table_id);
 
     if (succeed) {
       if (bucket.try_lock(iter, evict_key)) {
         if (evict_key != Bucket::reclaimed_key()) {
           int64_t flat_idx = counter_offset + iter;
-          if (::atomicAdd(&counter[flat_idx], 0) > 0) {
+          // Checked again under the lock: it can have been pinned, or the cache
+          // can have taken a reference to it, since the scan chose it.
+          if (::atomicAdd(&counter[flat_idx], 0) > 0 ||
+              guard.refuses(evict_key, table_id)) {
             bucket.unlock(iter, evict_key);
             continue;
           }
@@ -348,7 +359,9 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             int32_t *__restrict__ counter, uint64_t cur_ts = 0,
             typename Table::KeyType *__restrict__ evicted_keys = nullptr,
             int64_t *__restrict__ evicted_table_ids = nullptr,
-            CounterType *evicted_counter = nullptr) {
+            CounterType *evicted_counter = nullptr,
+            embedding_cache::EvictionGuardView guard =
+                embedding_cache::EvictionGuardView{nullptr, 0}) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -377,9 +390,11 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     int64_t bucket_id = 0;
     int64_t bkt_begin = 0;
     int64_t table_cap = 0;
+    int64_t guard_table = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
+      guard_table = t_id;
       bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
@@ -411,7 +426,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
         &iter, &result,
         CollectEvicted ? &evict_key : static_cast<KeyType *>(nullptr),
-        static_cast<ScoreType *>(nullptr), counter, counter_offset, cur_ts);
+        static_cast<ScoreType *>(nullptr), counter, counter_offset, cur_ts,
+        guard, guard_table);
 
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
@@ -474,11 +490,11 @@ __global__ void table_insert_kernel(
     InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
     ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
     typename Table::KeyType **__restrict__ table_key_slots,
-    int32_t *__restrict__ counter) {
+    int32_t *__restrict__ counter, embedding_cache::EvictionGuardView guard) {
   insert_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0);
+      counter, /*cur_ts=*/0, nullptr, nullptr, nullptr, guard);
 }
 
 // AoT entry: plain insert that also retains each evicted victim's (key,
@@ -496,11 +512,13 @@ __global__ void table_insert_collect_kernel(
     typename Table::KeyType **__restrict__ table_key_slots,
     int32_t *__restrict__ counter, CounterType *evicted_counter,
     typename Table::KeyType *__restrict__ evicted_keys,
-    int64_t *__restrict__ evicted_table_ids) {
+    int64_t *__restrict__ evicted_table_ids,
+    embedding_cache::EvictionGuardView guard) {
   insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter);
+      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter,
+      guard);
 }
 
 template <typename Table, typename KernelTraits, typename Evictor>

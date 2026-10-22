@@ -2487,6 +2487,12 @@ class DynamicEmbCache(Cache):
         self._core.reset()
 
     @property
+    def eviction_guard(self) -> Tuple[int, int]:
+        """What the backing's insert asks before evicting a key: a device pointer
+        to this cache's per-table maps, and how many tables."""
+        return self._core.guard()
+
+    @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
         return self._cache_metrics if self._record_cache_metrics else None
 
