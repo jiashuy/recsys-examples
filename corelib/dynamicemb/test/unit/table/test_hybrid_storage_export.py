@@ -523,3 +523,76 @@ def test_hybrid_incremental_dump_slot_index_tier():
     # key_slot = bits 0..62 (clear the tier bit) -> a valid non-negative slot.
     key_slot = slot_index & 0x7FFFFFFFFFFFFFFF
     assert int(key_slot.min()) >= 0
+
+
+@pytest.mark.parametrize("local_hbm_budget_scale", [0.55, 0.1])
+def test_hybrid_storage_dump_load_round_trip(local_hbm_budget_scale, tmp_path):
+    """Keys, LFU scores and embeddings survive ``dump`` -> ``load`` on a fresh storage.
+
+    Enough unique keys go in that both tiers hold rows. The dump appends the HBM
+    tier after the host tier into one file set, and the load routes every row back
+    into the tiers of the new storage, so the comparison is on the union.
+    """
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    num_embeddings, embedding_dim, num_keys = 10000, 16, 3000
+
+    def fresh_storage() -> HybridStorage:
+        storage = _build_storage(
+            num_embeddings,
+            embedding_dim,
+            DynamicEmbScoreStrategy.LFU,
+            local_hbm_budget_scale,
+            EmbOptimType.SGD,
+        )
+        storage.training = True
+        return storage
+
+    source = fresh_storage()
+    keys = torch.randperm(num_embeddings, device=device)[:num_keys].to(torch.int64)
+    tids = torch.zeros(num_keys, dtype=torch.int64, device=device)
+    counts = torch.randint(1, 50, (num_keys,), dtype=torch.int64, device=device)
+    values = torch.zeros(
+        num_keys, source.value_dim(0), dtype=source.embedding_dtype(), device=device
+    )
+    values[:, :embedding_dim] = keys.view(-1, 1).to(values.dtype) / num_embeddings
+    source.insert(keys, tids, values, scores=counts)
+
+    before_scores = export_scores_dict(source, device)
+    before_embs = export_embeddings_dict(source, device)
+    assert len(before_scores) > 0
+
+    # export_keys_values erased the HBM-resident keys from the host tier; build the
+    # source again so the dump sees the storage as the model left it.
+    source = fresh_storage()
+    source.insert(keys, tids, values, scores=counts)
+    paths = {
+        name: str(tmp_path / name)
+        for name in ("meta.json", "keys", "embeddings", "scores", "opt")
+    }
+    source.dump(
+        0,
+        paths["meta.json"],
+        paths["keys"],
+        paths["embeddings"],
+        paths["scores"],
+        paths["opt"],
+        include_optim=False,
+    )
+
+    target = fresh_storage()
+    target.load(
+        0,
+        paths["meta.json"],
+        paths["keys"],
+        paths["embeddings"],
+        paths["scores"],
+        None,
+        include_optim=False,
+    )
+
+    after_scores = export_scores_dict(target, device)
+    after_embs = export_embeddings_dict(target, device)
+    assert after_scores == before_scores
+    assert after_embs.keys() == before_embs.keys()
+    for key, vec in before_embs.items():
+        torch.testing.assert_close(after_embs[key], vec)
