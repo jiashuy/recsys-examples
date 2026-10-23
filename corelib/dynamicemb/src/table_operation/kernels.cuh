@@ -30,7 +30,7 @@ namespace dyn_emb {
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
           int CompactTileSize_, int NumScorePerThread_,
           ScorePolicyType PolicyType_ = ScorePolicyType::Const,
-          bool OutputScore_ = false, bool EnableOverflow_ = false>
+          bool OutputScore_ = false>
 struct InsertKernelTraits {
   static constexpr int ThreadBlockDim = ThreadBlockDim_;
   static constexpr int ProbingGroupSize = ProbingGroupSize_;
@@ -39,7 +39,6 @@ struct InsertKernelTraits {
   static constexpr int NumScorePerThread = NumScorePerThread_;
   static constexpr ScorePolicyType PolicyType = PolicyType_;
   static constexpr bool OutputScore = OutputScore_;
-  static constexpr bool EnableOverflow = EnableOverflow_;
 };
 
 template <bool Pred> struct ExportPredFunctor {
@@ -78,15 +77,13 @@ struct EvalAndCount {
   }
 };
 
-template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
-          bool EnableOverflow = false>
+template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType>
 __global__ void table_lookup_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int64_t batch, typename Table::KeyType const *__restrict__ input_keys,
     int64_t const *__restrict__ table_ids, bool *__restrict__ founds,
     IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
-    int64_t *__restrict__ score_output, Table ovf_table,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t *__restrict__ score_output) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -147,36 +144,6 @@ __global__ void table_lookup_kernel(
 
       if (found) {
         index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
-      }
-    }
-
-    if constexpr (EnableOverflow) {
-      if (!found && Bucket::is_valid(key)) {
-        Bucket ovf_bucket = ovf_table[t_id];
-        Iter ovf_iter = Iter(hashcode % ovf_bucket.capacity());
-        Iter ovf_out_iter;
-        bool ovf_found = overflow_find(
-            ovf_bucket, key, ovf_output_offsets[t_id], ovf_iter, &ovf_out_iter);
-        if (ovf_found) {
-          found = true;
-          index = ovf_out_iter;
-          Iter local = ovf_out_iter - ovf_output_offsets[t_id];
-          if constexpr (PolicyType == ScorePolicyType::Const) {
-            // Reduction score (frequency for LruLfu), not word 0 (timestamp).
-            score = *ovf_bucket.reduction_score(local);
-          } else {
-            // Maintain the overflow entry's score on access (stamp timestamp /
-            // accumulate frequency), mirroring the main-table found path; for
-            // LruLfu update() writes both words. Lock the slot for a consistent
-            // write; skip if the entry moved out concurrently.
-            KeyType expected_key = key;
-            if (ovf_bucket.try_lock(local, expected_key)) {
-              score = ScorePolicy<PolicyType>::update(ovf_bucket.scores(local),
-                                                      score);
-              ovf_bucket.unlock(local, key);
-            }
-          }
-        }
       }
     }
 
@@ -541,9 +508,7 @@ __device__ __forceinline__ void insert_and_evict_body(
     int64_t *__restrict__ evicted_scores,
     IndexType *__restrict__ evicted_indices,
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
-    Table ovf_table, int *__restrict__ ovf_bucket_sizes,
-    int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts) {
+    uint64_t cur_ts) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -556,8 +521,6 @@ __device__ __forceinline__ void insert_and_evict_body(
   static constexpr int ReductionGroupSize = KernelTraits::ReductionGroupSize;
   static constexpr ScorePolicyType PolicyType = KernelTraits::PolicyType;
   static constexpr bool OutputScore = KernelTraits::OutputScore;
-  static constexpr bool UseOverflow = KernelTraits::EnableOverflow;
-
   using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -614,68 +577,13 @@ __device__ __forceinline__ void insert_and_evict_body(
       table_key_slot = bucket.keys(iter);
     }
 
-    // Overflow fallback for Busy results
-    KeyType final_evict_key = evict_key;
-    ScoreType final_evict_score = evict_score;
-    IndexType final_evict_index = -static_cast<IndexType>(i + 1);
-    InsertResult final_result = result;
-
-    if constexpr (UseOverflow) {
-      if (result == InsertResult::Busy && Bucket::is_valid(key)) {
-        Bucket ovf_bucket = ovf_table[t_id];
-        int64_t ovf_bucket_capacity = ovf_bucket.capacity();
-        Iter ovf_iter = Iter(hashcode % ovf_bucket_capacity);
-        InsertResult ovf_result = InsertResult::Init;
-        KeyType ovf_evict_key = KeyType();
-        int32_t *ovf_counter_table = ovf_counter + t_id * ovf_bucket_capacity;
-        overflow_insert_and_evict(ovf_bucket, key, ovf_bucket_sizes, t_id,
-                                  ovf_counter_table, ovf_output_offsets[t_id],
-                                  ovf_iter, &ovf_iter, &ovf_result,
-                                  &ovf_evict_key);
-
-        if (isInsertSuccess(ovf_result)) {
-          index = ovf_iter;
-          final_result = ovf_result;
-          table_key_slot = nullptr;
-          Iter local = ovf_iter - ovf_output_offsets[t_id];
-          if (ovf_result == InsertResult::Insert ||
-              ovf_result == InsertResult::Evict) {
-            // Newly occupied overflow slot (locked until table_unlock_kernel):
-            // clear the whole score block so LruLfu frequency restarts at 0,
-            // then write the score words via the policy.
-            for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
-              *ovf_bucket.scores(local, s) = ScoreType();
-            score = Policy::update(ovf_bucket.scores(local), score);
-            table_key_slot = ovf_bucket.keys(local);
-            if (ovf_result == InsertResult::Evict) {
-              final_evict_key = ovf_evict_key;
-              final_evict_index = ovf_iter;
-            }
-          } else if (ovf_result == InsertResult::Assign) {
-            // Existing overflow key re-inserted: update its score under lock
-            // (accumulate for LruLfu). It is not locked by the find, so guard.
-            KeyType expected_key = key;
-            if (ovf_bucket.try_lock(local, expected_key)) {
-              score = Policy::update(ovf_bucket.scores(local), score);
-              ovf_bucket.unlock(local, key);
-            }
-          }
-        }
-      }
-
-      if (result == InsertResult::Evict) {
-        final_evict_index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
-      }
-    }
-
     // Eviction compaction -- all threads participate in ballot
     {
       auto g = cg::tiled_partition<KernelTraits::CompactTileSize>(
           cg::this_thread_block());
 
-      InsertResult cmp_result = UseOverflow ? final_result : result;
-      bool evicted = (cmp_result == InsertResult::Evict ||
-                      cmp_result == InsertResult::Busy);
+      bool evicted =
+          (result == InsertResult::Evict || result == InsertResult::Busy);
       uint32_t vote = g.ballot(evicted);
       int group_cnt = __popc(vote);
       CounterType group_offset = 0;
@@ -687,19 +595,13 @@ __device__ __forceinline__ void insert_and_evict_body(
       int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
       int64_t out_id = group_offset + previous_cnt;
       if (evicted) {
-        if constexpr (UseOverflow) {
-          evicted_keys[out_id] = final_evict_key;
-          evicted_scores[out_id] = static_cast<int64_t>(final_evict_score);
-          evicted_indices[out_id] = final_evict_index;
-        } else {
-          evicted_keys[out_id] = evict_key;
-          evicted_scores[out_id] = static_cast<int64_t>(evict_score);
-          IndexType evict_idx =
-              (result == InsertResult::Evict)
-                  ? (bucket_id - bkt_begin) * bucket.capacity() + iter
-                  : -static_cast<IndexType>(i + 1);
-          evicted_indices[out_id] = evict_idx;
-        }
+        evicted_keys[out_id] = evict_key;
+        evicted_scores[out_id] = static_cast<int64_t>(evict_score);
+        IndexType evict_idx =
+            (result == InsertResult::Evict)
+                ? (bucket_id - bkt_begin) * bucket.capacity() + iter
+                : -static_cast<IndexType>(i + 1);
+        evicted_indices[out_id] = evict_idx;
         evicted_table_ids[out_id] = table_ids[i];
       }
     }
@@ -714,7 +616,7 @@ __device__ __forceinline__ void insert_and_evict_body(
     table_key_slots[i] = table_key_slot;
     indices[i] = index;
     if (insert_results) {
-      insert_results[i] = UseOverflow ? final_result : result;
+      insert_results[i] = result;
     }
   }
 }
@@ -736,16 +638,12 @@ __global__ void table_insert_and_evict_kernel(
     typename Table::KeyType *__restrict__ evicted_keys,
     int64_t *__restrict__ evicted_scores,
     IndexType *__restrict__ evicted_indices,
-    int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
-    Table ovf_table, int *__restrict__ ovf_bucket_sizes,
-    int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
-      evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0);
+      evicted_table_ids, counter, /*cur_ts=*/0);
 }
 
 template <typename Table>
@@ -887,99 +785,6 @@ __global__ void table_export_batch_kernel(
       }
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Overflow buffer: find a key by linear scan.
-// Returns true if found, sets *iter_out = local_pos + output_offset.
-// ---------------------------------------------------------------------------
-template <typename Bucket, typename KeyType>
-__forceinline__ __device__ bool
-overflow_find(Bucket &ovf_bucket, KeyType key, int64_t output_offset,
-              typename Bucket::Iterator start_iter,
-              typename Bucket::Iterator *iter_out) {
-  for (int64_t scan = 0; scan < ovf_bucket.capacity(); scan++) {
-    auto pos = (start_iter + scan) % ovf_bucket.capacity();
-
-    auto key_slot =
-        reinterpret_cast<typename Bucket::AtomicKey *>(ovf_bucket.keys(pos));
-    KeyType k = key_slot->load(cuda::std::memory_order_relaxed);
-
-    if (k == key) {
-      *iter_out = pos + output_offset;
-      return true;
-    }
-    if (k == Bucket::empty_key()) {
-      return false;
-    }
-  }
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Overflow buffer: single-pass find-or-insert with counter-based eviction.
-// Linear scan: key found -> Assign; empty -> Insert; counter==0 -> Evict.
-// Outputs unified index (local + output_offset).
-// ---------------------------------------------------------------------------
-template <typename Bucket, typename KeyType>
-__forceinline__ __device__ void overflow_insert_and_evict(
-    Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
-    int64_t bucket_id, int32_t *__restrict__ counter, int64_t output_offset,
-    typename Bucket::Iterator start_iter, typename Bucket::Iterator *iter_out,
-    InsertResult *result_out, KeyType *evict_key_out) {
-
-  for (int64_t scan = 0; scan < bucket.capacity(); scan++) {
-    auto pos = (start_iter + scan) % bucket.capacity();
-
-    auto key_slot =
-        reinterpret_cast<typename Bucket::AtomicKey *>(bucket.keys(pos));
-    KeyType k = key_slot->load(cuda::std::memory_order_relaxed);
-
-    if (k == key) {
-      *iter_out = pos + output_offset;
-      *result_out = InsertResult::Assign;
-      return;
-    }
-
-    if (k == Bucket::empty_key()) {
-      KeyType expected = Bucket::empty_key();
-      if (bucket.try_lock(pos, expected)) {
-        *bucket.digests(pos) = Bucket::key_to_digest(key);
-        atomicAdd(&bucket_sizes[bucket_id], 1);
-        *iter_out = pos + output_offset;
-        *result_out = InsertResult::Insert;
-        return;
-      }
-      k = key_slot->load(cuda::std::memory_order_relaxed);
-      if (k == key) {
-        *iter_out = pos + output_offset;
-        *result_out = InsertResult::Assign;
-        return;
-      }
-      continue;
-    }
-
-    if (k == Bucket::LockedKey || k == Bucket::reclaimed_key())
-      continue;
-
-    if (counter[pos] == 0) {
-      if (bucket.try_lock(pos, k)) {
-        if (::atomicAdd(&counter[pos], 0) > 0) {
-          bucket.unlock(pos, k);
-          continue;
-        }
-        *bucket.digests(pos) = Bucket::key_to_digest(key);
-        *evict_key_out = k;
-        *iter_out = pos + output_offset;
-        *result_out = InsertResult::Evict;
-        return;
-      }
-      continue;
-    }
-  }
-
-  *result_out = InsertResult::Busy;
-  *evict_key_out = key;
 }
 
 template <typename Table, typename ExecFunctor, int TileSize>

@@ -38,7 +38,7 @@ void launch_table_insert_kernel(
     // Route the plain insert through the LruLfu cubin (default Lex when
     // score_fn_key == 0, else the nvJitLink-linked custom evictor) so a full
     // bucket evicts by the ranked comparator, not the single-score reduce().
-    // Reuses EvictParams; evicted_* / ovf_* stay null (dyn_emb_insert_entry
+    // Reuses EvictParams; evicted_* stay null (dyn_emb_insert_entry
     // collects no evicted output).
     EvictParams p{};
     p.table_storage = table.storage_;

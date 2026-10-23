@@ -673,7 +673,7 @@ def create_cache_state(
 
 
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
-    """Collect per-table sizes (main table only, no overflow) into a tensor on state.device.
+    """Collect per-table sizes into a tensor on state.device.
 
     Uses an async CUDA kernel when key_index_map exposes table_bucket_offsets_
     and bucket_sizes; otherwise falls back to a sync Python loop. No GPU-CPU

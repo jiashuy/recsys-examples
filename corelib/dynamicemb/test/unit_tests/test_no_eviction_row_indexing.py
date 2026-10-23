@@ -239,9 +239,9 @@ def test_explicit_init_capacity(current_device, init_capacity, n_keys, expect_gr
 
 
 def test_caching_downgrades_cache_but_not_backing(current_device):
-    """The cache tier cannot be NO_EVICTION (it enables an overflow buffer, which
-    ``create_table_state`` rejects for NO_EVICTION), so it is forced to
-    TIMESTAMP/LRU while the backing store keeps NO_EVICTION.
+    """NO_EVICTION means nothing to the cache tier (it keeps no score, and a
+    NO_EVICTION row is the key's own auto-increment row rather than a slot), so its
+    options carry TIMESTAMP/LRU while the backing store keeps NO_EVICTION.
 
     Pinning this down matters for users: with ``caching=True`` the *cache* still
     evicts -- only the backing store never drops a key.

@@ -3452,7 +3452,7 @@ def test_table_expansion_capacity_growth(
 
     bdebt.train()
     stbe.train()
-    # we need to do backward to unlock the keys in the cache, otherwise overflow buffer will be also full.
+    # we need to do backward to unlock the keys in the cache, otherwise the cache fills with referenced keys.
     for i in range(2):
         if not multi_table:
             for j, (idx, off) in enumerate(
