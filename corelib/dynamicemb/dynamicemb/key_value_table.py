@@ -2532,15 +2532,23 @@ def take_values_of_keys_evicted_in_the_same_insert(
     n = keys.numel()
     if n == 0 or evicted_keys.numel() == 0:
         return
-    # One column to search on: the key and its table folded together (wrapping),
-    # which a match below confirms.
-    mix = keys * 1000003 + table_ids
-    order = torch.argsort(mix)
-    pos = torch.searchsorted(
-        mix[order], evicted_keys * 1000003 + evicted_table_ids
-    ).clamp_(max=n - 1)
+    # One column to search on: the id of each (key, table_id) pair among all the
+    # pairs of both sides. The ids are exact, so two different pairs never share
+    # one, unlike a fold of the pair into a single integer, which can collide.
+    # ``view`` keeps the bits of an unsigned key and so its identity.
+    pairs = torch.stack(
+        [
+            torch.cat([keys, evicted_keys]).view(torch.int64),
+            torch.cat([table_ids, evicted_table_ids]),
+        ],
+        dim=1,
+    )
+    _, ids = torch.unique(pairs, dim=0, return_inverse=True)
+    key_ids, evicted_ids = ids[:n], ids[n:]
+    order = torch.argsort(key_ids)
+    pos = torch.searchsorted(key_ids[order], evicted_ids).clamp_(max=n - 1)
     cand = order[pos]
-    match = (keys[cand] == evicted_keys) & (table_ids[cand] == evicted_table_ids)
+    match = key_ids[cand] == evicted_ids
     if bool(match.any()):
         evicted_values[match] = values[cand[match]]
 

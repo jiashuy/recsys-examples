@@ -44,7 +44,10 @@ from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     StorageLayout,
 )
-from dynamicemb.key_value_table import DynamicEmbStorage
+from dynamicemb.key_value_table import (
+    DynamicEmbStorage,
+    take_values_of_keys_evicted_in_the_same_insert,
+)
 from torchrec.modules.embedding_configs import EmbeddingConfig  # noqa: F401
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
@@ -239,3 +242,30 @@ def test_keys_evicted_by_the_insert_that_put_them_in_keep_their_own_values(
     founds, values = out[5], out[7]
     assert bool(founds.all()), "a key was lost between the table and the tier below"
     assert torch.equal(values[:, :dim], expected)
+
+
+@pytest.mark.parametrize("order", ["colliding_first", "colliding_last"])
+@pytest.mark.parametrize("key_dtype", [torch.int64, torch.uint64])
+def test_victims_are_matched_by_the_whole_key_and_table_pair(order, key_dtype):
+    """(0, table 0) and (K, table 1) both come to 0 when the pair is folded into one
+    int64 as ``key * 1000003 + table_id`` and the product wraps, so a match that
+    went by the fold alone could pair a victim with the other's value."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    colliding = 2336937208910341525
+    assert (colliding * 1000003 + 1) % 2**64 == 0
+
+    pairs = [(0, 0), (colliding, 1)]
+    if order == "colliding_last":
+        pairs.reverse()
+    keys = torch.tensor([k for k, _ in pairs], dtype=torch.int64, device=device)
+    tids = torch.tensor([t for _, t in pairs], dtype=torch.int64, device=device)
+    keys = keys.to(key_dtype) if key_dtype == torch.int64 else keys.view(torch.uint64)
+    values = torch.tensor([[1.0] * 4, [2.0] * 4], device=device)
+
+    # Both are victims, in the opposite order, with the values their rows held.
+    evicted_keys, evicted_tids = keys.flip(0), tids.flip(0)
+    evicted_values = torch.full((2, 4), -1.0, device=device)
+    take_values_of_keys_evicted_in_the_same_insert(
+        evicted_keys, evicted_tids, evicted_values, keys, tids, values
+    )
+    assert torch.equal(evicted_values, values.flip(0))
