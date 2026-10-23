@@ -55,6 +55,7 @@ POOLED = [
     case(2, "pooled", "--output_dtype=bf16", id="2gpu-output-bf16"),
     case(2, "pooled", "--dynamicemb_num=4", id="2gpu-4-dynamicemb-tables"),
     case(2, "pooled", "--multi_hot_sizes=20,1,101,49", id="2gpu-multi-hot-20-1-101-49"),
+    case(2, "pooled", "--use_torch_opt", "True", id="2gpu-torch-optimizer"),
     case(
         2,
         "pooled",
@@ -119,6 +120,15 @@ SEQUENCE = [
         "True",
         "--multi_hot_sizes=20,49,101,0",
         id="2gpu-dedup-empty-feature-3",
+    ),
+    case(
+        2,
+        "sequence",
+        "--use_index_dedup",
+        "True",
+        "--use_torch_opt",
+        "True",
+        id="2gpu-dedup-torch-optimizer",
     ),
     case(
         2,
