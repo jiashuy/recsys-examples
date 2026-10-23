@@ -108,9 +108,20 @@ RESHARD_CASES = [
 ]
 
 
+# The matrix above stays on one axis at a time for cost (each case is two torchruns).
+# These add what it leaves out: the adagrad optimizer, and 4-rank worlds in both
+# directions, each with the full state dumped.
+EXTRA_CASES = [
+    pytest.param(1, 1, "adagrad", True, True, "step", id="dump1-load1-adagrad"),
+    pytest.param(4, 4, "sgd", True, True, "step", id="dump4-load4-sgd"),
+    pytest.param(1, 4, "sgd", True, True, "step", id="dump1-load4-sgd"),
+    pytest.param(4, 1, "sgd", True, True, "step", id="dump4-load1-sgd"),
+]
+
+
 @pytest.mark.parametrize(
     "dump_gpus,load_gpus,optimizer,include_optim,include_counter,score",
-    RESHARD_CASES,
+    RESHARD_CASES + EXTRA_CASES,
 )
 def test_dump_load_across_world_sizes(
     tmp_path_factory,
