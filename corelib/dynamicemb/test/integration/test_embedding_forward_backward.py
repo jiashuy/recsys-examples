@@ -55,7 +55,16 @@ POOLED = [
     case(2, "pooled", "--output_dtype=bf16", id="2gpu-output-bf16"),
     case(2, "pooled", "--dynamicemb_num=4", id="2gpu-4-dynamicemb-tables"),
     case(2, "pooled", "--multi_hot_sizes=20,1,101,49", id="2gpu-multi-hot-20-1-101-49"),
-    case(2, "pooled", "--use_torch_opt", "True", id="2gpu-torch-optimizer"),
+    # Every table is dynamicemb: the torch optimizer's kwargs (betas, ...) do not
+    # fit the TorchRec-owned fused tables a mixed model would also have.
+    case(
+        2,
+        "pooled",
+        "--dynamicemb_num=4",
+        "--use_torch_opt",
+        "True",
+        id="2gpu-torch-optimizer",
+    ),
     case(
         2,
         "pooled",
@@ -126,6 +135,7 @@ SEQUENCE = [
         "sequence",
         "--use_index_dedup",
         "True",
+        "--dynamicemb_num=4",
         "--use_torch_opt",
         "True",
         id="2gpu-dedup-torch-optimizer",
