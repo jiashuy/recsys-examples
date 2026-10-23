@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum, auto
 from typing import List, Optional, Tuple
 
@@ -201,6 +201,22 @@ class PrefetchState:
     unique_offsets: Optional[List[int]] = None
     cache_nodes: Optional[torch.Tensor] = None
     unique_size_per_table: Optional[torch.Tensor] = None
+
+
+def _record_stream_of_prefetch_state(state: PrefetchState) -> None:
+    """Tell the allocator the current stream reads what the prefetch allocated.
+
+    The prefetch may run on its own stream, while forward and backward (which
+    runs on the stream of its forward) read these tensors on another. Without the
+    record, freeing the context returns their memory to the prefetch stream's pool,
+    and the next prefetch can overwrite it under a kernel still reading it.
+    ``outstanding_keys_ref`` belongs to the module and is never freed.
+    """
+    stream = torch.cuda.current_stream()
+    for f in fields(state):
+        t = getattr(state, f.name)
+        if isinstance(t, torch.Tensor) and t.is_cuda and f.name != "outstanding_keys_ref":
+            t.record_stream(stream)
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -1243,6 +1259,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         *args,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
+            _record_stream_of_prefetch_state(prefetch_state)
             max_emb_dim = storage.max_embedding_dim()
             max_val_dim = storage.max_value_dim()
             emb_dtype = storage.embedding_dtype()
