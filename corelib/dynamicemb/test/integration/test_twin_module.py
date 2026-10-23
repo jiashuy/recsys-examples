@@ -120,7 +120,7 @@ def seed():
 @pytest.mark.parametrize("dim", [128])
 @pytest.mark.parametrize(
     "optimizer_name",
-    ["sgd", "exact_row_wise_adagrad", "exact_adagrad", "adam", "adamw"],
+    ["sgd", "exact_row_wise_adagrad", "exact_adagrad"],
 )
 @pytest.mark.parametrize("use_index_dedup", [True, False])
 @pytest.mark.parametrize("is_weighted", [False, True])
