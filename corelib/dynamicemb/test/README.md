@@ -67,7 +67,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `unit/table/test_table_operation.py` | scored hash table kernels: layout, `bucketize_keys`, insert / lookup / erase / evict, counter overflow |
 | `unit/table/test_lru_lfu.py` | LRU_LFU compound score policy and custom score functions (table level) |
 | `unit/table/test_table_dump_load.py` | table dump / load and threshold incremental dump (1 and 8 ranks, `load_dump`) |
-| `unit/table/test_hybrid_storage_export.py` | `HybridStorage` HBM+host tiers driven directly; tier bit of incremental dump |
+| `unit/table/test_hybrid_storage_export.py` | `HybridStorage` HBM+host tiers driven directly; export, dump/load round trip, tier bit of incremental dump |
 | `unit/table/test_no_eviction_row_indexing.py` | NO_EVICTION value-row indexing, caching spill |
 | `unit/table/test_expansion_value_capacity.py` | key-map expansion keeps a value row behind each slot |
 | `unit/eviction/test_insert_collect_evicted.py` | retain-evicted-keys at table / storage level |
@@ -128,7 +128,7 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 
 ## Known gaps (not covered by any test)
 
-* Table-level `HybridStorage` dump/load; `ScorePolicy.CONST` as a table's own (not per-call) policy; compound LRU_LFU at table-level dump/load.
+* `HybridStorage` dump/load with multi-word (compound LRU_LFU) scores, which the library does not support yet (raises `NotImplementedError`); `ScorePolicy.CONST` as a table's own (not per-call) policy.
 * Overflow-bucket behaviour with eviction / caching beyond one counter case.
 * Incremental dump with per-table differing score strategies.
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
