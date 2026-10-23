@@ -98,7 +98,7 @@ Fixtures in `conftest.py`: `current_device`, `backend_session`. Never redefine t
 | `integration/test_embedding_forward_backward.py` (`workers/embedding_forward.py`) | sharded pooled / sequence / multi-collection forward vs reference | dim, dedup, dtype, #tables, multi-hot, one data-parallel table, torch optimizer in backward, 2/4/8 GPUs |
 | `integration/test_twin_module.py` | sharded dynamicemb model trains identically to plain TorchRec | optimizer, pooling, weighted; 1 and 8 ranks |
 | `integration/test_alignment.py` | planner + DMP table capacity / HBM alignment | 1, 4, 8 ranks |
-| `integration/test_model_dump_load.py` (`workers/model_dump_load.py`) | dump a sharded model and load it back, incl. resharding 1↔8, hash_roundrobin / continuous | optimizer × optim-state × counter × score × world sizes (`load_dump`) |
+| `integration/test_model_dump_load.py` (`workers/model_dump_load.py`) | dump a sharded model and load it back, incl. resharding 1↔8, hash_roundrobin / continuous | optimizer × optim-state × counter × score × world sizes, plus adagrad and 4-rank cases (`load_dump`) |
 | `integration/test_lfu_scores.py` (`workers/lfu_scores.py`) | LFU scores of a sharded model | dedup × storage mode × GPUs × optimizer |
 | `integration/test_embedding_admission.py` (`workers/embedding_admission.py`) | frequency admission end to end | storage × optimizer × score × GPUs (`load_dump`) |
 | `integration/test_table_row_wise.py` (`workers/table_row_wise.py`) | table-row-wise: plan, parity, jagged, pooling, grad, checkpoints | topology × dist_type; checkpoints are `load_dump` |
@@ -135,5 +135,5 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` with a mix of dynamicemb and TorchRec tables (only all-dynamicemb is tested; betas do not fit the TorchRec fused tables); sharding types other than row-wise (outside table-row-wise).
 * Twin test: adam / adamw are not compared against TorchRec. Enabling them fails (80-100% of outputs differ) because the two sides count Adam steps differently: TorchRec's fused optimizer bumps `optimizer_step` on every forward, dynamicemb's on every optimizer step, and `ConstructTwinModule` itself notes this makes Adam impossible to compare exactly (it resets the step only once, at construction). Adam is covered against FBGEMM at module level in `unit/module/test_forward_backward.py` instead.
-* Dump/load: `adagrad`; `continuous` on several ranks is unsupported by the library (raises `NotImplementedError`), so it has no test; cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
+* Dump/load: `continuous` on several ranks is unsupported by the library (raises `NotImplementedError`), so it has no test; cross-world-size hash_roundrobin / continuous.
 * LFU / admission with compound LRU_LFU on cache or hybrid storage.
