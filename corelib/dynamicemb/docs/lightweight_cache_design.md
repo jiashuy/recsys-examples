@@ -787,7 +787,7 @@ metrics()                                   -> CacheMetrics
 
 **结论：链路是全双工的，但我们的访问形态只有在行有序时才吃得到。**
 
-H100（PCIe Gen5 x16）实测，`examples/pcie_bidir_bw/`：
+H100（PCIe Gen5 x16）实测，`corelib/dynamicemb/debug_pcie_bidir_bw/`（本地目录，已被 `.gitignore` 忽略，不在仓库中）：
 
 | 形态 | H2D | D2H | 双向 | 增益 |
 |---|---|---|---|---|
@@ -1058,7 +1058,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | 前 / 反向 gather-scatter | `src/lookup_forward.cu`、`src/lookup_backward.cu` |
 | host 侧可扩展缓冲（mapped pinned） | `dynamicemb/extendable_tensor.py:131`、`src/vmm_tensor.cu` |
 | 逐表指针数组模式 | `dynamicemb/key_value_table.py:160` |
-| PCIe 双向带宽基准 | `examples/pcie_bidir_bw/pcie_bidir_gather.cu` |
+| PCIe 双向带宽基准 | `corelib/dynamicemb/debug_pcie_bidir_bw/pcie_bidir_gather.cu` |
 
 需要新写的仅有三部分：链式哈希 kernel（查找 / 插入 / 摘链）、ring 的领取与校验、状态字的原子协议。
 
