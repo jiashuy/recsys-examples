@@ -134,6 +134,6 @@ rank-aware pytest files; that needs proof that several DMP models in one process
 * `BatchedDynamicEmbeddingTablesV2` eval mode with cache + external storage together; padded-buffer kernels for Adagrad / SGD.
 * fp16 / bf16 output dtype and low-precision all-to-all are accepted by the worker but never applied.
 * `use_torch_opt` with a mix of dynamicemb and TorchRec tables (only all-dynamicemb is tested; betas do not fit the TorchRec fused tables); sharding types other than row-wise (outside table-row-wise).
-* Twin test: adam / adamw entries exist but are not parametrized.
+* Twin test: adam / adamw entries exist but are not parametrized. Enabling them (1 and 8 ranks) fails with 80-100% of output elements different from TorchRec, so the two Adam implementations do not track each other in this setup; it is unexplained whether that is a real divergence or an unfair comparison (step counting, eps). Needs investigation before the cases can be added.
 * Dump/load: `adagrad`; `continuous` on several ranks is unsupported by the library (raises `NotImplementedError`), so it has no test; cross-world-size hash_roundrobin / continuous, 4-GPU resharding.
 * LFU / admission with compound LRU_LFU on cache or hybrid storage.
