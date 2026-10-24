@@ -27,7 +27,6 @@ import pytest
 import torch
 import torchrec
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -78,7 +77,6 @@ def _make_v2(dims, pooling_mode=DynamicEmbPoolingMode.SUM, lr=LR, device=None):
             embedding_dtype=torch.float32,
             device_id=device,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=DynamicEmbScoreStrategy.STEP,
         )

@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torchrec
 from debug import Debugger
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
@@ -104,7 +103,6 @@ def get_planner(args, device, eb_configs):
                     initializer_args=DynamicEmbInitializerArgs(
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
-                    safe_check_mode=DynamicEmbCheckMode.WARNING,
                 ),
             )
         dict_const[table_idx_to_name(i)] = const
@@ -294,6 +292,8 @@ def run(args):
         debugger.feature_before_all2all(sparse_feature)
         debugger.pooled_embds_after_all2all(kt, dims, feature_num, dyn_emb_features)
         # print(kt.size())
+        # A training forward holds its rows until its backward runs, so give it one.
+        kt.sum().backward()
         print(f"DynamicEmb iteration {i+1} Passed")
         # print(res_dict["cate_0"].shape)
         # product = ret.to_dict()["product"] # implicitly call awaitable.wait(); ec does not have to_dict attribute

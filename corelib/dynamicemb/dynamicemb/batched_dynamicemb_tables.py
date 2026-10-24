@@ -889,14 +889,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def _make_storage(
         self, options: List[DynamicEmbTableOptions], lower: Optional[Storage]
     ) -> Storage:
-        """The table of rows behind a cache, or the HBM-only or host-only one.
-
-        A bucket of the chained index holds at most 256 slots, so a larger configured
-        ``bucket_capacity`` (the default planner path asks for the maximum) is lowered.
-        """
-        options = deepcopy(options)
-        for option in options:
-            option.bucket_capacity = min(int(option.bucket_capacity), 256)
+        """The table of rows behind a cache, or the HBM-only or host-only one."""
         return ChainedStorage(options, self._optimizer, lower=lower)
 
     def _create_external_storage(

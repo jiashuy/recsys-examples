@@ -8,7 +8,6 @@ This document consists of two parts, one is the introduction to the API, which c
 - [DynamicEmbeddingShardingPlanner](#dynamicembeddingshardingplanner)
 - [Sharding planner](#sharding-planner)
 - [DynamicEmbeddingCollectionSharder](#dynamicembeddingcollectionsharder)
-- [DynamicEmbCheckMode](#dynamicembcheckmode)
 - [DynamicEmbInitializerMode](#dynamicembinitializermode)
 - [DynamicEmbInitializerArgs](#dynamicembinitializerargs)
 - [DynamicEmbPoolingMode](#dynamicembpoolingmode)
@@ -159,7 +158,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (validated by `check_bucket_capacity`). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (a positive multiple of **`BUCKET_ALIGNMENT` (16)**, at most **`MAX_BUCKET_CAPACITY`** = 256). `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
@@ -199,7 +198,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 
 - **`global_hbm_for_values`**: global HBM byte budget for the table’s values; the planner only splits it across ranks.
-- **`bucket_capacity`**: requested hashtable bucket size in rows (see rules above), or `MAX_BUCKET_CAPACITY` for “single bucket per rank table”.
+- **`bucket_capacity`**: hashtable bucket size in rows (see rules above): a multiple of 16, at most `MAX_BUCKET_CAPACITY` (256).
 - **`initializer_args`**: optional partial bounds for `UNIFORM`; missing bounds are completed as in step 1.
 
 **Downstream (after planning, when modules are built):** the batched embedding path uses **`max_capacity`** from **`DynamicEmbTableOptions`** (e.g. allocation size and consistency checks against TorchREC shard row counts in `_get_dynamicemb_options_per_table` in `batched_dynamicemb_compute_kernel.py`).
@@ -218,51 +217,6 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
     ```python
     #How to import
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-    ```
-
-## DynamicEmbCheckMode
-
-When the dynamic embedding table capacity is small, a single feature with a large number of indices may lead to issues where the hashtable cannot insert the indices. Enabling safe check allows you to observe this behavior (the number of times indices cannot be inserted and the number of indices each time) to determine if the dynamic embedding table capacity is set too low.
-
-    ```python
-    #How to import
-    from dynamicemb import DynamicEmbCheckMode
-
-    #API arguments
-    class DynamicEmbCheckMode(enum.IntEnum):
-        """
-        Enumeration for different modes of checking dynamic embedding's insertion behaviors.
-        DynamicEmb uses a hashtable as the backend. If the embedding table capacity is small and the number of indices in a single feature is large,
-        it is easy for too many indices to be allocated to the same hash table bucket in one lookup, resulting in the inability to insert indices into the hashtable.
-        DynamicEmb resolves this issue by setting the lookup results of indices that cannot be inserted to 0.
-        Fortunately, in a hashtable with a large capacity, such insertion failures are very rare and almost never occur.
-        This issue is more frequent in hashtables with small capacities, which can affect training accuracy.
-        Therefore, we do not recommend using dynamic embedding tables for very small embedding tables.
-
-        To prevent this behavior from affecting training without user awareness, DynamicEmb provides a safe check mode.
-        Users can set whether to enable safe check when configuring DynamicEmbTableOptions.
-        Enabling safe check will add some overhead, but it can provide insights into whether the hash table frequently fails to insert indices.
-        If the number of insertion failures is high and the proportion of affected indices is large,
-        it is recommended to either increase the dynamic embedding capacity or avoid using dynamic embedding tables for small embedding tables.
-
-        Attributes
-        ----------
-        ERROR : int
-            When there are indices that can't be inserted successfully:
-                This mode will throw a runtime error indicating how many indices failed to insert.
-                The program will crash.
-        WARNING : int
-            When there are indices that can't be inserted successfully:
-                This mode will give a warning about how many indices failed to insert.
-                The program will continue. For uninserted indices, their embeddings' values will be set to 0.0.
-        IGNORE : int
-            Don't check whether insertion is successful or not, therefore it doesn't bring additional checking overhead.
-            For uninserted indices, their embeddings' values will be set to 0.0 silently.
-        """
-        ERROR = 0
-        WARNING = 1
-        IGNORE = 2
-
     ```
 
 ## DynamicEmbInitializerMode
@@ -848,10 +802,6 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             A key will only be mapped to one bucket. 
             When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key. 
             The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
-        safe_check_mode : DynamicEmbCheckMode
-            Used to check if all keys in the current batch have been successfully inserted into the table.
-            Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
-            Please refer to the API documentation for DynamicEmbCheckMode for more information.
         global_hbm_for_values : int
             Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
             It has different meanings under `caching=True` and  `caching=False`.
@@ -859,7 +809,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 When `caching=True`, it decides the number of rows of the GPU cache.
             To match planner row counts and optimizer state width, size the **global** budget with
             ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
-            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
+            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``256``),
             then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
             ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
         external_storage: Storage
@@ -927,7 +877,6 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]
         ] = DynamicEmbScoreStrategy.TIMESTAMP
         bucket_capacity: int = 128
-        safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
         global_hbm_for_values: int = 0  # in bytes
         external_storage: Storage = None
         index_type: Optional[torch.dtype] = None

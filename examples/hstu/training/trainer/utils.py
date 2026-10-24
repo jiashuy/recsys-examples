@@ -274,7 +274,7 @@ def create_dynamic_optitons_dict(
     dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for embedding_args in embedding_args_list:
         if isinstance(embedding_args, DynamicEmbeddingArgs):
-            from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
+            from dynamicemb import DynamicEmbEvictStrategy
 
             embedding_args.calculate_and_reset_global_hbm_for_values(
                 hidden_size, embedding_dim_multiplier
@@ -284,7 +284,6 @@ def create_dynamic_optitons_dict(
                 evict_strategy=DynamicEmbEvictStrategy.LRU
                 if embedding_args.evict_strategy == "lru"
                 else DynamicEmbEvictStrategy.LFU,
-                safe_check_mode=DynamicEmbCheckMode.IGNORE,
                 bucket_capacity=128,
                 training=training,
                 caching=embedding_args.caching,

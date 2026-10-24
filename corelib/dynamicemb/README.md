@@ -103,27 +103,12 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
 7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
 
-### DynamicEmb Insertion Behavior Checking Modes
+### Small tables
 
-DynamicEmb uses a hashtable as the backend. If the embedding table capacity is small and the number of indices in a single feature is large, it is easy for too many indices to be allocated to the same hash table bucket in one lookup, resulting in the inability to insert indices into the hashtable. DynamicEmb resolves this issue by setting the lookup results of indices that cannot be inserted to 0.
+The keys of a table live in buckets of `bucket_capacity` rows (at most `MAX_BUCKET_CAPACITY` = 256), and a key can only take a row of its own bucket. A step whose new keys do not fit the buckets they hash to -- a very small table, or a batch with far more unique keys than the table has rows -- raises `ChainedTableFull` instead of silently returning zeros, so a table has to be able to hold the unique keys of a step and of the steps in flight. Do not use dynamic embedding tables for very small embedding tables.
 
-Fortunately, in a hashtable with a large capacity, such insertion failures are very rare and almost never occur. This issue is more frequent in hashtables with small capacities, which can affect training accuracy. Therefore, we do not recommend using dynamic embedding tables for very small embedding tables.
+A training forward holds the rows it read until its backward has run; call the backward of every training forward.
 
-To prevent this behavior from affecting training without user awareness, DynamicEmb provides a safe check mode. Users can set whether to enable safe check when configuring `DynamicEmbTableOptions`. Enabling safe check will add some overhead, but it can provide insights into whether the hash table frequently fails to insert indices. If the number of insertion failures is high and the proportion of affected indices is large, it is recommended to either increase the dynamic embedding capacity or avoid using dynamic embedding tables for small embedding tables.
-
-#### Example
-
-```python
-from dynamicemb import DynamicEmbTableOptions, DynamicEmbCheckMode
-
-# Configure the DynamicEmbTableOptions with safe check mode enabled
-table_options = DynamicEmbTableOptions(
-    safe_check_mode=DynamicEmbCheckMode.WARNING
-)
-
-# Use the table_options in your dynamic embedding setup
-# ...
-```
 
 ### Customized Eviction Score
 

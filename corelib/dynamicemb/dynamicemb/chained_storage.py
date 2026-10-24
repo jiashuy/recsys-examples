@@ -263,8 +263,6 @@ class ChainedStorage(Storage):
                 "age; a custom score_function is not supported"
             )
         cap = int(base.bucket_capacity)
-        if cap > 256:
-            raise ValueError("the chained index takes buckets of at most 256 slots")
         num_buckets = [max(1, math.ceil(int(o.init_capacity) / cap)) for o in options]
         slots = [n * cap for n in num_buckets]
         rows = [s + max(s // 8, 1024) for s in slots]

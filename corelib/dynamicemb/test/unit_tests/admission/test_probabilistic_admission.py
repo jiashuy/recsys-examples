@@ -30,7 +30,6 @@ import pytest
 import torch
 import torch.distributed as dist
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbTableOptions,
     ProbabilisticAdmissionStrategy,
@@ -178,7 +177,6 @@ def _table(probability):
         dim=8,
         max_capacity=1024,
         bucket_capacity=128,
-        safe_check_mode=DynamicEmbCheckMode.IGNORE,
         local_hbm_for_values=1024**3,
         admit_strategy=ProbabilisticAdmissionStrategy(probability),
     )

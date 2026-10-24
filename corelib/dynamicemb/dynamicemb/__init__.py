@@ -16,7 +16,6 @@
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
-    DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -74,7 +73,6 @@ __all__ = [
     "MultiTableFrequencyAdmitter",
     "MultiTableProbabilisticAdmitter",
     "ProbabilisticAdmissionStrategy",
-    "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",
     "DynamicEmbInitializerMode",
     "DynamicEmbTableOptions",

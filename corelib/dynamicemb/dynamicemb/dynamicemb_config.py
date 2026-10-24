@@ -82,43 +82,6 @@ def warning_for_cstm_score() -> None:
 DynamicEmbKernel = "DynamicEmb"
 
 
-@enum.unique
-class DynamicEmbCheckMode(enum.IntEnum):
-    """
-    Enumeration for different modes of checking dynamic embedding's insertion behaviors.
-    DynamicEmb uses a hashtable as the backend. If the embedding table capacity is small and the number of indices in a single lookup is large,
-    it is easy for too many indices to be allocated to the same hash table bucket in one lookup, resulting in the inability to insert indices into the hashtable.
-    DynamicEmb resolves this issue by setting the lookup results of indices that cannot be inserted to 0.
-    Fortunately, in a hashtable with a large capacity, such insertion failures are very rare and almost never occur.
-    This issue is more frequent in hashtables with small capacities, which can affect training accuracy.
-    Therefore, we do not recommend using dynamic embedding tables for very small embedding tables.
-
-    To prevent this behavior from affecting training without user awareness, DynamicEmb provides a safe check mode.
-    Users can set whether to enable safe check when configuring DynamicEmbTableOptions.
-    Enabling safe check will add some overhead, but it can provide insights into whether the hash table frequently fails to insert indices.
-    If the number of insertion failures is high and the proportion of affected indices is large,
-    it is recommended to either increase the dynamic embedding capacity or avoid using dynamic embedding tables for small embedding tables.
-
-    Attributes
-    ----------
-    ERROR : int
-        When there are indices that can't be inserted successfully:
-            This mode will throw a runtime error indicating how many indices failed to insert.
-            The program will crash.
-    WARNING : int
-        When there are indices that can't be inserted successfully:
-            This mode will give a warning about how many indices failed to insert.
-            The program will continue. For uninserted indices, their embeddings' values will be set to 0.0.
-    IGNORE : int
-        Don't check whether insertion is successful or not, therefore it doesn't bring additional checking overhead.
-        For uninserted indices, their embeddings' values will be set to 0.0 silently.
-    """
-
-    ERROR = 0
-    WARNING = 1
-    IGNORE = 2
-
-
 # Values come from dyn_emb::PoolingMode (src/utils.h) so the C++ enum stays
 # the single source of truth.  Unlike DynamicEmbEvictStrategy this is an IntEnum,
 # because the pooling mode is handed straight to the kernels and compared as an
@@ -505,9 +468,7 @@ class DynamicEmbTableOptions:
         Rehash will be done implicitly.
         Note: This is the setting for a single table at each rank.
     max_load_factor : float
-        The maximum load factor before rehashing occurs. Default is 0.5.
-        In NO_EVICTION mode, this option is ignored; the implementation uses
-        a fixed effective max load factor of 0.5 for the key_index_map.
+        The maximum load factor, in (0, 1], before the table grows toward ``max_capacity``. Default is 0.5.
     score_strategy(DynamicEmbScoreStrategy or Tuple[DynamicEmbScoreStrategy, ...]):
         dynamicemb gives each key-value pair a score to represent its importance.
         Once there is insufficient space, the key-value pair will be evicted based on the score.
@@ -532,14 +493,12 @@ class DynamicEmbTableOptions:
         strategies without a timestamp column, ``incremental_dump`` instead thresholds
         on the absolute score value.
     bucket_capacity : int
-        Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
+        Capacity of each bucket in the hash table, default 128: a positive multiple of ``BUCKET_ALIGNMENT``,
+        at most ``MAX_BUCKET_CAPACITY`` (256); anything else raises ``ValueError``.
         A key will only be mapped to one bucket.
-        When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key.
+        When the bucket is full, the key with the smallest score in the bucket will be evicted, and its row will be used to store a new key.
+        The new keys of one step must fit the buckets they hash to, or the step raises ``ChainedTableFull``.
         The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
-    safe_check_mode : DynamicEmbCheckMode
-        Used to check if all keys in the current batch have been successfully inserted into the table.
-        Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
-        Please refer to the API documentation for DynamicEmbCheckMode for more information.
     global_hbm_for_values : int
         Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
         It has different meanings under `caching=True` and  `caching=False`.
@@ -611,7 +570,6 @@ class DynamicEmbTableOptions:
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
     score_strategy: Optional[ScoreStrategy] = DynamicEmbScoreStrategy.TIMESTAMP
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
-    safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
@@ -712,6 +670,11 @@ class DynamicEmbTableOptions:
         # reject unsupported compound tuples) so all downstream code sees either a
         # single strategy or a supported compound tuple.
         self.score_strategy = normalize_score_strategy(self.score_strategy)
+        check_bucket_capacity(self.bucket_capacity)
+        if not 0 < self.max_load_factor <= 1:
+            raise ValueError(
+                f"max_load_factor must be in (0, 1], got {self.max_load_factor}"
+            )
         # A custom eviction score_function needs both frequency and timestamp, so
         # it requires the 2-word LruLfu layout -- i.e. the {TIMESTAMP, LFU}
         # compound. After normalization that is the only strategy left as a tuple.
@@ -722,6 +685,11 @@ class DynamicEmbTableOptions:
                 "score_function is only supported for the compound LruLfu score "
                 "strategy (TIMESTAMP, LFU) in either order; got "
                 f"score_strategy={self.score_strategy}."
+            )
+        if self.score_function is not None:
+            raise NotImplementedError(
+                "a custom score_function is not supported by the chained key index, "
+                "which ranks a (TIMESTAMP, LFU) table by frequency and then age"
             )
 
     def __eq__(self, other):
@@ -936,6 +904,20 @@ def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
+def check_bucket_capacity(bucket_capacity: int) -> None:
+    """A bucket holds a multiple of :data:`BUCKET_ALIGNMENT` rows, at most
+    :data:`MAX_BUCKET_CAPACITY`."""
+    if not 0 < bucket_capacity <= MAX_BUCKET_CAPACITY:
+        raise ValueError(
+            f"bucket_capacity must be in (0, {MAX_BUCKET_CAPACITY}], got {bucket_capacity}"
+        )
+    if bucket_capacity % BUCKET_ALIGNMENT != 0:
+        raise ValueError(
+            f"bucket_capacity ({bucket_capacity}) must be a multiple of "
+            f"BUCKET_ALIGNMENT ({BUCKET_ALIGNMENT})."
+        )
+
+
 def _sharded_table_bucket_layout(
     embedding_config: BaseEmbeddingConfig,
     world_size: int,
@@ -953,20 +935,7 @@ def _sharded_table_bucket_layout(
     num_global = int(embedding_config.num_embeddings)
     shard_rows = math.ceil(num_global / world_size)
 
-    if bucket_capacity == MAX_BUCKET_CAPACITY:
-        effective_bucket = align_to_table_size(shard_rows, BUCKET_ALIGNMENT)
-        return 1, effective_bucket
-
-    if bucket_capacity <= 0:
-        raise ValueError(
-            f"bucket_capacity must be positive when not MAX_BUCKET_CAPACITY, "
-            f"got {bucket_capacity}"
-        )
-    if bucket_capacity % BUCKET_ALIGNMENT != 0:
-        raise ValueError(
-            f"bucket_capacity ({bucket_capacity}) must be a multiple of "
-            f"BUCKET_ALIGNMENT ({BUCKET_ALIGNMENT}) when not using MAX_BUCKET_CAPACITY."
-        )
+    check_bucket_capacity(bucket_capacity)
 
     table_capacity = align_to_table_size(shard_rows, bucket_capacity)
     num_buckets = table_capacity // bucket_capacity
@@ -982,8 +951,7 @@ def get_sharded_table_capacity(
 
     Returns ``num_buckets * effective_bucket_width`` — the same value the sharding planner
     writes to ``DynamicEmbTableOptions.max_capacity``. Rules match
-    :func:`_sharded_table_bucket_layout` (and thus ``bucket_capacity`` handling including
-    :data:`MAX_BUCKET_CAPACITY`).
+    :func:`_sharded_table_bucket_layout`.
 
     Parameters
     ----------
@@ -993,9 +961,8 @@ def get_sharded_table_capacity(
     world_size
         Number of ranks (must be positive).
     bucket_capacity
-        Requested bucket size in rows, or :data:`dynamicemb.types.MAX_BUCKET_CAPACITY` for one
-        bucket spanning the full per-rank shard (width aligned to :data:`BUCKET_ALIGNMENT`).
-        Otherwise must be a positive multiple of :data:`BUCKET_ALIGNMENT`.
+        Bucket size in rows: a positive multiple of :data:`BUCKET_ALIGNMENT`, at most
+        :data:`dynamicemb.types.MAX_BUCKET_CAPACITY`.
 
     Returns
     -------
@@ -1121,8 +1088,7 @@ def get_table_value_bytes(
     bucket_capacity
         Same ``bucket_capacity`` as for :func:`get_sharded_table_capacity` and
         ``DynamicEmbTableOptions.bucket_capacity`` (default
-        :data:`DEFAULT_BUCKET_CAPACITY`; including the ``MAX_BUCKET_CAPACITY``
-        sentinel when applicable).
+        :data:`DEFAULT_BUCKET_CAPACITY`).
     """
     table_capacity_per_rank = get_sharded_table_capacity(
         embedding_config, world_size, bucket_capacity

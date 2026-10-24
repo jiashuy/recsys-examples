@@ -144,7 +144,8 @@ def test_pop_evicted_keys_distributed(backend_session, optimizer_kwargs):
     eb_config = torchrec.EmbeddingBagConfig(
         name=table_name,
         embedding_dim=dim,
-        num_embeddings=1024,  # small -> per-rank capacity small -> forced eviction
+        # Small, so training forces eviction, but a rank still holds the keys of one step.
+        num_embeddings=1024 * world_size,
         feature_names=[feature_name],
         pooling=PoolingType.SUM,
     )

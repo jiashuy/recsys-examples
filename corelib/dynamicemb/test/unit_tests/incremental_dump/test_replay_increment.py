@@ -22,7 +22,6 @@ import pytest
 import torch
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -62,7 +61,6 @@ def make_model(
         dim=DIM,
         max_capacity=max_capacity,
         bucket_capacity=bucket_capacity,
-        safe_check_mode=DynamicEmbCheckMode.IGNORE,
         # A cache only exists when the values do not fit in HBM
         # (``total_memory > local_hbm``), so a caching test has to shrink this --
         # ``caching=True`` alone silently yields a plain HBM_ONLY table.
@@ -371,22 +369,17 @@ def test_replay_spans_multiple_batches(current_device):
         torch.testing.assert_close(got[k], want[k])
 
 
-def test_replay_rejects_layout_mismatch(current_device):
-    """A target whose layout differs cannot take the source's slots, so the whole
-    table is rejected -- and nothing is written."""
+def test_replay_into_a_larger_table_keeps_every_key(current_device):
+    """Replay is by key, so the target need not be laid out like the source."""
     device = torch.device(f"cuda:{current_device}")
     src = make_model(current_device, max_capacity=DEFAULT_CAPACITY)
     dst = make_model(current_device, max_capacity=DEFAULT_CAPACITY * 2)
 
     keys = list(range(1001, 1201))
     touch(src, keys, device)
-    delta = dump_all(src)
+    dst.replay_increment(dump_all(src))
 
-    with pytest.raises(ValueError, match="capacity mismatch"):
-        dst.replay_increment(delta)
-
-    # Rejection must be total: no partial write is left behind.
-    assert dump_all(dst).keys[0].numel() == 0
+    assert set(dump_all(dst).keys[0].tolist()) == set(keys)
 
 
 def test_replay_rejects_score_strategy_mismatch(current_device):
@@ -451,7 +444,6 @@ def _two_table_model(current_device, capacities):
             dim=DIM,
             max_capacity=cap,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
         )
@@ -468,36 +460,6 @@ def _two_table_model(current_device, capacities):
         learning_rate=0.1,
         initial_accumulator_value=0.0,
     )
-
-
-def test_replay_rejects_a_multi_table_delta_without_writing_any(current_device):
-    """A mismatch on one table must leave the others untouched.
-
-    A delta normally spans a whole collection, so validating each table only when
-    its turn comes would let the last one's mismatch raise after the earlier ones
-    had already been written -- a partly applied delta, harder to recover from
-    than a rejected one. Here the first table matches and the second does not.
-    """
-    device = torch.device(f"cuda:{current_device}")
-    src = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
-    dst = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY * 2])
-
-    keys = list(range(1001, 1101))
-    indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
-    offsets = torch.arange(0, len(keys) * 2 + 1, dtype=torch.int64, device=device)
-    src(indices, offsets)
-    torch.cuda.synchronize()
-
-    delta = src.incremental_dump({"t_0": 0, "t_1": 0})
-    assert all(k.numel() == len(keys) for k in delta.keys), "both tables must dump"
-
-    with pytest.raises(ValueError, match="capacity mismatch"):
-        dst.replay_increment(delta)
-
-    after = dst.incremental_dump({"t_0": 0, "t_1": 0})
-    assert all(
-        k.numel() == 0 for k in after.keys
-    ), "t_0 must not have been written before t_1 was rejected"
 
 
 @pytest.mark.parametrize(
@@ -565,13 +527,11 @@ def test_replay_rejects_missing_table_options(current_device):
     assert dump_all(dst).keys[0].numel() == 0
 
 
-def test_replay_applies_erasures_and_ignores_evictions(current_device):
-    """``erased_keys`` is replayed; ``evicted_keys`` never is.
+def test_replay_applies_erasures_and_evictions(current_device):
+    """Both ``erased_keys`` and ``evicted_keys`` are removed from the replica.
 
-    An eviction needs no action on the replica -- the key that took the evicted
-    one's slot is in this very delta and overwrites it. An erase does, because
-    nothing takes over that slot. Feeding a non-empty ``evicted_keys`` here would
-    delete live keys if the two were ever confused.
+    Replay is by key, so an eviction at the source is not overwritten by the key
+    that took its slot: the replica has to drop the key itself.
     """
     device = torch.device(f"cuda:{current_device}")
     src = make_model(current_device)
@@ -579,32 +539,23 @@ def test_replay_applies_erasures_and_ignores_evictions(current_device):
 
     keys = list(range(1001, 1101))
     touch(src, keys, device)
-    delta = dump_all(src)
-    dst.replay_increment(delta)
+    dst.replay_increment(dump_all(src))
     assert set(dump_all(dst).keys[0].tolist()) == set(keys)
 
-    # A delta that erases half the keys and re-adds one of them.
-    dropped = keys[:50]
-    readmitted = dropped[0]
-    keep = keys[50:]
+    # A delta that erases a quarter, evicts another quarter and re-adds one erased key.
+    erased, evicted, keep = keys[:25], keys[25:50], keys[50:]
+    readmitted = erased[0]
     next_delta = dump_all(src)
     mask = torch.tensor([int(k) == readmitted for k in next_delta.keys[0].tolist()])
     _mask_delta(next_delta, mask)
-    next_delta.erased_keys[0] = torch.tensor(dropped, dtype=torch.int64)
-    # The surviving keys, offered as evictions: replay must not touch them.
-    next_delta.evicted_keys[0] = torch.tensor(keep, dtype=torch.int64)
+    next_delta.erased_keys[0] = torch.tensor(erased, dtype=torch.int64)
+    next_delta.evicted_keys[0] = torch.tensor(evicted, dtype=torch.int64)
 
-    stats = dst.replay_increment(next_delta)[TABLE_NAME]
-    assert stats.erased == len(dropped)
+    dst.replay_increment(next_delta)
     left = set(dump_all(dst).keys[0].tolist())
-    assert readmitted in left, "an erased-then-readmitted key must survive"
-    assert left == set(keep) | {
-        readmitted
-    }, "evicted_keys must not have removed anything"
+    assert left == set(keep) | {readmitted}
 
-    # An absent list is not an error: a table may never have been erased from,
-    # and under row-wise sharding a rank may own none of the keys that were.
-    # ``None`` rather than an empty tensor, since a hand-built delta may do that.
+    # An absent list is not an error: a table may never have been erased from.
     next_delta.erased_keys[0] = None
     next_delta.evicted_keys[0] = None
     assert dst.replay_increment(next_delta)[TABLE_NAME].erased == 0
@@ -709,70 +660,6 @@ def test_replay_content_restores_optimizer_state(current_device):
         torch.testing.assert_close(got[key], src_state[key])
 
 
-def test_replay_does_not_leave_displaced_keys_in_the_cache(current_device):
-    """A key whose slot a delta key takes over must not survive in the cache.
-
-    Writing a key at its source slot reproduces an eviction in the *storage* --
-    the slot's new owner overwrites the old one. It does not reach the cache,
-    which is a separate index the slot write knows nothing about. So the
-    displaced key is in neither ``keys`` nor ``erased_keys``, and an
-    invalidation working from those two lists alone leaves it behind.
-
-    Letting it survive is worse than a stale read: ``flush_cache`` pushes every
-    cached key back down, so the next dump would *resurrect* it into storage and
-    it would reappear in the dump -- which is what this asserts against.
-    """
-    device = torch.device(f"cuda:{current_device}")
-    # One bucket, so any key may legally occupy any slot (see below), and room
-    # to spare so that nothing here depends on the table being full.
-    # 1024 rows * 8 dims * 4 bytes = 32 KiB of values; half in HBM leaves a real
-    # GPU cache in front of a host-backed store.
-    cfg = dict(
-        max_capacity=1024,
-        init_capacity=1024,
-        bucket_capacity=1024,
-        caching=True,
-        local_hbm_for_values=16384,
-    )
-    src = make_model(current_device, **cfg)
-    dst = make_model(current_device, **cfg)
-    assert dst._cache is not None, "this test is meaningless without a cache"
-
-    keys = list(range(1001, 1129))
-    touch(src, keys, device)
-    delta = dump_all(src)
-    dst.replay_increment(delta)
-    assert set(dump_all(dst).keys[0].tolist()) == set(keys), "must start converged"
-
-    # Pull one key into the replica's cache while it is still resident there.
-    victim = int(delta.keys[0][0].item())
-    touch(dst, [victim], device)
-
-    # Now hand the replica a delta in which a *different* key claims the
-    # victim's slot -- what the source produces when it evicts the victim and
-    # admits someone else in its place.
-    #
-    # Constructed rather than provoked: which key a table evicts, and whether it
-    # evicts at all, depends on the eviction policy, on ref-counter pinning and
-    # on how full the table happens to be -- none of which this test is about,
-    # and all of which vary by GPU. The single bucket makes the substitution
-    # legal, since a slot only has to lie in its key's home bucket.
-    taker = 9001
-    delta.keys[0] = delta.keys[0].clone()
-    delta.keys[0][0] = taker
-    delta.evicted_keys[0] = torch.tensor([victim], dtype=delta.keys[0].dtype)
-
-    dst.replay_increment(delta)
-
-    # dump_all flushes the cache into storage first, so a surviving cached copy
-    # of the victim would reappear here.
-    left = set(dump_all(dst).keys[0].tolist())
-    assert taker in left, "the taker must hold the slot it was given"
-    assert (
-        victim not in left
-    ), f"key {victim} lost its slot to {taker} but survived in the cache"
-
-
 def test_replay_with_caching(current_device):
     """With a cache in front of the storage, a lookup after replay must see the
     replayed values, not the stale cached ones.
@@ -800,29 +687,3 @@ def test_replay_with_caching(current_device):
     torch.testing.assert_close(out_vals, src_vals)
 
 
-def test_replay_rechecks_layout_after_cache_flush_expansion(current_device):
-    """A cache flush may rehash storage, invalidating the source slot plan."""
-    device = torch.device(f"cuda:{current_device}")
-    cfg = dict(
-        max_capacity=4096,
-        init_capacity=512,
-        bucket_capacity=128,
-        caching=True,
-        local_hbm_for_values=65536,
-    )
-    src = make_model(current_device, **cfg)
-    dst = make_model(current_device, **cfg)
-
-    delta_keys = list(range(1001, 1101))
-    extra_keys = list(range(5001, 5451))
-    touch(src, delta_keys, device)
-    delta = dump_all(src)
-
-    # Keep the target's cache dirty and force its backing table to grow when
-    # replay flushes it. The pre-flush plan still sees the original capacity.
-    all_keys = delta_keys + extra_keys
-    for start in range(0, len(all_keys), 50):
-        touch(dst, all_keys[start : start + 50], device)
-
-    with pytest.raises(ValueError, match="capacity mismatch"):
-        dst.replay_increment(delta)

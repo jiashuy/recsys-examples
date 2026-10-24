@@ -23,7 +23,7 @@ import math
 import numpy as np
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbTableOptions,
@@ -263,7 +263,6 @@ def _lru_lfu_storage(
             # strategy explicitly (batched normally derives these).
             init_capacity=init_capacity if init_capacity is not None else max_capacity,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             evict_strategy=DynamicEmbEvictStrategy.LFU,

@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torchrec
 from debug import Debugger
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
@@ -115,7 +114,6 @@ def get_planner(args, device, eb_configs):
                     initializer_args=DynamicEmbInitializerArgs(
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
-                    safe_check_mode=DynamicEmbCheckMode.WARNING,
                 ),
             )
 
@@ -335,6 +333,8 @@ def run(args):
         debugger.sequence_embds_after_all2all(
             jagged_tensors, feature_names, dyn_emb_features, dims[0]
         )
+        # A training forward holds its rows until its backward runs, so give it one.
+        sum(v.values().float().sum() for v in jagged_tensors).backward()
         print(f"DynamicEmb iteration {i+1} Passed")
 
     # dict_ = model.state_dict()

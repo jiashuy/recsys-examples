@@ -153,9 +153,9 @@ DEMB_TABLE_ALIGN_SIZE = 16
 # Per-bucket row alignment for hashtable backends (same as :data:`DEMB_TABLE_ALIGN_SIZE`).
 BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
 
-# Sentinel ``bucket_capacity``: treat the whole per-rank table as one bucket; see
-# :func:`dynamicemb.dynamicemb_config.get_sharded_table_capacity` (per-rank row count).
-MAX_BUCKET_CAPACITY: int = 2**63 - 1
+# The largest ``bucket_capacity`` a table takes: slots of a bucket are addressed by a
+# byte in the chained key index.
+MAX_BUCKET_CAPACITY: int = 256
 
 torch_dtype_to_np_dtype = {
     torch.uint64: np.uint64,

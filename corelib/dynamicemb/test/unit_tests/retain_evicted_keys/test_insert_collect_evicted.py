@@ -33,7 +33,7 @@ oracle (mirroring test_lru_lfu.py) predicts the exact victim set.
 import numpy as np
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
+from dynamicemb import DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.key_value_table import _append_evicted, _pop_state_evicted_keys
@@ -379,7 +379,6 @@ def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
             max_capacity=max_capacity,
             init_capacity=max_capacity,
             bucket_capacity=bucket_capacity,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=LRU_LFU_TS_FIRST,
             evict_strategy=DynamicEmbEvictStrategy.LFU,
