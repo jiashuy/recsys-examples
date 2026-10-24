@@ -68,11 +68,12 @@ class _ChainedIndexView:
     insert that returns the rows. What those helpers call a slot index is, here, a row.
     """
 
-    num_scores_ = 1
     score_fn_key_ = 0
 
     def __init__(self, storage: "ChainedStorage"):
         self._s = storage
+        self.num_scores_ = storage.index.num_scores
+        self._inverse = None  # (table, version) -> row -> slot
         self.key_type = storage._state.options_list[0].index_type
         self.score_names_ = [storage._state.score_policy.name]
         self.bucket_capacity_ = storage.index.bucket_capacity
@@ -131,6 +132,8 @@ class _ChainedIndexView:
         return_index: bool = False,
     ):
         keys, scores, rows = self._s.index.export(table_id)
+        if scores.dim() == 2:
+            scores = scores[:, 0]  # the timestamp, the column an incremental dump thresholds
         if thresholds:
             keep = scores >= int(thresholds[0])
             keys, scores, rows = keys[keep], scores[keep], rows[keep]
@@ -142,6 +145,38 @@ class _ChainedIndexView:
                 named,
                 rows[sl] if return_index else None,
             )
+
+    def _slots_of(self, table_id: int, rows: torch.Tensor) -> torch.Tensor:
+        """Flat slot of each row, from a map built when the table last changed."""
+        index = self._s.index
+        key = (table_id, index.version(table_id))
+        if self._inverse is None or self._inverse[0] != key:
+            cap = index.bucket_capacity
+            occupied = (
+                torch.arange(cap, device=index.device)[None, :]
+                < index._bsize[table_id][:, None]
+            ).reshape(-1)
+            slots = occupied.nonzero().squeeze(1)
+            held = index._index[table_id][slots].to(torch.int64) & 0xFFFFFFFF
+            inverse = torch.full(
+                (index.row_capacity_of(table_id),), -1, dtype=torch.int64, device=index.device
+            )
+            inverse[held] = slots
+            self._inverse = (key, inverse)
+        return self._inverse[1][rows.to(torch.int64)]
+
+    def gather_score_blocks(self, table_id: int, rows: torch.Tensor) -> torch.Tensor:
+        """The score words of the keys on these rows, ``[n, num_scores]``."""
+        slots = self._slots_of(table_id, rows)
+        return self._s.index._scores[table_id].view(-1, self.num_scores_)[slots]
+
+    def scatter_score_blocks(
+        self, table_id: int, rows: torch.Tensor, block: torch.Tensor
+    ) -> None:
+        slots = self._slots_of(table_id, rows)
+        self._s.index._scores[table_id].view(-1, self.num_scores_)[slots] = block.to(
+            torch.int64
+        )
 
     def insert(
         self,
@@ -161,6 +196,10 @@ class _ChainedIndexView:
         index = s.index
         if score.policy == ScorePolicy.CONST:
             values, policy = None, "none"
+        elif self.num_scores_ == 2:
+            # a (timestamp, frequency) pair: the clock, and the frequency it is given
+            values = None if score.value is None else score.value.to(torch.int64)
+            policy = "lru_lfu"
         elif score.policy == ScorePolicy.ACCUMULATE:
             values, policy = score.value.to(torch.int64), "accumulate"
         elif score.value is None:  # the device clock
@@ -182,14 +221,26 @@ class _ChainedIndexView:
         return result
 
 
+def _is_lru_lfu(strategy) -> bool:
+    return isinstance(strategy, tuple) and frozenset(strategy) == frozenset(
+        {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
+    )
+
+
 class ChainedStorage(Storage):
     def __init__(self, options, optimizer, lower: Optional[Storage] = None):
         base = options[0]
         strategy = base.score_strategy
-        if strategy not in _SUPPORTED:
+        lru_lfu = _is_lru_lfu(strategy)
+        if not lru_lfu and strategy not in _SUPPORTED:
             raise NotImplementedError(
-                f"the chained index supports the single-score strategies "
-                f"{[s.name for s in _SUPPORTED]}, not {strategy}"
+                f"the chained index supports {[s.name for s in _SUPPORTED]} and the "
+                f"compound (TIMESTAMP, LFU), not {strategy}"
+            )
+        if lru_lfu and base.score_function is not None:
+            raise NotImplementedError(
+                "the chained index ranks a (TIMESTAMP, LFU) table by frequency and then "
+                "age; a custom score_function is not supported"
             )
         cap = int(base.bucket_capacity)
         if cap > 256:
@@ -219,6 +270,7 @@ class ChainedStorage(Storage):
             track_refs=hbm_direct,
             no_eviction=[strategy == DynamicEmbScoreStrategy.NO_EVICTION] * len(options),
             device=self._state.device,
+            num_scores=2 if lru_lfu else 1,
         )
         self._state.key_index_map = _ChainedIndexView(self)
         # An upper bound on the keys of each table, refreshed when it matters.
@@ -250,6 +302,10 @@ class ChainedStorage(Storage):
                 torch.full((n,), device_timestamp(), dtype=torch.int64, device=device),
                 "assign",
             )
+        if _is_lru_lfu(s):
+            # the timestamp is the device clock at the access; the frequency grows by
+            # what the step counted, or by one
+            return (None if frequency is None else frequency.to(torch.int64)), "lru_lfu"
         if s in (DynamicEmbScoreStrategy.STEP, DynamicEmbScoreStrategy.CUSTOMIZED):
             value = int(self._state.score or 0)
             return torch.full((n,), value, dtype=torch.int64, device=device), "assign"
@@ -413,7 +469,7 @@ class ChainedStorage(Storage):
             return
         device = unique_keys.device
         sc, policy = self.score_args(n, device)
-        if scores is not None:
+        if scores is not None and policy != "lru_lfu":
             sc, policy = scores.to(torch.int64), "assign"
         if preserve_existing:
             policy = "none"
@@ -519,7 +575,8 @@ class ChainedStorage(Storage):
                 state, table_id, torch.zeros(n, dtype=torch.int64, device=device),
                 timestamp, insert_score,
             )  # fmt: skip
-        score_vec = score_vec.reshape(-1).to(torch.int64)
+        score_vec = score_vec.to(torch.int64)
+        pair = index_pair = self._index.num_scores == 2
         index = self._index
         # A bucket takes at most as many new keys at once as it has slots.
         step = max(
@@ -530,7 +587,12 @@ class ChainedStorage(Storage):
             k = keys[start:end]
             tids = torch.full((k.numel(),), table_id, dtype=torch.int64, device=device)
             self.grow_for(table_id, int(k.numel()))
-            rows = index.find_and_stage(k, tids, score_vec[start:end], "assign")
+            rows = index.find_and_stage(
+                k,
+                tids,
+                None if pair else score_vec[start:end].reshape(-1),
+                "none" if pair else "assign",
+            )
             same_key = rows >= 0
             if index.num_staged:
                 out = index.commit()
@@ -538,6 +600,10 @@ class ChainedStorage(Storage):
                 rows[out.positions] = out.rows
                 self.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
                 index.release_rows(out.victim_rows, out.victim_tables)
+            if pair:  # both words, for the keys that were there as well as the new ones
+                state.key_index_map.scatter_score_blocks(
+                    table_id, rows, score_vec[start:end]
+                )
             _replay_write_values(
                 state,
                 table_id,

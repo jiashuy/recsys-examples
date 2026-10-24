@@ -344,3 +344,30 @@ def test_every_key_that_is_not_held_was_retained_as_evicted(layout):
     assert used <= held | popped, "a key was lost without being reported"
     assert popped <= used, "a key that was never used was reported"
     assert module.pop_evicted_keys()["t"].numel() == 0, "the keys are drained by a pop"
+
+
+# -- the compound (TIMESTAMP, LFU) strategy -------------------------------------
+
+LRU_LFU = (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
+
+
+@pytest.mark.parametrize("layout", ["hbm", "caching"])
+def test_a_timestamp_and_frequency_table_evicts_and_loses_nothing(layout):
+    module = _module(layout, PyDictStorage, 2048, LRU_LFU)
+    storage = module._storage
+    assert isinstance(storage, ChainedStorage)
+    uses = _train(module)
+    assert int((uses > 0).sum()) > 2 * 2048
+    assert storage.lower.size() > 0, "nothing was evicted into the storage below"
+    bad, total = _mismatched_keys(module, uses)
+    assert bad == 0, f"{bad} of {total} keys lost an update"
+    storage.index.check_invariants([0])
+
+
+@pytest.mark.parametrize("layout", ["hbm", "caching"])
+@pytest.mark.parametrize("admission", [False, True], ids=["all-admitted", "frequency-admission"])
+def test_the_pair_gives_the_same_answers_as_the_existing_index(layout, admission, monkeypatch):
+    old = _outputs(_two_tables(layout, False, monkeypatch, admission, LRU_LFU))
+    new = _outputs(_two_tables(layout, True, monkeypatch, admission, LRU_LFU))
+    for step, (a, b) in enumerate(zip(old, new)):
+        assert torch.equal(a, b), f"step {step} differs"

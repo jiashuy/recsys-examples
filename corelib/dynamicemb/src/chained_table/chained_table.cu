@@ -89,7 +89,7 @@ struct TableView {
   int64_t num_buckets;
   int64_t gid_base;  // buckets of the tables before this one: a bucket's global id
   int32_t cap;
-  int32_t pad;
+  int32_t num_scores;  // score words per slot: 1, or 2 for (timestamp, frequency)
 };
 static_assert(sizeof(TableView) == 96, "the layout is built on the host");
 
@@ -118,13 +118,16 @@ __global__ void bucket_ids_kernel(const int64_t *__restrict__ keys, int64_t n,
 }
 
 // mode: 0 leave scores alone, 1 assign the given score, 2 add the given score
-// (1 when none is given, which is how a frequency counts). With `pin`, a hit also
-// takes a reference on its row.
+// (1 when none is given, which is how a frequency counts), 3 for a (timestamp,
+// frequency) pair: the timestamp is set to `ts`, the frequency gets the given
+// amount added (1 when none is given). With `pin`, a hit also takes a reference
+// on its row.
 __global__ void find_kernel(const TableView *__restrict__ views,
                             const int64_t *__restrict__ keys,
                             const int64_t *__restrict__ tids,
                             const uint64_t *__restrict__ in_scores, int mode,
-                            int pin, int64_t n, int64_t *__restrict__ rows) {
+                            int64_t ts, int pin, int64_t n,
+                            int64_t *__restrict__ rows) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
     const TableView &v = views[tids[i]];
@@ -140,10 +143,14 @@ __global__ void find_kernel(const TableView *__restrict__ views,
       const int64_t s = base + cur;
       if (v.keys[s] == key) {
         row = static_cast<int64_t>(v.index[s]);
+        const int64_t w = s * v.num_scores;
         if (mode == 1) {
-          v.scores[s] = in_scores != nullptr ? in_scores[i] : 0;
+          v.scores[w] = in_scores != nullptr ? in_scores[i] : 0;
         } else if (mode == 2) {
-          v.scores[s] += in_scores != nullptr ? in_scores[i] : 1;
+          v.scores[w] += in_scores != nullptr ? in_scores[i] : 1;
+        } else if (mode == 3) {
+          v.scores[w] = static_cast<uint64_t>(ts);
+          v.scores[w + 1] += in_scores != nullptr ? in_scores[i] : 1;
         }
         if (pin && v.refs != nullptr) atomicAdd(&v.refs[row], 1);
         break;
@@ -186,6 +193,21 @@ __device__ __forceinline__ void warp_min(uint64_t &sc, uint32_t &sl) {
     if (osc < sc || (osc == sc && osl < sl)) {
       sc = osc;
       sl = osl;
+    }
+  }
+}
+
+// The same over a (hi, lo, slot) triple, smallest first.
+__device__ __forceinline__ void warp_min3(uint64_t &hi, uint64_t &lo,
+                                          uint32_t &sl) {
+  for (int off = 16; off > 0; off >>= 1) {
+    const uint64_t oh = __shfl_xor_sync(0xffffffffu, hi, off);
+    const uint64_t ol = __shfl_xor_sync(0xffffffffu, lo, off);
+    const uint32_t os = __shfl_xor_sync(0xffffffffu, sl, off);
+    if (oh < hi || (oh == hi && (ol < lo || (ol == lo && os < sl)))) {
+      hi = oh;
+      lo = ol;
+      sl = os;
     }
   }
 }
@@ -250,33 +272,46 @@ __global__ void place_kernel(
     // 1. victims
     bool fail = false;
     if (k > 0) {
-      uint64_t sc[8];
+      // The rank of a member: its score, or for a (timestamp, frequency) pair the
+      // frequency first and then the timestamp -- the least used goes first, the
+      // oldest of those first.
+      const int S = v.num_scores;
+      uint64_t sc[8], sl_[8];
       uint32_t taken = 0;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         const int j = lane + 32 * i;
         if (j < s0) {
-          sc[i] = v.scores[base + j];
+          if (S == 1) {
+            sc[i] = v.scores[base + j];
+            sl_[i] = 0;
+          } else {
+            sl_[i] = v.scores[(base + j) * S];      // timestamp
+            sc[i] = v.scores[(base + j) * S + 1];   // frequency
+          }
         } else {
           sc[i] = ~0ULL;
+          sl_[i] = ~0ULL;
           taken |= 1u << i;
         }
       }
       int64_t sel = 0;
       while (sel < k) {
-        uint64_t bs = ~0ULL;
+        uint64_t bs = ~0ULL, bt = ~0ULL;
         uint32_t bl = 0xFFFFFFFFu;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           if (!((taken >> i) & 1u)) {
             const uint32_t j = uint32_t(lane + 32 * i);
-            if (sc[i] < bs || (sc[i] == bs && j < bl)) {
+            if (sc[i] < bs ||
+                (sc[i] == bs && (sl_[i] < bt || (sl_[i] == bt && j < bl)))) {
               bs = sc[i];
+              bt = sl_[i];
               bl = j;
             }
           }
         }
-        warp_min(bs, bl);
+        warp_min3(bs, bt, bl);
         if (bl == 0xFFFFFFFFu) {
           fail = true;
           break;
@@ -362,7 +397,10 @@ __global__ void place_kernel(
         const int64_t sl = base + slot;
         const int64_t row = srows[begin + j];
         v.keys[sl] = key;
-        v.scores[sl] = sscores[begin + j];
+        for (int w2 = 0; w2 < v.num_scores; ++w2) {
+          v.scores[sl * v.num_scores + w2] =
+              sscores[(begin + j) * v.num_scores + w2];
+        }
         v.index[sl] = static_cast<uint32_t>(row);
         chn = static_cast<int>((hash64(key) >> 32) % uint32_t(v.cap));
         if (pin_new && v.refs != nullptr) v.refs[row] = 1;
@@ -443,7 +481,10 @@ __global__ void erase_kernel(const TableView *__restrict__ views,
         else v.next[base + p] = uint16_t(slot);
         v.next[base + slot] = v.next[base + last];
         v.keys[base + slot] = lk;
-        v.scores[base + slot] = v.scores[base + last];
+        for (int k = 0; k < v.num_scores; ++k) {
+          v.scores[(base + slot) * v.num_scores + k] =
+              v.scores[(base + last) * v.num_scores + k];
+        }
         v.index[base + slot] = v.index[base + last];
       }
       v.bucket_size[b] = last;
@@ -465,7 +506,8 @@ __global__ void miss_flag_kernel(const int64_t *__restrict__ rows, int64_t n,
 __global__ void stage_scatter_kernel(
     const int32_t *__restrict__ flag, const int32_t *__restrict__ pos,
     const int64_t *__restrict__ keys, const int64_t *__restrict__ tids,
-    const int64_t *__restrict__ scores, int64_t fill, int64_t n,
+    const int64_t *__restrict__ scores, int64_t fill, int64_t ts, int S,
+    int64_t n,
     int64_t *__restrict__ okeys, int64_t *__restrict__ otids,
     int64_t *__restrict__ oscores, int64_t *__restrict__ opos,
     int64_t *__restrict__ total) {
@@ -475,7 +517,13 @@ __global__ void stage_scatter_kernel(
       const int64_t o = pos[i];
       okeys[o] = keys[i];
       otids[o] = tids[i];
-      oscores[o] = scores != nullptr ? scores[i] : fill;
+      const int64_t given = scores != nullptr ? scores[i] : fill;
+      if (S == 1) {
+        oscores[o] = given;
+      } else {  // (timestamp, frequency)
+        oscores[o * 2] = ts;
+        oscores[o * 2 + 1] = given;
+      }
       opos[o] = i;
     }
     if (i == n - 1) total[0] = int64_t(pos[i]) + flag[i];
@@ -486,7 +534,7 @@ __global__ void gather_kernel(const int64_t *__restrict__ perm,
                               const int64_t *__restrict__ keys,
                               const int64_t *__restrict__ tids,
                               const int64_t *__restrict__ scores,
-                              const int64_t *__restrict__ local, int64_t n,
+                              const int64_t *__restrict__ local, int S, int64_t n,
                               int64_t *__restrict__ skeys,
                               int64_t *__restrict__ stids,
                               int64_t *__restrict__ sscores,
@@ -496,7 +544,7 @@ __global__ void gather_kernel(const int64_t *__restrict__ perm,
     const int64_t j = perm[i];
     skeys[i] = keys[j];
     stids[i] = tids[j];
-    sscores[i] = scores[j];
+    for (int k = 0; k < S; ++k) sscores[i * S + k] = scores[j * S + k];
     slocal[i] = local[j];
   }
 }
@@ -649,7 +697,8 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
                               std::vector<c10::optional<at::Tensor>> refs,
                               std::vector<at::Tensor> free_rows,
                               at::Tensor tops,
-                              std::vector<int64_t> num_buckets, int64_t cap) {
+                              std::vector<int64_t> num_buckets, int64_t cap,
+                              int64_t num_scores) {
   const size_t nt = keys.size();
   TORCH_CHECK(scores.size() == nt && index.size() == nt && next.size() == nt &&
                   head.size() == nt && bucket_size.size() == nt &&
@@ -672,13 +721,15 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     check_cuda(bucket_size[t], "table bucket_size");
     TORCH_CHECK(keys[t].element_size() == 8 && scores[t].element_size() == 8,
                 "keys and scores must be 8 bytes wide");
+    TORCH_CHECK(num_scores == 1 || num_scores == 2, "one or two score words");
     TORCH_CHECK(index[t].element_size() == 4, "index must be 4 bytes wide");
     TORCH_CHECK(next[t].element_size() == 2 && head[t].element_size() == 2,
                 "next and head must be 2 bytes wide");
     TORCH_CHECK(bucket_size[t].scalar_type() == at::kInt,
                 "bucket_size must be int32");
     const int64_t slots = num_buckets[t] * cap;
-    TORCH_CHECK(keys[t].numel() == slots && scores[t].numel() == slots &&
+    TORCH_CHECK(keys[t].numel() == slots &&
+                    scores[t].numel() == slots * num_scores &&
                     index[t].numel() == slots && next[t].numel() == slots &&
                     head[t].numel() == slots &&
                     bucket_size[t].numel() == num_buckets[t],
@@ -704,7 +755,7 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     v.num_buckets = num_buckets[t];
     v.gid_base = gid_base;
     v.cap = static_cast<int32_t>(cap);
-    v.pad = 0;
+    v.num_scores = static_cast<int32_t>(num_scores);
     gid_base += num_buckets[t];
   }
   auto out = at::empty({int64_t(nt * sizeof(TableView))},
@@ -759,13 +810,13 @@ std::tuple<at::Tensor, at::Tensor> chained_gids(at::Tensor views,
 
 at::Tensor chained_find(at::Tensor views, at::Tensor keys, at::Tensor tids,
                         c10::optional<at::Tensor> scores, int64_t mode,
-                        bool pin) {
+                        bool pin, int64_t ts) {
   check_cuda(keys, "keys");
   check_cuda(tids, "table ids");
   TORCH_CHECK(keys.element_size() == 8, "keys must be 8 bytes wide");
   TORCH_CHECK(tids.scalar_type() == at::kLong && tids.numel() == keys.numel(),
               "table ids must be int64, one per key");
-  TORCH_CHECK(mode >= 0 && mode <= 2, "mode must be 0, 1 or 2");
+  TORCH_CHECK(mode >= 0 && mode <= 3, "mode must be 0, 1, 2 or 3");
   const uint64_t *sc = nullptr;
   if (scores.has_value() && scores->defined()) {
     check_cuda(*scores, "scores");
@@ -779,7 +830,7 @@ at::Tensor chained_find(at::Tensor views, at::Tensor keys, at::Tensor tids,
   auto stream = at::cuda::getCurrentCUDAStream();
   find_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
       views_ptr(views), reinterpret_cast<const int64_t *>(keys.data_ptr()),
-      tids.data_ptr<int64_t>(), sc, static_cast<int>(mode), pin ? 1 : 0, n,
+      tids.data_ptr<int64_t>(), sc, static_cast<int>(mode), ts, pin ? 1 : 0, n,
       rows.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return rows;
@@ -871,14 +922,15 @@ void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
 // the first `m` entries mean anything. One host synchronisation, for `m`.
 std::tuple<int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 chained_stage(at::Tensor rows, at::Tensor keys, at::Tensor tids,
-              c10::optional<at::Tensor> scores, int64_t fill) {
+              c10::optional<at::Tensor> scores, int64_t fill, int64_t ts,
+              int64_t num_scores) {
   check_cuda(rows, "rows");
   check_cuda(keys, "keys");
   check_cuda(tids, "table ids");
   const int64_t n = keys.numel();
   auto okeys = at::empty({n}, keys.options().dtype(at::kLong));
   auto otids = at::empty({n}, keys.options().dtype(at::kLong));
-  auto oscores = at::empty({n}, keys.options().dtype(at::kLong));
+  auto oscores = at::empty({n * num_scores}, keys.options().dtype(at::kLong));
   auto opos = at::empty({n}, keys.options().dtype(at::kLong));
   if (n == 0) return {0, okeys, otids, oscores, opos};
   const int64_t *sc = nullptr;
@@ -901,7 +953,8 @@ chained_stage(at::Tensor rows, at::Tensor keys, at::Tensor tids,
   stage_scatter_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
       flag.data_ptr<int32_t>(), pos.data_ptr<int32_t>(),
       reinterpret_cast<const int64_t *>(keys.data_ptr()),
-      tids.data_ptr<int64_t>(), sc, fill, n, okeys.data_ptr<int64_t>(),
+      tids.data_ptr<int64_t>(), sc, fill, ts, static_cast<int>(num_scores), n,
+      okeys.data_ptr<int64_t>(),
       otids.data_ptr<int64_t>(), oscores.data_ptr<int64_t>(),
       opos.data_ptr<int64_t>(), total.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -917,7 +970,8 @@ chained_stage(at::Tensor rows, at::Tensor keys, at::Tensor tids,
 //   need, voff, num_runs, tstart
 std::vector<at::Tensor> chained_plan(at::Tensor views, at::Tensor keys,
                                      at::Tensor tids, at::Tensor scores,
-                                     int64_t total_buckets, int64_t num_tables) {
+                                     int64_t total_buckets, int64_t num_tables,
+                                     int64_t num_scores) {
   check_cuda(keys, "keys");
   check_cuda(tids, "table ids");
   check_cuda(scores, "scores");
@@ -948,13 +1002,14 @@ std::vector<at::Tensor> chained_plan(at::Tensor views, at::Tensor keys,
   }
   auto skeys = at::empty({n}, o64);
   auto stids = at::empty({n}, o64);
-  auto sscores = at::empty({n}, o64);
+  auto sscores = at::empty({n * num_scores}, o64);
   auto slocal = at::empty({n}, o64);
   gather_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
       perm.data_ptr<int64_t>(), reinterpret_cast<const int64_t *>(keys.data_ptr()),
       tids.data_ptr<int64_t>(),
       reinterpret_cast<const int64_t *>(scores.data_ptr()),
-      local.data_ptr<int64_t>(), n, skeys.data_ptr<int64_t>(),
+      local.data_ptr<int64_t>(), static_cast<int>(num_scores), n,
+      skeys.data_ptr<int64_t>(),
       stids.data_ptr<int64_t>(), sscores.data_ptr<int64_t>(),
       slocal.data_ptr<int64_t>());
 
@@ -1084,14 +1139,16 @@ void chained_release(at::Tensor views, int64_t table, at::Tensor rows) {
 // Remove keys. Returns each key's row in input order, -1 for a key that was not there.
 // The rows are not put back on the stack: that is the caller's.
 at::Tensor chained_erase(at::Tensor views, at::Tensor keys, at::Tensor tids,
-                         int64_t total_buckets, int64_t num_tables) {
+                         int64_t total_buckets, int64_t num_tables,
+                         int64_t num_scores) {
   check_cuda(keys, "keys");
   check_cuda(tids, "table ids");
   const int64_t n = keys.numel();
   auto rows = at::empty({n}, keys.options().dtype(at::kLong));
   if (n == 0) return rows;
-  auto zeros = at::zeros({n}, keys.options().dtype(at::kLong));
-  auto plan = chained_plan(views, keys, tids, zeros, total_buckets, num_tables);
+  auto zeros = at::zeros({n * num_scores}, keys.options().dtype(at::kLong));
+  auto plan = chained_plan(views, keys, tids, zeros, total_buckets, num_tables,
+                           num_scores);
   // perm, sgid, skeys, stids, sscores, seg_table, seg_bucket, seg_begin, counts,
   // need, voff, num_runs, tstart
   auto &perm = plan[0];
@@ -1123,7 +1180,8 @@ void bind_chained_table(py::module &m) {
         "build the device array of table views", py::arg("keys"),
         py::arg("scores"), py::arg("index"), py::arg("next"), py::arg("head"),
         py::arg("bucket_size"), py::arg("refs"), py::arg("free_rows"), py::arg("tops"),
-        py::arg("num_buckets"), py::arg("bucket_capacity"));
+        py::arg("num_buckets"), py::arg("bucket_capacity"),
+        py::arg("num_scores") = 1);
   m.def("chained_bucket_ids", &dyn_emb::chained::chained_bucket_ids,
         "bucket of each key: hash(key) % num_buckets", py::arg("keys"),
         py::arg("num_buckets"));
@@ -1136,7 +1194,7 @@ void bind_chained_table(py::module &m) {
         "a reference on the rows found",
         py::arg("views"), py::arg("keys"), py::arg("table_ids"),
         py::arg("scores") = py::none(), py::arg("mode") = 0,
-        py::arg("pin") = false);
+        py::arg("pin") = false, py::arg("ts") = 0);
   m.def("chained_pin", &dyn_emb::chained::chained_pin,
         "add delta to the pin count of each (table, row)", py::arg("views"),
         py::arg("rows"), py::arg("table_ids"), py::arg("delta"));
@@ -1156,11 +1214,13 @@ void bind_chained_table(py::module &m) {
         "compact the misses after chained_find: (count, keys, table ids, scores, "
         "positions), each sized to the input",
         py::arg("rows"), py::arg("keys"), py::arg("table_ids"),
-        py::arg("scores") = py::none(), py::arg("fill") = 0);
+        py::arg("scores") = py::none(), py::arg("fill") = 0,
+        py::arg("ts") = 0, py::arg("num_scores") = 1);
   m.def("chained_plan", &dyn_emb::chained::chained_plan,
         "sort staged keys by bucket and cut them into one run per bucket",
         py::arg("views"), py::arg("keys"), py::arg("table_ids"),
-        py::arg("scores"), py::arg("total_buckets"), py::arg("num_tables"));
+        py::arg("scores"), py::arg("total_buckets"), py::arg("num_tables"),
+        py::arg("num_scores") = 1);
   m.def("chained_apply", &dyn_emb::chained::chained_apply,
         "take the rows, place the planned keys, return rows in input order",
         py::arg("views"), py::arg("perm"), py::arg("skeys"), py::arg("stids"),
@@ -1175,5 +1235,6 @@ void bind_chained_table(py::module &m) {
   m.def("chained_erase", &dyn_emb::chained::chained_erase,
         "remove keys; the row of each (-1 if absent), in input order",
         py::arg("views"), py::arg("keys"), py::arg("table_ids"),
-        py::arg("total_buckets"), py::arg("num_tables"));
+        py::arg("total_buckets"), py::arg("num_tables"),
+        py::arg("num_scores") = 1);
 }

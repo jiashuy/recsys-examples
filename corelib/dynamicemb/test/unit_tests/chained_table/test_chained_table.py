@@ -680,3 +680,136 @@ def test_two_runs_of_the_same_steps_end_identically(device):
     for name in ("_keys", "_scores", "_index", "_next", "_head", "_bsize", "_free"):
         assert torch.equal(getattr(a, name)[0], getattr(b, name)[0]), name
     assert a.free_rows() == b.free_rows()
+
+
+# -- a (timestamp, frequency) pair ----------------------------------------------
+
+
+class PairModel(Model):
+    """Two words per key: the clock at the last access, and a count. The least used goes
+    first, and of those the longest unused."""
+
+    def find_and_stage(self, keys, freqs, ts):
+        rows = []
+        self.staged = []
+        for pos, key in enumerate(keys):
+            add = 1 if freqs is None else freqs[pos]
+            for entry in self.buckets[self.bucket(key)]:
+                if entry[0] == key:
+                    entry[1] = (ts, entry[1][1] + add)
+                    rows.append(entry[2])
+                    break
+            else:
+                rows.append(-1)
+                self.staged.append((pos, key, (ts, add)))
+        return rows
+
+    def commit(self, keep=None, protected=frozenset()):
+        staged = self.staged
+        if keep is not None:
+            staged = [s for s, k in zip(staged, keep) if k]
+        self.staged = []
+        m = len(staged)
+        pool = self.free[len(self.free) - m :] if m else []
+        del self.free[len(self.free) - m :]
+        order = sorted(range(m), key=lambda j: (self.bucket(staged[j][1]), j))
+        new_rows = [None] * m
+        for i, j in enumerate(order):
+            new_rows[j] = pool[i]
+        by_bucket = {}
+        for j in order:
+            pos, key, score = staged[j]
+            by_bucket.setdefault(self.bucket(key), []).append((key, score, new_rows[j]))
+        victims = []
+        for b in sorted(by_bucket):
+            new = by_bucket[b]
+            members = self.buckets[b]
+            s0 = len(members)
+            free_slots = self.cap - s0
+            need = max(0, len(new) - free_slots)
+            # frequency, then timestamp, then slot
+            rank = lambda s: (members[s][1][1], members[s][1][0], s)
+            chosen = [s for s in sorted(range(s0), key=rank)][:need]
+            for key, score, row in new[:free_slots]:
+                members.append([key, score, row])
+            for slot, (key, score, row) in zip(chosen, new[free_slots:]):
+                victims.append((members[slot][0], members[slot][2]))
+                members[slot] = [key, score, row]
+        return new_rows, [p for p, _, _ in staged], victims
+
+    def flat(self):
+        return [(e[0], e[1][0], e[1][1], e[2]) for b in self.buckets for e in b]
+
+
+def _pair_state(table):
+    keys, scores, rows = table.export()
+    return list(zip(keys.tolist(), scores[:, 0].tolist(), scores[:, 1].tolist(), rows.tolist()))
+
+
+@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100)])
+def test_a_timestamp_and_frequency_pair_matches_the_model(device, shape):
+    nb, cap, per_step = shape
+    rng = random.Random(321 + nb)
+    table = ChainedTable(num_buckets=nb, bucket_capacity=cap, device=device, num_scores=2)
+    model = PairModel(nb, cap, table.row_capacity)
+    universe = nb * cap * 3
+    clock = 1000
+    for step in range(25):
+        clock += rng.randrange(1, 50)
+        keys = rng.sample(range(1, universe + 1), per_step)
+        freqs = None if rng.random() < 0.3 else [rng.randrange(1, 5) for _ in keys]
+        rows = table.find_and_stage(
+            _t(keys, device), None if freqs is None else _t(freqs, device), "lru_lfu", timestamp=clock
+        )
+        assert rows.tolist() == model.find_and_stage(keys, freqs, clock)
+        out = table.commit()
+        new_rows, positions, victims = model.commit()
+        assert out.rows.tolist() == new_rows
+        assert out.positions.tolist() == positions
+        assert list(zip(out.victim_keys.tolist(), out.victim_rows.tolist())) == victims
+        table.release_rows(out.victim_rows)
+        model.release([r for _, r in victims])
+        assert _pair_state(table) == model.flat()
+    table.check_invariants()
+
+
+def test_the_least_used_goes_first_and_of_those_the_oldest(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=4, device=device, num_scores=2)
+    keys = _t([1, 2, 3, 4], device)
+    # key: (frequency, timestamp) -- 1: (5, 10), 2: (1, 40), 3: (1, 20), 4: (9, 5)
+    for key, freq, ts in [(1, 5, 10), (2, 1, 40), (3, 1, 20), (4, 9, 5)]:
+        table.find_and_stage(_t([key], device), _t([freq], device), "lru_lfu", timestamp=ts)
+        table.commit()
+    table.find_and_stage(_t([9], device), None, "lru_lfu", timestamp=100)
+    out = table.commit()
+    assert out.victim_keys.tolist() == [3]  # frequency 1, and older than key 2
+    table.release_rows(out.victim_rows)
+
+
+def test_a_hit_moves_its_timestamp_and_adds_to_its_frequency(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=8, device=device, num_scores=2)
+    k = _t([7], device)
+    table.find_and_stage(k, _t([3], device), "lru_lfu", timestamp=10)
+    table.commit()
+    table.find_and_stage(k, _t([4], device), "lru_lfu", timestamp=99)
+    _, scores, _ = table.export()
+    assert scores.tolist() == [[99, 7]]
+
+
+def test_erase_and_growth_keep_both_words(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=16, device=device, num_scores=2)
+    keys = list(range(1, 25))
+    table.find_and_stage(
+        _t(keys, device), _t([k * 3 for k in keys], device), "lru_lfu", timestamp=500
+    )
+    table.commit()
+    table.erase(_t(keys[::4], device))
+    table.expand(0)
+    k, scores, _ = table.export()
+    got = dict(zip(k.tolist(), scores.tolist()))
+    for key in keys:
+        if key in keys[::4]:
+            assert key not in got
+        else:
+            assert got[key] == [500, key * 3]
+    table.check_invariants()

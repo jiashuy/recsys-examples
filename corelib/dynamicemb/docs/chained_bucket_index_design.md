@@ -524,7 +524,26 @@ value 行: 全局行池, 与槽位无关
 - `fill_tables`、`test_table_expansion_capacity_growth`（读写 `key_index_map` 或假设旧的扩容阈值）、`test_deterministic_insert`（比较两个旧索引）：对链式路径需要另写，部分已由上面的用例覆盖。
 - 多 GPU / 分布式的 incremental dump 与 replay 没有测（单卡路径通过 `pg=None`）。
 
+### LruLfu：两字 score（已实现）
+
+复合策略 `(TIMESTAMP, LFU)`（任一顺序）现在可用：每个槽两个 score 字，字 0 是最近一次访问的时间戳（设备时钟），字 1 是累计频次；与旧实现相同，物理布局固定，用户给的顺序只影响 checkpoint 的列序。
+
+- **排名**：频次最小的先被淘汰，频次相同的先淘汰时间戳最老的，再相同取槽位小的（与旧实现默认的 `LexFreqTsComparator` 一致，外加槽位保证确定）。选 victim 时每个 lane 把自己槽的两个字读进寄存器，一次规约比较 `(频次, 时间戳, 槽位)`。
+- **更新**：命中时时间戳置为当前时钟、频次加上这一步统计的次数（没有则加 1）；新 key 以 `(当前时钟, 次数)` 进入。
+- **C++**：`TableView` 带 `num_scores`；`find`、暂存、排序、放置、erase 都按每槽两个字处理。
+- **checkpoint 与增量 dump**：旧代码里取多字 score 的辅助函数按槽位索引，而这里导出的"索引"是行号，所以适配视图维护一张"行号→槽位"的映射（表发生变化时重建，版本号由 `ChainedTables.version` 提供），`gather_score_blocks` / `scatter_score_blocks` 经由它读写整块 score。增量 dump 对时间戳字设阈值（时间窗口），与旧实现一致。
+- **不支持**：自定义 `score_function`（旧实现用 JIT 编译成 cubin 做比较器），构造时抛 `NotImplementedError`。
+
+测试：
+- 与模型逐槽位对照（4 种规模，每步随机的时钟和频次，含大量平局），以及"频次小的先走，同频次时间戳老的先走"、命中同时更新两个字、erase 与扩容保留两个字。
+- 端到端：带下层 PS 的复合策略表（HBM-direct 与缓存）不丢任何更新；与现有索引逐步对照（有无频次 admission）。
+- **用现有套件在链式下重跑**：增量 dump（`test_batched_dynamicemb_tables.py`）18 个全部通过（之前 18 个失败）；`test_pop_evicted_keys.py` 5 个、`test_insert_collect_evicted.py` 13 个全部通过；分布式增量 dump 在 1 卡和 8 卡下各 16 个全部通过；`test_replay_increment.py` 27 个中 22 个通过，其余 5 个测的是旧实现逐槽位 replay 的语义（布局不匹配必须拒绝、evicted keys 不能删除任何东西）或用了超过 256 的桶容量。
+
+**已知限制**：
+- 一个桶在**一步里的新 key 数不能超过桶容量**（新 key 不会淘汰同一步的其他新 key）。表比每步的 unique key 还小的玩具配置会抛 `ChainedTableFull`，旧实现则会在步内淘汰；分布式的 `test_distributed_pop_evicted_keys.py` 在 8 卡下就是这个原因失败（每个 rank 的表只有一个桶、一步 256 个新 key）。要消除这个限制需要 §4.4 的残留节点。
+- 桶容量最大 256。
+
 ### 后续阶段
 
-3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score（解锁复合策略与现有的增量 dump / retain 用例）；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
-6. hybrid 布局；分布式的增量 dump / replay 测试；默认开启链式索引前的灰度与回退方案。
+3. 残留节点的复制前移（软超限，同时解除上面的限制）；整表 top-K 淘汰、排名函数与自定义 `score_function`；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
+6. hybrid 布局；默认开启链式索引前的灰度与回退方案。

@@ -49,14 +49,21 @@ from dynamicemb_extensions import (
     chained_release,
     chained_segment_need,
     chained_stage,
+    device_timestamp,
 )
 
 # How find treats the score of a key it finds.
 SCORE_NONE = 0  # leave it alone
 SCORE_ASSIGN = 1  # set it to the given score
 SCORE_ACCUMULATE = 2  # add the given score (1 when none is given)
+SCORE_LRU_LFU = 3  # (timestamp, frequency): the timestamp is now, the frequency grows
 
-_POLICIES = {"none": SCORE_NONE, "assign": SCORE_ASSIGN, "accumulate": SCORE_ACCUMULATE}
+_POLICIES = {
+    "none": SCORE_NONE,
+    "assign": SCORE_ASSIGN,
+    "accumulate": SCORE_ACCUMULATE,
+    "lru_lfu": SCORE_LRU_LFU,
+}
 
 
 class CommitResult(NamedTuple):
@@ -108,7 +115,11 @@ class ChainedTables:
         track_refs: bool = False,
         no_eviction: Union[bool, Sequence[bool]] = False,
         device: Optional[torch.device] = None,
+        num_scores: int = 1,
     ):
+        if num_scores not in (1, 2):
+            raise ValueError("a slot holds one score word, or two: (timestamp, frequency)")
+        self.num_scores = int(num_scores)
         if not 1 <= bucket_capacity <= 256:
             raise ValueError("bucket_capacity must be in [1, 256]")
         self.num_tables = len(num_buckets)
@@ -153,6 +164,7 @@ class ChainedTables:
             # The pool of free rows is a stack; _tops[t] is how many are on it.
             self._free.append(torch.arange(rows[t], dtype=torch.int32, device=dev))
         self._tops = torch.tensor(rows, dtype=torch.int32, device=dev)
+        self._version = [0] * self.num_tables
         self._rebuild_views()
 
         self._staged_keys: Optional[torch.Tensor] = None
@@ -167,7 +179,7 @@ class ChainedTables:
         dev = self.device
         return (
             torch.zeros(slots, dtype=torch.int64, device=dev),
-            torch.zeros(slots, dtype=torch.int64, device=dev),
+            torch.zeros(slots * self.num_scores, dtype=torch.int64, device=dev),
             torch.zeros(slots, dtype=torch.int32, device=dev),
             torch.full((slots,), -1, dtype=torch.int16, device=dev),
             torch.full((slots,), -1, dtype=torch.int16, device=dev),
@@ -196,7 +208,13 @@ class ChainedTables:
             self._tops,
             self._nb,
             self.bucket_capacity,
+            self.num_scores,
         )
+
+    def version(self, table: int = 0) -> int:
+        """Changes whenever a key of the table moves or goes: what a map from rows to
+        slots, built once, is good for."""
+        return self._version[table]
 
     # -- queries --------------------------------------------------------------
 
@@ -229,6 +247,7 @@ class ChainedTables:
         scores: Optional[torch.Tensor] = None,
         policy: str = "assign",
         pin: bool = False,
+        timestamp: Optional[int] = None,
     ) -> torch.Tensor:
         """Answer the keys the tables have and hold back the ones they do not.
 
@@ -242,12 +261,17 @@ class ChainedTables:
         mode = _POLICIES[policy]
         keys = _as_int64(keys)
         sc = None if scores is None else _as_int64(scores)
-        rows = chained_find(self._views, keys, table_ids, sc, mode, pin)
-        fill = 1 if mode == SCORE_ACCUMULATE else 0
-        m, skeys, stids, sscores, spos = chained_stage(rows, keys, table_ids, sc, fill)
+        if mode == SCORE_LRU_LFU and self.num_scores != 2:
+            raise ValueError("lru_lfu needs tables with two score words")
+        ts = int(device_timestamp() if timestamp is None else timestamp) if mode == SCORE_LRU_LFU else 0
+        rows = chained_find(self._views, keys, table_ids, sc, mode, pin, ts)
+        fill = 1 if mode in (SCORE_ACCUMULATE, SCORE_LRU_LFU) else 0
+        m, skeys, stids, sscores, spos = chained_stage(
+            rows, keys, table_ids, sc, fill, ts, self.num_scores
+        )
         self._staged_keys = skeys[:m]
         self._staged_tids = stids[:m]
-        self._staged_scores = sscores[:m]
+        self._staged_scores = sscores[: m * self.num_scores].view(m, self.num_scores)
         self._staged_positions = spos[:m]
         return rows
 
@@ -312,7 +336,13 @@ class ChainedTables:
         # Sort by bucket, growing the tables that must not evict until they fit.
         while True:
             plan = chained_plan(
-                self._views, keys, tids, scores, total_buckets, self.num_tables
+                self._views,
+                keys,
+                tids,
+                scores.reshape(-1).contiguous(),
+                total_buckets,
+                self.num_tables,
+                self.num_scores,
             )
             (perm, _sgid, skeys, stids, sscores, seg_table, seg_bucket, seg_begin,
              counts, need, voff, num_runs, tstart) = plan  # fmt: skip
@@ -337,6 +367,8 @@ class ChainedTables:
             seg_begin, counts, need, voff, num_runs, tstart, g_ptr, g_n, pin,
             self.num_tables,
         )  # fmt: skip
+        for t in range(self.num_tables):
+            self._version[t] += 1
         victims, runs, failed_buckets, exhausted = stats.tolist()
         if exhausted:
             per_table = (tstart[1:] - tstart[:-1]).tolist()
@@ -400,8 +432,10 @@ class ChainedTables:
         if keys.numel() == 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         rows = chained_erase(
-            self._views, keys, table_ids, sum(self._nb), self.num_tables
+            self._views, keys, table_ids, sum(self._nb), self.num_tables, self.num_scores
         )
+        for t in range(self.num_tables):
+            self._version[t] += 1
         found = rows >= 0
         self.release_rows(rows[found], table_ids[found])
         return rows
@@ -429,6 +463,7 @@ class ChainedTables:
         old_nb = self._nb[table]
         new_nb = max(int(num_buckets) if num_buckets else 2 * old_nb, old_nb + 1)
         keys, scores, rows = self.export(table)
+        scores = scores.reshape(keys.numel(), self.num_scores)
         cap = self.bucket_capacity
         dev = self.device
         while True:
@@ -436,7 +471,7 @@ class ChainedTables:
             tmp = chained_make_views(
                 [arrays[0]], [arrays[1]], [arrays[2]], [arrays[3]], [arrays[4]],
                 [arrays[5]], [None], [self._free[table]], self._tops[table : table + 1],
-                [new_nb], cap,
+                [new_nb], cap, self.num_scores,
             )  # fmt: skip
             local = chained_bucket_ids(keys, new_nb)
             perm = torch.argsort(local, stable=True)
@@ -453,7 +488,7 @@ class ChainedTables:
         chained_place(
             tmp,
             keys[perm],
-            scores[perm],
+            scores[perm].reshape(-1).contiguous(),
             rows[perm],
             seg_table,
             seg_bucket,
@@ -477,6 +512,7 @@ class ChainedTables:
             self._bsize[table],
         ) = arrays
         self._nb[table] = new_nb
+        self._version[table] += 1
 
         # The pool has to cover every slot; the new rows go on the free stack.
         slots = new_nb * cap
@@ -509,9 +545,10 @@ class ChainedTables:
             :, None
         ]
         mask = occupied.reshape(-1)
+        scores = self._scores[table].view(-1, self.num_scores)[mask]
         return (
             self._keys[table][mask],
-            self._scores[table][mask],
+            scores[:, 0] if self.num_scores == 1 else scores,
             self._index[table][mask].to(torch.int64) & 0xFFFFFFFF,
         )
 
@@ -576,6 +613,7 @@ class ChainedTable(ChainedTables):
         device: Optional[torch.device] = None,
         track_refs: bool = False,
         no_eviction: bool = False,
+        num_scores: int = 1,
     ):
         super().__init__(
             [num_buckets],
@@ -584,6 +622,7 @@ class ChainedTable(ChainedTables):
             track_refs,
             [no_eviction],
             device,
+            num_scores,
         )
 
     @property
@@ -610,8 +649,11 @@ class ChainedTable(ChainedTables):
         scores: Optional[torch.Tensor] = None,
         policy: str = "assign",
         pin: bool = False,
+        timestamp: Optional[int] = None,
     ) -> torch.Tensor:
-        return super().find_and_stage(keys, self._zeros(keys.numel()), scores, policy, pin)
+        return super().find_and_stage(
+            keys, self._zeros(keys.numel()), scores, policy, pin, timestamp
+        )
 
     def release_rows(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
         super().release_rows(rows, self._zeros(rows.numel()))
