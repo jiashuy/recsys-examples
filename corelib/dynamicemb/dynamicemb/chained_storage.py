@@ -28,20 +28,30 @@ import math
 from typing import Iterator, List, Optional, Tuple
 
 import torch
-from dynamicemb_extensions import flagged_compact
+from dynamicemb_extensions import EvictStrategy, ScorePolicy, device_timestamp, flagged_compact
 
 from .chained_table import ChainedTables
-from .dynamicemb_config import DynamicEmbScoreStrategy, EvictedItemMode
+from .dynamicemb_config import DynamicEmbScoreStrategy, EvictedItemMode, ReplayContent
 from .key_value_table import (
     DynamicEmbTableState,
+    _append_erased,
     _append_evicted,
+    _dump_table,
     _fill_from_lower,
+    _iter_batches_from_files,
+    _fresh_score_block,
+    _load_key_values,
+    _pop_state_erased_keys,
+    _replay_score_block,
+    _replay_write_values,
+    _validate_load_meta,
     create_table_state,
+    export_keys_values_iter,
     get_table_ptrs,
     load_from_flat,
     store_to_flat,
 )
-from .types import CopyMode, Storage
+from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
 
 _SUPPORTED = (
     DynamicEmbScoreStrategy.TIMESTAMP,
@@ -50,6 +60,126 @@ _SUPPORTED = (
     DynamicEmbScoreStrategy.LFU,
     DynamicEmbScoreStrategy.NO_EVICTION,
 )
+
+
+class _ChainedIndexView:
+    """The part of a key index that the checkpoint code reads, answered from a
+    :class:`ChainedStorage`: the keys of a table with their scores and rows, and an
+    insert that returns the rows. What those helpers call a slot index is, here, a row.
+    """
+
+    num_scores_ = 1
+    score_fn_key_ = 0
+
+    def __init__(self, storage: "ChainedStorage"):
+        self._s = storage
+        self.key_type = storage._state.options_list[0].index_type
+        self.score_names_ = [storage._state.score_policy.name]
+        self.bucket_capacity_ = storage.index.bucket_capacity
+
+    def incremental_dump(
+        self,
+        score_threshold,
+        table_id: int,
+        batch_size: int = 65536,
+        pg=None,
+        return_index: bool = False,
+    ):
+        """Keys, scores and rows of what scores at least the threshold, on the host."""
+        names = [n for n in score_threshold if n in self.score_names_]
+        thresholds = [score_threshold[n] for n in names]
+        keys, scores, rows = [], {n: [] for n in names}, []
+        for k, named, r in self._batched_export_keys_scores(
+            names, self._s._state.device, table_id, thresholds, batch_size, True
+        ):
+            keys.append(k.cpu())
+            rows.append(r.cpu())
+            for n in names:
+                scores[n].append(named[n].cpu())
+
+        def cat(parts, dtype):
+            return torch.cat(parts) if parts else torch.empty(0, dtype=dtype)
+
+        out_scores = {n: cat(scores[n], SCORE_TYPE) for n in names}
+        return (
+            cat(keys, torch.int64),
+            out_scores,
+            cat(rows, torch.int64) if return_index else None,
+        )
+
+    @property
+    def per_table_capacity_(self) -> List[int]:
+        return [self._s.index.capacity_of(t) for t in range(self._s.num_tables)]
+
+    def capacity(self, table_id: Optional[int] = None) -> int:
+        if table_id is None:
+            return sum(self.per_table_capacity_)
+        return self._s.index.capacity_of(table_id)
+
+    def size(self, table_id: Optional[int] = None) -> int:
+        if table_id is None:
+            return sum(self._s.index.size(t) for t in range(self._s.num_tables))
+        return self._s.index.size(table_id)
+
+    def _batched_export_keys_scores(
+        self,
+        score_names: List[str],
+        target_device: torch.device,
+        table_id: int,
+        thresholds: Optional[List[int]] = None,
+        batch_size: int = 65536,
+        return_index: bool = False,
+    ):
+        keys, scores, rows = self._s.index.export(table_id)
+        if thresholds:
+            keep = scores >= int(thresholds[0])
+            keys, scores, rows = keys[keep], scores[keep], rows[keep]
+        for start in range(0, int(keys.numel()), batch_size):
+            sl = slice(start, start + batch_size)
+            named = {name: scores[sl].to(SCORE_TYPE) for name in score_names}
+            yield (
+                keys[sl].view(self.key_type),
+                named,
+                rows[sl] if return_index else None,
+            )
+
+    def insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score,
+        insert_results=None,
+        score_out=None,
+        collect_evicted: bool = False,
+        guard=None,
+    ) -> torch.Tensor:
+        """Put keys in, returning the row of each: the existing row of a key already
+        there, a new one otherwise. Whatever has to go to make room goes down a tier."""
+        if collect_evicted:
+            raise NotImplementedError("the chained index reports its evictions itself")
+        s = self._s
+        index = s.index
+        if score.policy == ScorePolicy.CONST:
+            values, policy = None, "none"
+        elif score.policy == ScorePolicy.ACCUMULATE:
+            values, policy = score.value.to(torch.int64), "accumulate"
+        elif score.value is None:  # the device clock
+            values = torch.full(
+                (keys.numel(),), device_timestamp(), dtype=torch.int64, device=keys.device
+            )
+            policy = "assign"
+        else:
+            values, policy = score.value.to(torch.int64), "assign"
+        rows = index.find_and_stage(keys, table_ids, values, policy)
+        if index.num_staged == 0:
+            return rows
+        out = index.commit(guard=guard)
+        s.sync_value_buffers()
+        result = rows.clone()
+        result[out.positions] = out.rows
+        s.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
+        index.release_rows(out.victim_rows, out.victim_tables)
+        return result
 
 
 class ChainedStorage(Storage):
@@ -90,7 +220,7 @@ class ChainedStorage(Storage):
             no_eviction=[strategy == DynamicEmbScoreStrategy.NO_EVICTION] * len(options),
             device=self._state.device,
         )
-        self._tick = 0
+        self._state.key_index_map = _ChainedIndexView(self)
         # An upper bound on the keys of each table, refreshed when it matters.
         self._estimated_size = [0] * len(options)
 
@@ -114,8 +244,12 @@ class ChainedStorage(Storage):
         """
         s = self._strategy
         if s == DynamicEmbScoreStrategy.TIMESTAMP:
-            self._tick += 1
-            return torch.full((n,), self._tick, dtype=torch.int64, device=device), "assign"
+            # The device clock, as the existing index uses, so that a checkpoint's ages
+            # (a timestamp minus a score) mean the same thing here.
+            return (
+                torch.full((n,), device_timestamp(), dtype=torch.int64, device=device),
+                "assign",
+            )
         if s in (DynamicEmbScoreStrategy.STEP, DynamicEmbScoreStrategy.CUSTOMIZED):
             value = int(self._state.score or 0)
             return torch.full((n,), value, dtype=torch.int64, device=device), "assign"
@@ -142,30 +276,34 @@ class ChainedStorage(Storage):
         A table that never evicts grows when a bucket cannot hold its keys, which is
         decided when they are placed.
         """
+        for t, n in enumerate(unique_size_per_table.tolist()):
+            if n:
+                self.grow_for(t, int(n))
+
+    def grow_for(self, table: int, extra_keys: int) -> None:
+        """Make room, within the table's maximum capacity, for ``extra_keys`` more."""
         if self._strategy == DynamicEmbScoreStrategy.NO_EVICTION:
             return
-        state = self._state
-        for t, n in enumerate(unique_size_per_table.tolist()):
-            if n == 0:
-                continue
-            opt = state.options_list[t]
-            capacity = self._index.capacity_of(t)
-            max_lf = float(opt.max_load_factor)
-            if max_lf <= 0 or capacity >= int(opt.max_capacity):
-                continue
-            self._estimated_size[t] += int(n)
-            if self._estimated_size[t] / capacity <= max_lf:
-                continue
-            self._estimated_size[t] = self._index.size(t)  # the real size, once
-            if (self._estimated_size[t] + int(n)) / capacity <= max_lf:
-                continue
-            old_nb = self._index.num_buckets_of(t)
-            cap = self._index.bucket_capacity
-            limit = max(1, int(opt.max_capacity) // cap)
-            new_nb = min(2 * old_nb, max(limit, old_nb))
-            if new_nb > old_nb:
-                self._index.expand(t, new_nb)
-                self.sync_value_buffers()
+        opt = self._state.options_list[table]
+        max_lf = float(opt.max_load_factor)
+        cap = self._index.bucket_capacity
+        limit = max(1, int(opt.max_capacity) // cap)
+        capacity = self._index.capacity_of(table)
+        if max_lf <= 0 or capacity >= int(opt.max_capacity):
+            return
+        self._estimated_size[table] += extra_keys
+        if self._estimated_size[table] / capacity <= max_lf:
+            return
+        self._estimated_size[table] = self._index.size(table)  # the real size, once
+        grew = False
+        while True:
+            nb = self._index.num_buckets_of(table)
+            if (self._estimated_size[table] + extra_keys) / (nb * cap) <= max_lf or nb >= limit:
+                break
+            self._index.expand(table, min(2 * nb, limit))
+            grew = True
+        if grew:
+            self.sync_value_buffers()
 
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         return None
@@ -326,27 +464,179 @@ class ChainedStorage(Storage):
 
         return _pop_state_evicted_keys(self._state, table_id)
 
-    def dump(self, *args, **kwargs) -> None:
-        raise NotImplementedError("the chained index has no checkpoint format yet")
+    def erase_keys(
+        self,
+        table_id: int,
+        keys: torch.Tensor,
+        mode: EvictedItemMode = EvictedItemMode.DISCARD,
+    ) -> int:
+        """Erase keys from a table; returns how many of them were there."""
+        n = int(keys.numel())
+        if n == 0:
+            return 0
+        device = self._state.device
+        keys = keys.to(device=device, dtype=self._state.key_index_map.key_type)
+        tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
+        removed = self._index.erase(keys, tids) >= 0
+        if EvictedItemMode.RETAIN_KEY in mode:
+            _append_erased(self._state, keys[removed], table_id)
+        return int(removed.sum().item())
 
-    def load(self, *args, **kwargs) -> None:
-        raise NotImplementedError("the chained index has no checkpoint format yet")
+    def pop_erased_keys(self, table_id: int) -> torch.Tensor:
+        return _pop_state_erased_keys(self._state, table_id)
+
+    def replay_increment(
+        self,
+        table_id: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        optimizer_states: Optional[torch.Tensor],
+        scores: Optional[torch.Tensor],
+        slot_index: torch.Tensor,
+        insert_score: int,
+        content: ReplayContent = ReplayContent.ALL,
+        timestamp: Optional[int] = None,
+    ) -> ReplayStats:
+        """Write an ``incremental_dump`` delta back into one table, key by key.
+
+        A key that is there takes the delta's value (and score, when asked); one that
+        is not is placed, in whatever slot and row the table hands out. ``slot_index``
+        is the source's and says nothing here.
+        """
+        stats = ReplayStats()
+        n = int(keys.numel())
+        if n == 0:
+            return stats
+        state = self._state
+        device = state.device
+        timestamp = device_timestamp() if timestamp is None else timestamp
+        keys = keys.to(device=device, dtype=state.key_index_map.key_type)
+        embeddings = values.to(device=device, dtype=state.emb_dtype)
+        if ReplayContent.SCORE in content and scores is not None:
+            score_vec = _replay_score_block(state, table_id, scores, timestamp)
+        else:
+            score_vec = _fresh_score_block(
+                state, table_id, torch.zeros(n, dtype=torch.int64, device=device),
+                timestamp, insert_score,
+            )  # fmt: skip
+        score_vec = score_vec.reshape(-1).to(torch.int64)
+        index = self._index
+        # A bucket takes at most as many new keys at once as it has slots.
+        step = max(
+            1, min(int(state.threads_in_wave), index.capacity_of(table_id) // 4)
+        )
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            k = keys[start:end]
+            tids = torch.full((k.numel(),), table_id, dtype=torch.int64, device=device)
+            self.grow_for(table_id, int(k.numel()))
+            rows = index.find_and_stage(k, tids, score_vec[start:end], "assign")
+            same_key = rows >= 0
+            if index.num_staged:
+                out = index.commit()
+                self.sync_value_buffers()
+                rows[out.positions] = out.rows
+                self.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
+                index.release_rows(out.victim_rows, out.victim_tables)
+            _replay_write_values(
+                state,
+                table_id,
+                rows,
+                embeddings[start:end],
+                optimizer_states[start:end] if optimizer_states is not None else None,
+                same_key,
+                content,
+            )
+        stats.upserted = n
+        return stats
+
+    def dump(
+        self,
+        table_id: int,
+        meta_json_file_path: str,
+        emb_key_path: str,
+        embedding_file_path: str,
+        score_file_path: str,
+        opt_file_path: str,
+        include_optim: bool = True,
+        include_meta: bool = True,
+        current_score: Optional[int] = None,
+        timestamp: int = 0,
+    ) -> None:
+        _dump_table(
+            self._state,
+            table_id,
+            meta_json_file_path,
+            emb_key_path,
+            embedding_file_path,
+            score_file_path,
+            opt_file_path,
+            include_optim,
+            include_meta,
+            timestamp=timestamp,
+            current_score=current_score,
+        )
+
+    def load(
+        self,
+        table_id: int,
+        meta_json_file_path: str,
+        emb_key_path: str,
+        embedding_file_path: str,
+        score_file_path: Optional[str],
+        opt_file_path: Optional[str],
+        include_optim: bool = True,
+        timestamp: int = 0,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> Optional[int]:
+        params = _validate_load_meta(
+            self._state,
+            table_id,
+            meta_json_file_path,
+            emb_key_path,
+            embedding_file_path,
+            score_file_path,
+            opt_file_path,
+            include_optim,
+        )
+        self.grow_for(table_id, params.num_keys)
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        for keys, embeddings, scores, opt_states in _iter_batches_from_files(
+            emb_key_path,
+            embedding_file_path,
+            score_file_path,
+            opt_file_path if params.include_optim else None,
+            params.dim,
+            params.file_optstate_dim,
+            device,
+            params.dist_type,
+            num_scores=1,
+            emb_dtype=params.emb_dtype,
+            opt_state_dtype=params.opt_state_dtype,
+            shard_index=shard_index,
+            num_shards=num_shards,
+        ):
+            if scores is not None and self._state.evict_strategy == EvictStrategy.KLru:
+                scores = torch.clamp(timestamp - scores, min=0)
+            _load_key_values(
+                self._state, keys, embeddings, scores, opt_states, table_id=table_id
+            )
+        return params.meta_data.get("step_score", None)
 
     def export_keys_values(
         self, device: torch.device, batch_size: int = 65536, table_id: int = 0
     ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
-        keys, scores, rows = self._index.export(table_id)
-        tid = torch.full((keys.numel(),), table_id, dtype=torch.int64, device=keys.device)
-        for start in range(0, keys.numel(), batch_size):
-            sl = slice(start, start + batch_size)
-            yield (
-                keys[sl],
-                scores[sl],
-                None,
-                load_from_flat(
-                    self._state, rows[sl], tid[sl], copy_mode=CopyMode.EMBEDDING
-                ),
-            )
+        yield from export_keys_values_iter(self._state, device, batch_size, table_id)
+
+    def incremental_dump(self, table_id, threshold, pg, timestamp=None):
+        """What the existing storage's does: it reads only ``_state``, whose index view
+        answers for this one. ``slot_index`` is the row, for information."""
+        from .key_value_table import DynamicEmbStorage
+
+        return DynamicEmbStorage.incremental_dump(
+            self, table_id, threshold, pg, timestamp
+        )
 
     # -- accessors ------------------------------------------------------------
 

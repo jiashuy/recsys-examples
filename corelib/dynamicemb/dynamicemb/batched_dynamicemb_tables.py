@@ -820,9 +820,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     storage_options = deepcopy(self._dynamicemb_options)
                     for storage_option in storage_options:
                         storage_option.local_hbm_for_values = 0
-                    self._storage = DynamicEmbStorage(
+                    self._storage = self._make_storage(
                         storage_options,
-                        self._optimizer,
                         lower=self._create_external_storage(storage_options),
                     )
                     self._storage_layout = StorageLayout.HOST_ONLY
@@ -1791,12 +1790,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pg = self._shard_pg
 
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
             raise TypeError(
                 f"incremental_dump requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
             )
-        if self._cache is not None and isinstance(storage, DynamicEmbStorage):
+        if self._cache is not None and isinstance(
+            storage, (DynamicEmbStorage, ChainedStorage)
+        ):
             flush_cache(self._cache, storage)
         res = DeltaDumpResult()
         # One reference timestamp for the whole call: the age baseline for the
@@ -1890,21 +1891,30 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if src_options is None:
             return "delta carries no 'table_options' (dumped by an older version)"
 
+        # A chained table places keys one by one, in whatever slot and row it hands
+        # out, so the slot-for-slot checks (capacity, rows, buckets) say nothing.
+        by_slot = not isinstance(storage, ChainedStorage)
         checks = [
-            (
-                "capacity",
-                meta.get("current_capacity"),
-                self._capacity_of(storage, table_id),
-            ),
-            (
-                "row_capacity",
-                meta.get("row_capacity"),
-                self._row_capacity_of(storage, table_id),
-            ),
-            (
-                "bucket_capacity",
-                meta.get("bucket_capacity"),
-                self._bucket_capacity_of(storage),
+            *(
+                [
+                    (
+                        "capacity",
+                        meta.get("current_capacity"),
+                        self._capacity_of(storage, table_id),
+                    ),
+                    (
+                        "row_capacity",
+                        meta.get("row_capacity"),
+                        self._row_capacity_of(storage, table_id),
+                    ),
+                    (
+                        "bucket_capacity",
+                        meta.get("bucket_capacity"),
+                        self._bucket_capacity_of(storage),
+                    ),
+                ]
+                if by_slot
+                else []
             ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
             ("world_size", meta.get("world_size"), self._shard_world_size),
@@ -1983,7 +1993,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 mid-write, so the table may hold a partial replay.
         """
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
             raise TypeError(
                 f"replay_increment requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
@@ -1995,7 +2005,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # promises. Planning touches nothing; applying validates nothing.
         plan = self._plan_replay(delta, content, storage)
 
-        if self._cache is not None and isinstance(storage, DynamicEmbStorage):
+        if self._cache is not None and isinstance(
+            storage, (DynamicEmbStorage, ChainedStorage)
+        ):
             # After planning, so a rejected delta leaves the model exactly as it
             # was. Pushing dirty cache entries down first makes the storage copy
             # this replay is about to overwrite the authoritative one.
@@ -2197,6 +2209,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # dump source for someone further down would want the opposite --
             # say so when that case turns up.
             stats.erased = storage.erase_keys(job.table_id, erased)
+        if (
+            isinstance(storage, ChainedStorage)
+            and evicted is not None
+            and evicted.numel() > 0
+        ):
+            # Writing slots does not reproduce an eviction here, so the keys the source
+            # evicted are removed; one that was evicted and came back is in the delta,
+            # and the write below puts it back.
+            storage.erase_keys(job.table_id, evicted)
 
         # Before writing, so a restored key lands on the same scale the replica
         # will later threshold its own incremental_dump against. Timestamp-based

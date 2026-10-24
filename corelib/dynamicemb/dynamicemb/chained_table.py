@@ -40,6 +40,7 @@ import torch
 from dynamicemb_extensions import (
     chained_apply,
     chained_bucket_ids,
+    chained_erase,
     chained_find,
     chained_make_views,
     chained_pin,
@@ -391,6 +392,20 @@ class ChainedTables:
         for t in range(self.num_tables):
             chained_release(self._views, t, rows[table_ids == t])
 
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
+        """Remove keys. Their rows go back to the pools; each key's row comes back, -1
+        for a key that was not there. Not for a step in flight: a pinned row is erased
+        like any other."""
+        keys = _as_int64(keys)
+        if keys.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        rows = chained_erase(
+            self._views, keys, table_ids, sum(self._nb), self.num_tables
+        )
+        found = rows >= 0
+        self.release_rows(rows[found], table_ids[found])
+        return rows
+
     def pin(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
         """Take a reference on each row: a row with one is not evicted."""
         assert self.track_refs, "this table does not pin"
@@ -600,6 +615,9 @@ class ChainedTable(ChainedTables):
 
     def release_rows(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
         super().release_rows(rows, self._zeros(rows.numel()))
+
+    def erase(self, keys: torch.Tensor, table_ids=None) -> torch.Tensor:  # type: ignore[override]
+        return super().erase(keys, self._zeros(keys.numel()))
 
     def pin(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
         super().pin(rows, self._zeros(rows.numel()))

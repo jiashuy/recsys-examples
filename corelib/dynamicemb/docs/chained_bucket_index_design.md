@@ -495,7 +495,36 @@ value 行: 全局行池, 与槽位无关
 
 一步包含 prefetch、forward 和 backward。HBM-direct 上几乎持平（forward / backward 占了大头，索引的差别被稀释）；缓存路径上快 45%，说明后备的 `find_and_stage` + `commit` 比旧的"查找 + 带守卫的 insert + 搬值"省得多。只测了这一个规模和这一种分布（均匀）；倾斜分布和更小的批没有测。
 
+### 第五阶段：checkpoint、增量 dump 与 replay、host-only（已实现，实验性）
+
+**checkpoint（dump / load）**：文件格式不变（key、embedding、score、优化器状态、meta json 各一个文件）。这些格式本来就不含槽位，所以不需要新格式；`ChainedStorage` 给自己的 `state.key_index_map` 装了一个视图（`_ChainedIndexView`），它回答 checkpoint 代码要读的几件事：一张表的 key 与 score 与行号、一个返回行号的 `insert`、容量与大小。于是现有的 `_dump_table`、`_load_key_values`、`_validate_load_meta`、`export_keys_values_iter` 不用改，直接复用。TIMESTAMP 策略的 score 用设备时钟（与旧实现相同），这样 checkpoint 里的"年龄 = 时间戳 − score"含义一致。
+- 主测试文件里 dump / load 相关的 43 个用例（单表、多表、`dist_type`、旧版 meta、优化器状态精度和宽度等）在 `DEMB_CHAINED_INDEX` 下全部通过。
+
+**erase**：补上了设计里的"补洞"：`ChainedTables.erase`，一个线程负责一个桶的一段 key，摘链后用桶内最后一条记录填洞，并把被搬动记录的链指向新槽，`bucket_size` 减一，行还回行池。与模型逐槽位对照（4 种规模，每步随机插入再随机删除，含不存在的 key）。
+
+**增量 dump 与 replay**：
+- `incremental_dump` 直接复用现有存储的实现（它只读 `_state`），`slot_index` 在这里是行号，仅供参考。
+- `replay_increment` 改为**按 key**：已有的 key 取 delta 的值（和 score，按 `content`），没有的 key 放进表里，槽位和行号由表分配。现有的 replay 是逐槽位的，只在布局相同的两张表之间才有意义，所以这里不检查容量、行容量、桶容量，只检查维度、score 策略、world size、`dist_type`。
+- **被源端淘汰的 key 也会在副本里删除**（先删除，再写 delta 里的 key，所以一个窗口内被淘汰又回来的 key 会保留）。现有实现里写槽位本身就会复现淘汰，所以它不处理 evicted keys，而这里必须处理。
+- 测试（`test_chained_incremental.py`）：副本与源逐位给出相同的答案、持有相同的 key 集合（HBM-direct 与缓存、TIMESTAMP / LFU / STEP）；源端淘汰过的 key 不出现在副本里；源端 erase 的 key 在副本里也被删；一个窗口里被 erase 又写回的 key 保留。
+
+**host-only 布局**：`_make_storage` 现在也服务 host-only（没有缓存、value 在 host），走原有的通用 forward 路径（`find` / `insert`）。`test_forward_train_eval` 的 160 个用例（含 host-only 的 32 个）全部通过。
+
+**确定性**：`commit` 与 `erase` 本身没有原子操作和依赖线程调度的步骤；同样的输入两次运行，key、score、行号、链和空闲行完全一致（带大量 score 平局的 25 步随机序列，含 erase），已加为测试。
+
+**evicted keys 的保留**（`evicted_item_mode=RETAIN_KEY`）：`pop_evicted_keys` / `pop_erased_keys` 可用；测试核对"每个用过但不在表里的 key 都被报告过、没有报告没用过的 key、pop 之后清空"，HBM-direct 与缓存两种布局。
+
+测试总数：链式目录 88 个全部通过；旧路径全套回归与改动前一致；主测试文件在 `DEMB_CHAINED_INDEX` 下：`test_forward_train_eval`（160）、`test_backward` 等（97）、dump / load（43）全部通过。
+
+**仍然不支持或不适用**（用现有套件在链式下跑，失败的都是下列原因）：
+- **hybrid 布局**（HBM 层加 host 层）：仍用旧存储。
+- **复合 score 策略**（如 `(TIMESTAMP, LFU)`，即 LruLfu 两字 score）：构造时抛 `NotImplementedError`；增量 dump / retain 里大部分现有用例用的就是它们。
+- **桶容量大于 256**：构造时抛 `ValueError`（有一个现有用例用 1024 的存储桶）。
+- **逐槽位 replay 的语义**：现有的"布局不匹配必须拒绝""evicted keys 不能删除任何东西"这类用例对按 key 的 replay 不适用。
+- `fill_tables`、`test_table_expansion_capacity_growth`（读写 `key_index_map` 或假设旧的扩容阈值）、`test_deterministic_insert`（比较两个旧索引）：对链式路径需要另写，部分已由上面的用例覆盖。
+- 多 GPU / 分布式的 incremental dump 与 replay 没有测（单卡路径通过 `pg=None`）。
+
 ### 后续阶段
 
-3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
-5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）；host-only 与 hybrid 布局的支持；`fill_tables` 与确定性插入在链式路径下的对应测试、多 GPU 的测试。
+3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score（解锁复合策略与现有的增量 dump / retain 用例）；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
+6. hybrid 布局；分布式的增量 dump / replay 测试；默认开启链式索引前的灰度与回退方案。

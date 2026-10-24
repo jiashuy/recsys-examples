@@ -64,7 +64,7 @@ def chained_index(monkeypatch):
     monkeypatch.setenv("DEMB_CHAINED_INDEX", "1")
 
 
-def _module(layout, ps, capacity, strategy=DynamicEmbScoreStrategy.TIMESTAMP):
+def _module(layout, ps, capacity, strategy=DynamicEmbScoreStrategy.TIMESTAMP, **extra):
     value_bytes = capacity * DIM * 4
     caching = layout == "caching"
     local_hbm = value_bytes // 2 if caching else 2 * value_bytes
@@ -82,6 +82,7 @@ def _module(layout, ps, capacity, strategy=DynamicEmbScoreStrategy.TIMESTAMP):
         initializer_args=DynamicEmbInitializerArgs(
             mode=DynamicEmbInitializerMode.CONSTANT, value=1.0
         ),
+        **extra,
     )
     return BatchedDynamicEmbeddingTablesV2(
         table_names=["t"],
@@ -323,3 +324,23 @@ def test_a_table_grows_toward_its_maximum_and_keeps_its_keys(layout):
     bad, total = _mismatched_keys(module, uses)
     assert bad == 0, f"{bad} of {total} keys were lost while the table grew"
     storage.index.check_invariants([0])
+
+
+# -- what is evicted can be retained -------------------------------------------
+
+
+@pytest.mark.parametrize("layout", ["hbm", "caching"])
+def test_every_key_that_is_not_held_was_retained_as_evicted(layout):
+    from dynamicemb.dynamicemb_config import EvictedItemMode
+
+    module = _module(layout, None, 2048, evicted_item_mode=EvictedItemMode.RETAIN_KEY)
+    assert isinstance(module._storage, ChainedStorage)
+    uses = _train(module)
+    module.flush()
+    popped = set(module.pop_evicted_keys()["t"].tolist())
+    held = set(module._storage.index.export(0)[0].tolist())
+    used = set((uses > 0).nonzero().squeeze(1).tolist())
+    assert popped, "the run must evict"
+    assert used <= held | popped, "a key was lost without being reported"
+    assert popped <= used, "a key that was never used was reported"
+    assert module.pop_evicted_keys()["t"].numel() == 0, "the keys are drained by a pop"

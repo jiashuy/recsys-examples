@@ -393,6 +393,64 @@ __global__ void place_kernel(
   }
 }
 
+// Erase, one thread per bucket segment: the keys of a bucket go one after another.
+// A key is taken off its chain and its slot refilled with the bucket's last record,
+// so the occupied slots stay the prefix [0, size); the moved record's chain is
+// pointed at its new slot. srows[j] is the row the key had, or -1 if it was absent.
+__global__ void erase_kernel(const TableView *__restrict__ views,
+                             const int64_t *__restrict__ skeys,
+                             const int64_t *__restrict__ seg_table,
+                             const int64_t *__restrict__ seg_bucket,
+                             const int64_t *__restrict__ seg_begin,
+                             const int64_t *__restrict__ seg_count,
+                             const int64_t *__restrict__ nseg_ptr,
+                             int64_t *__restrict__ srows) {
+  const int64_t num_segments = *nseg_ptr;
+  for (int64_t seg = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       seg < num_segments; seg += int64_t(gridDim.x) * blockDim.x) {
+    const TableView &v = views[seg_table[seg]];
+    const int64_t b = seg_bucket[seg];
+    const int64_t base = b * v.cap;
+    const int64_t begin = seg_begin[seg];
+    for (int64_t j = 0; j < seg_count[seg]; ++j) {
+      const int64_t key = skeys[begin + j];
+      const int ch = static_cast<int>((hash64(key) >> 32) % uint32_t(v.cap));
+      int prev = -1;
+      uint16_t cur = v.head[base + ch];
+      while (cur != kNull && v.keys[base + cur] != key) {
+        prev = cur;
+        cur = v.next[base + cur];
+      }
+      if (cur == kNull) {
+        srows[begin + j] = -1;
+        continue;
+      }
+      const int64_t slot = cur;
+      srows[begin + j] = static_cast<int64_t>(v.index[base + slot]);
+      if (prev < 0) v.head[base + ch] = v.next[base + slot];
+      else v.next[base + prev] = v.next[base + slot];
+      const int32_t last = v.bucket_size[b] - 1;
+      if (slot != last) {
+        const int64_t lk = v.keys[base + last];
+        const int lch = static_cast<int>((hash64(lk) >> 32) % uint32_t(v.cap));
+        int p = -1;
+        uint16_t c2 = v.head[base + lch];
+        while (c2 != kNull && c2 != uint16_t(last)) {
+          p = c2;
+          c2 = v.next[base + c2];
+        }
+        if (p < 0) v.head[base + lch] = uint16_t(slot);
+        else v.next[base + p] = uint16_t(slot);
+        v.next[base + slot] = v.next[base + last];
+        v.keys[base + slot] = lk;
+        v.scores[base + slot] = v.scores[base + last];
+        v.index[base + slot] = v.index[base + last];
+      }
+      v.bucket_size[b] = last;
+    }
+  }
+}
+
 // -- the rest of a step's bookkeeping, as kernels ------------------------------
 
 // positions of the misses, compacted in input order
@@ -1023,6 +1081,40 @@ void chained_release(at::Tensor views, int64_t table, at::Tensor rows) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Remove keys. Returns each key's row in input order, -1 for a key that was not there.
+// The rows are not put back on the stack: that is the caller's.
+at::Tensor chained_erase(at::Tensor views, at::Tensor keys, at::Tensor tids,
+                         int64_t total_buckets, int64_t num_tables) {
+  check_cuda(keys, "keys");
+  check_cuda(tids, "table ids");
+  const int64_t n = keys.numel();
+  auto rows = at::empty({n}, keys.options().dtype(at::kLong));
+  if (n == 0) return rows;
+  auto zeros = at::zeros({n}, keys.options().dtype(at::kLong));
+  auto plan = chained_plan(views, keys, tids, zeros, total_buckets, num_tables);
+  // perm, sgid, skeys, stids, sscores, seg_table, seg_bucket, seg_begin, counts,
+  // need, voff, num_runs, tstart
+  auto &perm = plan[0];
+  auto &skeys = plan[2];
+  auto &seg_table = plan[5];
+  auto &seg_bucket = plan[6];
+  auto &seg_begin = plan[7];
+  auto &counts = plan[8];
+  auto &num_runs = plan[11];
+  auto srows = at::empty({n}, keys.options().dtype(at::kLong));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  erase_kernel<<<grid_for(n, 128), 128, 0, stream>>>(
+      views_ptr(views), skeys.data_ptr<int64_t>(), seg_table.data_ptr<int64_t>(),
+      seg_bucket.data_ptr<int64_t>(), seg_begin.data_ptr<int64_t>(),
+      counts.data_ptr<int64_t>(), num_runs.data_ptr<int64_t>(),
+      srows.data_ptr<int64_t>());
+  unpermute_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      perm.data_ptr<int64_t>(), srows.data_ptr<int64_t>(), n,
+      rows.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return rows;
+}
+
 } // namespace chained
 } // namespace dyn_emb
 
@@ -1080,4 +1172,8 @@ void bind_chained_table(py::module &m) {
   m.def("chained_release", &dyn_emb::chained::chained_release,
         "put rows back on a table's stack", py::arg("views"), py::arg("table"),
         py::arg("rows"));
+  m.def("chained_erase", &dyn_emb::chained::chained_erase,
+        "remove keys; the row of each (-1 if absent), in input order",
+        py::arg("views"), py::arg("keys"), py::arg("table_ids"),
+        py::arg("total_buckets"), py::arg("num_tables"));
 }

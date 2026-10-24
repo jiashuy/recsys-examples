@@ -1505,7 +1505,7 @@ def test_forward_train_eval(
     elif local_hbm_for_values == 0:
         assert bdebt._cache is None, "Host-only mode should have no cache"
         assert isinstance(
-            bdebt._storage, DynamicEmbStorage
+            bdebt._storage, (DynamicEmbStorage, ChainedStorage)
         ), f"Expected DynamicEmbStorage when local_hbm=0 without cache, got {type(bdebt._storage)}"
     else:
         assert bdebt._cache is None, "HybridStorage mode should have no cache"

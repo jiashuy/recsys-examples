@@ -589,3 +589,94 @@ def test_every_member_pinned_is_an_error_even_without_a_guard(device):
         table.commit()
     assert table.size() == 4
     table.check_invariants()
+
+
+# -- erase ---------------------------------------------------------------------
+
+
+def _model_erase(model, keys):
+    """The rule the kernel applies: the bucket's last record fills the hole."""
+    freed = []
+    for key in keys:
+        members = model.buckets[model.bucket(key)]
+        for s, entry in enumerate(members):
+            if entry[0] == key:
+                freed.append(entry[2])
+                members[s] = members[-1]
+                members.pop()
+                break
+    return freed
+
+
+@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100)])
+def test_erase_matches_the_model(device, shape):
+    nb, cap, per_step = shape
+    rng = random.Random(99 + nb)
+    table = ChainedTable(num_buckets=nb, bucket_capacity=cap, device=device)
+    model = Model(nb, cap, table.row_capacity)
+    universe = nb * cap * 2
+    for step in range(20):
+        keys = rng.sample(range(1, universe + 1), per_step)
+        _step(table, model, keys, [rng.randrange(1, 1000) for _ in keys], "assign")
+        # erase some keys that are there and some that are not
+        present = [e[0] for b in model.buckets for e in b]
+        gone = rng.sample(present, min(len(present), per_step // 2))
+        gone += rng.sample(range(universe + 1, universe + 50), 5)  # never stored
+        rng.shuffle(gone)
+        rows = table.erase(_t(gone, device))
+        freed = _model_erase(model, gone)
+        assert [r for r in rows.tolist() if r >= 0] == freed
+        model.release(freed)
+        assert _state(table) == model.flat()
+        for key in gone:
+            assert table.lookup(_t([key], device)).item() == -1
+    table.check_invariants()
+
+
+def test_erase_leaves_the_others_findable(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=64, device=device)
+    keys = _t(list(range(1, 61)), device)
+    table.find_and_stage(keys, keys.clone())
+    table.commit()
+    rows_before = dict(zip(keys.tolist(), table.lookup(keys).tolist()))
+    victims = _t(list(range(1, 61, 3)), device)
+    table.erase(victims)
+    left = [k for k in keys.tolist() if k not in set(victims.tolist())]
+    after = table.lookup(_t(left, device)).tolist()
+    assert after == [rows_before[k] for k in left]
+    assert table.size() == len(left)
+    table.check_invariants()
+
+
+def test_a_rows_erased_come_back_to_the_pool(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=8, device=device)
+    keys = _t([1, 2, 3, 4], device)
+    table.find_and_stage(keys, keys.clone())
+    table.commit()
+    free = table.free_rows()
+    table.erase(_t([1, 2], device))
+    assert table.free_rows() == free + 2
+    table.erase(_t([1, 2], device))  # already gone
+    assert table.free_rows() == free + 2
+
+
+def test_two_runs_of_the_same_steps_end_identically(device):
+    """Nothing in a step depends on the order threads happen to run in: the same input
+    leaves the same keys, scores, rows, chains and free rows."""
+
+    def run():
+        rng = random.Random(5)
+        table = ChainedTable(num_buckets=16, bucket_capacity=32, device=device)
+        for _ in range(25):
+            keys = rng.sample(range(1, 1500), 150)
+            scores = [rng.randrange(1, 100) for _ in keys]  # plenty of ties
+            table.find_and_stage(_t(keys, device), _t(scores, device))
+            out = table.commit()
+            table.release_rows(out.victim_rows)
+            table.erase(_t(rng.sample(range(1, 1500), 20), device))
+        return table
+
+    a, b = run(), run()
+    for name in ("_keys", "_scores", "_index", "_next", "_head", "_bsize", "_free"):
+        assert torch.equal(getattr(a, name)[0], getattr(b, name)[0]), name
+    assert a.free_rows() == b.free_rows()
