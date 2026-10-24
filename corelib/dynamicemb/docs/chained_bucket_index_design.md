@@ -471,9 +471,20 @@ value 行: 全局行池, 与槽位无关
 - TIMESTAMP 用每次访问递增的计数（单调即可），不是设备时钟。
 - 选 victim 只在桶内、按 score 升序，被守卫或引用计数保护的跳过（与旧实现的桶内淘汰语义一致，具体选出哪些 key 可能不同，见 §8.9）。
 
-测试（`test_chained_prefetch.py`，12 个，EOS 上全部通过）：沿用 `test_ps_tier` 的端到端检查，每个 key 从 1.0 开始，loss 是输出之和，每次出现梯度为 1，SGD 之后 key 应该是 `1 - lr × 出现次数`，无论它被淘汰、送到下层、再取回多少次。HBM-direct 与缓存两种布局，TIMESTAMP / LFU / STEP 三种策略；一个控制组（下层把收到的东西都丢掉，检查必须失败）；一个"容量够装下所有 key、不需要下层"；一个"不淘汰的表随 key 增长"。并在每个测试后用 `check_invariants` 核对没有行丢失或重复。旧路径的全套分片回归（主测试文件五个分片、单元测试三组）结果与之前一致。
+测试（`test_chained_prefetch.py`，24 个，EOS 上全部通过）：
+- **端到端检查**（沿用 `test_ps_tier`）：每个 key 从 1.0 开始，loss 是输出之和，每次出现梯度为 1，SGD 之后 key 应该是 `1 - lr × 出现次数`，无论它被淘汰、送到下层、再取回多少次。HBM-direct 与缓存两种布局，TIMESTAMP / LFU / STEP 三种策略；一个控制组（下层把收到的东西都丢掉，检查必须失败）；一个"容量够装下所有 key"；一个"不淘汰的表随 key 增长"；一个"淘汰的表从 `init_capacity` 增长到不超过 `max_capacity`"。
+- **与现有索引逐步对照**：两张表（dim 8 和 16）、SUM 池化，同样的输入，每一步 forward 的输出必须逐位相同（`torch.equal`）；HBM-direct 与缓存、TIMESTAMP 与 LFU、有无频次 admission（阈值 2）共八个组合；admission 的用例还核对了"确实有 key 被拒绝"，否则这个检查没有意义。
+- **带单独 prefetch 流的流水线**：下一步在另一条流上 prefetch，而上一步的 backward 还排在一个长 kernel 后面。缓存布局下，去掉 prefetch 状态的流记录（`record_stream`）就会非法访存，加上则 120 步没有一个错的 key（用与旧路径相同的实验确认过）；HBM-direct 布局两种情况下都没有现象，所以它不是对照。
+- 每个测试后用 `check_invariants` 核对没有行丢失或重复。
 
-**没有测的**：admission 路径（代码按旧实现改写，没有用例走到）、带单独 prefetch 流的流水线（`record_stream` 与新路径的配合）、多表模块、多 GPU、`pooling_mode` 不是 NONE 的情形（forward/backward 本身没有改，但没有跑）。
+另外把主测试文件 `test_batched_dynamic_embedding_tables_v2.py` 在 `DEMB_CHAINED_INDEX` 下整体跑了一遍（仅放宽两处只认旧存储类型的断言）：
+- `test_forward_train_eval`（160 个，含 SUM / MEAN / NONE 池化、dim 7 / 8 / 11 / 13 / 16 / 32、sgd / adam、缓存带或不带 PS）全部通过，其中缓存与 HBM-only 两种布局（约 160 个中的 96 个）走链式路径，host-only 与 hybrid 仍走旧存储；
+- `test_backward`、`test_empty_batch`、`test_export_keys_values_empty_table`（97 个）、`test_prefetch_flush_in_cache`、`test_multi_table_mixed_dims_forward_backward`、`test_multi_table_with_admission`、`test_multi_table_caching_flush` 全部通过；
+- 失败的都是针对旧实现内部或 checkpoint 的用例，本阶段不适用：dump / load 相关（约 40 个，抛 `NotImplementedError`，第五阶段）、`test_fill_tables`（12 个）、`test_table_expansion_capacity_growth`（32 个）、`test_deterministic_insert`（4 个），后三者直接读写 `key_index_map` 或断言存储类型，对链式路径需要另写（扩容已由上面的端到端用例覆盖）。
+
+旧路径的全套分片回归结果与之前一致。
+
+**没有测的**：多 GPU、旧实现内部相关的那几类（`fill_tables`、确定性插入）在链式路径下的对应测试。
 
 ### 微基准（端到端，H100，一张表 419 万行、dim 64、SGD、每步 65536 个 key，key 取自 4 倍表大小的全集，表已满）
 
@@ -487,4 +498,4 @@ value 行: 全局行池, 与槽位无关
 ### 后续阶段
 
 3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
-5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）；host-only 与 hybrid 布局的支持；admission、流水线 prefetch 流、多表模块的测试。
+5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）；host-only 与 hybrid 布局的支持；`fill_tables` 与确定性插入在链式路径下的对应测试、多 GPU 的测试。

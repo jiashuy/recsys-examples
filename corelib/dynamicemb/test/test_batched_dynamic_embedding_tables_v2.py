@@ -33,6 +33,7 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
+from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
@@ -1367,7 +1368,7 @@ def init_embedding_tables(stbe, bdet):
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
         )
-        if isinstance(storage, DynamicEmbStorage):
+        if isinstance(storage, (DynamicEmbStorage, ChainedStorage)):
             max_emb_dim = storage.max_embedding_dim()
             max_value_dim = storage.max_value_dim()
             values = torch.zeros(
@@ -1499,7 +1500,7 @@ def test_forward_train_eval(
     elif local_hbm_for_values == 1024**3:
         assert bdebt._cache is None, "HBM-only mode should have no cache"
         assert isinstance(
-            bdebt._storage, DynamicEmbStorage
+            bdebt._storage, (DynamicEmbStorage, ChainedStorage)
         ), f"Expected DynamicEmbStorage, got {type(bdebt._storage)}"
     elif local_hbm_for_values == 0:
         assert bdebt._cache is None, "Host-only mode should have no cache"
@@ -2257,7 +2258,7 @@ def test_multi_table_mixed_dims_forward_backward(
         **opt_params,
     )
 
-    assert isinstance(bdeb.tables, DynamicEmbStorage)
+    assert isinstance(bdeb.tables, (DynamicEmbStorage, ChainedStorage))
     assert bdeb.tables.num_tables == 3
 
     batch_size = 4
