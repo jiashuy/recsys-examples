@@ -256,7 +256,13 @@ def test_the_row_pool_can_run_out(device):
 
 
 @pytest.mark.parametrize("policy", ["assign", "accumulate", "none"])
-@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (64, 128, 800)])
+# (buckets, bucket capacity, keys per step). The last three put more than 32 new keys
+# in one bucket, which the kernel places a chunk of 32 at a time, and enough of them
+# on one chain that several victims and several new keys share it.
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 8, 6), (4, 16, 24), (16, 32, 150), (64, 128, 800), (1, 128, 100), (2, 256, 200), (1, 64, 60)],
+)
 def test_matches_the_model_over_many_steps(device, shape, policy):
     nb, cap, per_step = shape
     rng = random.Random(1234 + nb)

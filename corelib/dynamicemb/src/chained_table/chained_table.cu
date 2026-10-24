@@ -195,12 +195,17 @@ __device__ __forceinline__ void warp_min(uint64_t &sc, uint32_t &sl) {
 //
 //   1. If the new keys outnumber the free slots, choose the victims first, all
 //      of them, from the slots occupied before this step: lowest (score, slot)
-//      first, skipping any the guard refuses or whose row is pinned. If there are
-//      not enough, the segment is left untouched and flagged.
-//   2. Then place: the first free slots take the first new keys, the victims'
-//      slots take the rest. A victim's (key, row) is reported before its slot is
-//      overwritten, and it is taken off its chain. With `pin_new` a placed key's
-//      row starts with one reference.
+//      first, skipping any the guard refuses or whose row is pinned. A lane holds
+//      its own slots' scores in registers (slot j is lane j % 32's j / 32-th), so
+//      the choice costs a warp reduction per victim and no memory traffic. If
+//      there are not enough, the segment is left untouched and flagged.
+//   2. Then place, 32 new keys at a time, one per lane. A key takes the next free
+//      slot, or the slot of the next victim, and in three steps with the warp in
+//      step: the victims are taken off their chains (one lane per chain walks it,
+//      skipping the dead), the records are written, and the new keys are put on
+//      their chains (keys of one chain go in lane order). A victim's (key, row) is
+//      reported before its slot is overwritten. With `pin_new` a placed key's row
+//      starts with one reference.
 __global__ void place_kernel(
     const TableView *__restrict__ views, const int64_t *__restrict__ skeys,
     const uint64_t *__restrict__ sscores, const int64_t *__restrict__ srows,
@@ -214,9 +219,16 @@ __global__ void place_kernel(
     int64_t *__restrict__ vtabs, int32_t *__restrict__ seg_fail,
     unsigned long long *__restrict__ nfail,
     embedding_cache::EvictionGuardView guard, int pin_new) {
-  __shared__ uint8_t taken[kWarpsPerBlock][kMaxBucketCapacity];
+  __shared__ uint8_t dead[kWarpsPerBlock][kMaxBucketCapacity];
 
   if (*abort != 0) return;
+  for (int j = threadIdx.x; j < kWarpsPerBlock * kMaxBucketCapacity;
+       j += blockDim.x) {
+    (&dead[0][0])[j] = 0;
+  }
+  __syncthreads();
+
+  constexpr unsigned kFull = 0xffffffffu;
   const int64_t num_segments = *nseg_ptr;
   const int lane = threadIdx.x & 31;
   const int w = threadIdx.x >> 5;
@@ -238,18 +250,29 @@ __global__ void place_kernel(
     // 1. victims
     bool fail = false;
     if (k > 0) {
-      for (int j = lane; j < v.cap; j += 32) taken[w][j] = 0;
-      __syncwarp();
+      uint64_t sc[8];
+      uint32_t taken = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int j = lane + 32 * i;
+        if (j < s0) {
+          sc[i] = v.scores[base + j];
+        } else {
+          sc[i] = ~0ULL;
+          taken |= 1u << i;
+        }
+      }
       int64_t sel = 0;
       while (sel < k) {
         uint64_t bs = ~0ULL;
         uint32_t bl = 0xFFFFFFFFu;
-        for (int j = lane; j < s0; j += 32) {
-          if (!taken[w][j]) {
-            const uint64_t sc = v.scores[base + j];
-            if (sc < bs || (sc == bs && uint32_t(j) < bl)) {
-              bs = sc;
-              bl = uint32_t(j);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          if (!((taken >> i) & 1u)) {
+            const uint32_t j = uint32_t(lane + 32 * i);
+            if (sc[i] < bs || (sc[i] == bs && j < bl)) {
+              bs = sc[i];
+              bl = j;
             }
           }
         }
@@ -258,17 +281,17 @@ __global__ void place_kernel(
           fail = true;
           break;
         }
+        const int owner = int(bl & 31u);
         bool refused = false;
-        if (lane == 0) {
+        if (lane == owner) {
+          taken |= 1u << (bl >> 5);
           if (v.refs != nullptr && v.refs[v.index[base + bl]] > 0) {
             refused = true;
           } else if (guard.tables != nullptr) {
             refused = guard.refuses(v.keys[base + bl], t);
           }
         }
-        refused = __shfl_sync(0xffffffffu, refused, 0);
-        if (lane == 0) taken[w][bl] = 1;
-        __syncwarp();
+        refused = __shfl_sync(kFull, refused, owner);
         if (!refused) {
           if (lane == 0) vict_slot[voff + sel] = int32_t(bl);
           ++sel;
@@ -283,52 +306,89 @@ __global__ void place_kernel(
       __syncwarp();
       continue;
     }
+    __syncwarp();  // the victim slots are written by lane 0, read by all
 
-    // 2. place
-    if (lane == 0) {
-      int32_t s = s0;
-      int64_t vi = 0;
-      for (int64_t j = 0; j < c; ++j) {
-        const int64_t key = skeys[begin + j];
-        int64_t slot;
-        if (s < v.cap) {
-          slot = s++;
-        } else {
-          slot = vict_slot[voff + vi];
-          const int64_t sl = base + slot;
-          const int64_t vkey = v.keys[sl];
-          vkeys[voff + vi] = vkey;
-          vrows[voff + vi] = static_cast<int64_t>(v.index[sl]);
-          vtabs[voff + vi] = t;
-          ++vi;
-          // off its chain
-          const int chv = static_cast<int>((hash64(vkey) >> 32) % uint32_t(v.cap));
+    // 2. place, a chunk of 32 new keys at a time
+    for (int64_t chunk = 0; chunk * 32 < c; ++chunk) {
+      const int64_t j = chunk * 32 + lane;
+      const bool active = j < c;
+      const bool victim = active && j >= f;
+      int64_t slot = 0;
+      int64_t key = 0;
+      if (active) {
+        key = skeys[begin + j];
+        slot = victim ? int64_t(vict_slot[voff + (j - f)]) : int64_t(s0) + j;
+      }
+
+      // 2a. the victims leave their chains
+      int chv = 0;
+      if (victim) {
+        const int64_t sl = base + slot;
+        const int64_t vkey = v.keys[sl];
+        vkeys[voff + (j - f)] = vkey;
+        vrows[voff + (j - f)] = static_cast<int64_t>(v.index[sl]);
+        vtabs[voff + (j - f)] = t;
+        chv = static_cast<int>((hash64(vkey) >> 32) % uint32_t(v.cap));
+        dead[w][slot] = 1;
+      }
+      __syncwarp();
+      const unsigned vmask = __ballot_sync(kFull, victim);
+      if (vmask != 0) {
+        bool leader = false;
+        if (victim) {
+          const unsigned same = __match_any_sync(vmask, chv);
+          leader = (same & ((1u << lane) - 1u)) == 0;  // the lowest lane of its chain
+        }
+        if (leader) {
+          int prev = -1;
           uint16_t cur = v.head[base + chv];
-          if (cur == uint16_t(slot)) {
-            v.head[base + chv] = v.next[sl];
-          } else {
-            while (cur != kNull) {
-              const uint16_t nx = v.next[base + cur];
-              if (nx == uint16_t(slot)) {
-                v.next[base + cur] = v.next[sl];
-                break;
-              }
-              cur = nx;
+          while (cur != kNull) {
+            const uint16_t nx = v.next[base + cur];
+            if (dead[w][cur]) {
+              if (prev < 0) v.head[base + chv] = nx; else v.next[base + prev] = nx;
+            } else {
+              prev = cur;
             }
+            cur = nx;
           }
         }
+      }
+      __syncwarp();
+      if (victim) dead[w][slot] = 0;
+
+      // 2b. the records
+      int chn = 0;
+      if (active) {
         const int64_t sl = base + slot;
         const int64_t row = srows[begin + j];
         v.keys[sl] = key;
         v.scores[sl] = sscores[begin + j];
         v.index[sl] = static_cast<uint32_t>(row);
-        const int chn = static_cast<int>((hash64(key) >> 32) % uint32_t(v.cap));
-        v.next[sl] = v.head[base + chn];
-        v.head[base + chn] = uint16_t(slot);
+        chn = static_cast<int>((hash64(key) >> 32) % uint32_t(v.cap));
         if (pin_new && v.refs != nullptr) v.refs[row] = 1;
       }
-      v.bucket_size[b] = s;
+      __syncwarp();
+
+      // 2c. the new keys onto their chains, those of one chain in lane order
+      const unsigned amask = __ballot_sync(kFull, active);
+      int rank = 0;
+      if (active) {
+        const unsigned same = __match_any_sync(amask, chn);
+        rank = __popc(same & ((1u << lane) - 1u));
+      }
+      int maxrank = rank;
+      for (int off = 16; off > 0; off >>= 1) {
+        maxrank = max(maxrank, __shfl_xor_sync(kFull, maxrank, off));
+      }
+      for (int r = 0; r <= maxrank; ++r) {
+        if (active && rank == r) {
+          v.next[base + slot] = v.head[base + chn];
+          v.head[base + chn] = uint16_t(slot);
+        }
+        __syncwarp();
+      }
     }
+    if (lane == 0) v.bucket_size[b] = s0 + int32_t(c < f ? c : f);
     __syncwarp();
   }
 }
