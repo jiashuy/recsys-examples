@@ -366,8 +366,43 @@ value 行: 全局行池, 与槽位无关
 
 ## 11. 实施阶段（建议）
 
-1. 新增 `chained_table`（C++ kernel + Python 封装），单表，做排序分段、`find_and_stage` / `commit` / `release_rows`，活动空间用共享的按桶连续段，守卫沿用 `EvictionGuardView`。**残留节点的复制前移先不做：出现残留时先报明确的容量错误**（它是少见路径，先把正常路径做对），加单元测试和微基准。
-2. 每表一个 map + 设备端指针数组；扩容（只搬记录）；NO_EVICTION 的扩容兜底；HBM_DIRECT 的按行号 `refs`。
-3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入。
+### 第一阶段：已实现
+
+代码：`src/chained_table/chained_table.cu`（`find` 与 `place` 两个 kernel）、`dynamicemb/chained_table.py`（`ChainedTable`）、`test/unit_tests/chained_table/test_chained_table.py`（26 个测试）、`benchmark/bench_chained_table.py`。
+
+做了什么：单表，`find_and_stage` / `commit` / `release_rows`，守卫沿用 `EvictionGuardView`，分区内一次规约选出全部 victim，行池空闲栈，出现残留时抛 `ChainedTableFull`（带上已放置部分的 `partial` 结果，未放置的行已归还）。
+
+测试：以几行 python 写的模型为对照（桶内槽位、行号、victim 及其顺序逐项比较），覆盖 4 种规模、3 种 score 策略、随机 admission 掩码；另有守卫（用真实的 `EmbeddingCacheCore`）、全部被保护的桶、行池耗尽、uint64 key、链结构不变量检查。EOS（H100）上 26 个全部通过；与之相邻的 `test_eviction_guard`、`test_ps_tier`、`test_embedding_cache_core` 仍通过。
+
+与设计相比的差别（有意为之，后续阶段再收口）：
+- **`find` 没有按桶排序**：key 已去重，每个线程只写自己命中的那个槽，没有写冲突，所以直接一个线程一个 key。按桶排序只用在 `commit`（放置阶段）。§4.1 说的"`find_and_stage` 前排序"在这一阶段没有做，是否值得做取决于后面的实测。
+- **排序、分段、行池栈都在 python 层**，用 `torch.argsort`、`unique_consecutive`、`nonzero` 完成，每步有几次主机同步；之后换成 C++/cub。
+- `bucket_size` 用 int32，`next` / `head` 用 int16 张量按 uint16 使用，行号用 int32 张量按 uint32 使用。
+- 只有单 score 字（S=1），score 策略为 `assign` / `accumulate` / `none`，排名就是 score 升序；LruLfu 的两字 score 和 JIT 比较器放到后面。
+- 单表；`table_id` 只用于守卫。
+- **一个桶一步内的新 key 数不能超过桶容量**：新 key 不会淘汰同一步的其他新 key，所以 victim 只能来自已存在的成员，新 key 数大于桶容量就是容量错误（§8.2 讨论过的情形，这里作为明确的错误处理）。
+
+### 微基准（EOS，H100，单表 1677 万槽，桶 128，约 96% 满）
+
+对比现有的 `LinearBucketTable`；时间是每次调用的毫秒数，现有实现的 lookup 计时里包含它每次分配 `table_ids` 的开销，所以对它略不利。
+
+| 批大小 | 操作 | 现有 ms | 链式 ms | 现有/链式 |
+|---|---|---|---|---|
+| 65536 | 命中 lookup | 0.030 | 0.008 | 3.8× |
+| 65536 | 未命中 lookup | 0.054 | 0.006 | 9.0× |
+| 524288 | 命中 lookup | 0.112 | 0.063 | 1.8× |
+| 524288 | 未命中 lookup | 0.188 | 0.046 | 4.0× |
+| 65536 | 整步（全是新 key，满表） | 0.218 | 0.429 | 0.5× |
+| 524288 | 整步（全是新 key，满表） | 1.026 | 0.781 | 1.3× |
+
+解读：
+- **lookup 比现有实现快**：与 §8.6 的担心相反，`head` 加读 key 的路径在这个规模下没有比 digest 向量慢，未命中尤其便宜。
+- **整步在小批量时更慢**：链式的整步包含 python 层的排序、分段和几次主机同步（见上），小批量被这些固定开销主导；批量增大后已经比现有实现快。这一部分是第二阶段要用 C++ 实现替换的对象，不代表最终水平。
+- 只测了单表、批内全是新 key 这一种整步；命中占比、分布倾斜和多表都还没有测。
+
+### 后续阶段
+
+2. 每表一个 map + 设备端指针数组；扩容（只搬记录）；NO_EVICTION 的扩容兜底；HBM_DIRECT 的按行号 `refs`；把排序、分段、行池栈从 python 层挪进 C++。
+3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score。
 4. 接入 prefetch 路径（缓存路径与 HBM_DIRECT 路径），保持"缓存 allocate → 存储 `commit`"的顺序；与 `_prefetch_cache_path` 的重构一并做。
 5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）。

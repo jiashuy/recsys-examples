@@ -1,0 +1,402 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The chained bucket table, against a model of what it is meant to do.
+
+The model is a few lines of python that apply the rule directly: a step finds its keys,
+stages the misses, and commits the ones kept; a bucket gives free slots to its new keys
+in order and evicts the lowest-scored members, skipping any that are protected, for the
+rest. The table is checked against it slot for slot, rows included, after every step.
+"""
+
+import random
+
+import pytest
+import torch
+from dynamicemb.chained_table import (
+    SCORE_ACCUMULATE,
+    ChainedTable,
+    ChainedTableFull,
+    hash_py,
+)
+from dynamicemb_extensions import EmbeddingCacheCore
+
+
+@pytest.fixture
+def device():
+    assert torch.cuda.is_available()
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _t(values, device, dtype=torch.int64):
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
+class Model:
+    """What a ChainedTable should hold, written out the plain way."""
+
+    def __init__(self, num_buckets, cap, row_capacity):
+        self.nb, self.cap = num_buckets, cap
+        self.buckets = [[] for _ in range(num_buckets)]  # each: [key, score, row]
+        self.free = list(range(row_capacity))
+        self.staged = []  # (position, key, score)
+
+    def bucket(self, key):
+        return hash_py(key) % self.nb
+
+    def find_and_stage(self, keys, scores, policy):
+        rows = []
+        self.staged = []
+        for pos, key in enumerate(keys):
+            score = None if scores is None else scores[pos]
+            for entry in self.buckets[self.bucket(key)]:
+                if entry[0] == key:
+                    if policy == "assign":
+                        entry[1] = score if score is not None else 0
+                    elif policy == "accumulate":
+                        entry[1] += score if score is not None else 1
+                    rows.append(entry[2])
+                    break
+            else:
+                rows.append(-1)
+                init = score if score is not None else (1 if policy == "accumulate" else 0)
+                self.staged.append((pos, key, init))
+        return rows
+
+    def commit(self, keep=None, protected=frozenset()):
+        staged = self.staged
+        if keep is not None:
+            staged = [s for s, k in zip(staged, keep) if k]
+        self.staged = []
+        m = len(staged)
+        new_rows = self.free[len(self.free) - m :] if m else []
+        del self.free[len(self.free) - m :]
+        by_bucket = {}
+        for j, (pos, key, score) in enumerate(staged):
+            by_bucket.setdefault(self.bucket(key), []).append((key, score, new_rows[j]))
+        victims = []
+        for b in sorted(by_bucket):
+            new = by_bucket[b]
+            members = self.buckets[b]
+            s0 = len(members)
+            free_slots = self.cap - s0
+            need = max(0, len(new) - free_slots)
+            order = sorted(range(s0), key=lambda s: (members[s][1], s))
+            chosen = [s for s in order if members[s][0] not in protected][:need]
+            if len(chosen) < need:
+                raise ChainedTableFull("model: not enough victims", None)
+            for key, score, row in new[:free_slots]:
+                members.append([key, score, row])
+            for slot, (key, score, row) in zip(chosen, new[free_slots:]):
+                victims.append((members[slot][0], members[slot][2]))
+                members[slot] = [key, score, row]
+        return new_rows, [p for p, _, _ in staged], victims
+
+    def release(self, rows):
+        self.free.extend(rows)
+
+    def flat(self):
+        return [tuple(e) for b in self.buckets for e in b]
+
+
+def _state(table):
+    keys, scores, rows = table.export()
+    return list(zip(keys.tolist(), scores.tolist(), rows.tolist()))
+
+
+def _step(table, model, keys, scores, policy, keep=None, guard=None, protected=frozenset()):
+    dev = table.device
+    rows = table.find_and_stage(
+        _t(keys, dev),
+        None if scores is None else _t(scores, dev),
+        policy,
+    )
+    assert rows.tolist() == model.find_and_stage(keys, scores, policy)
+    keep_t = None if keep is None else _t(keep, dev, torch.bool)
+    out = table.commit(keep_t, guard=guard)
+    new_rows, positions, victims = model.commit(keep, protected)
+    assert out.rows.tolist() == new_rows
+    assert out.positions.tolist() == positions
+    got = list(zip(out.victim_keys.tolist(), out.victim_rows.tolist()))
+    assert got == victims
+    table.release_rows(out.victim_rows)
+    model.release([r for _, r in victims])
+    assert _state(table) == model.flat()
+    return out
+
+
+def test_empty_table_places_everything(device):
+    table = ChainedTable(num_buckets=4, bucket_capacity=8, device=device)
+    keys = [5, 6, 7, 8, 9]
+    rows = table.find_and_stage(_t(keys, device))
+    assert rows.tolist() == [-1] * 5
+    assert table.num_staged == 5
+    out = table.commit()
+    assert out.victim_keys.numel() == 0
+    assert sorted(out.rows.tolist()) == sorted(set(out.rows.tolist()))
+    assert table.size() == 5
+    assert table.lookup(_t(keys, device)).tolist() == out.rows.tolist()
+    table.check_invariants()
+
+
+def test_an_unknown_key_is_not_found_and_nothing_changes(device):
+    table = ChainedTable(num_buckets=4, bucket_capacity=8, device=device)
+    table.find_and_stage(_t([1, 2, 3], device))
+    table.commit()
+    before = _state(table)
+    assert table.lookup(_t([4, 5], device)).tolist() == [-1, -1]
+    table.find_and_stage(_t([4, 5], device))  # staged, never committed
+    assert _state(table) == before
+    table.check_invariants()
+
+
+def test_dropped_keys_never_enter_the_table(device):
+    table = ChainedTable(num_buckets=4, bucket_capacity=8, device=device)
+    table.find_and_stage(_t([1, 2, 3, 4], device))
+    out = table.commit(_t([True, False, True, False], device, torch.bool))
+    assert out.positions.tolist() == [0, 2]
+    assert table.lookup(_t([1, 2, 3, 4], device)).tolist()[1::2] == [-1, -1]
+    assert table.size() == 2
+    table.check_invariants()
+
+
+def test_find_updates_the_score_of_a_hit(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=8, device=device)
+    table.find_and_stage(_t([10, 11], device), _t([5, 6], device))
+    table.commit()
+    table.find_and_stage(_t([10, 11], device), _t([100, 200], device), "assign")
+    _, scores, _ = table.export()
+    assert sorted(scores.tolist()) == [100, 200]
+    table.find_and_stage(_t([10], device), None, "accumulate")
+    table.find_and_stage(_t([10], device), None, "accumulate")
+    _, scores, _ = table.export()
+    assert sorted(scores.tolist()) == [102, 200]
+    table.find_and_stage(_t([10, 11], device), None, "none")
+    _, scores, _ = table.export()
+    assert sorted(scores.tolist()) == [102, 200]
+
+
+def test_the_lowest_scored_members_are_evicted(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=8, device=device)
+    keys = list(range(100, 108))
+    table.find_and_stage(_t(keys, device), _t([50, 10, 40, 20, 30, 70, 60, 80], device))
+    table.commit()
+    table.find_and_stage(_t([200, 201, 202], device), _t([1, 2, 3], device))
+    out = table.commit()
+    assert sorted(out.victim_keys.tolist()) == [101, 103, 104]  # scores 10, 20, 30
+    assert table.lookup(_t([200, 201, 202], device)).min() >= 0
+    assert table.lookup(_t([101, 103, 104], device)).tolist() == [-1, -1, -1]
+    table.release_rows(out.victim_rows)
+    table.check_invariants()
+
+
+def test_a_survivor_keeps_its_row(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=8, device=device)
+    table.find_and_stage(_t(list(range(8)), device), _t(list(range(8)), device))
+    table.commit()
+    before = dict(zip(*[x.tolist() for x in table.export()[::2]]))
+    table.find_and_stage(_t([50, 51], device), _t([100, 101], device))
+    out = table.commit()
+    table.release_rows(out.victim_rows)
+    after = dict(zip(*[x.tolist() for x in table.export()[::2]]))
+    for key in set(before) & set(after):
+        assert before[key] == after[key]
+    table.check_invariants()
+
+
+def test_victim_rows_hold_until_released(device):
+    """A victim's row is not given to anyone until the caller releases it."""
+    table = ChainedTable(num_buckets=1, bucket_capacity=4, device=device)
+    table.find_and_stage(_t([1, 2, 3, 4], device), _t([1, 2, 3, 4], device))
+    table.commit()
+    table.find_and_stage(_t([9], device), _t([9], device))
+    out = table.commit()
+    assert out.victim_keys.tolist() == [1]
+    held = out.victim_rows.item()
+    assert held not in table.export()[2].tolist()
+    free_before = table.free_rows()
+    table.release_rows(out.victim_rows)
+    assert table.free_rows() == free_before + 1
+
+
+def test_uint64_keys(device):
+    table = ChainedTable(num_buckets=4, bucket_capacity=8, device=device)
+    keys = torch.tensor([2**63 + 5, 2**63 + 6, 7], dtype=torch.uint64, device=device)
+    table.find_and_stage(keys)
+    table.commit()
+    assert bool((table.lookup(keys) >= 0).all())
+    table.check_invariants()
+
+
+def test_the_row_pool_can_run_out(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=4, row_capacity=4, device=device)
+    table.find_and_stage(_t([1, 2, 3, 4], device))
+    table.commit()
+    table.find_and_stage(_t([5], device))
+    with pytest.raises(RuntimeError, match="free rows"):
+        table.commit()
+
+
+@pytest.mark.parametrize("policy", ["assign", "accumulate", "none"])
+@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (64, 128, 800)])
+def test_matches_the_model_over_many_steps(device, shape, policy):
+    nb, cap, per_step = shape
+    rng = random.Random(1234 + nb)
+    table = ChainedTable(num_buckets=nb, bucket_capacity=cap, device=device)
+    model = Model(nb, cap, table.row_capacity)
+    universe = nb * cap * 3  # three times the capacity: plenty of eviction
+    for step in range(25):
+        keys = rng.sample(range(1, universe + 1), per_step)
+        scores = None if rng.random() < 0.2 else [rng.randrange(1, 1000) for _ in keys]
+        keep = None
+        if rng.random() < 0.5:
+            keep = [rng.random() < 0.7 for _ in range(per_step)]
+            # the mask is over the staged keys only; the model slices it the same way
+            n_staged = sum(
+                1 for k in keys if all(e[0] != k for e in model.buckets[model.bucket(k)])
+            )
+            keep = keep[:n_staged]
+        _step(table, model, keys, scores, policy, keep)
+        if step % 8 == 0:
+            table.check_invariants()
+    table.check_invariants()
+
+
+def test_more_new_keys_than_a_bucket_can_make_room_for_is_an_error(device):
+    """A new key never evicts another new key of the same step, so a bucket can take
+    at most as many new keys as it has slots; more is a capacity error, and the bucket
+    is left as it was."""
+    table = ChainedTable(num_buckets=1, bucket_capacity=8, device=device)
+    table.find_and_stage(_t(list(range(8)), device), _t([1] * 8, device))
+    table.commit()
+    before = _state(table)
+    free_before = table.free_rows()
+    table.find_and_stage(_t(list(range(100, 112)), device), _t([5] * 12, device))
+    with pytest.raises(ChainedTableFull):
+        table.commit()
+    assert _state(table) == before
+    assert table.free_rows() == free_before
+    table.check_invariants()
+
+
+# -- the cache's guard ---------------------------------------------------------
+
+
+def _cache_keys(core, keys, device, hold):
+    """Bind `keys` in the cache's only table. The first `hold` keep the reference a
+    step in flight would; the rest are released, idle."""
+    n = keys.numel()
+    nodes = core.lookup_pin(keys, [0, n])
+    _, _, new_nodes = core.allocate(
+        keys, torch.arange(n, dtype=torch.int64, device=device), [0, n], nodes
+    )
+    assert bool((new_nodes >= 0).all())
+    core.publish(new_nodes, [0, n])
+    if n > hold:
+        idle = new_nodes[hold:].contiguous()
+        core.release(idle, [0, idle.numel()])
+    torch.cuda.synchronize()
+
+
+def test_a_referenced_key_is_never_evicted(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=128, device=device)
+    core = EmbeddingCacheCore([4 * 128])
+    stored = torch.arange(1, 101, dtype=torch.int64, device=device)
+    table.find_and_stage(stored, stored.clone())  # score == key: 1 is the lowest
+    table.commit()
+
+    _cache_keys(core, torch.arange(1, 61, dtype=torch.int64, device=device), device, hold=30)
+    held = set(range(1, 31))
+
+    # 80 new keys into a bucket with 28 free slots: 52 evictions, with scores that put
+    # the held keys first in line
+    new = torch.arange(1000, 1080, dtype=torch.int64, device=device)
+    table.find_and_stage(new, torch.full_like(new, 10_000))
+    out = table.commit(guard=core.guard())
+    victims = set(out.victim_keys.tolist())
+    assert len(victims) == 52
+    assert not (victims & held), "a referenced key was evicted"
+    assert victims == set(range(31, 83))  # the lowest scores the guard lets go
+    table.release_rows(out.victim_rows)
+    table.check_invariants()
+
+
+def test_without_the_guard_the_same_keys_go(device):
+    """The control: the keys the guard protects are ones the score alone would take."""
+    table = ChainedTable(num_buckets=1, bucket_capacity=128, device=device)
+    stored = torch.arange(1, 101, dtype=torch.int64, device=device)
+    table.find_and_stage(stored, stored.clone())
+    table.commit()
+    new = torch.arange(1000, 1080, dtype=torch.int64, device=device)
+    table.find_and_stage(new, torch.full_like(new, 10_000))
+    out = table.commit()
+    assert set(out.victim_keys.tolist()) == set(range(1, 53))
+
+
+def test_a_bucket_of_protected_members_is_an_error(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=128, device=device)
+    core = EmbeddingCacheCore([4 * 128])
+    stored = torch.arange(1, 129, dtype=torch.int64, device=device)
+    table.find_and_stage(stored, stored.clone())
+    table.commit()
+    _cache_keys(core, stored, device, hold=128)  # every member is held
+
+    free_before = table.free_rows()
+    before = list(zip(*[x.tolist() for x in table.export()]))
+    new = _t([9999], device)
+    table.find_and_stage(new, new.clone())
+    with pytest.raises(ChainedTableFull, match="in use by a step in flight") as info:
+        table.commit(guard=core.guard())
+    assert table.free_rows() == free_before, "the row of the unplaced key was not returned"
+    assert list(zip(*[x.tolist() for x in table.export()])) == before
+    assert info.value.partial.rows.numel() == 0
+    table.check_invariants()
+
+
+def test_other_buckets_still_place_when_one_is_full(device):
+    nb, cap = 8, 16
+    table = ChainedTable(num_buckets=nb, bucket_capacity=cap, device=device)
+    pool = torch.arange(1, 20000, dtype=torch.int64, device=device)
+    bucket = table.bucket_of(pool)
+
+    def take(b, n, skip=0):
+        return pool[bucket == b][skip : skip + n]
+
+    # Fill every bucket exactly.
+    stored = torch.cat([take(b, cap) for b in range(nb)])
+    table.find_and_stage(stored, stored.clone())
+    table.commit()
+    assert table.size() == nb * cap
+
+    # Hold all of bucket 0 in the cache.
+    core = EmbeddingCacheCore([4 * 128])
+    held = take(0, cap)
+    _cache_keys(core, held, device, hold=cap)
+
+    # Two new keys for bucket 0, which cannot make room, and two for bucket 1, which can.
+    new0, new1 = take(0, 2, skip=cap), take(1, 2, skip=cap)
+    new = torch.cat([new0, new1])
+    table.find_and_stage(new, torch.full_like(new, 10**6))
+    with pytest.raises(ChainedTableFull) as info:
+        table.commit(guard=core.guard())
+    partial = info.value.partial
+    assert partial.rows.numel() == 2
+    assert sorted(new[partial.positions].tolist()) == sorted(new1.tolist())
+    assert bool((table.lookup(new1) >= 0).all())
+    assert bool((table.lookup(new0) < 0).all())
+    assert bool((table.lookup(held) >= 0).all())
+    assert partial.victim_keys.numel() == 2
+    table.release_rows(partial.victim_rows)
+    table.check_invariants()
