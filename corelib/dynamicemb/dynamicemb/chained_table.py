@@ -13,27 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A key index with value rows apart from the slots: one table.
+"""A key index with value rows apart from the slots.
 
 A key is looked up by chain inside its bucket and carries the number of the row its
 value lives in, taken from a pool of rows that has nothing to do with where the key
 sits. A step is two calls with whatever the caller needs to decide in between:
 
-    rows = table.find_and_stage(keys)      # hits answered; misses held back
-    ...                                    # admission, a lower tier, ...
-    out = table.commit(keep)               # misses placed; room made where needed
-    ...                                    # read the victims' rows, then
-    table.release_rows(out.victim_rows)
+    rows = tables.find_and_stage(keys, table_ids)   # hits answered; misses held back
+    ...                                             # admission, a lower tier, ...
+    out = tables.commit(keep)                       # misses placed; room made
+    ...                                             # read the victims' rows, then
+    tables.release_rows(out.victim_rows, out.victim_tables)
 
-See docs/chained_bucket_index_design.md. This is the first stage: one table, the
-single-word score, no pinning of its own (the cache's eviction guard is the only
-protection), and a bucket that cannot make room is an error.
+Each table has its own arrays and its own pool of rows; a table can be grown without
+touching the others, and growing moves only the keys, never the values. A table that
+never evicts (``no_eviction``) grows when a bucket cannot hold its keys. A table that
+pins (``track_refs``) keeps a count per row, and a row with a count is never chosen as
+a victim; the cache's eviction guard is honoured as well.
+
+See docs/chained_bucket_index_design.md.
 """
 
-from typing import NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
-from dynamicemb_extensions import chained_bucket_ids, chained_find, chained_place
+from dynamicemb_extensions import (
+    chained_bucket_ids,
+    chained_find,
+    chained_gids,
+    chained_make_views,
+    chained_pin,
+    chained_place,
+    chained_segment_need,
+)
 
 # How find treats the score of a key it finds.
 SCORE_NONE = 0  # leave it alone
@@ -44,24 +56,27 @@ _POLICIES = {"none": SCORE_NONE, "assign": SCORE_ASSIGN, "accumulate": SCORE_ACC
 
 
 class CommitResult(NamedTuple):
-    # Row of each placed key, in the order the staged keys were given.
+    # Each placed key: its row, its table, and its position in the keys passed to
+    # find_and_stage, in the order the keys were staged.
     rows: torch.Tensor
-    # Position in the keys passed to find_and_stage of each placed key.
     positions: torch.Tensor
+    tables: torch.Tensor
     # What was evicted to make room. The rows still hold the victims' values;
     # give them back with release_rows once they have been read.
     victim_keys: torch.Tensor
     victim_rows: torch.Tensor
+    victim_tables: torch.Tensor
 
 
 class ChainedTableFull(RuntimeError):
-    """A bucket could not make room: every member it could evict is protected.
+    """A bucket could not make room: every member it could evict is protected, or
+    it was given more new keys than it has slots.
 
     ``partial`` is the CommitResult of the buckets that did place their keys; the rows
     of the keys that were not placed have already been given back.
     """
 
-    def __init__(self, message: str, partial: CommitResult):
+    def __init__(self, message: str, partial: Optional[CommitResult]):
         super().__init__(message)
         self.partial = partial
 
@@ -74,185 +89,269 @@ def _as_int64(t: torch.Tensor) -> torch.Tensor:
     raise TypeError(f"keys must be int64 or uint64, got {t.dtype}")
 
 
-class ChainedTable:
+def _default_rows(slots: int) -> int:
+    # The rows of the keys of a step that the table has not yet made room for, plus
+    # some: a row is held from when a key is placed until its victim is released.
+    return slots + max(slots // 8, 1024)
+
+
+class ChainedTables:
     def __init__(
         self,
-        num_buckets: int,
+        num_buckets: Sequence[int],
         bucket_capacity: int = 128,
-        row_capacity: Optional[int] = None,
+        row_capacities: Optional[Sequence[int]] = None,
+        track_refs: bool = False,
+        no_eviction: Union[bool, Sequence[bool]] = False,
         device: Optional[torch.device] = None,
     ):
         if not 1 <= bucket_capacity <= 256:
             raise ValueError("bucket_capacity must be in [1, 256]")
-        if num_buckets < 1:
-            raise ValueError("num_buckets must be positive")
+        self.num_tables = len(num_buckets)
+        if self.num_tables < 1 or min(num_buckets) < 1:
+            raise ValueError("every table needs at least one bucket")
         self.device = device or torch.device("cuda", torch.cuda.current_device())
-        self.num_buckets = int(num_buckets)
         self.bucket_capacity = int(bucket_capacity)
-        slots = self.num_buckets * self.bucket_capacity
-        if row_capacity is None:
-            # The rows of the keys of a step that the table has not yet made room
-            # for, plus some: a row is held from when a key is placed until its
-            # victim is released.
-            row_capacity = slots + max(slots // 8, 1024)
-        if row_capacity < slots:
-            raise ValueError("row_capacity must cover every slot")
-        if row_capacity >= 1 << 32:
-            raise ValueError("row_capacity must fit in 32 bits")
-        self.row_capacity = int(row_capacity)
+        self.track_refs = bool(track_refs)
+        if isinstance(no_eviction, bool):
+            no_eviction = [no_eviction] * self.num_tables
+        self.no_eviction = [bool(x) for x in no_eviction]
+        assert len(self.no_eviction) == self.num_tables
 
+        self._nb = [int(n) for n in num_buckets]
+        rows = (
+            [_default_rows(n * self.bucket_capacity) for n in self._nb]
+            if row_capacities is None
+            else [int(r) for r in row_capacities]
+        )
+        self._row_cap = rows
         dev = self.device
-        self.keys = torch.zeros(slots, dtype=torch.int64, device=dev)
-        self.scores = torch.zeros(slots, dtype=torch.int64, device=dev)
-        self.index = torch.zeros(slots, dtype=torch.int32, device=dev)
-        self.next = torch.full((slots,), -1, dtype=torch.int16, device=dev)
-        self.head = torch.full((slots,), -1, dtype=torch.int16, device=dev)
-        self.bucket_size = torch.zeros(self.num_buckets, dtype=torch.int32, device=dev)
-
-        # The pool of free rows is a stack; _top is how many are on it.
-        self._free = torch.arange(self.row_capacity, dtype=torch.int32, device=dev)
-        self._top = self.row_capacity
+        self._keys: List[torch.Tensor] = []
+        self._scores: List[torch.Tensor] = []
+        self._index: List[torch.Tensor] = []
+        self._next: List[torch.Tensor] = []
+        self._head: List[torch.Tensor] = []
+        self._bsize: List[torch.Tensor] = []
+        self._refs: List[Optional[torch.Tensor]] = []
+        self._free: List[torch.Tensor] = []
+        self._top: List[int] = []
+        for t, nb in enumerate(self._nb):
+            slots = nb * self.bucket_capacity
+            if rows[t] < slots:
+                raise ValueError("row_capacity must cover every slot")
+            if rows[t] >= 1 << 32:
+                raise ValueError("row_capacity must fit in 32 bits")
+            self._append_arrays(nb)
+            self._refs.append(
+                torch.zeros(rows[t], dtype=torch.int32, device=dev)
+                if self.track_refs
+                else None
+            )
+            # The pool of free rows is a stack; _top is how many are on it.
+            self._free.append(torch.arange(rows[t], dtype=torch.int32, device=dev))
+            self._top.append(rows[t])
+        self._rebuild_views()
 
         self._staged_keys: Optional[torch.Tensor] = None
+        self._staged_tids: Optional[torch.Tensor] = None
         self._staged_scores: Optional[torch.Tensor] = None
         self._staged_positions: Optional[torch.Tensor] = None
 
-    # -- queries --------------------------------------------------------------
+    # -- layout ---------------------------------------------------------------
 
-    @property
-    def capacity(self) -> int:
-        return self.num_buckets * self.bucket_capacity
-
-    def size(self) -> int:
-        return int(self.bucket_size.sum().item())
-
-    def free_rows(self) -> int:
-        return self._top
-
-    def bucket_of(self, keys: torch.Tensor) -> torch.Tensor:
-        return chained_bucket_ids(_as_int64(keys), self.num_buckets)
-
-    def _find(self, keys, scores, mode) -> torch.Tensor:
-        return chained_find(
-            _as_int64(keys),
-            self.keys,
-            self.scores,
-            self.index,
-            self.next,
-            self.head,
-            self.bucket_size,
-            self.num_buckets,
-            self.bucket_capacity,
-            None if scores is None else _as_int64(scores),
-            mode,
+    def _new_arrays(self, nb: int):
+        slots = nb * self.bucket_capacity
+        dev = self.device
+        return (
+            torch.zeros(slots, dtype=torch.int64, device=dev),
+            torch.zeros(slots, dtype=torch.int64, device=dev),
+            torch.zeros(slots, dtype=torch.int32, device=dev),
+            torch.full((slots,), -1, dtype=torch.int16, device=dev),
+            torch.full((slots,), -1, dtype=torch.int16, device=dev),
+            torch.zeros(nb, dtype=torch.int32, device=dev),
         )
 
-    def lookup(self, keys: torch.Tensor) -> torch.Tensor:
+    def _append_arrays(self, nb: int) -> None:
+        keys, scores, index, nxt, head, bsize = self._new_arrays(nb)
+        self._keys.append(keys)
+        self._scores.append(scores)
+        self._index.append(index)
+        self._next.append(nxt)
+        self._head.append(head)
+        self._bsize.append(bsize)
+
+    def _rebuild_views(self) -> None:
+        self._views = chained_make_views(
+            self._keys,
+            self._scores,
+            self._index,
+            self._next,
+            self._head,
+            self._bsize,
+            self._refs,
+            self._nb,
+            self.bucket_capacity,
+        )
+
+    # -- queries --------------------------------------------------------------
+
+    def num_buckets_of(self, table: int) -> int:
+        return self._nb[table]
+
+    def row_capacity_of(self, table: int) -> int:
+        """Rows the table's value pool has to have."""
+        return self._row_cap[table]
+
+    def capacity_of(self, table: int) -> int:
+        return self._nb[table] * self.bucket_capacity
+
+    def size(self, table: int = 0) -> int:
+        return int(self._bsize[table].sum().item())
+
+    def free_rows(self, table: int = 0) -> int:
+        return self._top[table]
+
+    def lookup(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """Row of each key, -1 for a key the table does not have. Changes nothing."""
-        return self._find(keys, None, SCORE_NONE)
+        return chained_find(self._views, _as_int64(keys), table_ids, None, SCORE_NONE, False)
 
     # -- one step -------------------------------------------------------------
 
     def find_and_stage(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
         policy: str = "assign",
+        pin: bool = False,
     ) -> torch.Tensor:
-        """Answer the keys the table has and hold back the ones it does not.
+        """Answer the keys the tables have and hold back the ones they do not.
 
-        ``keys`` must be unique. Returns each key's row, -1 for a key the table does
-        not have; those are staged, with ``scores`` (or 0, or 1 for ``accumulate``)
-        as the score they will enter with. A hit's score is updated by ``policy``.
-        The table is otherwise untouched, so nothing needs undoing if the step is
-        abandoned before :meth:`commit`.
+        ``keys`` must be unique within a table. Returns each key's row, -1 for a key
+        its table does not have; those are staged, with ``scores`` (or 0, or 1 for
+        ``accumulate``) as the score they will enter with. A hit's score is updated by
+        ``policy``, and with ``pin`` its row takes a reference. The tables are
+        otherwise untouched, so nothing needs undoing if the step is abandoned before
+        :meth:`commit`.
         """
         mode = _POLICIES[policy]
         keys = _as_int64(keys)
-        rows = self._find(keys, scores, mode)
+        sc = None if scores is None else _as_int64(scores)
+        rows = chained_find(self._views, keys, table_ids, sc, mode, pin)
         miss = (rows < 0).nonzero(as_tuple=True)[0]
         self._staged_positions = miss
         self._staged_keys = keys[miss]
-        if scores is None:
+        self._staged_tids = table_ids[miss]
+        if sc is None:
             fill = 1 if mode == SCORE_ACCUMULATE else 0
             self._staged_scores = torch.full(
                 (miss.numel(),), fill, dtype=torch.int64, device=self.device
             )
         else:
-            self._staged_scores = _as_int64(scores)[miss]
+            self._staged_scores = sc[miss]
         return rows
 
     @property
     def num_staged(self) -> int:
         return 0 if self._staged_keys is None else int(self._staged_keys.numel())
 
+    def _empty_result(self) -> CommitResult:
+        e = torch.empty(0, dtype=torch.int64, device=self.device)
+        return CommitResult(e, e, e, e, e, e)
+
     def commit(
         self,
         keep: Optional[torch.Tensor] = None,
         guard: Optional[Tuple[int, int]] = None,
-        guard_table: int = 0,
+        pin: bool = False,
     ) -> CommitResult:
         """Place the staged keys.
 
         ``keep`` is a bool mask over the staged keys (``None`` keeps them all); the
-        others are dropped, having never been in the table. A kept key takes a free
-        slot of its bucket if there is one; otherwise the bucket's lowest-scored
-        member that ``guard`` allows is evicted and the key takes its slot. All the
-        keys of a bucket choose their victims together.
+        others are dropped, having never been in a table. A kept key takes a free slot
+        of its bucket if there is one; otherwise the bucket's lowest-scored member that
+        is neither pinned nor refused by ``guard`` is evicted and the key takes its
+        slot. All the keys of a bucket choose their victims together. With ``pin`` the
+        placed keys' rows start with a reference.
+
+        A table that never evicts is grown instead, until its buckets hold the keys.
         """
-        empty = torch.empty(0, dtype=torch.int64, device=self.device)
         if self._staged_keys is None or self._staged_keys.numel() == 0:
             self._clear_staged()
-            return CommitResult(empty, empty, empty, empty)
-        keys, scores, positions = (
+            return self._empty_result()
+        keys, tids, scores, positions = (
             self._staged_keys,
+            self._staged_tids,
             self._staged_scores,
             self._staged_positions,
         )
+        self._clear_staged()
         if keep is not None:
-            keys, scores, positions = keys[keep], scores[keep], positions[keep]
+            keys, tids, scores, positions = (
+                keys[keep],
+                tids[keep],
+                scores[keep],
+                positions[keep],
+            )
         m = int(keys.numel())
         if m == 0:
-            self._clear_staged()
-            return CommitResult(empty, empty, empty, empty)
-        if m > self._top:
-            raise RuntimeError(
-                f"the pool has {self._top} free rows and {m} keys need one; "
-                "increase row_capacity or release the victims of earlier steps"
+            return self._empty_result()
+        dev = self.device
+
+        # Sort by bucket, growing the tables that must not evict until they fit.
+        while True:
+            gid, local = chained_gids(self._views, keys, tids)
+            perm = torch.argsort(gid, stable=True)
+            sgid = gid[perm]
+            stids, slocal = tids[perm], local[perm]
+            seg_gid, counts = torch.unique_consecutive(sgid, return_counts=True)
+            seg_begin = torch.cumsum(counts, 0) - counts
+            seg_table, seg_bucket = stids[seg_begin], slocal[seg_begin]
+            need = chained_segment_need(self._views, seg_table, seg_bucket, counts)
+            if not any(self.no_eviction):
+                break
+            grow = sorted(
+                {
+                    t
+                    for t in seg_table[need > 0].unique().tolist()
+                    if self.no_eviction[t]
+                }
             )
+            if not grow:
+                break
+            for t in grow:
+                self.expand(t)
 
-        rows = self._free[self._top - m : self._top].to(torch.int64)
-        self._top -= m
+        # Rows, per table, in the order the keys are sorted.
+        per_table = torch.bincount(stids, minlength=self.num_tables).tolist()
+        for t, c in enumerate(per_table):
+            if c > self._top[t]:
+                raise RuntimeError(
+                    f"table {t} has {self._top[t]} free rows and {c} keys need one; "
+                    "increase row_capacity or release the victims of earlier steps"
+                )
+        srows = torch.empty(m, dtype=torch.int64, device=dev)
+        start = 0
+        for t, c in enumerate(per_table):
+            if c:
+                srows[start : start + c] = self._free[t][self._top[t] - c : self._top[t]]
+                self._top[t] -= c
+            start += c
 
-        bucket = self.bucket_of(keys)
-        perm = torch.argsort(bucket, stable=True)
-        sb = bucket[perm]
-        skeys, sscores, srows = keys[perm], scores[perm], rows[perm]
-        seg_bucket, counts = torch.unique_consecutive(sb, return_counts=True)
-        u = int(seg_bucket.numel())
-        seg_begin = torch.cumsum(counts, 0) - counts
-        free_slots = self.bucket_capacity - self.bucket_size[seg_bucket].to(torch.int64)
-        need = torch.clamp(counts - free_slots, min=0)
+        skeys, sscores = keys[perm], scores[perm]
         seg_voff = torch.cumsum(need, 0) - need
         total_victims = int(need.sum().item())
-
-        vict_slot = torch.empty(total_victims, dtype=torch.int32, device=self.device)
-        vkeys = torch.empty(total_victims, dtype=torch.int64, device=self.device)
-        vrows = torch.empty(total_victims, dtype=torch.int64, device=self.device)
-        seg_fail = torch.zeros(u, dtype=torch.int32, device=self.device)
+        vict_slot = torch.empty(total_victims, dtype=torch.int32, device=dev)
+        vkeys = torch.empty(total_victims, dtype=torch.int64, device=dev)
+        vrows = torch.empty(total_victims, dtype=torch.int64, device=dev)
+        seg_fail = torch.zeros(seg_table.numel(), dtype=torch.int32, device=dev)
         g_ptr, g_n = guard if guard is not None else (0, 0)
         chained_place(
-            self.keys,
-            self.scores,
-            self.index,
-            self.next,
-            self.head,
-            self.bucket_size,
-            self.num_buckets,
-            self.bucket_capacity,
+            self._views,
             skeys,
             sscores,
             srows,
+            seg_table,
             seg_bucket,
             seg_begin,
             counts,
@@ -263,106 +362,277 @@ class ChainedTable:
             seg_fail,
             g_ptr,
             g_n,
-            guard_table,
+            pin,
         )
-        self._clear_staged()
 
+        vtables = torch.repeat_interleave(seg_table, need)
+        rows = torch.empty_like(srows)
+        rows[perm] = srows
         failed = seg_fail.to(torch.bool)
         if bool(failed.any()):
             seg_of_key = torch.repeat_interleave(
-                torch.arange(u, device=self.device), counts
+                torch.arange(failed.numel(), device=dev), counts
             )
             unplaced = failed[seg_of_key]
-            self.release_rows(srows[unplaced])
+            self.release_rows(srows[unplaced], stids[unplaced])
             ok_victim = torch.repeat_interleave(~failed, need)
             partial = CommitResult(
                 srows[~unplaced],
                 positions[perm][~unplaced],
+                stids[~unplaced],
                 vkeys[ok_victim],
                 vrows[ok_victim],
+                vtables[ok_victim],
             )
             raise ChainedTableFull(
                 f"{int(failed.sum())} bucket(s) could not make room for "
                 f"{int(unplaced.sum())} key(s): every member they could evict is "
-                "in use by a step in flight. Increase the capacity or reduce the "
-                "prefetch pipeline depth.",
+                "in use by a step in flight, or they were given more new keys than "
+                "they have slots. Increase the capacity or reduce the prefetch "
+                "pipeline depth.",
                 partial,
             )
-        return CommitResult(rows, positions, vkeys, vrows)
+        return CommitResult(rows, positions, tids, vkeys, vrows, vtables)
 
     def _clear_staged(self) -> None:
         self._staged_keys = None
+        self._staged_tids = None
         self._staged_scores = None
         self._staged_positions = None
 
-    def release_rows(self, rows: torch.Tensor) -> None:
-        """Give rows back to the pool, once nothing needs what they hold."""
-        r = int(rows.numel())
-        if r == 0:
+    def release_rows(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Give rows back to their pools, once nothing needs what they hold."""
+        if rows.numel() == 0:
             return
-        if self._top + r > self.row_capacity:
-            raise RuntimeError("more rows released than were taken")
-        self._free[self._top : self._top + r] = rows.to(torch.int32)
-        self._top += r
+        if self.num_tables == 1:
+            groups = [(0, rows)]
+        else:
+            groups = [(t, rows[table_ids == t]) for t in range(self.num_tables)]
+        for t, r in groups:
+            n = int(r.numel())
+            if n == 0:
+                continue
+            if self._top[t] + n > self._row_cap[t]:
+                raise RuntimeError("more rows released than were taken")
+            self._free[t][self._top[t] : self._top[t] + n] = r.to(torch.int32)
+            self._top[t] += n
+
+    def pin(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Take a reference on each row: a row with one is not evicted."""
+        assert self.track_refs, "this table does not pin"
+        chained_pin(self._views, rows, table_ids, 1)
+
+    def unpin(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
+        assert self.track_refs, "this table does not pin"
+        chained_pin(self._views, rows, table_ids, -1)
+
+    def refs_of(self, table: int) -> torch.Tensor:
+        assert self.track_refs, "this table does not pin"
+        return self._refs[table]
+
+    # -- growing --------------------------------------------------------------
+
+    def expand(self, table: int, num_buckets: Optional[int] = None) -> int:
+        """Rebuild a table with more buckets. Only the keys move: each keeps its row,
+        so the values do not. Returns the table's row capacity, which grows with it;
+        the value pool has to follow.
+        """
+        old_nb = self._nb[table]
+        new_nb = max(int(num_buckets) if num_buckets else 2 * old_nb, old_nb + 1)
+        keys, scores, rows = self.export(table)
+        cap = self.bucket_capacity
+        dev = self.device
+        while True:
+            arrays = self._new_arrays(new_nb)
+            tmp = chained_make_views(
+                [arrays[0]], [arrays[1]], [arrays[2]], [arrays[3]], [arrays[4]],
+                [arrays[5]], [None], [new_nb], cap,
+            )  # fmt: skip
+            local = chained_bucket_ids(keys, new_nb)
+            perm = torch.argsort(local, stable=True)
+            slocal = local[perm]
+            seg_bucket, counts = torch.unique_consecutive(slocal, return_counts=True)
+            seg_table = torch.zeros_like(seg_bucket)
+            need = chained_segment_need(tmp, seg_table, seg_bucket, counts)
+            if bool((need > 0).any()):
+                new_nb *= 2  # a bucket would overflow: spread them further
+                continue
+            break
+        seg_begin = torch.cumsum(counts, 0) - counts
+        empty = torch.empty(0, dtype=torch.int64, device=dev)
+        chained_place(
+            tmp,
+            keys[perm],
+            scores[perm],
+            rows[perm],
+            seg_table,
+            seg_bucket,
+            seg_begin,
+            counts,
+            torch.zeros_like(counts),
+            torch.empty(0, dtype=torch.int32, device=dev),
+            empty,
+            empty,
+            torch.zeros(seg_bucket.numel(), dtype=torch.int32, device=dev),
+            0,
+            0,
+            False,
+        )
+        (
+            self._keys[table],
+            self._scores[table],
+            self._index[table],
+            self._next[table],
+            self._head[table],
+            self._bsize[table],
+        ) = arrays
+        self._nb[table] = new_nb
+
+        # The pool has to cover every slot; the new rows go on the free stack.
+        slots = new_nb * cap
+        if slots > self._row_cap[table]:
+            old_r = self._row_cap[table]
+            new_r = _default_rows(slots)
+            free = torch.empty(new_r, dtype=torch.int32, device=dev)
+            free[: self._top[table]] = self._free[table][: self._top[table]]
+            added = new_r - old_r
+            free[self._top[table] : self._top[table] + added] = torch.arange(
+                old_r, new_r, dtype=torch.int32, device=dev
+            )
+            self._free[table] = free
+            self._top[table] += added
+            self._row_cap[table] = new_r
+            if self.track_refs:
+                refs = torch.zeros(new_r, dtype=torch.int32, device=dev)
+                refs[:old_r] = self._refs[table]
+                self._refs[table] = refs
+        self._rebuild_views()
+        return self._row_cap[table]
 
     # -- inspection -----------------------------------------------------------
 
-    def export(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(keys, scores, rows) of everything stored, bucket by bucket."""
+    def export(self, table: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(keys, scores, rows) of everything a table stores, bucket by bucket."""
         cap = self.bucket_capacity
-        occupied = torch.arange(cap, device=self.device)[None, :] < self.bucket_size[
+        occupied = torch.arange(cap, device=self.device)[None, :] < self._bsize[table][
             :, None
         ]
         mask = occupied.reshape(-1)
         return (
-            self.keys[mask],
-            self.scores[mask],
-            self.index[mask].to(torch.int64) & 0xFFFFFFFF,
+            self._keys[table][mask],
+            self._scores[table][mask],
+            self._index[table][mask].to(torch.int64) & 0xFFFFFFFF,
         )
 
-    def check_invariants(self, pending_rows: int = 0) -> None:
+    def bucket_of(self, keys: torch.Tensor, table: int = 0) -> torch.Tensor:
+        return chained_bucket_ids(_as_int64(keys), self._nb[table])
+
+    def check_invariants(self, pending_rows: Optional[Sequence[int]] = None) -> None:
         """Walk every chain and check the structure; for tests, it is slow.
 
-        ``pending_rows`` is the number of rows taken from the pool that are not on a
-        slot: victims not yet released.
+        ``pending_rows`` is, per table, the number of rows taken from the pool that are
+        not on a slot: victims not yet released.
         """
+        pending = list(pending_rows) if pending_rows is not None else [0] * self.num_tables
         cap = self.bucket_capacity
-        keys = self.keys.cpu().tolist()
-        index = self.index.cpu().tolist()
-        nxt = (self.next.cpu().to(torch.int32) & 0xFFFF).tolist()
-        head = (self.head.cpu().to(torch.int32) & 0xFFFF).tolist()
-        sizes = self.bucket_size.cpu().tolist()
-        seen_keys = set()
-        seen_rows = set()
-        for b in range(self.num_buckets):
-            size = sizes[b]
-            assert 0 <= size <= cap, f"bucket {b}: size {size}"
-            visited = []
-            for c in range(cap):
-                cur = head[b * cap + c]
-                steps = 0
-                while cur != 0xFFFF:
-                    assert cur < size, f"bucket {b}: chain {c} reaches slot {cur}"
-                    key = keys[b * cap + cur]
-                    h = hash_py(key)
-                    assert h % self.num_buckets == b, f"key {key} in the wrong bucket"
-                    assert (h >> 32) % cap == c, f"key {key} on the wrong chain"
-                    visited.append(cur)
-                    cur = nxt[b * cap + cur]
-                    steps += 1
-                    assert steps <= cap, f"bucket {b}: chain {c} does not end"
-            assert sorted(visited) == list(range(size)), f"bucket {b}: chains miss slots"
-            for s in range(size):
-                key = keys[b * cap + s]
-                assert key not in seen_keys, f"key {key} stored twice"
-                seen_keys.add(key)
-                row = index[b * cap + s] & 0xFFFFFFFF
-                assert row < self.row_capacity, f"row {row} out of range"
-                assert row not in seen_rows, f"row {row} used twice"
-                seen_rows.add(row)
-        assert (
-            self._top + len(seen_rows) + pending_rows == self.row_capacity
-        ), "rows are lost or duplicated"
+        for t in range(self.num_tables):
+            keys = self._keys[t].cpu().tolist()
+            index = self._index[t].cpu().tolist()
+            nxt = (self._next[t].cpu().to(torch.int32) & 0xFFFF).tolist()
+            head = (self._head[t].cpu().to(torch.int32) & 0xFFFF).tolist()
+            sizes = self._bsize[t].cpu().tolist()
+            seen_keys = set()
+            seen_rows = set()
+            for b in range(self._nb[t]):
+                size = sizes[b]
+                assert 0 <= size <= cap, f"table {t} bucket {b}: size {size}"
+                visited = []
+                for c in range(cap):
+                    cur = head[b * cap + c]
+                    steps = 0
+                    while cur != 0xFFFF:
+                        assert cur < size, f"bucket {b}: chain {c} reaches slot {cur}"
+                        key = keys[b * cap + cur]
+                        h = hash_py(key)
+                        assert h % self._nb[t] == b, f"key {key} in the wrong bucket"
+                        assert (h >> 32) % cap == c, f"key {key} on the wrong chain"
+                        visited.append(cur)
+                        cur = nxt[b * cap + cur]
+                        steps += 1
+                        assert steps <= cap, f"bucket {b}: chain {c} does not end"
+                assert sorted(visited) == list(range(size)), f"bucket {b}: chains miss slots"
+                for s in range(size):
+                    key = keys[b * cap + s]
+                    assert key not in seen_keys, f"key {key} stored twice"
+                    seen_keys.add(key)
+                    row = index[b * cap + s] & 0xFFFFFFFF
+                    assert row < self._row_cap[t], f"row {row} out of range"
+                    assert row not in seen_rows, f"row {row} used twice"
+                    seen_rows.add(row)
+            assert (
+                self._top[t] + len(seen_rows) + pending[t] == self._row_cap[t]
+            ), f"table {t}: rows are lost or duplicated"
+
+
+class ChainedTable(ChainedTables):
+    """One table: the same thing without the table ids."""
+
+    def __init__(
+        self,
+        num_buckets: int,
+        bucket_capacity: int = 128,
+        row_capacity: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        track_refs: bool = False,
+        no_eviction: bool = False,
+    ):
+        super().__init__(
+            [num_buckets],
+            bucket_capacity,
+            None if row_capacity is None else [row_capacity],
+            track_refs,
+            [no_eviction],
+            device,
+        )
+
+    @property
+    def num_buckets(self) -> int:
+        return self._nb[0]
+
+    @property
+    def row_capacity(self) -> int:
+        return self._row_cap[0]
+
+    @property
+    def capacity(self) -> int:
+        return self._nb[0] * self.bucket_capacity
+
+    def _zeros(self, n: int) -> torch.Tensor:
+        return torch.zeros(n, dtype=torch.int64, device=self.device)
+
+    def lookup(self, keys: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return super().lookup(keys, self._zeros(keys.numel()))
+
+    def find_and_stage(  # type: ignore[override]
+        self,
+        keys: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        policy: str = "assign",
+        pin: bool = False,
+    ) -> torch.Tensor:
+        return super().find_and_stage(keys, self._zeros(keys.numel()), scores, policy, pin)
+
+    def release_rows(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
+        super().release_rows(rows, self._zeros(rows.numel()))
+
+    def pin(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
+        super().pin(rows, self._zeros(rows.numel()))
+
+    def unpin(self, rows: torch.Tensor, table_ids=None) -> None:  # type: ignore[override]
+        super().unpin(rows, self._zeros(rows.numel()))
+
+    def check_invariants(self, pending_rows: int = 0) -> None:  # type: ignore[override]
+        super().check_invariants([pending_rows])
 
 
 def hash_py(key: int) -> int:

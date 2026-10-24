@@ -26,8 +26,8 @@ import random
 import pytest
 import torch
 from dynamicemb.chained_table import (
-    SCORE_ACCUMULATE,
     ChainedTable,
+    ChainedTables,
     ChainedTableFull,
     hash_py,
 )
@@ -81,10 +81,16 @@ class Model:
             staged = [s for s, k in zip(staged, keep) if k]
         self.staged = []
         m = len(staged)
-        new_rows = self.free[len(self.free) - m :] if m else []
+        pool = self.free[len(self.free) - m :] if m else []
         del self.free[len(self.free) - m :]
+        # Rows go to the keys in the order they sort in: by bucket, then as staged.
+        order = sorted(range(m), key=lambda j: (self.bucket(staged[j][1]), j))
+        new_rows = [None] * m
+        for i, j in enumerate(order):
+            new_rows[j] = pool[i]
         by_bucket = {}
-        for j, (pos, key, score) in enumerate(staged):
+        for j in order:
+            pos, key, score = staged[j]
             by_bucket.setdefault(self.bucket(key), []).append((key, score, new_rows[j]))
         victims = []
         for b in sorted(by_bucket):
@@ -399,4 +405,181 @@ def test_other_buckets_still_place_when_one_is_full(device):
     assert bool((table.lookup(held) >= 0).all())
     assert partial.victim_keys.numel() == 2
     table.release_rows(partial.victim_rows)
+    table.check_invariants()
+
+
+# -- several tables, growing, pinning ------------------------------------------
+
+
+def _multi_state(tables, t):
+    keys, scores, rows = tables.export(t)
+    return list(zip(keys.tolist(), scores.tolist(), rows.tolist()))
+
+
+def test_several_tables_match_one_model_each(device):
+    nbs = [4, 8, 2]
+    cap = 16
+    tables = ChainedTables(nbs, bucket_capacity=cap, device=device)
+    models = [Model(nb, cap, tables.row_capacity_of(t)) for t, nb in enumerate(nbs)]
+    rng = random.Random(7)
+    for step in range(20):
+        keys, tids = [], []
+        for t, nb in enumerate(nbs):
+            n = rng.randrange(1, nb * cap // 2)
+            ks = rng.sample(range(1, nb * cap * 3), n)
+            keys += ks
+            tids += [t] * n
+        order = list(range(len(keys)))
+        rng.shuffle(order)  # tables interleaved in the input
+        keys, tids = [keys[i] for i in order], [tids[i] for i in order]
+        scores = [rng.randrange(1, 1000) for _ in keys]
+
+        rows = tables.find_and_stage(_t(keys, device), _t(tids, device), _t(scores, device))
+        expect = [-1] * len(keys)
+        for t, model in enumerate(models):
+            idx = [i for i, x in enumerate(tids) if x == t]
+            r = model.find_and_stage([keys[i] for i in idx], [scores[i] for i in idx], "assign")
+            for i, row in zip(idx, r):
+                expect[i] = row
+        assert rows.tolist() == expect
+
+        out = tables.commit()
+        vk, vr, vt = out.victim_keys.tolist(), out.victim_rows.tolist(), out.victim_tables.tolist()
+        got_victims = {t: [] for t in range(len(nbs))}
+        for k, r, t in zip(vk, vr, vt):
+            got_victims[t].append((k, r))
+        for t, model in enumerate(models):
+            new_rows, _, victims = model.commit()
+            sel = out.tables == t
+            assert out.rows[sel].tolist() == new_rows
+            assert got_victims[t] == victims
+        tables.release_rows(out.victim_rows, out.victim_tables)
+        for t, model in enumerate(models):
+            model.release([r for _, r in got_victims[t]])
+            assert _multi_state(tables, t) == model.flat()
+    tables.check_invariants()
+
+
+def test_the_same_key_in_two_tables_is_two_keys(device):
+    tables = ChainedTables([4, 4], bucket_capacity=8, device=device)
+    keys = _t([5, 5], device)
+    tids = _t([0, 1], device)
+    tables.find_and_stage(keys, tids, _t([1, 2], device))
+    out = tables.commit()
+    assert tables.size(0) == 1 and tables.size(1) == 1
+    assert tables.lookup(keys, tids).tolist() == out.rows[torch.argsort(out.positions)].tolist()
+    tables.check_invariants()
+
+
+def test_growing_one_table_leaves_the_others_alone(device):
+    tables = ChainedTables([2, 2], bucket_capacity=8, device=device)
+    keys = _t(list(range(1, 9)), device)
+    for t in (0, 1):
+        tables.find_and_stage(keys, _t([t] * 8, device), keys.clone())
+        tables.commit()
+    state1 = _multi_state(tables, 1)
+    ptr1 = tables._keys[1].data_ptr()
+    tables.expand(0)
+    assert tables.num_buckets_of(0) >= 4
+    assert tables.num_buckets_of(1) == 2
+    assert tables._keys[1].data_ptr() == ptr1, "the other table's arrays were replaced"
+    assert _multi_state(tables, 1) == state1
+    assert bool((tables.lookup(keys, _t([0] * 8, device)) >= 0).all())
+    tables.check_invariants()
+
+
+@pytest.mark.parametrize("factor", [None, 3, 16])
+def test_growing_moves_the_keys_and_not_the_rows(device, factor):
+    table = ChainedTable(num_buckets=4, bucket_capacity=16, device=device)
+    keys = torch.arange(1, 33, dtype=torch.int64, device=device)
+    table.find_and_stage(keys, keys * 7)
+    table.commit()
+    before = sorted(zip(*[x.tolist() for x in table.export()]))
+    old_rows = table.row_capacity
+    new_rows = table.expand(0, None if factor is None else 4 * factor)
+    after = sorted(zip(*[x.tolist() for x in table.export()]))
+    assert before == after, "a key, its score or its row changed"
+    assert new_rows >= table.capacity and new_rows >= old_rows
+    assert table.free_rows() == new_rows - 32
+    assert bool((table.lookup(keys) >= 0).all())
+    table.check_invariants()
+
+
+def test_a_table_that_never_evicts_grows_instead(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=8, no_eviction=True, device=device)
+    seen = {}
+    rng = random.Random(3)
+    universe = list(range(1, 2000))
+    rng.shuffle(universe)
+    for step in range(10):
+        keys = [universe.pop() for _ in range(30)]
+        t = _t(keys, device)
+        table.find_and_stage(t, t.clone())
+        out = table.commit()
+        assert out.victim_keys.numel() == 0, "a table that never evicts evicted"
+        for k, r in zip(keys, table.lookup(t).tolist()):
+            assert r >= 0
+            seen[k] = r
+    assert table.size() == 300
+    assert table.num_buckets > 2
+    got = dict(zip(*[x.tolist() for x in table.export()[::2]]))
+    assert got == seen, "a key lost or changed its row while the table grew"
+    table.check_invariants()
+
+
+def test_a_bucket_with_more_new_keys_than_slots_grows_a_no_eviction_table(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=8, no_eviction=True, device=device)
+    keys = _t(list(range(1, 30)), device)
+    table.find_and_stage(keys, keys.clone())
+    out = table.commit()
+    assert out.victim_keys.numel() == 0
+    assert table.size() == 29
+    table.check_invariants()
+
+
+def test_a_pinned_row_is_not_evicted(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=8, track_refs=True, device=device)
+    keys = _t(list(range(1, 9)), device)
+    table.find_and_stage(keys, keys.clone())  # score == key: 1 is the lowest
+    table.commit()
+    rows = table.lookup(_t([1, 2, 3], device))
+    table.pin(rows)
+    assert table.refs_of(0)[rows].tolist() == [1, 1, 1]
+
+    table.find_and_stage(_t([100, 101], device), _t([50, 51], device))
+    out = table.commit()
+    assert sorted(out.victim_keys.tolist()) == [4, 5]  # 1, 2, 3 are pinned
+    table.release_rows(out.victim_rows)
+
+    table.unpin(rows)
+    assert table.refs_of(0)[rows].tolist() == [0, 0, 0]
+    table.find_and_stage(_t([102], device), _t([60], device))
+    out = table.commit()
+    assert out.victim_keys.tolist() == [1]
+    table.release_rows(out.victim_rows)
+    table.check_invariants()
+
+
+def test_find_and_commit_can_pin(device):
+    table = ChainedTable(num_buckets=2, bucket_capacity=8, track_refs=True, device=device)
+    keys = _t([1, 2, 3], device)
+    table.find_and_stage(keys, keys.clone())
+    out = table.commit(pin=True)
+    assert table.refs_of(0)[out.rows].tolist() == [1, 1, 1]
+    rows = table.find_and_stage(keys, keys.clone(), pin=True)
+    assert table.refs_of(0)[rows].tolist() == [2, 2, 2]
+    table.unpin(rows)
+    table.unpin(rows)
+    assert table.refs_of(0)[rows].tolist() == [0, 0, 0]
+
+
+def test_every_member_pinned_is_an_error_even_without_a_guard(device):
+    table = ChainedTable(num_buckets=1, bucket_capacity=4, track_refs=True, device=device)
+    keys = _t([1, 2, 3, 4], device)
+    table.find_and_stage(keys, keys.clone())
+    table.commit(pin=True)
+    table.find_and_stage(_t([9], device), _t([9], device))
+    with pytest.raises(ChainedTableFull):
+        table.commit()
+    assert table.size() == 4
     table.check_invariants()
