@@ -36,6 +36,7 @@ from dynamicemb.key_value_table import (
     load_from_flat,
     store_to_flat,
 )
+from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode, MultiTableAdmitter
@@ -224,7 +225,7 @@ def _is_hbm_storage(storage: Storage) -> bool:
     tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
     """
     return (
-        isinstance(storage, DynamicEmbStorage)
+        isinstance(storage, (DynamicEmbStorage, ChainedStorage))
         and storage._state.tables[0].is_device_buffer()
     )
 
@@ -972,11 +973,17 @@ def dynamicemb_prefetch(
                             "Reduce prefetch pipeline depth or increase "
                             "cache size."
                         )
+            if isinstance(storage, ChainedStorage):
+                from dynamicemb.chained_prefetch import prefetch_cache_path
+
+                cache_path = prefetch_cache_path
+            else:
+                cache_path = _prefetch_cache_path
             (
                 slot_indices,
                 non_admitted_positions,
                 cache_nodes,
-            ) = _prefetch_cache_path(
+            ) = cache_path(
                 cache,
                 storage,
                 unique_keys,
@@ -995,11 +1002,17 @@ def dynamicemb_prefetch(
             # no ref counter beside a hash table, so the two index spaces coincide.
             value_row_indices = slot_indices
         elif storage_mode == StorageMode.HBM_DIRECT:
+            if isinstance(storage, ChainedStorage):
+                from dynamicemb.chained_prefetch import prefetch_hbm_direct_path
+
+                hbm_path = prefetch_hbm_direct_path
+            else:
+                hbm_path = _prefetch_hbm_direct_path
             (
                 slot_indices,
                 non_admitted_positions,
                 value_row_indices,
-            ) = _prefetch_hbm_direct_path(
+            ) = hbm_path(
                 storage,
                 unique_keys,
                 unique_table_ids,

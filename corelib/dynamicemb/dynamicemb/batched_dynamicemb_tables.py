@@ -35,6 +35,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
 )
+from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
@@ -808,9 +809,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 storage_options = deepcopy(self._dynamicemb_options)
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
-                self._storage = DynamicEmbStorage(
+                self._storage = self._make_storage(
                     storage_options,
-                    self._optimizer,
                     lower=self._create_external_storage(storage_options),
                 )
                 self._storage_layout = StorageLayout.CACHING
@@ -874,9 +874,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._storage_layout = StorageLayout.HYBRID
         else:
             # HBM-only: everything fits in GPU memory.
-            self._storage = DynamicEmbStorage(
+            self._storage = self._make_storage(
                 self._dynamicemb_options,
-                self._optimizer,
                 lower=self._create_external_storage(self._dynamicemb_options),
             )
             self._storage_layout = StorageLayout.HBM_ONLY
@@ -891,6 +890,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.device_id,
             self._optimizer_type,
         )
+
+    def _make_storage(
+        self, options: List[DynamicEmbTableOptions], lower: Optional[Storage]
+    ) -> Storage:
+        """The table of rows behind a cache, or the HBM-only one.
+
+        ``DEMB_CHAINED_INDEX`` (experimental) puts the keys in the chained index
+        instead: training prefetch, forward, backward and flush are covered, not
+        checkpoints.
+        """
+        if os.environ.get("DEMB_CHAINED_INDEX"):
+            return ChainedStorage(options, self._optimizer, lower=lower)
+        return DynamicEmbStorage(options, self._optimizer, lower=lower)
 
     def _create_external_storage(
         self, options: List[DynamicEmbTableOptions]
@@ -1239,7 +1251,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
-            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
             return dynamicemb_eval_forward(
@@ -1279,7 +1291,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
             self._storage.training = False
 
         return res
@@ -1306,7 +1318,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
             self._storage.training = True
             self._storage.set_score(fused_score)
 

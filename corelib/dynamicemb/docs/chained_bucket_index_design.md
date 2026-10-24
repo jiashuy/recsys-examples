@@ -451,8 +451,40 @@ value 行: 全局行池, 与槽位无关
 
 收益比预期小（`place_kernel` 约快 25%）。不淘汰时仍要 134 µs，说明剩下的时间不在选 victim 或链操作的串行度上，更可能是每个桶要访问的数据分散在多条缓存行、warp 的驻留数不够；要确认需要用 ncu 看访存和占用率，这一步**还没做**。
 
+### 第四阶段：prefetch 接入（已实现，实验性）
+
+设置环境变量 `DEMB_CHAINED_INDEX` 后，模块用 `ChainedStorage`（`dynamicemb/chained_storage.py`）代替 `DynamicEmbStorage`；prefetch 的两条路径在 `dynamicemb/chained_prefetch.py`。
+
+覆盖范围：
+- **缓存路径**（HBM 缓存加 host 后备，后备用链式索引）和 **HBM-direct 路径**（没有缓存），都可以带下层 PS。
+- 训练的 prefetch、forward、backward，`flush`，以及 eval 的 `find`。
+- 单 score 字的策略：TIMESTAMP、STEP、CUSTOMIZED、LFU、NO_EVICTION；LruLfu（两字 score）直接抛 `NotImplementedError`。
+- 扩容：不淘汰的表在 `commit` 里增长；其他表按 `max_load_factor` 增长到 `max_capacity`；value 缓冲随行池一起追加（`sync_value_buffers`）。
+
+没有覆盖：host-only 与 hybrid 布局（仍用旧存储）、dump / load / 导出 / 增量 dump / replay / `fill_tables`（`ChainedStorage` 对 dump / load 抛 `NotImplementedError`，第五阶段）。
+
+两条路径按 §4.10 的顺序重写：缓存路径是"缓存 pin → `find_and_stage` → 下层 PS → admission → 缓存 allocate → 缓存 victim 写回 → 载入已有的行、初始化新行 → `commit`（传入缓存的守卫）→ 被淘汰的 key 离开缓存 → publish"；HBM-direct 路径在 `find_and_stage` 时 pin 命中的行，`commit(pin=True)` 给新行加引用，backward 里 `unpin`。因为新 key 拿的是新行，victim 的行在释放前原封不动，所以：
+- 不再需要 `take_values_of_keys_evicted_in_the_same_insert` 那一套，也不再有 `select_insert_failed_values`；victim 的值直接从它的行里读；
+- 缓存 victim 写回时，所有被缓存的 key 在存储里都必须有行，否则抛 `RuntimeError`（旧代码里的 "gone" 分支）：这里没有 load / erase 能打破这个不变量。
+
+与旧实现的差别：
+- TIMESTAMP 用每次访问递增的计数（单调即可），不是设备时钟。
+- 选 victim 只在桶内、按 score 升序，被守卫或引用计数保护的跳过（与旧实现的桶内淘汰语义一致，具体选出哪些 key 可能不同，见 §8.9）。
+
+测试（`test_chained_prefetch.py`，12 个，EOS 上全部通过）：沿用 `test_ps_tier` 的端到端检查，每个 key 从 1.0 开始，loss 是输出之和，每次出现梯度为 1，SGD 之后 key 应该是 `1 - lr × 出现次数`，无论它被淘汰、送到下层、再取回多少次。HBM-direct 与缓存两种布局，TIMESTAMP / LFU / STEP 三种策略；一个控制组（下层把收到的东西都丢掉，检查必须失败）；一个"容量够装下所有 key、不需要下层"；一个"不淘汰的表随 key 增长"。并在每个测试后用 `check_invariants` 核对没有行丢失或重复。旧路径的全套分片回归（主测试文件五个分片、单元测试三组）结果与之前一致。
+
+**没有测的**：admission 路径（代码按旧实现改写，没有用例走到）、带单独 prefetch 流的流水线（`record_stream` 与新路径的配合）、多表模块、多 GPU、`pooling_mode` 不是 NONE 的情形（forward/backward 本身没有改，但没有跑）。
+
+### 微基准（端到端，H100，一张表 419 万行、dim 64、SGD、每步 65536 个 key，key 取自 4 倍表大小的全集，表已满）
+
+| 布局 | 现有 ms/步 | 链式 ms/步 | 现有/链式 |
+|---|---|---|---|
+| HBM-direct | 1.209 | 1.154 | 1.05× |
+| 缓存（HBM 缓存为 1/4，host 后备） | 3.597 | 2.480 | 1.45× |
+
+一步包含 prefetch、forward 和 backward。HBM-direct 上几乎持平（forward / backward 占了大头，索引的差别被稀释）；缓存路径上快 45%，说明后备的 `find_and_stage` + `commit` 比旧的"查找 + 带守卫的 insert + 搬值"省得多。只测了这一个规模和这一种分布（均匀）；倾斜分布和更小的批没有测。
+
 ### 后续阶段
 
 3. 残留节点的复制前移（软超限）；整表 top-K 淘汰、排名函数与 JIT 接入；LruLfu 两字 score；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
-4. 接入 prefetch 路径（缓存路径与 HBM_DIRECT 路径），保持"缓存 allocate → 存储 `commit`"的顺序；与 `_prefetch_cache_path` 的重构一并做。
-5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）。
+5. checkpoint / 增量 dump / replay 按新布局设计（不兼容旧格式）；host-only 与 hybrid 布局的支持；admission、流水线 prefetch 流、多表模块的测试。

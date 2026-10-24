@@ -459,9 +459,15 @@ def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
+    build_index: bool = True,
+    row_capacities: Optional[List[int]] = None,
 ) -> DynamicEmbTableState:
+    """``build_index=False`` makes the value buffers only, ``row_capacities`` rows each:
+    the key index lives elsewhere (see :mod:`dynamicemb.chained_table`)."""
     if not options:
         raise ValueError("options must be non-empty")
+    if not build_index and row_capacities is None:
+        raise ValueError("without an index, row_capacities says how big the buffers are")
 
     base_opt = options[0]
     num_tables = len(options)
@@ -509,15 +515,19 @@ def create_table_state(
     else:
         capacities = [opt.init_capacity for opt in options]
 
-    key_index_map = get_scored_table(
-        capacity=capacities,
-        bucket_capacity=base_opt.bucket_capacity,
-        key_type=base_opt.index_type,
-        score_specs=[score_policy],
-        device=device,
-        score_fn_key=score_fn_key,
-    )
-    capacity = key_index_map.capacity()
+    if build_index:
+        key_index_map = get_scored_table(
+            capacity=capacities,
+            bucket_capacity=base_opt.bucket_capacity,
+            key_type=base_opt.index_type,
+            score_specs=[score_policy],
+            device=device,
+            score_fn_key=score_fn_key,
+        )
+        capacity = key_index_map.capacity()
+    else:
+        key_index_map = None
+        capacity = int(sum(row_capacities))
 
     dims = [opt.dim for opt in options]
     max_emb_dim = max(dims)
@@ -535,11 +545,13 @@ def create_table_state(
     table_emb_dims_host = torch.tensor(dims, dtype=torch.int64)
     table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)
 
-    key_index_map_caps = key_index_map.per_table_capacity_
+    key_index_map_caps = (
+        key_index_map.per_table_capacity_ if build_index else list(row_capacities)
+    )
 
     # Table (embedding) capacity may differ from key_index_map in NO_EVICTION:
     # key_index_map is larger (by max_load_factor); table uses init_capacity per table.
-    if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+    if build_index and base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
         table_caps = [
             (
                 opt.init_capacity
@@ -591,12 +603,14 @@ def create_table_state(
         training=False,
         no_eviction_next_index=(
             torch.zeros(num_tables, dtype=torch.int64, pin_memory=True)
-            if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+            if build_index
+            and base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
             else None
         ),
         no_eviction_next_index_dev=(
             torch.zeros(num_tables, dtype=torch.int64, device=device)
-            if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+            if build_index
+            and base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
             else None
         ),
         estimated_table_sizes=torch.zeros(
@@ -4268,6 +4282,9 @@ def flush_cache(cache: DynamicEmbCache, storage: DynamicEmbStorage) -> None:
     The storage already has a row for every cached key (a key enters it when it is
     admitted), so the rows are written in place and nothing is inserted.
     """
+    if hasattr(storage, "flush_from"):  # the chained index
+        storage.flush_from(cache)
+        return
     state = cache._state
     batch_size = state.threads_in_wave
 

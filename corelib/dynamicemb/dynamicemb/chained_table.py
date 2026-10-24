@@ -254,6 +254,16 @@ class ChainedTables:
     def num_staged(self) -> int:
         return 0 if self._staged_keys is None else int(self._staged_keys.numel())
 
+    def staged_positions(self) -> torch.Tensor:
+        """Where, among the keys given to find_and_stage, the staged ones are."""
+        if self._staged_positions is None:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        return self._staged_positions
+
+    def discard_staged(self) -> None:
+        """Drop the staged keys without placing any: a step none of whose misses stays."""
+        self._clear_staged()
+
     def _empty_result(self) -> CommitResult:
         e = torch.empty(0, dtype=torch.int64, device=self.device)
         return CommitResult(e, e, e, e, e, e)
