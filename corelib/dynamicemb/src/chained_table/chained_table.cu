@@ -238,8 +238,8 @@ __global__ void place_kernel(
     const int64_t *__restrict__ seg_voff, const int64_t *__restrict__ nseg_ptr,
     const int32_t *__restrict__ abort, int32_t *__restrict__ vict_slot,
     int64_t *__restrict__ vkeys, int64_t *__restrict__ vrows,
-    int64_t *__restrict__ vtabs, int32_t *__restrict__ seg_fail,
-    unsigned long long *__restrict__ nfail,
+    int64_t *__restrict__ vtabs, int64_t *__restrict__ vscores,
+    int32_t *__restrict__ seg_fail, unsigned long long *__restrict__ nfail,
     embedding_cache::EvictionGuardView guard, int pin_new) {
   __shared__ uint8_t dead[kWarpsPerBlock][kMaxBucketCapacity];
 
@@ -363,6 +363,10 @@ __global__ void place_kernel(
         vkeys[voff + (j - f)] = vkey;
         vrows[voff + (j - f)] = static_cast<int64_t>(v.index[sl]);
         vtabs[voff + (j - f)] = t;
+        for (int w3 = 0; w3 < v.num_scores; ++w3) {
+          vscores[(voff + (j - f)) * v.num_scores + w3] =
+              static_cast<int64_t>(v.scores[sl * v.num_scores + w3]);
+        }
         chv = static_cast<int>((hash64(vkey) >> 32) % uint32_t(v.cap));
         dead[w][slot] = 1;
       }
@@ -900,6 +904,7 @@ void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
   auto nseg = device_scalar(u, seg_table);
   auto abort = at::zeros({1}, seg_table.options().dtype(at::kInt));
   auto vtabs = at::empty({std::max<int64_t>(vkeys.numel(), 1)}, seg_table.options());
+  auto vscores = at::empty({std::max<int64_t>(vkeys.numel(), 1) * 2}, seg_table.options());
   auto nfail = at::zeros({1}, seg_table.options());
   auto stream = at::cuda::getCurrentCUDAStream();
   place_kernel<<<grid_for(u, kWarpsPerBlock), kWarpsPerBlock * 32, 0, stream>>>(
@@ -911,7 +916,7 @@ void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
       nseg.data_ptr<int64_t>(), abort.data_ptr<int32_t>(),
       vict_slot.data_ptr<int32_t>(), vkeys.data_ptr<int64_t>(),
       vrows.data_ptr<int64_t>(), vtabs.data_ptr<int64_t>(),
-      seg_fail.data_ptr<int32_t>(),
+      vscores.data_ptr<int64_t>(), seg_fail.data_ptr<int32_t>(),
       reinterpret_cast<unsigned long long *>(nfail.data_ptr<int64_t>()), guard,
       pin_new ? 1 : 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1073,7 +1078,8 @@ std::vector<at::Tensor> chained_apply(
     at::Tensor sscores, at::Tensor seg_table, at::Tensor seg_bucket,
     at::Tensor seg_begin, at::Tensor counts, at::Tensor need, at::Tensor voff,
     at::Tensor num_runs, at::Tensor tstart, int64_t guard_tables,
-    int64_t guard_num_tables, bool pin_new, int64_t num_tables) {
+    int64_t guard_num_tables, bool pin_new, int64_t num_tables,
+    int64_t num_scores) {
   const int64_t n = perm.numel();
   auto o64 = perm.options();
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -1085,6 +1091,7 @@ std::vector<at::Tensor> chained_apply(
   auto vkeys = at::empty({n}, o64);
   auto vrows = at::empty({n}, o64);
   auto vtabs = at::empty({n}, o64);
+  auto vscores = at::empty({n * num_scores}, o64);
   auto seg_fail = at::zeros({n}, o64.dtype(at::kInt));
   embedding_cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
@@ -1107,7 +1114,7 @@ std::vector<at::Tensor> chained_apply(
       num_runs.data_ptr<int64_t>(), abort.data_ptr<int32_t>(),
       vict_slot.data_ptr<int32_t>(), vkeys.data_ptr<int64_t>(),
       vrows.data_ptr<int64_t>(), vtabs.data_ptr<int64_t>(),
-      seg_fail.data_ptr<int32_t>(),
+      vscores.data_ptr<int64_t>(), seg_fail.data_ptr<int32_t>(),
       reinterpret_cast<unsigned long long *>(stats.data_ptr<int64_t>() + 2),
       guard, pin_new ? 1 : 0);
   unpermute_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
@@ -1120,7 +1127,7 @@ std::vector<at::Tensor> chained_apply(
                                     stats.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   auto host = stats.to(at::kCPU);  // the one synchronisation
-  return {rows, srows, vict_slot, vkeys, vrows, vtabs, seg_fail, host};
+  return {rows, srows, vict_slot, vkeys, vrows, vtabs, seg_fail, host, vscores};
 }
 
 // Put rows back on a table's stack, in the order given.
@@ -1228,7 +1235,7 @@ void bind_chained_table(py::module &m) {
         py::arg("seg_begin"), py::arg("counts"), py::arg("need"),
         py::arg("voff"), py::arg("num_runs"), py::arg("tstart"),
         py::arg("guard_tables"), py::arg("guard_num_tables"),
-        py::arg("pin_new"), py::arg("num_tables"));
+        py::arg("pin_new"), py::arg("num_tables"), py::arg("num_scores") = 1);
   m.def("chained_release", &dyn_emb::chained::chained_release,
         "put rows back on a table's stack", py::arg("views"), py::arg("table"),
         py::arg("rows"));

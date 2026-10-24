@@ -35,7 +35,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
 )
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
@@ -867,9 +867,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             "configuration."
                         )
 
-                    self._storage = HybridStorage(
-                        hbm_options, host_options, self._optimizer
-                    )
+                    if os.environ.get("DEMB_CHAINED_INDEX"):
+                        for hbm_option in hbm_options:
+                            # the chained index takes buckets of at most 256 slots
+                            hbm_option.bucket_capacity = min(
+                                int(hbm_option.bucket_capacity), 128
+                            )
+                        self._storage = ChainedHybridStorage(
+                            hbm_options, host_options, self._optimizer
+                        )
+                    else:
+                        self._storage = HybridStorage(
+                            hbm_options, host_options, self._optimizer
+                        )
                     self._storage_layout = StorageLayout.HYBRID
         else:
             # HBM-only: everything fits in GPU memory.
@@ -1250,7 +1260,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
-            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
+            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
             return dynamicemb_eval_forward(
@@ -1290,7 +1300,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
             self._storage.training = False
 
         return res
@@ -1317,7 +1327,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
             self._storage.training = True
             self._storage.set_score(fused_score)
 
@@ -1790,7 +1800,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pg = self._shard_pg
 
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
             raise TypeError(
                 f"incremental_dump requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
@@ -1893,7 +1903,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         # A chained table places keys one by one, in whatever slot and row it hands
         # out, so the slot-for-slot checks (capacity, rows, buckets) say nothing.
-        by_slot = not isinstance(storage, ChainedStorage)
+        by_slot = not isinstance(storage, (ChainedStorage, ChainedHybridStorage))
         checks = [
             *(
                 [
@@ -1993,7 +2003,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 mid-write, so the table may hold a partial replay.
         """
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage)):
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
             raise TypeError(
                 f"replay_increment requires DynamicEmbStorage or HybridStorage, "
                 f"got {type(storage).__name__}"
@@ -2210,7 +2220,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # say so when that case turns up.
             stats.erased = storage.erase_keys(job.table_id, erased)
         if (
-            isinstance(storage, ChainedStorage)
+            isinstance(storage, (ChainedStorage, ChainedHybridStorage))
             and evicted is not None
             and evicted.numel() > 0
         ):

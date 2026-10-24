@@ -543,7 +543,18 @@ value 行: 全局行池, 与槽位无关
 - 一个桶在**一步里的新 key 数不能超过桶容量**（新 key 不会淘汰同一步的其他新 key）。表比每步的 unique key 还小的玩具配置会抛 `ChainedTableFull`，旧实现则会在步内淘汰；分布式的 `test_distributed_pop_evicted_keys.py` 在 8 卡下就是这个原因失败（每个 rank 的表只有一个桶、一步 256 个新 key）。要消除这个限制需要 §4.4 的残留节点。
 - 桶容量最大 256。
 
+### hybrid 布局（已实现）
+
+`ChainedHybridStorage`（`chained_storage.py`）：HBM 层与 host 层各是一个 `ChainedStorage`，**key 不相交**。新 key 进 HBM 层；HBM 层淘汰的 key 连同它们的 score 下沉到 host 层（`CommitResult` 现在带着 `victim_scores`，由 `place_kernel` 在覆盖槽位之前读出）；host 层淘汰的被丢弃（或按 `evicted_item_mode` 保留）。查找先问 HBM 层再问 host 层；更新就地写行，不移动 key（`preserve_existing`）。
+
+- **checkpoint**：先写 host 层，再把 HBM 层追加到同一组文件里（与旧的 hybrid 存储一致）；加载走 HBM 层，它的淘汰自然下沉到 host 层。带两字 score 的 hybrid 仍然不支持 dump（两层共用一个 score 文件），与旧实现相同。
+- **增量 dump 与 replay**：把两层的结果拼起来；replay 对 host 层已有的 key 在原处更新，其余的走 HBM 层。
+- **`ChainedStorage.find` 现在在训练态更新 score**：之前它是只读的（对 HBM-direct 与缓存路径没有影响，因为它们走 `find_and_stage`），但 host-only 与 hybrid 用的通用 forward 路径靠 `find` 更新被访问 key 的 score，否则淘汰顺序不反映访问。这是之前的一个缺陷，现在已修，并加了对应的测试。
+- **桶容量**：旧 hybrid 的 HBM 层用 1024 的桶；链式索引上限 256，所以这一层改用 128。
+
+测试：新增 hybrid 的端到端用例（每个 key 恰好在一个层里、两层 key 不相交、什么都没丢、TIMESTAMP / LFU / LRU_LFU 三种策略、两层都装不下时被丢弃的与保留的都账目对得上）、host-only 下的 score 更新、hybrid 与 host-only 的增量 dump 与 replay。**全部五种布局**（HBM-only、host-only、缓存带或不带 PS、hybrid）下，主测试文件的 `test_forward_train_eval` 160 个、`test_backward` 等 97 个、dump / load 43 个在链式下全部通过；链式目录 107 个测试通过。
+
 ### 后续阶段
 
-3. 残留节点的复制前移（软超限，同时解除上面的限制）；整表 top-K 淘汰、排名函数与自定义 `score_function`；`place_kernel` 的进一步优化（先用 ncu 确认瓶颈是访存分散还是占用率）；小批量的固定开销（约 25 次 kernel launch 加两次同步，可以用 CUDA graph 或融合 kernel 压缩）。
-6. hybrid 布局；默认开启链式索引前的灰度与回退方案。
+3. 残留节点的复制前移（软超限，同时解除"一个桶一步里的新 key 数不能超过桶容量"的限制）；整表 top-K 淘汰、排名函数与自定义 `score_function`；`place_kernel` 的进一步优化；小批量的固定开销。
+6. 删除旧的训练路径（`DynamicEmbStorage`、`HybridStorage` 及其 prefetch 路径），保留推理用到的旧索引部分；默认开启链式索引。

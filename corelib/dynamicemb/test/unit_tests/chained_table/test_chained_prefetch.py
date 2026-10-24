@@ -56,7 +56,12 @@ from test_ps_tier import (  # noqa: E402
     _train,
 )
 
-LAYOUT = {"hbm": StorageLayout.HBM_ONLY, "caching": StorageLayout.CACHING}
+LAYOUT = {
+    "hbm": StorageLayout.HBM_ONLY,
+    "caching": StorageLayout.CACHING,
+    "host": StorageLayout.HOST_ONLY,
+    "hybrid": StorageLayout.HYBRID,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -67,7 +72,14 @@ def chained_index(monkeypatch):
 def _module(layout, ps, capacity, strategy=DynamicEmbScoreStrategy.TIMESTAMP, **extra):
     value_bytes = capacity * DIM * 4
     caching = layout == "caching"
-    local_hbm = value_bytes // 2 if caching else 2 * value_bytes
+    # hbm: room for everything on the device; caching: half; hybrid: an eighth, the rest
+    # on the host; host: none
+    local_hbm = {
+        "hbm": 2 * value_bytes,
+        "caching": value_bytes // 2,
+        "hybrid": value_bytes // 8,
+        "host": 0,
+    }[layout]
     options = DynamicEmbTableOptions(
         dim=DIM,
         init_capacity=capacity,
@@ -371,3 +383,74 @@ def test_the_pair_gives_the_same_answers_as_the_existing_index(layout, admission
     new = _outputs(_two_tables(layout, True, monkeypatch, admission, LRU_LFU))
     for step, (a, b) in enumerate(zip(old, new)):
         assert torch.equal(a, b), f"step {step} differs"
+
+
+# -- the hybrid layout: an HBM tier, a host tier, disjoint -------------------------
+
+
+def test_hybrid_the_hbm_tier_spills_into_the_host_tier_and_nothing_is_lost():
+    from dynamicemb.chained_storage import ChainedHybridStorage
+
+    module = _module("hybrid", None, 16384)
+    storage = module._storage
+    assert isinstance(storage, ChainedHybridStorage)
+    assert module._storage_layout == LAYOUT["hybrid"]
+    uses = _train(module)
+    hbm, host = storage._hbm_tier.index, storage._host_tier.index
+    assert hbm.size(0) > 0 and host.size(0) > 0, "both tiers must hold keys"
+    used = int((uses > 0).sum())
+    assert hbm.size(0) + host.size(0) == used, "a key is in exactly one tier"
+    hbm_keys, host_keys = set(hbm.export(0)[0].tolist()), set(host.export(0)[0].tolist())
+    assert not (hbm_keys & host_keys), "the tiers must hold disjoint keys"
+    bad, total = _mismatched_keys(module, uses)
+    assert bad == 0, f"{bad} of {total} keys are wrong"
+    hbm.check_invariants([0])
+    host.check_invariants([0])
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU, LRU_LFU],
+)
+def test_hybrid_keeps_every_key_whatever_the_strategy(strategy):
+    module = _module("hybrid", None, 16384, strategy)
+    uses = _train(module)
+    bad, total = _mismatched_keys(module, uses)
+    assert bad == 0, f"{bad} of {total} keys are wrong"
+
+
+def test_hybrid_what_the_host_tier_evicts_is_dropped_and_what_it_keeps_is_right():
+    # more keys than the two tiers hold: some are lost, but none of the rest is wrong
+    from dynamicemb.dynamicemb_config import EvictedItemMode
+
+    module = _module("hybrid", None, 4096, evicted_item_mode=EvictedItemMode.RETAIN_KEY)
+    uses = _train(module)
+    storage = module._storage
+    held = set()
+    for tier in (storage._hbm_tier, storage._host_tier):
+        held |= set(tier.index.export(0)[0].tolist())
+    popped = set(module.pop_evicted_keys()["t"].tolist())
+    used = set((uses > 0).nonzero().squeeze(1).tolist())
+    assert popped, "the run must overflow both tiers"
+    assert used <= held | popped
+    # a key that was never evicted is exactly as trained (one that was, and came back,
+    # started again from its initial value)
+    kept = torch.tensor(sorted(held - popped), dtype=torch.int64)
+    assert kept.numel() > 0
+    device = torch.device("cuda")
+    module.flush()
+    module.eval()
+    with torch.no_grad():
+        out = module(kept.to(device), torch.arange(kept.numel() + 1, dtype=torch.int64, device=device))
+    expected = (1.0 - LR * uses[kept].float()).to(device)
+    assert bool(torch.isclose(out[:, 0], expected, atol=1e-4).all())
+
+
+def test_host_only_scores_are_updated_by_a_training_find():
+    """A table of rows on the host, nothing in front of it: the keys a step touches are
+    the ones that stay when the table is full."""
+    module = _module("host", PyDictStorage, 2048)
+    assert isinstance(module._storage, ChainedStorage)
+    uses = _train(module)
+    bad, total = _mismatched_keys(module, uses)
+    assert bad == 0, f"{bad} of {total} keys lost an update"

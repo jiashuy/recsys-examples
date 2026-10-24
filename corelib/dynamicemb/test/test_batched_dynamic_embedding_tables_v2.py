@@ -33,7 +33,7 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
@@ -1510,7 +1510,7 @@ def test_forward_train_eval(
     else:
         assert bdebt._cache is None, "HybridStorage mode should have no cache"
         assert isinstance(
-            bdebt._storage, HybridStorage
+            bdebt._storage, (HybridStorage, ChainedHybridStorage)
         ), f"Expected HybridStorage, got {type(bdebt._storage)}"
 
     """

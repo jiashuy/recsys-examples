@@ -77,6 +77,8 @@ class CommitResult(NamedTuple):
     victim_keys: torch.Tensor
     victim_rows: torch.Tensor
     victim_tables: torch.Tensor
+    # The victims' score words, ``[n, num_scores]``: what a tier below can keep them at.
+    victim_scores: torch.Tensor
 
 
 class ChainedTableFull(RuntimeError):
@@ -234,6 +236,21 @@ class ChainedTables:
     def free_rows(self, table: int = 0) -> int:
         return int(self._tops[table].item())
 
+    def touch(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        policy: str = "assign",
+        timestamp: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Row of each key (-1 if absent), updating the score of the ones that are there
+        as :meth:`find_and_stage` does; nothing is staged."""
+        mode = _POLICIES[policy]
+        ts = int(device_timestamp() if timestamp is None else timestamp) if mode == SCORE_LRU_LFU else 0
+        sc = None if scores is None else _as_int64(scores)
+        return chained_find(self._views, _as_int64(keys), table_ids, sc, mode, False, ts)
+
     def lookup(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """Row of each key, -1 for a key the table does not have. Changes nothing."""
         return chained_find(self._views, _as_int64(keys), table_ids, None, SCORE_NONE, False)
@@ -291,7 +308,9 @@ class ChainedTables:
 
     def _empty_result(self) -> CommitResult:
         e = torch.empty(0, dtype=torch.int64, device=self.device)
-        return CommitResult(e, e, e, e, e, e)
+        return CommitResult(
+            e, e, e, e, e, e, torch.empty(0, self.num_scores, dtype=torch.int64, device=self.device)
+        )
 
     def commit(
         self,
@@ -362,14 +381,15 @@ class ChainedTables:
             total_buckets = sum(self._nb)
 
         g_ptr, g_n = guard if guard is not None else (0, 0)
-        (rows, srows, _vict_slot, vkeys, vrows, vtabs, seg_fail, stats) = chained_apply(
+        (rows, srows, _vict_slot, vkeys, vrows, vtabs, seg_fail, stats, vscores) = chained_apply(
             self._views, perm, skeys, stids, sscores, seg_table, seg_bucket,
             seg_begin, counts, need, voff, num_runs, tstart, g_ptr, g_n, pin,
-            self.num_tables,
+            self.num_tables, self.num_scores,
         )  # fmt: skip
         for t in range(self.num_tables):
             self._version[t] += 1
         victims, runs, failed_buckets, exhausted = stats.tolist()
+        vscores = vscores[: victims * self.num_scores].view(victims, self.num_scores)
         if exhausted:
             per_table = (tstart[1:] - tstart[:-1]).tolist()
             tops = self._tops.tolist()
@@ -395,6 +415,7 @@ class ChainedTables:
                 vkeys[:victims][ok_victim],
                 vrows[:victims][ok_victim],
                 vtabs[:victims][ok_victim],
+                vscores[ok_victim],
             )
             raise ChainedTableFull(
                 f"{failed_buckets} bucket(s) could not make room for "
@@ -405,7 +426,7 @@ class ChainedTables:
                 partial,
             )
         return CommitResult(
-            rows, positions, tids, vkeys[:victims], vrows[:victims], vtabs[:victims]
+            rows, positions, tids, vkeys[:victims], vrows[:victims], vtabs[:victims], vscores
         )
 
     def _clear_staged(self) -> None:

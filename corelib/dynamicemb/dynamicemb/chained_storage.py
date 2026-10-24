@@ -228,7 +228,17 @@ def _is_lru_lfu(strategy) -> bool:
 
 
 class ChainedStorage(Storage):
-    def __init__(self, options, optimizer, lower: Optional[Storage] = None):
+    def __init__(
+        self,
+        options,
+        optimizer,
+        lower: Optional[Storage] = None,
+        spill_to: Optional["ChainedStorage"] = None,
+        track_refs: Optional[bool] = None,
+    ):
+        """``lower`` is the tier below that a miss is asked of and an eviction goes to
+        (a parameter server). ``spill_to`` only receives evictions: the tier of a hybrid
+        storage next to this one, whose keys are disjoint from ours."""
         base = options[0]
         strategy = base.score_strategy
         lru_lfu = _is_lru_lfu(strategy)
@@ -250,19 +260,24 @@ class ChainedStorage(Storage):
         rows = [s + max(s // 8, 1024) for s in slots]
 
         self._lower = lower
+        self._spill = spill_to
         self._strategy = strategy
         self._state: DynamicEmbTableState = create_table_state(
             options,
             optimizer,
             # With nothing below it this is a last tier and honours evicted_item_mode.
             evicted_item_mode=(
-                base.evicted_item_mode if lower is None else EvictedItemMode.DISCARD
+                base.evicted_item_mode
+                if lower is None and spill_to is None
+                else EvictedItemMode.DISCARD
             ),
             build_index=False,
             row_capacities=rows,
         )
         # Without a cache in front, the rows in use have to be protected by a count.
-        hbm_direct = self._state.tables[0].is_device_buffer()
+        hbm_direct = (
+            self._state.tables[0].is_device_buffer() if track_refs is None else track_refs
+        )
         self._index = ChainedTables(
             num_buckets,
             cap,
@@ -379,16 +394,18 @@ class ChainedStorage(Storage):
         table_ids: torch.Tensor,
         rows: torch.Tensor,
         values: Optional[torch.Tensor] = None,
+        scores: Optional[torch.Tensor] = None,
     ) -> None:
         """What was evicted: kept for ``pop_evicted_keys``, and sent down a tier.
 
         ``rows`` still hold the victims' values; ``values`` overrides them (a key that
-        is also cached has a newer one there).
+        is also cached has a newer one there). ``scores`` are the victims' own score
+        words, which a tier of the same kind beside this one keeps them at.
         """
         n = int(keys.numel())
         if n == 0:
             return
-        if self._lower is None:
+        if self._lower is None and self._spill is None:
             if EvictedItemMode.RETAIN_KEY in self._state.evicted_item_mode:
                 _append_evicted(
                     self._state,
@@ -401,7 +418,10 @@ class ChainedStorage(Storage):
             values = load_from_flat(
                 self._state, rows, table_ids, copy_mode=CopyMode.VALUE
             )
-        self._lower.insert(keys, table_ids, values)
+        if self._spill is not None:
+            self._spill.insert(keys, table_ids, values, scores)
+        else:
+            self._lower.insert(keys, table_ids, values)
 
     # -- Storage interface ----------------------------------------------------
 
@@ -412,7 +432,14 @@ class ChainedStorage(Storage):
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ):
-        rows = self._index.lookup(unique_keys, table_ids)
+        if self._state.training and self._strategy != DynamicEmbScoreStrategy.NO_EVICTION:
+            # a training step's access counts: it moves the score of what it finds
+            scores, policy = self.score_args(
+                unique_keys.numel(), unique_keys.device, lfu_accumulated_frequency
+            )
+            rows = self._index.touch(unique_keys, table_ids, scores, policy)
+        else:
+            rows = self._index.lookup(unique_keys, table_ids)
         founds = rows >= 0
         values = load_from_flat(self._state, rows, table_ids, copy_mode=copy_mode)
         n_missing, miss_idx, (missing_keys, missing_tids) = flagged_compact(
@@ -456,6 +483,30 @@ class ChainedStorage(Storage):
             values,
         )
 
+    def update_existing(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        unique_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write the rows of the keys that are here; the others are left alone. Returns
+        which were here."""
+        rows = self._index.lookup(unique_keys, table_ids)
+        found = rows >= 0
+        if bool(found.any()):
+            store_to_flat(
+                self._state, rows[found], table_ids[found], unique_values[found]
+            )
+        return found
+
+    def _write_score_blocks(
+        self, rows: torch.Tensor, table_ids: torch.Tensor, block: torch.Tensor
+    ) -> None:
+        for t in range(self.num_tables):
+            sel = table_ids == t
+            if bool(sel.any()):
+                self._state.key_index_map.scatter_score_blocks(t, rows[sel], block[sel])
+
     def insert(
         self,
         unique_keys: torch.Tensor,
@@ -469,8 +520,13 @@ class ChainedStorage(Storage):
             return
         device = unique_keys.device
         sc, policy = self.score_args(n, device)
-        if scores is not None and policy != "lru_lfu":
-            sc, policy = scores.to(torch.int64), "assign"
+        block = None
+        if scores is not None:
+            if self._index.num_scores == 2 and scores.dim() == 2:
+                block = scores.to(torch.int64)  # both words, written once the rows are known
+                sc, policy = None, "none"
+            elif policy != "lru_lfu":
+                sc, policy = scores.reshape(-1).to(torch.int64), "assign"
         if preserve_existing:
             policy = "none"
         index = self._index
@@ -480,18 +536,25 @@ class ChainedStorage(Storage):
             store_to_flat(
                 self._state, rows[found], table_ids[found], unique_values[found]
             )
-        if index.num_staged == 0:
-            return
-        out = index.commit()
-        self.sync_value_buffers()
-        store_to_flat(
-            self._state,
-            out.rows,
-            table_ids[out.positions],
-            unique_values[out.positions],
-        )
-        self.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
-        index.release_rows(out.victim_rows, out.victim_tables)
+        if index.num_staged:
+            out = index.commit()
+            self.sync_value_buffers()
+            store_to_flat(
+                self._state,
+                out.rows,
+                table_ids[out.positions],
+                unique_values[out.positions],
+            )
+            rows[out.positions] = out.rows
+            self.retain_and_spill(
+                out.victim_keys,
+                out.victim_tables,
+                out.victim_rows,
+                scores=out.victim_scores,
+            )
+            index.release_rows(out.victim_rows, out.victim_tables)
+        if block is not None:
+            self._write_score_blocks(rows, table_ids, block)
 
     def flush_from(self, cache) -> None:
         """Write every row the cache holds back to this table's own row of the key."""
@@ -628,6 +691,7 @@ class ChainedStorage(Storage):
         include_meta: bool = True,
         current_score: Optional[int] = None,
         timestamp: int = 0,
+        append: bool = False,
     ) -> None:
         _dump_table(
             self._state,
@@ -641,6 +705,7 @@ class ChainedStorage(Storage):
             include_meta,
             timestamp=timestamp,
             current_score=current_score,
+            append=append,
         )
 
     def load(
@@ -753,3 +818,274 @@ class ChainedStorage(Storage):
     @property
     def tables(self) -> List[DynamicEmbTableState]:
         return [self._state]
+
+
+class ChainedHybridStorage(Storage):
+    """Two tiers, an HBM one and a host one, holding disjoint keys.
+
+    A new key goes into the HBM tier; what that tier evicts goes down into the host
+    tier with its score, and what the host tier evicts is dropped (or retained, when
+    asked). A lookup asks the HBM tier and then the host tier; an update writes the row
+    wherever the key is, and never moves it.
+    """
+
+    def __init__(self, hbm_options, host_options, optimizer):
+        self._host_tier = ChainedStorage(host_options, optimizer, track_refs=False)
+        self._hbm_tier = ChainedStorage(
+            hbm_options, optimizer, spill_to=self._host_tier, track_refs=False
+        )
+        self.optimizer = optimizer
+        # The tiers' states, as the existing hybrid storage exposes them.
+        self._hbm = self._hbm_tier._state
+        self._host = self._host_tier._state
+
+    @property
+    def _tiers(self) -> List[ChainedStorage]:
+        return [self._hbm_tier, self._host_tier]
+
+    @property
+    def tables(self) -> List[DynamicEmbTableState]:
+        return [self._hbm, self._host]
+
+    @property
+    def num_tables(self) -> int:
+        return self._hbm.num_tables
+
+    # -- score management and accessors, as the HBM tier has them -------------------
+
+    @property
+    def training(self) -> bool:
+        return self._hbm.training
+
+    @training.setter
+    def training(self, value: bool) -> None:
+        self._hbm.training = value
+        self._host.training = value
+
+    def set_score(self, score: int) -> None:
+        self._hbm.score = score
+        self._host.score = score
+
+    def evict_strategy(self):
+        return self._hbm.evict_strategy
+
+    def embedding_dtype(self) -> torch.dtype:
+        return self._hbm.emb_dtype
+
+    def embedding_dim(self, table_id: int) -> int:
+        return self._hbm.table_emb_dims_cpu[table_id]
+
+    def value_dim(self, table_id: int) -> int:
+        return self._hbm.table_value_dims_cpu[table_id]
+
+    def max_embedding_dim(self) -> int:
+        return self._hbm.emb_dim
+
+    def max_value_dim(self) -> int:
+        return self._hbm.value_dim
+
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        return self._hbm.table_emb_dims if on_device else self._hbm.table_emb_dims_host
+
+    def all_dims_vec4(self) -> bool:
+        return self._hbm.all_dims_vec4
+
+    def init_optimizer_state(self) -> float:
+        return self._hbm.optimizer.get_initial_optimizer_state()
+
+    def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
+        for tier in self._tiers:
+            tier.expand_if_need(unique_size_per_table)
+
+    def collect_table_sizes(self, non_blocking: bool = True) -> None:
+        return None
+
+    def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
+        # the HBM tier spills, so only the host tier ever lets a key go
+        return self._host_tier.pop_evicted_keys(table_id)
+
+    def pop_erased_keys(self, table_id: int) -> torch.Tensor:
+        parts = [t.pop_erased_keys(table_id) for t in self._tiers]
+        parts = [p for p in parts if p.numel()]
+        if not parts:
+            return self._hbm_tier.pop_erased_keys(table_id)[:0]
+        return torch.unique(torch.cat(parts))
+
+    # -- lookup and update ----------------------------------------------------------
+
+    def find(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    ):
+        (n_missing, miss_keys, miss_idx, miss_tids, miss_scores, founds, scores, values) = (
+            self._hbm_tier.find(unique_keys, table_ids, copy_mode, lfu_accumulated_frequency)
+        )
+        if n_missing == 0:
+            return (0, miss_keys, miss_idx, miss_tids, miss_scores, founds, scores, values)
+        (n_both, keys_both, idx_both, tids_both, scores_both, in_host, host_scores, host_values) = (
+            self._host_tier.find(miss_keys, miss_tids, copy_mode, miss_scores)
+        )
+        if bool(in_host.any()):
+            at = miss_idx[in_host]
+            values[at] = host_values[in_host]
+            founds = founds.clone()
+            founds[at] = True
+            scores = scores.clone()
+            scores[at] = host_scores[in_host].to(scores.dtype)
+        return (
+            n_both,
+            keys_both,
+            miss_idx[idx_both],
+            tids_both,
+            scores_both,
+            founds,
+            scores,
+            values,
+        )
+
+    def insert(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        unique_values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        """A new key goes into the HBM tier. With ``preserve_existing`` nothing is
+        inserted: the rows of the keys that are in either tier are rewritten."""
+        if preserve_existing:
+            if unique_keys.numel() == 0:
+                return
+            in_hbm = self._hbm_tier.update_existing(unique_keys, table_ids, unique_values)
+            rest = ~in_hbm
+            if bool(rest.any()):
+                self._host_tier.update_existing(
+                    unique_keys[rest], table_ids[rest], unique_values[rest]
+                )
+            return
+        self._hbm_tier.insert(unique_keys, table_ids, unique_values, scores)
+
+    def erase_keys(
+        self,
+        table_id: int,
+        keys: torch.Tensor,
+        mode: EvictedItemMode = EvictedItemMode.DISCARD,
+    ) -> int:
+        """The tiers hold disjoint keys, so the counts add."""
+        return sum(t.erase_keys(table_id, keys, mode) for t in self._tiers)
+
+    # -- checkpoints ----------------------------------------------------------------
+
+    def dump(
+        self,
+        table_id: int,
+        meta_json_file_path: str,
+        emb_key_path: str,
+        embedding_file_path: str,
+        score_file_path: str,
+        opt_file_path: str,
+        include_optim: bool = True,
+        include_meta: bool = True,
+        current_score: Optional[int] = None,
+        timestamp: int = 0,
+    ) -> None:
+        """The host tier, then the HBM tier appended to the same files."""
+        if self._host.key_index_map.num_scores_ > 1 or self._hbm.key_index_map.num_scores_ > 1:
+            raise NotImplementedError(
+                "dump of a hybrid storage with a (timestamp, frequency) score is not "
+                "supported: the tiers share one score file"
+            )
+        self._host_tier.dump(
+            table_id,
+            meta_json_file_path,
+            emb_key_path,
+            embedding_file_path,
+            score_file_path,
+            opt_file_path,
+            include_optim,
+            include_meta,
+            current_score,
+            timestamp,
+        )
+        self._hbm_tier.dump(
+            table_id,
+            meta_json_file_path,
+            emb_key_path,
+            embedding_file_path,
+            score_file_path,
+            opt_file_path,
+            include_optim,
+            False,
+            None,
+            timestamp,
+            append=True,
+        )
+
+    def load(self, *args, **kwargs) -> Optional[int]:
+        """Through the HBM tier, whose evictions go down to the host tier."""
+        return self._hbm_tier.load(*args, **kwargs)
+
+    def export_keys_values(
+        self, device: torch.device, batch_size: int = 65536, table_id: int = 0
+    ):
+        for tier in self._tiers:
+            yield from tier.export_keys_values(device, batch_size, table_id)
+
+    def incremental_dump(self, table_id, threshold, pg, timestamp=None):
+        timestamp = device_timestamp() if timestamp is None else timestamp
+        parts = [t.incremental_dump(table_id, threshold, pg, timestamp) for t in self._tiers]
+        keys, values, slots, opts, scores = (list(col) for col in zip(*parts))
+        opt = None if opts[0] is None else torch.cat(opts, dim=0)
+        return (
+            torch.cat(keys),
+            torch.cat(values, dim=0),
+            torch.cat(slots),
+            opt,
+            torch.cat(scores, dim=0),
+        )
+
+    def replay_increment(
+        self,
+        table_id: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        optimizer_states: Optional[torch.Tensor],
+        scores: Optional[torch.Tensor],
+        slot_index: torch.Tensor,
+        insert_score: int,
+        content: ReplayContent = ReplayContent.ALL,
+        timestamp: Optional[int] = None,
+    ) -> ReplayStats:
+        """A key the host tier holds is updated there; every other key goes through the
+        HBM tier, which sends what it evicts down."""
+        stats = ReplayStats()
+        if keys.numel() == 0:
+            return stats
+        device = self._hbm.device
+        k = keys.to(device=device, dtype=self._hbm.key_index_map.key_type)
+        tids = torch.full((k.numel(),), table_id, dtype=torch.int64, device=device)
+        in_host = (self._host_tier.index.lookup(k, tids) >= 0).to(keys.device)
+
+        def pick(t, mask):
+            return None if t is None else t[mask]
+
+        for mask, tier in ((in_host, self._host_tier), (~in_host, self._hbm_tier)):
+            if not bool(mask.any()):
+                continue
+            stats.merge(
+                tier.replay_increment(
+                    table_id,
+                    keys[mask],
+                    values[mask],
+                    pick(optimizer_states, mask),
+                    pick(scores, mask),
+                    slot_index[mask],
+                    insert_score,
+                    content,
+                    timestamp,
+                )
+            )
+        return stats

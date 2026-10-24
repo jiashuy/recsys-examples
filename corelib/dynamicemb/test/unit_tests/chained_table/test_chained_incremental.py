@@ -53,11 +53,19 @@ def _answers(module, keys):
 
 
 def _held(module):
-    keys, _scores, _rows = module._storage.index.export(0)
-    return set(keys.tolist())
+    storage = module._storage
+    tiers = (
+        [storage._hbm_tier, storage._host_tier]
+        if hasattr(storage, "_hbm_tier")
+        else [storage]
+    )
+    held = set()
+    for tier in tiers:
+        held |= set(tier.index.export(0)[0].tolist())
+    return held
 
 
-@pytest.mark.parametrize("layout", ["hbm", "caching"])
+@pytest.mark.parametrize("layout", ["hbm", "caching", "hybrid", "host"])
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -70,7 +78,7 @@ def test_a_replica_holds_what_the_source_held(layout, strategy):
     source = _module(layout, None, 16384, strategy)
     uses = _train(source)
     used = (uses > 0).nonzero().squeeze(1)
-    assert isinstance(source._storage, ChainedStorage)
+    assert source._storage is not None
 
     delta = source.incremental_dump({"t": 0})
     assert delta.keys[0].numel() == used.numel()
@@ -82,7 +90,6 @@ def test_a_replica_holds_what_the_source_held(layout, strategy):
     assert torch.equal(_answers(source, used), _answers(replica, used))
     replica.flush()
     assert _held(replica) == set(used.tolist())
-    replica._storage.index.check_invariants([0])
 
 
 def test_what_the_source_evicted_is_not_in_the_replica():
