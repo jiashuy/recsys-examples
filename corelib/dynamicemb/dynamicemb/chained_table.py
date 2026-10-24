@@ -38,13 +38,16 @@ from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 from dynamicemb_extensions import (
+    chained_apply,
     chained_bucket_ids,
     chained_find,
-    chained_gids,
     chained_make_views,
     chained_pin,
     chained_place,
+    chained_plan,
+    chained_release,
     chained_segment_need,
+    chained_stage,
 )
 
 # How find treats the score of a key it finds.
@@ -134,7 +137,6 @@ class ChainedTables:
         self._bsize: List[torch.Tensor] = []
         self._refs: List[Optional[torch.Tensor]] = []
         self._free: List[torch.Tensor] = []
-        self._top: List[int] = []
         for t, nb in enumerate(self._nb):
             slots = nb * self.bucket_capacity
             if rows[t] < slots:
@@ -147,9 +149,9 @@ class ChainedTables:
                 if self.track_refs
                 else None
             )
-            # The pool of free rows is a stack; _top is how many are on it.
+            # The pool of free rows is a stack; _tops[t] is how many are on it.
             self._free.append(torch.arange(rows[t], dtype=torch.int32, device=dev))
-            self._top.append(rows[t])
+        self._tops = torch.tensor(rows, dtype=torch.int32, device=dev)
         self._rebuild_views()
 
         self._staged_keys: Optional[torch.Tensor] = None
@@ -189,6 +191,8 @@ class ChainedTables:
             self._head,
             self._bsize,
             self._refs,
+            self._free,
+            self._tops,
             self._nb,
             self.bucket_capacity,
         )
@@ -209,7 +213,7 @@ class ChainedTables:
         return int(self._bsize[table].sum().item())
 
     def free_rows(self, table: int = 0) -> int:
-        return self._top[table]
+        return int(self._tops[table].item())
 
     def lookup(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """Row of each key, -1 for a key the table does not have. Changes nothing."""
@@ -238,17 +242,12 @@ class ChainedTables:
         keys = _as_int64(keys)
         sc = None if scores is None else _as_int64(scores)
         rows = chained_find(self._views, keys, table_ids, sc, mode, pin)
-        miss = (rows < 0).nonzero(as_tuple=True)[0]
-        self._staged_positions = miss
-        self._staged_keys = keys[miss]
-        self._staged_tids = table_ids[miss]
-        if sc is None:
-            fill = 1 if mode == SCORE_ACCUMULATE else 0
-            self._staged_scores = torch.full(
-                (miss.numel(),), fill, dtype=torch.int64, device=self.device
-            )
-        else:
-            self._staged_scores = sc[miss]
+        fill = 1 if mode == SCORE_ACCUMULATE else 0
+        m, skeys, stids, sscores, spos = chained_stage(rows, keys, table_ids, sc, fill)
+        self._staged_keys = skeys[:m]
+        self._staged_tids = stids[:m]
+        self._staged_scores = sscores[:m]
+        self._staged_positions = spos[:m]
         return rows
 
     @property
@@ -297,17 +296,15 @@ class ChainedTables:
         if m == 0:
             return self._empty_result()
         dev = self.device
+        total_buckets = sum(self._nb)
 
         # Sort by bucket, growing the tables that must not evict until they fit.
         while True:
-            gid, local = chained_gids(self._views, keys, tids)
-            perm = torch.argsort(gid, stable=True)
-            sgid = gid[perm]
-            stids, slocal = tids[perm], local[perm]
-            seg_gid, counts = torch.unique_consecutive(sgid, return_counts=True)
-            seg_begin = torch.cumsum(counts, 0) - counts
-            seg_table, seg_bucket = stids[seg_begin], slocal[seg_begin]
-            need = chained_segment_need(self._views, seg_table, seg_bucket, counts)
+            plan = chained_plan(
+                self._views, keys, tids, scores, total_buckets, self.num_tables
+            )
+            (perm, _sgid, skeys, stids, sscores, seg_table, seg_bucket, seg_begin,
+             counts, need, voff, num_runs, tstart) = plan  # fmt: skip
             if not any(self.no_eviction):
                 break
             grow = sorted(
@@ -321,78 +318,52 @@ class ChainedTables:
                 break
             for t in grow:
                 self.expand(t)
+            total_buckets = sum(self._nb)
 
-        # Rows, per table, in the order the keys are sorted.
-        per_table = torch.bincount(stids, minlength=self.num_tables).tolist()
-        for t, c in enumerate(per_table):
-            if c > self._top[t]:
-                raise RuntimeError(
-                    f"table {t} has {self._top[t]} free rows and {c} keys need one; "
-                    "increase row_capacity or release the victims of earlier steps"
-                )
-        srows = torch.empty(m, dtype=torch.int64, device=dev)
-        start = 0
-        for t, c in enumerate(per_table):
-            if c:
-                srows[start : start + c] = self._free[t][self._top[t] - c : self._top[t]]
-                self._top[t] -= c
-            start += c
-
-        skeys, sscores = keys[perm], scores[perm]
-        seg_voff = torch.cumsum(need, 0) - need
-        total_victims = int(need.sum().item())
-        vict_slot = torch.empty(total_victims, dtype=torch.int32, device=dev)
-        vkeys = torch.empty(total_victims, dtype=torch.int64, device=dev)
-        vrows = torch.empty(total_victims, dtype=torch.int64, device=dev)
-        seg_fail = torch.zeros(seg_table.numel(), dtype=torch.int32, device=dev)
         g_ptr, g_n = guard if guard is not None else (0, 0)
-        chained_place(
-            self._views,
-            skeys,
-            sscores,
-            srows,
-            seg_table,
-            seg_bucket,
-            seg_begin,
-            counts,
-            seg_voff,
-            vict_slot,
-            vkeys,
-            vrows,
-            seg_fail,
-            g_ptr,
-            g_n,
-            pin,
-        )
+        (rows, srows, _vict_slot, vkeys, vrows, vtabs, seg_fail, stats) = chained_apply(
+            self._views, perm, skeys, stids, sscores, seg_table, seg_bucket,
+            seg_begin, counts, need, voff, num_runs, tstart, g_ptr, g_n, pin,
+            self.num_tables,
+        )  # fmt: skip
+        victims, runs, failed_buckets, exhausted = stats.tolist()
+        if exhausted:
+            per_table = (tstart[1:] - tstart[:-1]).tolist()
+            tops = self._tops.tolist()
+            short = [(t, tops[t], c) for t, c in enumerate(per_table) if c > tops[t]]
+            t, have, need_rows = short[0]
+            raise RuntimeError(
+                f"table {t} has {have} free rows and {need_rows} keys need one; "
+                "increase row_capacity or release the victims of earlier steps"
+            )
 
-        vtables = torch.repeat_interleave(seg_table, need)
-        rows = torch.empty_like(srows)
-        rows[perm] = srows
-        failed = seg_fail.to(torch.bool)
-        if bool(failed.any()):
+        if failed_buckets:
+            failed = seg_fail[:runs].to(torch.bool)
             seg_of_key = torch.repeat_interleave(
-                torch.arange(failed.numel(), device=dev), counts
+                torch.arange(runs, device=dev), counts[:runs]
             )
             unplaced = failed[seg_of_key]
             self.release_rows(srows[unplaced], stids[unplaced])
-            ok_victim = torch.repeat_interleave(~failed, need)
+            ok_victim = torch.repeat_interleave(~failed, need[:runs])
             partial = CommitResult(
                 srows[~unplaced],
                 positions[perm][~unplaced],
                 stids[~unplaced],
-                vkeys[ok_victim],
-                vrows[ok_victim],
-                vtables[ok_victim],
+                vkeys[:victims][ok_victim],
+                vrows[:victims][ok_victim],
+                vtabs[:victims][ok_victim],
             )
             raise ChainedTableFull(
-                f"{int(failed.sum())} bucket(s) could not make room for "
+                f"{failed_buckets} bucket(s) could not make room for "
                 f"{int(unplaced.sum())} key(s): every member they could evict is "
                 "in use by a step in flight, or they were given more new keys than "
                 "they have slots. Increase the capacity or reduce the prefetch "
                 "pipeline depth.",
                 partial,
             )
-        return CommitResult(rows, positions, tids, vkeys, vrows, vtables)
+        return CommitResult(
+            rows, positions, tids, vkeys[:victims], vrows[:victims], vtabs[:victims]
+        )
 
     def _clear_staged(self) -> None:
         self._staged_keys = None
@@ -405,17 +376,10 @@ class ChainedTables:
         if rows.numel() == 0:
             return
         if self.num_tables == 1:
-            groups = [(0, rows)]
-        else:
-            groups = [(t, rows[table_ids == t]) for t in range(self.num_tables)]
-        for t, r in groups:
-            n = int(r.numel())
-            if n == 0:
-                continue
-            if self._top[t] + n > self._row_cap[t]:
-                raise RuntimeError("more rows released than were taken")
-            self._free[t][self._top[t] : self._top[t] + n] = r.to(torch.int32)
-            self._top[t] += n
+            chained_release(self._views, 0, rows)
+            return
+        for t in range(self.num_tables):
+            chained_release(self._views, t, rows[table_ids == t])
 
     def pin(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
         """Take a reference on each row: a row with one is not evicted."""
@@ -446,7 +410,8 @@ class ChainedTables:
             arrays = self._new_arrays(new_nb)
             tmp = chained_make_views(
                 [arrays[0]], [arrays[1]], [arrays[2]], [arrays[3]], [arrays[4]],
-                [arrays[5]], [None], [new_nb], cap,
+                [arrays[5]], [None], [self._free[table]], self._tops[table : table + 1],
+                [new_nb], cap,
             )  # fmt: skip
             local = chained_bucket_ids(keys, new_nb)
             perm = torch.argsort(local, stable=True)
@@ -493,14 +458,15 @@ class ChainedTables:
         if slots > self._row_cap[table]:
             old_r = self._row_cap[table]
             new_r = _default_rows(slots)
+            top = int(self._tops[table].item())
             free = torch.empty(new_r, dtype=torch.int32, device=dev)
-            free[: self._top[table]] = self._free[table][: self._top[table]]
+            free[:top] = self._free[table][:top]
             added = new_r - old_r
-            free[self._top[table] : self._top[table] + added] = torch.arange(
+            free[top : top + added] = torch.arange(
                 old_r, new_r, dtype=torch.int32, device=dev
             )
             self._free[table] = free
-            self._top[table] += added
+            self._tops[table] = top + added
             self._row_cap[table] = new_r
             if self.track_refs:
                 refs = torch.zeros(new_r, dtype=torch.int32, device=dev)
@@ -570,7 +536,7 @@ class ChainedTables:
                     assert row not in seen_rows, f"row {row} used twice"
                     seen_rows.add(row)
             assert (
-                self._top[t] + len(seen_rows) + pending[t] == self._row_cap[t]
+                int(self._tops[t].item()) + len(seen_rows) + pending[t] == self._row_cap[t]
             ), f"table {t}: rows are lost or duplicated"
 
 

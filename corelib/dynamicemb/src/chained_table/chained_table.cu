@@ -48,6 +48,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
 
+#include <cub/cub.cuh>
+
 #include <algorithm>
 #include <cstdint>
 #include <tuple>
@@ -82,12 +84,14 @@ struct TableView {
   uint16_t *head;
   int32_t *bucket_size;
   int32_t *refs;     // pin count of each row, or null when the table does not pin
+  uint32_t *free_rows;  // the stack of free rows ...
+  int32_t *top;         // ... and how many are on it (on the device)
   int64_t num_buckets;
   int64_t gid_base;  // buckets of the tables before this one: a bucket's global id
   int32_t cap;
   int32_t pad;
 };
-static_assert(sizeof(TableView) == 80, "the layout is built on the host");
+static_assert(sizeof(TableView) == 96, "the layout is built on the host");
 
 __global__ void gid_kernel(const TableView *__restrict__ views,
                            const int64_t *__restrict__ keys,
@@ -204,12 +208,16 @@ __global__ void place_kernel(
     const int64_t *__restrict__ seg_bucket,
     const int64_t *__restrict__ seg_begin,
     const int64_t *__restrict__ seg_count,
-    const int64_t *__restrict__ seg_voff, int64_t num_segments,
-    int32_t *__restrict__ vict_slot, int64_t *__restrict__ vkeys,
-    int64_t *__restrict__ vrows, int32_t *__restrict__ seg_fail,
+    const int64_t *__restrict__ seg_voff, const int64_t *__restrict__ nseg_ptr,
+    const int32_t *__restrict__ abort, int32_t *__restrict__ vict_slot,
+    int64_t *__restrict__ vkeys, int64_t *__restrict__ vrows,
+    int64_t *__restrict__ vtabs, int32_t *__restrict__ seg_fail,
+    unsigned long long *__restrict__ nfail,
     embedding_cache::EvictionGuardView guard, int pin_new) {
   __shared__ uint8_t taken[kWarpsPerBlock][kMaxBucketCapacity];
 
+  if (*abort != 0) return;
+  const int64_t num_segments = *nseg_ptr;
   const int lane = threadIdx.x & 31;
   const int w = threadIdx.x >> 5;
   const int64_t warp_id = int64_t(blockIdx.x) * kWarpsPerBlock + w;
@@ -268,7 +276,10 @@ __global__ void place_kernel(
       }
     }
     if (fail) {
-      if (lane == 0) seg_fail[seg] = 1;
+      if (lane == 0) {
+        seg_fail[seg] = 1;
+        atomicAdd(nfail, 1ULL);
+      }
       __syncwarp();
       continue;
     }
@@ -288,6 +299,7 @@ __global__ void place_kernel(
           const int64_t vkey = v.keys[sl];
           vkeys[voff + vi] = vkey;
           vrows[voff + vi] = static_cast<int64_t>(v.index[sl]);
+          vtabs[voff + vi] = t;
           ++vi;
           // off its chain
           const int chv = static_cast<int>((hash64(vkey) >> 32) % uint32_t(v.cap));
@@ -321,6 +333,171 @@ __global__ void place_kernel(
   }
 }
 
+// -- the rest of a step's bookkeeping, as kernels ------------------------------
+
+// positions of the misses, compacted in input order
+__global__ void miss_flag_kernel(const int64_t *__restrict__ rows, int64_t n,
+                                 int32_t *__restrict__ flag) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    flag[i] = rows[i] < 0 ? 1 : 0;
+  }
+}
+
+__global__ void stage_scatter_kernel(
+    const int32_t *__restrict__ flag, const int32_t *__restrict__ pos,
+    const int64_t *__restrict__ keys, const int64_t *__restrict__ tids,
+    const int64_t *__restrict__ scores, int64_t fill, int64_t n,
+    int64_t *__restrict__ okeys, int64_t *__restrict__ otids,
+    int64_t *__restrict__ oscores, int64_t *__restrict__ opos,
+    int64_t *__restrict__ total) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    if (flag[i]) {
+      const int64_t o = pos[i];
+      okeys[o] = keys[i];
+      otids[o] = tids[i];
+      oscores[o] = scores != nullptr ? scores[i] : fill;
+      opos[o] = i;
+    }
+    if (i == n - 1) total[0] = int64_t(pos[i]) + flag[i];
+  }
+}
+
+__global__ void gather_kernel(const int64_t *__restrict__ perm,
+                              const int64_t *__restrict__ keys,
+                              const int64_t *__restrict__ tids,
+                              const int64_t *__restrict__ scores,
+                              const int64_t *__restrict__ local, int64_t n,
+                              int64_t *__restrict__ skeys,
+                              int64_t *__restrict__ stids,
+                              int64_t *__restrict__ sscores,
+                              int64_t *__restrict__ slocal) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t j = perm[i];
+    skeys[i] = keys[j];
+    stids[i] = tids[j];
+    sscores[i] = scores[j];
+    slocal[i] = local[j];
+  }
+}
+
+// seg_table, seg_bucket and need of each run of equal bucket ids; 0 past the last
+__global__ void segment_info_kernel(
+    const TableView *__restrict__ views, const int64_t *__restrict__ stids,
+    const int64_t *__restrict__ slocal, const int64_t *__restrict__ seg_begin,
+    const int64_t *__restrict__ counts, const int64_t *__restrict__ nruns_ptr,
+    int64_t n, int64_t *__restrict__ seg_table, int64_t *__restrict__ seg_bucket,
+    int64_t *__restrict__ need) {
+  const int64_t nruns = *nruns_ptr;
+  for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < n;
+       r += int64_t(gridDim.x) * blockDim.x) {
+    if (r < nruns) {
+      const int64_t b = seg_begin[r];
+      const int64_t t = stids[b];
+      const int64_t bucket = slocal[b];
+      const TableView &v = views[t];
+      const int64_t free_slots = v.cap - v.bucket_size[bucket];
+      const int64_t c = counts[r];
+      seg_table[r] = t;
+      seg_bucket[r] = bucket;
+      need[r] = c > free_slots ? c - free_slots : 0;
+    } else {
+      seg_table[r] = 0;
+      seg_bucket[r] = 0;
+      need[r] = 0;
+    }
+  }
+}
+
+// where each table's keys start in the sorted staged arrays (and n at the end)
+__global__ void table_start_kernel(const TableView *__restrict__ views,
+                                   const int64_t *__restrict__ sgid, int64_t n,
+                                   int64_t num_tables,
+                                   int64_t *__restrict__ tstart) {
+  const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t > num_tables) return;
+  if (t == num_tables) {
+    tstart[t] = n;
+    return;
+  }
+  const int64_t target = views[t].gid_base;
+  int64_t lo = 0, hi = n;
+  while (lo < hi) {
+    const int64_t mid = (lo + hi) / 2;
+    if (sgid[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  tstart[t] = lo;
+}
+
+__global__ void check_pool_kernel(const TableView *__restrict__ views,
+                                  const int64_t *__restrict__ tstart,
+                                  int64_t num_tables, int32_t *__restrict__ abort) {
+  const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= num_tables) return;
+  const int64_t c = tstart[t + 1] - tstart[t];
+  if (c > int64_t(*views[t].top)) atomicExch(abort, 1);
+}
+
+__global__ void assign_rows_kernel(const TableView *__restrict__ views,
+                                   const int64_t *__restrict__ stids,
+                                   const int64_t *__restrict__ tstart,
+                                   const int32_t *__restrict__ abort, int64_t n,
+                                   int64_t *__restrict__ srows) {
+  if (*abort != 0) return;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t t = stids[i];
+    const TableView &v = views[t];
+    const int64_t c = tstart[t + 1] - tstart[t];
+    srows[i] = static_cast<int64_t>(v.free_rows[int64_t(*v.top) - c + (i - tstart[t])]);
+  }
+}
+
+__global__ void pop_rows_kernel(const TableView *__restrict__ views,
+                                const int64_t *__restrict__ tstart,
+                                int64_t num_tables,
+                                const int32_t *__restrict__ abort) {
+  const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= num_tables || *abort != 0) return;
+  *views[t].top -= int32_t(tstart[t + 1] - tstart[t]);
+}
+
+__global__ void unpermute_kernel(const int64_t *__restrict__ perm,
+                                 const int64_t *__restrict__ srows, int64_t n,
+                                 int64_t *__restrict__ rows) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    rows[perm[i]] = srows[i];
+  }
+}
+
+__global__ void stats_kernel(const int64_t *__restrict__ voff,
+                             const int64_t *__restrict__ need,
+                             const int64_t *__restrict__ nruns_ptr, int64_t n,
+                             const int32_t *__restrict__ abort,
+                             int64_t *__restrict__ stats) {
+  stats[0] = voff[n - 1] + need[n - 1];
+  stats[1] = *nruns_ptr;
+  stats[3] = *abort;
+}
+
+__global__ void release_kernel(const TableView *__restrict__ views, int64_t table,
+                               const int64_t *__restrict__ rows, int64_t n) {
+  const TableView &v = views[table];
+  const int64_t top = *v.top;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    v.free_rows[top + i] = static_cast<uint32_t>(rows[i]);
+  }
+}
+
+__global__ void push_rows_kernel(const TableView *__restrict__ views,
+                                 int64_t table, int64_t n) {
+  *views[table].top += int32_t(n);
+}
+
 // ---------------------------------------------------------------------------
 // torch glue
 // ---------------------------------------------------------------------------
@@ -352,14 +529,20 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
                               std::vector<at::Tensor> head,
                               std::vector<at::Tensor> bucket_size,
                               std::vector<c10::optional<at::Tensor>> refs,
+                              std::vector<at::Tensor> free_rows,
+                              at::Tensor tops,
                               std::vector<int64_t> num_buckets, int64_t cap) {
   const size_t nt = keys.size();
   TORCH_CHECK(scores.size() == nt && index.size() == nt && next.size() == nt &&
                   head.size() == nt && bucket_size.size() == nt &&
-                  refs.size() == nt && num_buckets.size() == nt,
+                  refs.size() == nt && free_rows.size() == nt &&
+                  num_buckets.size() == nt,
               "one entry per table in every list");
   TORCH_CHECK(cap > 0 && cap <= kMaxBucketCapacity,
               "bucket capacity must be in [1, ", kMaxBucketCapacity, "]");
+  check_cuda(tops, "tops");
+  TORCH_CHECK(tops.scalar_type() == at::kInt && tops.numel() == int64_t(nt),
+              "tops must be one int32 per table");
   std::vector<TableView> host(nt);
   int64_t gid_base = 0;
   for (size_t t = 0; t < nt; ++t) {
@@ -396,6 +579,10 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     } else {
       v.refs = nullptr;
     }
+    check_cuda(free_rows[t], "free rows");
+    TORCH_CHECK(free_rows[t].element_size() == 4, "free rows must be 4 bytes wide");
+    v.free_rows = reinterpret_cast<uint32_t *>(free_rows[t].data_ptr());
+    v.top = tops.data_ptr<int32_t>() + t;
     v.num_buckets = num_buckets[t];
     v.gid_base = gid_base;
     v.cap = static_cast<int32_t>(cap);
@@ -514,6 +701,16 @@ at::Tensor chained_segment_need(at::Tensor views, at::Tensor seg_table,
   return need;
 }
 
+inline at::Tensor temp_storage(size_t bytes) {
+  return at::empty({int64_t(std::max<size_t>(bytes, 1))},
+                   at::TensorOptions().dtype(at::kByte).device(at::kCUDA));
+}
+
+inline at::Tensor device_scalar(int64_t v, const at::Tensor &like) {
+  return at::full({1}, v, like.options().dtype(at::kLong));
+}
+
+// Place with a segment count known on the host: for rebuilding a table.
 void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
                    at::Tensor srows, at::Tensor seg_table,
                    at::Tensor seg_bucket, at::Tensor seg_begin,
@@ -531,17 +728,238 @@ void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
   embedding_cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
       static_cast<int32_t>(guard_num_tables)};
+  auto nseg = device_scalar(u, seg_table);
+  auto abort = at::zeros({1}, seg_table.options().dtype(at::kInt));
+  auto vtabs = at::empty({std::max<int64_t>(vkeys.numel(), 1)}, seg_table.options());
+  auto nfail = at::zeros({1}, seg_table.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  const int blocks = grid_for(u, kWarpsPerBlock);
-  place_kernel<<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+  place_kernel<<<grid_for(u, kWarpsPerBlock), kWarpsPerBlock * 32, 0, stream>>>(
       views_ptr(views), reinterpret_cast<const int64_t *>(skeys.data_ptr()),
       reinterpret_cast<const uint64_t *>(sscores.data_ptr()),
       srows.data_ptr<int64_t>(), seg_table.data_ptr<int64_t>(),
       seg_bucket.data_ptr<int64_t>(), seg_begin.data_ptr<int64_t>(),
-      seg_count.data_ptr<int64_t>(), seg_voff.data_ptr<int64_t>(), u,
+      seg_count.data_ptr<int64_t>(), seg_voff.data_ptr<int64_t>(),
+      nseg.data_ptr<int64_t>(), abort.data_ptr<int32_t>(),
       vict_slot.data_ptr<int32_t>(), vkeys.data_ptr<int64_t>(),
-      vrows.data_ptr<int64_t>(), seg_fail.data_ptr<int32_t>(), guard,
+      vrows.data_ptr<int64_t>(), vtabs.data_ptr<int64_t>(),
+      seg_fail.data_ptr<int32_t>(),
+      reinterpret_cast<unsigned long long *>(nfail.data_ptr<int64_t>()), guard,
       pin_new ? 1 : 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// After find: compact the misses, in input order. Returns the number of misses and
+// the staged (keys, table ids, scores, positions), each sized to the input; only
+// the first `m` entries mean anything. One host synchronisation, for `m`.
+std::tuple<int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+chained_stage(at::Tensor rows, at::Tensor keys, at::Tensor tids,
+              c10::optional<at::Tensor> scores, int64_t fill) {
+  check_cuda(rows, "rows");
+  check_cuda(keys, "keys");
+  check_cuda(tids, "table ids");
+  const int64_t n = keys.numel();
+  auto okeys = at::empty({n}, keys.options().dtype(at::kLong));
+  auto otids = at::empty({n}, keys.options().dtype(at::kLong));
+  auto oscores = at::empty({n}, keys.options().dtype(at::kLong));
+  auto opos = at::empty({n}, keys.options().dtype(at::kLong));
+  if (n == 0) return {0, okeys, otids, oscores, opos};
+  const int64_t *sc = nullptr;
+  if (scores.has_value() && scores->defined()) {
+    check_cuda(*scores, "scores");
+    sc = reinterpret_cast<const int64_t *>(scores->data_ptr());
+  }
+  auto flag = at::empty({n}, keys.options().dtype(at::kInt));
+  auto pos = at::empty({n}, keys.options().dtype(at::kInt));
+  auto total = at::zeros({1}, keys.options().dtype(at::kLong));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  miss_flag_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      rows.data_ptr<int64_t>(), n, flag.data_ptr<int32_t>());
+  size_t tb = 0;
+  cub::DeviceScan::ExclusiveSum(nullptr, tb, flag.data_ptr<int32_t>(),
+                                pos.data_ptr<int32_t>(), int(n), stream);
+  auto tmp = temp_storage(tb);
+  cub::DeviceScan::ExclusiveSum(tmp.data_ptr(), tb, flag.data_ptr<int32_t>(),
+                                pos.data_ptr<int32_t>(), int(n), stream);
+  stage_scatter_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      flag.data_ptr<int32_t>(), pos.data_ptr<int32_t>(),
+      reinterpret_cast<const int64_t *>(keys.data_ptr()),
+      tids.data_ptr<int64_t>(), sc, fill, n, okeys.data_ptr<int64_t>(),
+      otids.data_ptr<int64_t>(), oscores.data_ptr<int64_t>(),
+      opos.data_ptr<int64_t>(), total.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  auto host = total.to(at::kCPU);  // the one synchronisation
+  return {host.item<int64_t>(), okeys, otids, oscores, opos};
+}
+
+// Sort the staged keys by bucket and cut them into one run per bucket. Everything
+// returned is sized to the input and stays on the device; `seg_*`, `need`, `voff`
+// are meaningful for the first `num_runs` entries (0 after).
+//
+//   perm, sgid, skeys, stids, sscores, seg_table, seg_bucket, seg_begin, counts,
+//   need, voff, num_runs, tstart
+std::vector<at::Tensor> chained_plan(at::Tensor views, at::Tensor keys,
+                                     at::Tensor tids, at::Tensor scores,
+                                     int64_t total_buckets, int64_t num_tables) {
+  check_cuda(keys, "keys");
+  check_cuda(tids, "table ids");
+  check_cuda(scores, "scores");
+  const int64_t n = keys.numel();
+  TORCH_CHECK(n > 0, "nothing to plan");
+  auto o64 = keys.options().dtype(at::kLong);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  auto [gid, local] = chained_gids(views, keys, tids);
+  auto perm_in = at::arange(n, o64);
+  auto sgid = at::empty({n}, o64);
+  auto perm = at::empty({n}, o64);
+  int bits = 1;
+  while ((int64_t(1) << bits) < total_buckets) ++bits;
+  size_t tb = 0;
+  cub::DeviceRadixSort::SortPairs(nullptr, tb, gid.data_ptr<int64_t>(),
+                                  sgid.data_ptr<int64_t>(),
+                                  perm_in.data_ptr<int64_t>(),
+                                  perm.data_ptr<int64_t>(), int(n), 0, bits,
+                                  stream);
+  {
+    auto tmp = temp_storage(tb);
+    cub::DeviceRadixSort::SortPairs(tmp.data_ptr(), tb, gid.data_ptr<int64_t>(),
+                                    sgid.data_ptr<int64_t>(),
+                                    perm_in.data_ptr<int64_t>(),
+                                    perm.data_ptr<int64_t>(), int(n), 0, bits,
+                                    stream);
+  }
+  auto skeys = at::empty({n}, o64);
+  auto stids = at::empty({n}, o64);
+  auto sscores = at::empty({n}, o64);
+  auto slocal = at::empty({n}, o64);
+  gather_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      perm.data_ptr<int64_t>(), reinterpret_cast<const int64_t *>(keys.data_ptr()),
+      tids.data_ptr<int64_t>(),
+      reinterpret_cast<const int64_t *>(scores.data_ptr()),
+      local.data_ptr<int64_t>(), n, skeys.data_ptr<int64_t>(),
+      stids.data_ptr<int64_t>(), sscores.data_ptr<int64_t>(),
+      slocal.data_ptr<int64_t>());
+
+  auto seg_gid = at::empty({n}, o64);
+  auto counts = at::zeros({n}, o64);
+  auto num_runs = at::zeros({1}, o64);
+  tb = 0;
+  cub::DeviceRunLengthEncode::Encode(nullptr, tb, sgid.data_ptr<int64_t>(),
+                                     seg_gid.data_ptr<int64_t>(),
+                                     counts.data_ptr<int64_t>(),
+                                     num_runs.data_ptr<int64_t>(), int(n), stream);
+  {
+    auto tmp = temp_storage(tb);
+    cub::DeviceRunLengthEncode::Encode(
+        tmp.data_ptr(), tb, sgid.data_ptr<int64_t>(), seg_gid.data_ptr<int64_t>(),
+        counts.data_ptr<int64_t>(), num_runs.data_ptr<int64_t>(), int(n), stream);
+  }
+  auto seg_begin = at::empty({n}, o64);
+  tb = 0;
+  cub::DeviceScan::ExclusiveSum(nullptr, tb, counts.data_ptr<int64_t>(),
+                                seg_begin.data_ptr<int64_t>(), int(n), stream);
+  {
+    auto tmp = temp_storage(tb);
+    cub::DeviceScan::ExclusiveSum(tmp.data_ptr(), tb, counts.data_ptr<int64_t>(),
+                                  seg_begin.data_ptr<int64_t>(), int(n), stream);
+  }
+  auto seg_table = at::empty({n}, o64);
+  auto seg_bucket = at::empty({n}, o64);
+  auto need = at::empty({n}, o64);
+  segment_info_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      views_ptr(views), stids.data_ptr<int64_t>(), slocal.data_ptr<int64_t>(),
+      seg_begin.data_ptr<int64_t>(), counts.data_ptr<int64_t>(),
+      num_runs.data_ptr<int64_t>(), n, seg_table.data_ptr<int64_t>(),
+      seg_bucket.data_ptr<int64_t>(), need.data_ptr<int64_t>());
+  auto voff = at::empty({n}, o64);
+  tb = 0;
+  cub::DeviceScan::ExclusiveSum(nullptr, tb, need.data_ptr<int64_t>(),
+                                voff.data_ptr<int64_t>(), int(n), stream);
+  {
+    auto tmp = temp_storage(tb);
+    cub::DeviceScan::ExclusiveSum(tmp.data_ptr(), tb, need.data_ptr<int64_t>(),
+                                  voff.data_ptr<int64_t>(), int(n), stream);
+  }
+  auto tstart = at::empty({num_tables + 1}, o64);
+  table_start_kernel<<<grid_for(num_tables + 1, 128), 128, 0, stream>>>(
+      views_ptr(views), sgid.data_ptr<int64_t>(), n, num_tables,
+      tstart.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {perm,      sgid,   skeys, stids, sscores, seg_table, seg_bucket,
+          seg_begin, counts, need,  voff,  num_runs, tstart};
+}
+
+// Take the rows, place the keys, put every key's row back in input order. Returns
+//   rows (input order), srows (sorted order), vict_slot, vkeys, vrows, vtabs,
+//   seg_fail, stats
+// where stats (on the host) is [victims, runs, failed buckets, pool exhausted].
+// If the pool is exhausted nothing is taken and nothing placed. One host
+// synchronisation, for stats.
+std::vector<at::Tensor> chained_apply(
+    at::Tensor views, at::Tensor perm, at::Tensor skeys, at::Tensor stids,
+    at::Tensor sscores, at::Tensor seg_table, at::Tensor seg_bucket,
+    at::Tensor seg_begin, at::Tensor counts, at::Tensor need, at::Tensor voff,
+    at::Tensor num_runs, at::Tensor tstart, int64_t guard_tables,
+    int64_t guard_num_tables, bool pin_new, int64_t num_tables) {
+  const int64_t n = perm.numel();
+  auto o64 = perm.options();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto abort = at::zeros({1}, o64.dtype(at::kInt));
+  auto stats = at::zeros({4}, o64);
+  auto srows = at::empty({n}, o64);
+  auto rows = at::empty({n}, o64);
+  auto vict_slot = at::empty({n}, o64.dtype(at::kInt));
+  auto vkeys = at::empty({n}, o64);
+  auto vrows = at::empty({n}, o64);
+  auto vtabs = at::empty({n}, o64);
+  auto seg_fail = at::zeros({n}, o64.dtype(at::kInt));
+  embedding_cache::EvictionGuardView guard{
+      reinterpret_cast<const void *>(guard_tables),
+      static_cast<int32_t>(guard_num_tables)};
+  const TableView *views_d = views_ptr(views);
+
+  check_pool_kernel<<<1, 128, 0, stream>>>(views_d, tstart.data_ptr<int64_t>(),
+                                           num_tables, abort.data_ptr<int32_t>());
+  assign_rows_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      views_d, stids.data_ptr<int64_t>(), tstart.data_ptr<int64_t>(),
+      abort.data_ptr<int32_t>(), n, srows.data_ptr<int64_t>());
+  pop_rows_kernel<<<1, 128, 0, stream>>>(views_d, tstart.data_ptr<int64_t>(),
+                                         num_tables, abort.data_ptr<int32_t>());
+  place_kernel<<<grid_for(n, kWarpsPerBlock), kWarpsPerBlock * 32, 0, stream>>>(
+      views_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
+      reinterpret_cast<const uint64_t *>(sscores.data_ptr()),
+      srows.data_ptr<int64_t>(), seg_table.data_ptr<int64_t>(),
+      seg_bucket.data_ptr<int64_t>(), seg_begin.data_ptr<int64_t>(),
+      counts.data_ptr<int64_t>(), voff.data_ptr<int64_t>(),
+      num_runs.data_ptr<int64_t>(), abort.data_ptr<int32_t>(),
+      vict_slot.data_ptr<int32_t>(), vkeys.data_ptr<int64_t>(),
+      vrows.data_ptr<int64_t>(), vtabs.data_ptr<int64_t>(),
+      seg_fail.data_ptr<int32_t>(),
+      reinterpret_cast<unsigned long long *>(stats.data_ptr<int64_t>() + 2),
+      guard, pin_new ? 1 : 0);
+  unpermute_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      perm.data_ptr<int64_t>(), srows.data_ptr<int64_t>(), n,
+      rows.data_ptr<int64_t>());
+  stats_kernel<<<1, 1, 0, stream>>>(voff.data_ptr<int64_t>(),
+                                    need.data_ptr<int64_t>(),
+                                    num_runs.data_ptr<int64_t>(), n,
+                                    abort.data_ptr<int32_t>(),
+                                    stats.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  auto host = stats.to(at::kCPU);  // the one synchronisation
+  return {rows, srows, vict_slot, vkeys, vrows, vtabs, seg_fail, host};
+}
+
+// Put rows back on a table's stack, in the order given.
+void chained_release(at::Tensor views, int64_t table, at::Tensor rows) {
+  check_cuda(rows, "rows");
+  TORCH_CHECK(rows.scalar_type() == at::kLong, "rows must be int64");
+  const int64_t n = rows.numel();
+  if (n == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  release_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+      views_ptr(views), table, rows.data_ptr<int64_t>(), n);
+  push_rows_kernel<<<1, 1, 0, stream>>>(views_ptr(views), table, n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -552,8 +970,8 @@ void bind_chained_table(py::module &m) {
   m.def("chained_make_views", &dyn_emb::chained::chained_make_views,
         "build the device array of table views", py::arg("keys"),
         py::arg("scores"), py::arg("index"), py::arg("next"), py::arg("head"),
-        py::arg("bucket_size"), py::arg("refs"), py::arg("num_buckets"),
-        py::arg("bucket_capacity"));
+        py::arg("bucket_size"), py::arg("refs"), py::arg("free_rows"), py::arg("tops"),
+        py::arg("num_buckets"), py::arg("bucket_capacity"));
   m.def("chained_bucket_ids", &dyn_emb::chained::chained_bucket_ids,
         "bucket of each key: hash(key) % num_buckets", py::arg("keys"),
         py::arg("num_buckets"));
@@ -582,4 +1000,24 @@ void bind_chained_table(py::module &m) {
         py::arg("vict_slot"), py::arg("vkeys"), py::arg("vrows"),
         py::arg("seg_fail"), py::arg("guard_tables") = 0,
         py::arg("guard_num_tables") = 0, py::arg("pin_new") = false);
+  m.def("chained_stage", &dyn_emb::chained::chained_stage,
+        "compact the misses after chained_find: (count, keys, table ids, scores, "
+        "positions), each sized to the input",
+        py::arg("rows"), py::arg("keys"), py::arg("table_ids"),
+        py::arg("scores") = py::none(), py::arg("fill") = 0);
+  m.def("chained_plan", &dyn_emb::chained::chained_plan,
+        "sort staged keys by bucket and cut them into one run per bucket",
+        py::arg("views"), py::arg("keys"), py::arg("table_ids"),
+        py::arg("scores"), py::arg("total_buckets"), py::arg("num_tables"));
+  m.def("chained_apply", &dyn_emb::chained::chained_apply,
+        "take the rows, place the planned keys, return rows in input order",
+        py::arg("views"), py::arg("perm"), py::arg("skeys"), py::arg("stids"),
+        py::arg("sscores"), py::arg("seg_table"), py::arg("seg_bucket"),
+        py::arg("seg_begin"), py::arg("counts"), py::arg("need"),
+        py::arg("voff"), py::arg("num_runs"), py::arg("tstart"),
+        py::arg("guard_tables"), py::arg("guard_num_tables"),
+        py::arg("pin_new"), py::arg("num_tables"));
+  m.def("chained_release", &dyn_emb::chained::chained_release,
+        "put rows back on a table's stack", py::arg("views"), py::arg("table"),
+        py::arg("rows"));
 }
