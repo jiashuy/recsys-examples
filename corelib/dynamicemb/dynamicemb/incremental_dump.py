@@ -563,8 +563,8 @@ def replay_increment(
             delta is missing the per-key data replay needs. The rejected table is
             not written, nor is any other table of its module; see above for what
             a multi-module collection may already have applied.
-        TypeError: a module's storage is neither ``DynamicEmbStorage`` nor
-            ``HybridStorage``.
+        TypeError: a module's storage is neither ``ChainedStorage`` nor
+            ``ChainedHybridStorage``.
         NotImplementedError: a table is sharded with ``dist_type="continuous"``
             across more than one rank.
         RuntimeError: a key could not be written at its source slot even though

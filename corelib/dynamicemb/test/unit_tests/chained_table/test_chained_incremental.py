@@ -37,11 +37,6 @@ from test_chained_prefetch import _module  # noqa: E402
 from test_ps_tier import KEYS, _train  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def chained_index(monkeypatch):
-    monkeypatch.setenv("DEMB_CHAINED_INDEX", "1")
-
-
 def _answers(module, keys):
     device = torch.device("cuda", torch.cuda.current_device())
     module.eval()

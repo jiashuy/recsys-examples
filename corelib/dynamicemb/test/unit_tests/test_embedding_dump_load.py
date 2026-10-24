@@ -43,7 +43,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.key_ownership import murmur3_fmix64
-from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
+from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.planner import get_planner
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
@@ -105,31 +105,31 @@ def assert_batched_dynamicemb_storage_class(
 ) -> None:
     """Check ``BatchedDynamicEmbeddingTablesV2`` backing storage type.
 
-    - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
-    - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
-    - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
+    - Must be :class:`ChainedStorage` or :class:`ChainedHybridStorage`.
+    - With ``--caching``: expect ``ChainedStorage`` (backing store under cache).
+    - No cache and ``global_hbm_budget_scale < 1``: expect ``ChainedHybridStorage``
       (StorageMode DEFAULT / two-tier).
-    - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
+    - No cache and full budget: expect single-tier ``ChainedStorage``.
     """
     for _, _, sharded_module in find_sharded_modules(model, ""):
         for emb in get_dynamic_emb_module(sharded_module):
             storage = emb.tables
-            assert isinstance(storage, (DynamicEmbStorage, HybridStorage)), (
-                "BatchedDynamicEmbedding storage must be DynamicEmbStorage or "
-                f"HybridStorage, got {type(storage)}"
+            assert isinstance(storage, (ChainedStorage, ChainedHybridStorage)), (
+                "BatchedDynamicEmbedding storage must be ChainedStorage or "
+                f"ChainedHybridStorage, got {type(storage)}"
             )
             if caching:
                 assert isinstance(
-                    storage, DynamicEmbStorage
-                ), f"With --caching, expected DynamicEmbStorage, got {type(storage)}"
+                    storage, ChainedStorage
+                ), f"With --caching, expected ChainedStorage, got {type(storage)}"
             elif global_hbm_budget_scale < 1.0:
-                assert isinstance(storage, HybridStorage), (
+                assert isinstance(storage, ChainedHybridStorage), (
                     f"With global_hbm_budget_scale={global_hbm_budget_scale} (no cache), "
-                    f"expected HybridStorage, got {type(storage)}"
+                    f"expected ChainedHybridStorage, got {type(storage)}"
                 )
             else:
-                assert isinstance(storage, DynamicEmbStorage), (
-                    "Full HBM budget without cache: expected DynamicEmbStorage, "
+                assert isinstance(storage, ChainedStorage), (
+                    "Full HBM budget without cache: expected ChainedStorage, "
                     f"got {type(storage)}"
                 )
 

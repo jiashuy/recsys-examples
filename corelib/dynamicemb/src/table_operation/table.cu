@@ -194,11 +194,6 @@ void bind_table_operation(py::module &m) {
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
         py::arg("num_tables"), py::arg("table_ids") = py::none());
 
-  m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
-        "Assign per-table monotonic scores via atomicAdd on "
-        "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",
-        py::arg("no_eviction_next_index_dev"), py::arg("table_ids"));
-
   // --- LruLfu eviction JIT (see jit_link.h) ---
   m.def(
       "demb_set_lex_fatbin",

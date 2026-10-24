@@ -15,7 +15,7 @@
 
 """Training over the chained index, end to end.
 
-The module is built with ``DEMB_CHAINED_INDEX`` set, so its storage is a
+The module's storage is a
 ChainedStorage: HBM-direct with nothing in front of it, or the backing behind an HBM
 cache. The check is the one the tier-below tests use: every key starts at 1.0, the
 loss is the sum of the outputs, so each occurrence of a key has gradient 1 and plain
@@ -62,11 +62,6 @@ LAYOUT = {
     "host": StorageLayout.HOST_ONLY,
     "hybrid": StorageLayout.HYBRID,
 }
-
-
-@pytest.fixture(autouse=True)
-def chained_index(monkeypatch):
-    monkeypatch.setenv("DEMB_CHAINED_INDEX", "1")
 
 
 def _module(layout, ps, capacity, strategy=DynamicEmbScoreStrategy.TIMESTAMP, **extra):
@@ -165,91 +160,6 @@ def test_a_table_that_never_evicts_grows_with_the_keys(layout):
     assert storage.index.capacity_of(0) > before, "the table did not grow"
     assert storage.index.size(0) == int((uses > 0).sum())
     storage.index.check_invariants([0])
-
-
-# -- against the existing index ------------------------------------------------
-#
-# Where nothing is evicted the two indexes must give the same answers, step by step: the
-# forward of every step, which reads what the steps before trained.
-
-
-def _two_tables(layout, chained, monkeypatch, admission=False, strategy=None):
-    from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
-
-    if chained:
-        monkeypatch.setenv("DEMB_CHAINED_INDEX", "1")
-    else:
-        monkeypatch.delenv("DEMB_CHAINED_INDEX", raising=False)
-    capacity = 4096
-    options = []
-    for dim in (8, 16):
-        extra = {}
-        if admission:
-            extra["admit_strategy"] = FrequencyAdmissionStrategy(
-                threshold=2, counter=KVCounter(capacity=capacity)
-            )
-        options.append(
-            DynamicEmbTableOptions(
-                dim=dim,
-                init_capacity=capacity,
-                max_capacity=capacity,
-                index_type=torch.int64,
-                embedding_dtype=torch.float32,
-                device_id=torch.cuda.current_device(),
-                score_strategy=strategy or DynamicEmbScoreStrategy.TIMESTAMP,
-                caching=layout == "caching",
-                local_hbm_for_values=(
-                    capacity * 24 * 4 // 2 if layout == "caching" else 1024**3
-                ),
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.CONSTANT, value=1.0
-                ),
-                **extra,
-            )
-        )
-    module = BatchedDynamicEmbeddingTablesV2(
-        table_names=["a", "b"],
-        table_options=options,
-        feature_table_map=[0, 1],
-        pooling_mode=DynamicEmbPoolingMode.SUM,
-        optimizer=EmbOptimType.SGD,
-        learning_rate=0.1,
-        use_index_dedup=True,
-    )
-    assert isinstance(module._storage, ChainedStorage) == chained
-    return module
-
-
-def _outputs(module, steps=15, universe=300, per_feature=48):
-    device = torch.device("cuda", torch.cuda.current_device())
-    g = torch.Generator(device="cpu").manual_seed(11)
-    outs = []
-    for _ in range(steps):
-        keys = torch.randint(0, universe, (2 * per_feature,), generator=g, dtype=torch.int64)
-        offsets = torch.arange(0, 2 * per_feature + 1, dtype=torch.int64)
-        out = module(keys.to(device), offsets.to(device))
-        outs.append(out.detach().clone())
-        out.backward(torch.ones_like(out))
-    torch.cuda.synchronize()
-    return outs
-
-
-@pytest.mark.parametrize("layout", ["hbm", "caching"])
-@pytest.mark.parametrize("admission", [False, True], ids=["all-admitted", "frequency-admission"])
-@pytest.mark.parametrize(
-    "strategy", [DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU]
-)
-def test_two_tables_give_the_same_answers_as_the_existing_index(
-    layout, admission, strategy, monkeypatch
-):
-    old = _outputs(_two_tables(layout, False, monkeypatch, admission, strategy))
-    new = _outputs(_two_tables(layout, True, monkeypatch, admission, strategy))
-    for step, (a, b) in enumerate(zip(old, new)):
-        assert torch.equal(a, b), f"step {step} differs"
-    if admission:
-        # The check is only worth something if the admission had something to refuse:
-        # keys seen once stay at their initial value, which training never touched.
-        assert not torch.equal(old[0], old[-1])
 
 
 # -- a prefetch stream and a backward that runs late ---------------------------
@@ -374,15 +284,6 @@ def test_a_timestamp_and_frequency_table_evicts_and_loses_nothing(layout):
     bad, total = _mismatched_keys(module, uses)
     assert bad == 0, f"{bad} of {total} keys lost an update"
     storage.index.check_invariants([0])
-
-
-@pytest.mark.parametrize("layout", ["hbm", "caching"])
-@pytest.mark.parametrize("admission", [False, True], ids=["all-admitted", "frequency-admission"])
-def test_the_pair_gives_the_same_answers_as_the_existing_index(layout, admission, monkeypatch):
-    old = _outputs(_two_tables(layout, False, monkeypatch, admission, LRU_LFU))
-    new = _outputs(_two_tables(layout, True, monkeypatch, admission, LRU_LFU))
-    for step, (a, b) in enumerate(zip(old, new)):
-        assert torch.equal(a, b), f"step {step} differs"
 
 
 # -- the hybrid layout: an HBM tier, a host tier, disjoint -------------------------

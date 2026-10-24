@@ -33,7 +33,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import DynamicEmbStorage
+from dynamicemb.chained_storage import ChainedStorage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.types import BoundsCheckMode
 from torchrec.modules.embedding_configs import PoolingType
@@ -127,7 +127,7 @@ def _seed_dynamicemb_from_reference(module, ref):
     written in one shot so the two sides start identical.
     """
     storage = module.tables
-    assert isinstance(storage, DynamicEmbStorage), type(storage)
+    assert isinstance(storage, ChainedStorage), type(storage)
     optimizer = module.optimizer
     max_emb_dim = storage.max_embedding_dim()
     max_value_dim = storage.max_value_dim()

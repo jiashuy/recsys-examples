@@ -176,7 +176,4 @@ void table_update_counter_with_layout(
     at::Tensor table_bucket_offsets, int64_t bucket_capacity,
     int64_t num_tables, c10::optional<at::Tensor> table_ids);
 
-at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
-                                     at::Tensor table_ids);
-
 } // namespace dyn_emb

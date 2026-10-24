@@ -453,7 +453,7 @@ value 行: 全局行池, 与槽位无关
 
 ### 第四阶段：prefetch 接入（已实现，实验性）
 
-设置环境变量 `DEMB_CHAINED_INDEX` 后，模块用 `ChainedStorage`（`dynamicemb/chained_storage.py`）代替 `DynamicEmbStorage`；prefetch 的两条路径在 `dynamicemb/chained_prefetch.py`。
+模块用 `ChainedStorage`（`dynamicemb/chained_storage.py`）作训练存储（最初由环境变量 `DEMB_CHAINED_INDEX` 开关，旧路径删除后已无此开关）；prefetch 的两条路径在 `dynamicemb/chained_prefetch.py`。
 
 覆盖范围：
 - **缓存路径**（HBM 缓存加 host 后备，后备用链式索引）和 **HBM-direct 路径**（没有缓存），都可以带下层 PS。
@@ -557,4 +557,14 @@ value 行: 全局行池, 与槽位无关
 ### 后续阶段
 
 3. 残留节点的复制前移（软超限，同时解除"一个桶一步里的新 key 数不能超过桶容量"的限制）；整表 top-K 淘汰、排名函数与自定义 `score_function`；`place_kernel` 的进一步优化；小批量的固定开销。
-6. 删除旧的训练路径（`DynamicEmbStorage`、`HybridStorage` 及其 prefetch 路径），保留推理用到的旧索引部分；默认开启链式索引。
+6. （已完成，见下）删除旧的训练路径。
+
+### 删除旧的训练路径（已完成，分支 `chained-only`）
+
+训练只走链式索引：`DynamicEmbStorage`、`HybridStorage`、旧的两条 prefetch 路径（`_prefetch_cache_path` / `_prefetch_hbm_direct_path`）、`no_eviction_scores.cu` 及其绑定、以及 `key_value_table.py` 里只被它们用到的辅助函数都已删除（`key_value_table.py` 从约 4400 行降到约 1900 行）。`DEMB_CHAINED_INDEX` 不再存在，`BatchedDynamicEmbeddingTablesV2` 总是构造 `ChainedStorage` / `ChainedHybridStorage`。
+
+**保留**（推理或其他模块仍在用）：`exportable_tables.py`、`lookup_meta.py`、`lookup_torch_binding.cu`、`table_insert` / `INFERENCE_EMB::table_lookup`（schema 与上游一致）、`scored_hashtable.py`（`KVCounter` 用）、`_iter_batches_from_files` / `load_from_json` / `resolve_checkpoint_value_layout`。这些与上游逐字节一致或行为一致，见 `debug_inference_check`（本地）里的对比探针。原分支 `lw-cache-wip`（只替换 Cache）与 `lw-cache-squashed` 不动，可随时回到那里。
+
+**测试的处理**：依赖旧实现内部的用例删除——`test_no_eviction_row_indexing`、`test_hybrid_storage_export`、`test_expansion_value_capacity`、`test_deterministic_insert`、`test_table_expansion_capacity_growth`、`test_fill_tables`、以及"链式对旧索引逐步比对"的差分用例（旧索引已不存在）；其余改用 `ChainedStorage`。`test_alignment` 的桶容量参数改为 128 / 256（链式上限 256），值缓冲的行数断言改为"大于索引容量"（缓冲含每步新 key 用的备用行）。
+
+**迁移时测出并修掉的缺陷**：`ChainedStorage.load` 对两字 score 的 checkpoint 把 `num_scores` 写死为 1，且没有把按用户配置顺序存的列换回物理顺序（`score_load_permutation`）——LFU 在前的复合策略 dump → load 后两个字互换。主测试文件没有覆盖这一点，由 `test_lru_lfu_storage_dump_load_roundtrip` 测出。

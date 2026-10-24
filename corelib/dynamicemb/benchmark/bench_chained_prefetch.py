@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A training step over the existing key index and over the chained one.
+"""A training step over the chained key index.
 
 One table, plain SGD, keys drawn uniformly from a universe several times the table, so
 every step brings new keys and evicts old ones. Time is per step, prefetch, forward
@@ -24,7 +24,6 @@ Usage: python bench_chained_prefetch.py [--rows 4194304] [--batch 65536] [--dim 
 
 import argparse
 import gc
-import os
 
 import torch
 from dynamicemb import (
@@ -66,11 +65,7 @@ def build(layout, rows, dim):
     )
 
 
-def run(layout, chained, rows, batch, dim, steps, warmup):
-    if chained:
-        os.environ["DEMB_CHAINED_INDEX"] = "1"
-    else:
-        os.environ.pop("DEMB_CHAINED_INDEX", None)
+def run(layout, rows, batch, dim, steps, warmup):
     module = build(layout, rows, dim)
     device = torch.device("cuda")
     g = torch.Generator(device="cpu").manual_seed(1)
@@ -110,11 +105,10 @@ def main():
         f"rows {args.rows}  batch {args.batch}  dim {args.dim}  "
         f"{torch.cuda.get_device_name()}"
     )
-    print(f"{'layout':>9} {'existing ms':>12} {'chained ms':>12} {'ratio':>7}")
+    print(f"{'layout':>9} {'ms/step':>12}")
     for layout in ("hbm", "caching"):
-        old = run(layout, False, args.rows, args.batch, args.dim, args.steps, args.warmup)
-        new = run(layout, True, args.rows, args.batch, args.dim, args.steps, args.warmup)
-        print(f"{layout:>9} {old:>12.3f} {new:>12.3f} {old / new:>7.2f}")
+        ms = run(layout, args.rows, args.batch, args.dim, args.steps, args.warmup)
+        print(f"{layout:>9} {ms:>12.3f}")
 
 
 if __name__ == "__main__":

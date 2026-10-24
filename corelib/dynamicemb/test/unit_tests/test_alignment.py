@@ -12,8 +12,8 @@
 # ``world_size`` is ``int(os.environ.get("WORLD_SIZE", "1"))``; it must match
 # ``dist.get_world_size()`` after init (``torchrun`` sets ``WORLD_SIZE``; default is 1).
 # Set ``DYNAMICEMB_ALIGNMENT_FULL=1`` to add extra single-table ``num_embeddings`` values.
-# ``bucket_capacity`` is parametrized over ``DEFAULT_BUCKET_CAPACITY``, ``1024``, and
-# ``MAX_BUCKET_CAPACITY``.
+# ``bucket_capacity`` is parametrized over ``DEFAULT_BUCKET_CAPACITY`` and ``256`` (the chained index
+# takes at most 256 slots per bucket).
 
 from __future__ import annotations
 
@@ -37,11 +37,11 @@ from dynamicemb.dynamicemb_config import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.key_value_table import DynamicEmbCache, DynamicEmbStorage, HybridStorage
+from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.key_value_table import DynamicEmbCache
 from dynamicemb.optimizer import DynamicEmbOptimType, OptimType, get_optimizer_state_dim
 from dynamicemb.planner import get_planner
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from dynamicemb.types import MAX_BUCKET_CAPACITY
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -164,14 +164,15 @@ def build_dmp_for_alignment_test(
 
 
 def _assert_value_buffer_matches_hashtable(state: object, table_id: int) -> None:
-    """Value tensor rows must match the hashtable's capacity."""
+    """Value tensor holds a row for every slot of the index, plus the spare rows that
+    keys new in a step take before the rows of their victims are released."""
     km = state.key_index_map
     expected_rows = int(km.per_table_capacity_[table_id])
     t = state.tables[table_id].tensor()
     vd = int(state.table_value_dims_cpu[table_id])
-    assert t.shape == (expected_rows, vd), (
-        f"table {table_id}: value buffer shape {tuple(t.shape)} != "
-        f"expected ({expected_rows}, {vd})"
+    assert t.shape[0] > expected_rows and t.shape[1] == vd, (
+        f"table {table_id}: value buffer shape {tuple(t.shape)} should have more than "
+        f"{expected_rows} rows of width {vd}"
     )
 
 
@@ -235,10 +236,10 @@ def assert_cache_and_storage_shapes(
         assert batched._cache is None
 
     storage = batched._storage
-    if isinstance(storage, DynamicEmbStorage):
+    if isinstance(storage, ChainedStorage):
         for tid in range(len(names)):
             _assert_value_buffer_matches_hashtable(storage._state, tid)
-    elif isinstance(storage, HybridStorage):
+    elif isinstance(storage, ChainedHybridStorage):
         assert not batched._caching
         assert total_memory > local_hbm
         for tid in range(len(names)):
@@ -252,7 +253,7 @@ def assert_cache_and_storage_shapes(
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize(
     "bucket_capacity",
-    [DEFAULT_BUCKET_CAPACITY, 1024, MAX_BUCKET_CAPACITY],
+    [DEFAULT_BUCKET_CAPACITY, 256],
 )
 @pytest.mark.parametrize(
     "optimizer_type",
@@ -329,7 +330,7 @@ def test_alignment_cache_storage_shapes(
         torch_dtype = batched._dynamicemb_options[0].embedding_dtype
         assert torch_dtype is not None
         st_dim = get_optimizer_state_dim(optimizer_type, embedding_dim, torch_dtype)
-        if isinstance(batched._storage, HybridStorage):
+        if isinstance(batched._storage, ChainedHybridStorage):
             vd_state = batched._storage._hbm
         else:
             vd_state = batched._storage._state

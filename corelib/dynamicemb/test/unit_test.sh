@@ -2,7 +2,6 @@ set -e
 FWD_BWD_TEST_FILES=(
     "test/unit_tests/table_operation/test_table_operation.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
-    "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_lfu_scores.sh"
     "test/test_batched_dynamic_embedding_tables_v2.py"
     "test/test_unique_op.py"
@@ -19,8 +18,6 @@ FWD_BWD_TEST_FILES=(
     # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
     # precision -- have not run in CI since.
     "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
-    "test/unit_tests/test_no_eviction_row_indexing.py"
-    "test/unit_tests/test_expansion_value_capacity.py"
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
@@ -62,7 +59,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
         # Run shell scripts with bash. The group travels in the environment
         # rather than as an argument, so that a script spanning both groups
         # can run only the half being asked for without the others seeing an
-        # argument they did not expect -- test_hybrid_storage_export.sh
+        # argument they did not expect -- a script that
         # forwards "$@" to pytest, which would read "fwd_bwd" as a path to
         # collect and fail.
         DYNAMICEMB_TEST_GROUP="$1" bash "$TEST_FILE"

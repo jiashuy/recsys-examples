@@ -49,14 +49,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
-from dynamicemb.key_value_table import (
-    Cache,
-    DynamicEmbCache,
-    DynamicEmbStorage,
-    HybridStorage,
-    Storage,
-    flush_cache,
-)
+from dynamicemb.key_value_table import Cache, DynamicEmbCache, Storage, flush_cache
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
@@ -795,7 +788,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
                 # The cache holds no score and does no eviction of its own, so
                 # NO_EVICTION means nothing to it: its options carry TIMESTAMP/LRU,
-                # as HybridStorage's HBM tier does, and the backing keeps NO_EVICTION.
+                # as the hybrid's HBM tier does, and the backing keeps NO_EVICTION.
                 if (
                     self._dynamicemb_options[0].score_strategy
                     == DynamicEmbScoreStrategy.NO_EVICTION
@@ -826,13 +819,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     )
                     self._storage_layout = StorageLayout.HOST_ONLY
                 else:
-                    # No caching: HybridStorage (HBM tier + host tier)
+                    # No caching: ChainedHybridStorage (HBM tier + host tier)
                     if any(
                         opt.external_storage is not None
                         for opt in self._dynamicemb_options
                     ):
                         warnings.warn(
-                            "external_storage is ignored in HybridStorage mode. "
+                            "external_storage is ignored in hybrid mode. "
                             "Set caching=True to use external storage.",
                             UserWarning,
                         )
@@ -853,33 +846,26 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
-                    # HybridStorage does not support NO_EVICTION: its slot_index
-                    # packs only a tier bit + key_slot (which assumes key_slot ==
-                    # value_row); NO_EVICTION's independent value row breaks that.
+                    # The hybrid does not support NO_EVICTION: its tiers hold disjoint keys and spill by eviction.
                     if (
                         self._dynamicemb_options[0].score_strategy
                         == DynamicEmbScoreStrategy.NO_EVICTION
                     ):
                         raise ValueError(
-                            "NO_EVICTION is not supported with HybridStorage "
+                            "NO_EVICTION is not supported with the hybrid storage "
                             "(non-caching partial-HBM storage). Use caching=True "
                             "(the backing store keeps NO_EVICTION) or a single-tier "
                             "configuration."
                         )
 
-                    if os.environ.get("DEMB_CHAINED_INDEX"):
-                        for hbm_option in hbm_options:
-                            # the chained index takes buckets of at most 256 slots
-                            hbm_option.bucket_capacity = min(
-                                int(hbm_option.bucket_capacity), 128
-                            )
-                        self._storage = ChainedHybridStorage(
-                            hbm_options, host_options, self._optimizer
+                    for hbm_option in hbm_options:
+                        # the chained index takes buckets of at most 256 slots
+                        hbm_option.bucket_capacity = min(
+                            int(hbm_option.bucket_capacity), 128
                         )
-                    else:
-                        self._storage = HybridStorage(
-                            hbm_options, host_options, self._optimizer
-                        )
+                    self._storage = ChainedHybridStorage(
+                        hbm_options, host_options, self._optimizer
+                    )
                     self._storage_layout = StorageLayout.HYBRID
         else:
             # HBM-only: everything fits in GPU memory.
@@ -903,15 +889,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def _make_storage(
         self, options: List[DynamicEmbTableOptions], lower: Optional[Storage]
     ) -> Storage:
-        """The table of rows behind a cache, or the HBM-only one.
+        """The table of rows behind a cache, or the HBM-only or host-only one.
 
-        ``DEMB_CHAINED_INDEX`` (experimental) puts the keys in the chained index
-        instead: training prefetch, forward, backward and flush are covered, not
-        checkpoints.
+        A bucket of the chained index holds at most 256 slots, so a larger configured
+        ``bucket_capacity`` (the default planner path asks for the maximum) is lowered.
         """
-        if os.environ.get("DEMB_CHAINED_INDEX"):
-            return ChainedStorage(options, self._optimizer, lower=lower)
-        return DynamicEmbStorage(options, self._optimizer, lower=lower)
+        options = deepcopy(options)
+        for option in options:
+            option.bucket_capacity = min(int(option.bucket_capacity), 256)
+        return ChainedStorage(options, self._optimizer, lower=lower)
 
     def _create_external_storage(
         self, options: List[DynamicEmbTableOptions]
@@ -1260,7 +1246,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
-            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
+            if isinstance(self._storage, (ChainedStorage, ChainedHybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
             return dynamicemb_eval_forward(
@@ -1300,7 +1286,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
+        if isinstance(self._storage, (ChainedStorage, ChainedHybridStorage)):
             self._storage.training = False
 
         return res
@@ -1327,7 +1313,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
+        if isinstance(self._storage, (ChainedStorage, ChainedHybridStorage)):
             self._storage.training = True
             self._storage.set_score(fused_score)
 
@@ -1399,22 +1385,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         tolerance: float = 1e-5,
     ) -> None:
         """
-        Raise ``key_index_map`` occupancy toward the given load factor using random keys.
+        Raise the occupancy of every table toward the given load factor using random keys.
 
-        Default ``load_factor`` is ``0.95``; values above ``0.95`` are clamped (see
-        :meth:`DynamicEmbStorage.fill_tables`).
+        Default ``load_factor`` is ``0.95``; values above ``0.95`` are clamped. Keys are
+        sampled uniformly from ``[0, 2**63 - 2]`` (``torch.randint`` cannot use
+        ``high = 2**63``). Only the index is updated; the rows are not written
+        (typically still zeros from allocation). A table counts as done once its
+        load factor is within ``tolerance`` of the target.
 
-        Only supported when backend storage is :class:`DynamicEmbStorage` (not
-        ``HybridStorage`` or external PS). Keys are sampled uniformly from
-        ``[0, 2**63 - 2]`` (``torch.randint`` cannot use ``high = 2**63``). Only
-        the hash map is updated; embedding / optimizer
-        slots are not written (typically still zeros from allocation).
-
-        See :meth:`DynamicEmbStorage.fill_tables` for ``tolerance``.
+        Only supported for a single tier (not the hybrid layout).
         """
-        if not isinstance(self._storage, DynamicEmbStorage):
+        if not isinstance(self._storage, ChainedStorage):
             raise TypeError(
-                "fill_tables requires DynamicEmbStorage; "
+                "fill_tables requires a single-tier storage; "
                 f"got {type(self._storage).__name__}"
             )
         fused_score = max(self.get_score().values())
@@ -1800,13 +1783,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pg = self._shard_pg
 
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
+        if not isinstance(storage, (ChainedStorage, ChainedHybridStorage)):
             raise TypeError(
-                f"incremental_dump requires DynamicEmbStorage or HybridStorage, "
+                f"incremental_dump requires a chained storage, "
                 f"got {type(storage).__name__}"
             )
         if self._cache is not None and isinstance(
-            storage, (DynamicEmbStorage, ChainedStorage)
+            storage, ChainedStorage
         ):
             flush_cache(self._cache, storage)
         res = DeltaDumpResult()
@@ -1901,31 +1884,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if src_options is None:
             return "delta carries no 'table_options' (dumped by an older version)"
 
-        # A chained table places keys one by one, in whatever slot and row it hands
-        # out, so the slot-for-slot checks (capacity, rows, buckets) say nothing.
-        by_slot = not isinstance(storage, (ChainedStorage, ChainedHybridStorage))
+        # A table places keys one by one, in whatever slot and row it hands out, so
+        # nothing about slots, rows or buckets has to match.
         checks = [
-            *(
-                [
-                    (
-                        "capacity",
-                        meta.get("current_capacity"),
-                        self._capacity_of(storage, table_id),
-                    ),
-                    (
-                        "row_capacity",
-                        meta.get("row_capacity"),
-                        self._row_capacity_of(storage, table_id),
-                    ),
-                    (
-                        "bucket_capacity",
-                        meta.get("bucket_capacity"),
-                        self._bucket_capacity_of(storage),
-                    ),
-                ]
-                if by_slot
-                else []
-            ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
             ("world_size", meta.get("world_size"), self._shard_world_size),
             # Configured order, not physical layout -- see the note above.
@@ -1994,8 +1955,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ValueError: a table's metadata does not match the source's, or the
                 delta is missing the per-key data replay needs. Raised before
                 this module writes anything.
-            TypeError: this module's storage is neither ``DynamicEmbStorage`` nor
-                ``HybridStorage``.
+            TypeError: this module's storage is not a chained storage.
             NotImplementedError: a table is sharded with
                 ``dist_type="continuous"`` across more than one rank.
             RuntimeError: a key could not be written at its source slot even
@@ -2003,9 +1963,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 mid-write, so the table may hold a partial replay.
         """
         storage = self._storage
-        if not isinstance(storage, (DynamicEmbStorage, HybridStorage, ChainedStorage, ChainedHybridStorage)):
+        if not isinstance(storage, (ChainedStorage, ChainedHybridStorage)):
             raise TypeError(
-                f"replay_increment requires DynamicEmbStorage or HybridStorage, "
+                f"replay_increment requires a chained storage, "
                 f"got {type(storage).__name__}"
             )
         # Two passes on purpose. A delta usually spans a whole collection, so
@@ -2016,7 +1976,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         plan = self._plan_replay(delta, content, storage)
 
         if self._cache is not None and isinstance(
-            storage, (DynamicEmbStorage, ChainedStorage)
+            storage, ChainedStorage
         ):
             # After planning, so a rejected delta leaves the model exactly as it
             # was. Pushing dirty cache entries down first makes the storage copy
@@ -2034,7 +1994,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         delta: "DeltaDumpResult",
         content: ReplayContent,
-        storage: Union[DynamicEmbStorage, HybridStorage],
+        storage: Union[ChainedStorage, ChainedHybridStorage],
     ) -> List["_ReplayJob"]:
         """Resolve and check every table in *delta*, writing nothing.
 
@@ -2097,7 +2057,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         job: "_ReplayJob",
         content: ReplayContent,
-        storage: Union[DynamicEmbStorage, HybridStorage],
+        storage: Union[ChainedStorage, ChainedHybridStorage],
     ) -> None:
         """Every shape the write path depends on, checked before it runs.
 
@@ -2172,7 +2132,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         job: "_ReplayJob",
         content: ReplayContent,
-        storage: Union[DynamicEmbStorage, HybridStorage],
+        storage: Union[ChainedStorage, ChainedHybridStorage],
         ts: int,
     ) -> ReplayStats:
         """Write one planned table. Everything here has already been checked."""
@@ -2220,8 +2180,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # say so when that case turns up.
             stats.erased = storage.erase_keys(job.table_id, erased)
         if (
-            isinstance(storage, (ChainedStorage, ChainedHybridStorage))
-            and evicted is not None
+            evicted is not None
             and evicted.numel() > 0
         ):
             # Writing slots does not reproduce an eviction here, so the keys the source
@@ -2295,7 +2254,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     @staticmethod
     def _drain_retained(
-        storage: Union[DynamicEmbStorage, HybridStorage],
+        storage: Union[ChainedStorage, ChainedHybridStorage],
         method: str,
         wanted: bool,
         table_id: int,
@@ -2320,7 +2279,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     @staticmethod
     def _row_capacity_of(
-        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+        storage: Union[ChainedStorage, ChainedHybridStorage], table_id: int
     ) -> Tuple[int, ...]:
         """Value-buffer rows per tier for one logical table.
 
@@ -2347,7 +2306,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     @staticmethod
     def _capacity_of(
-        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+        storage: Union[ChainedStorage, ChainedHybridStorage], table_id: int
     ) -> int:
         """Slots one logical table has across the whole storage.
 
@@ -2358,11 +2317,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return sum(s.key_index_map.capacity(table_id) for s in storage.tables)
 
     @staticmethod
-    def _bucket_capacity_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
+    def _bucket_capacity_of(storage: Union[ChainedStorage, ChainedHybridStorage]) -> int:
         """The storage's hash-bucket capacity (HBM tier for a hybrid storage)."""
         return storage.tables[0].key_index_map.bucket_capacity_
 
     @staticmethod
-    def _num_scores_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
+    def _num_scores_of(storage: Union[ChainedStorage, ChainedHybridStorage]) -> int:
         """Score words per key (HBM tier for a hybrid storage)."""
         return storage.tables[0].key_index_map.num_scores_

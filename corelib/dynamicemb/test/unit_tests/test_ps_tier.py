@@ -44,10 +44,7 @@ from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     StorageLayout,
 )
-from dynamicemb.key_value_table import (
-    DynamicEmbStorage,
-    take_values_of_keys_evicted_in_the_same_insert,
-)
+from dynamicemb.chained_storage import ChainedStorage
 from torchrec.modules.embedding_configs import EmbeddingConfig  # noqa: F401
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
@@ -158,7 +155,7 @@ def test_what_the_table_evicts_comes_back_from_the_storage_below(layout, determi
     module = _module(layout, PyDictStorage)
     assert module._storage_layout == LAYOUT[layout]
     storage = module._storage
-    assert isinstance(storage, DynamicEmbStorage)
+    assert isinstance(storage, ChainedStorage)
     assert storage.lower is not None
 
     uses = _train(module)
@@ -179,93 +176,3 @@ def test_control_a_storage_that_drops_what_it_is_given_fails_the_check(layout):
         "with a lower tier that forgets everything the check still passes, so it "
         "does not show that evicted values reach the storage below"
     )
-
-
-def _storage_over(lower, dim=8):
-    """A one-bucket table of 128 rows with CUSTOMIZED scores, over ``lower``."""
-    from dynamicemb import DynamicEmbCheckMode
-    from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
-
-    optimizer = SGDDynamicEmbeddingOptimizer(OptimizerArgs())
-    options = [
-        DynamicEmbTableOptions(
-            index_type=torch.int64,
-            embedding_dtype=torch.float32,
-            device_id=torch.cuda.current_device(),
-            dim=dim,
-            max_capacity=128,
-            init_capacity=128,
-            bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
-            local_hbm_for_values=1024**3,
-            score_strategy=DynamicEmbScoreStrategy.CUSTOMIZED,
-        )
-    ]
-    return DynamicEmbStorage(options, optimizer, lower=lower(options, optimizer))
-
-
-def test_keys_evicted_by_the_insert_that_put_them_in_keep_their_own_values(
-    determinism,
-):
-    """The table is full of keys that score high, and one insert brings 200 more
-    that all score low: each evicts the lowest-scored key there is, which after the
-    first is one of the insert's own, whose row has not been written yet. What goes
-    down must be the value it came with, not what the slot held before."""
-    from dynamicemb.types import CopyMode
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    storage = _storage_over(PyDictStorage)
-    dim = 8
-    tids = lambda n: torch.zeros(n, dtype=torch.int64, device=device)
-
-    resident = torch.arange(1, 129, dtype=torch.int64, device=device)
-    resident_values = torch.full((128, dim), -1.0, device=device)
-    storage.insert(
-        resident,
-        tids(128),
-        resident_values,
-        scores=torch.full((128,), 1000, dtype=torch.uint64, device=device),
-    )
-
-    new = torch.arange(1001, 1201, dtype=torch.int64, device=device)
-    new_values = new.float().unsqueeze(1).repeat(1, dim)
-    storage.insert(
-        new,
-        tids(200),
-        new_values,
-        scores=torch.arange(1, 201, dtype=torch.int64, device=device).to(torch.uint64),
-    )
-
-    everyone = torch.cat([resident, new])
-    expected = torch.cat([resident_values, new_values])
-    out = storage.find(everyone, tids(328), CopyMode.VALUE)
-    founds, values = out[5], out[7]
-    assert bool(founds.all()), "a key was lost between the table and the tier below"
-    assert torch.equal(values[:, :dim], expected)
-
-
-@pytest.mark.parametrize("order", ["colliding_first", "colliding_last"])
-@pytest.mark.parametrize("key_dtype", [torch.int64, torch.uint64])
-def test_victims_are_matched_by_the_whole_key_and_table_pair(order, key_dtype):
-    """(0, table 0) and (K, table 1) both come to 0 when the pair is folded into one
-    int64 as ``key * 1000003 + table_id`` and the product wraps, so a match that
-    went by the fold alone could pair a victim with the other's value."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    colliding = 2336937208910341525
-    assert (colliding * 1000003 + 1) % 2**64 == 0
-
-    pairs = [(0, 0), (colliding, 1)]
-    if order == "colliding_last":
-        pairs.reverse()
-    keys = torch.tensor([k for k, _ in pairs], dtype=torch.int64, device=device)
-    tids = torch.tensor([t for _, t in pairs], dtype=torch.int64, device=device)
-    keys = keys.to(key_dtype) if key_dtype == torch.int64 else keys.view(torch.uint64)
-    values = torch.tensor([[1.0] * 4, [2.0] * 4], device=device)
-
-    # Both are victims, in the opposite order, with the values their rows held.
-    evicted_keys, evicted_tids = keys.flip(0), tids.flip(0)
-    evicted_values = torch.full((2, 4), -1.0, device=device)
-    take_values_of_keys_evicted_in_the_same_insert(
-        evicted_keys, evicted_tids, evicted_values, keys, tids, values
-    )
-    assert torch.equal(evicted_values, values.flip(0))

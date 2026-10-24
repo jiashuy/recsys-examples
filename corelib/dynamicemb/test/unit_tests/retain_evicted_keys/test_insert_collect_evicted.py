@@ -35,11 +35,8 @@ import pytest
 import torch
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
-from dynamicemb.key_value_table import (
-    DynamicEmbStorage,
-    _append_evicted,
-    _pop_state_evicted_keys,
-)
+from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.key_value_table import _append_evicted, _pop_state_evicted_keys
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
@@ -361,14 +358,14 @@ def test_evicted_slots_are_the_slots_the_victims_held(current_device, kind):
 
 
 # ---------------------------------------------------------------------------
-# Storage-level tests: the end-to-end retain flow through DynamicEmbStorage
+# Storage-level tests: the end-to-end retain flow through ChainedStorage
 # (a last tier). insert() routes to _insert_key_values, which collects into the
 # state's retain buffers; pop_evicted_keys() drains them (unique, per table).
 # ---------------------------------------------------------------------------
 
 
 def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
-    """A single-tier DynamicEmbStorage. init_capacity == max_capacity disables
+    """A single-tier ChainedStorage. init_capacity == max_capacity disables
     rehash growth, so a full bucket evicts (rather than expanding) -- the last-tier
     eviction the retain hook targets. LruLfu score policy + LFU evict strategy
     mirror the validated _lru_lfu_storage fixture."""
@@ -391,7 +388,7 @@ def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
             ),
         )
     ]
-    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+    return ChainedStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
 
 
 def _storage_insert(storage, keys, dim, device):
@@ -467,7 +464,7 @@ def test_erase_retention_is_per_call_not_per_table(current_device):
 
 
 def test_storage_retain_end_to_end(current_device):
-    """DynamicEmbStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
+    """ChainedStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
     insert evicts; pop returns the unique evicted keys; those keys are gone from the
     table; a second pop is empty (read-and-clear / incremental)."""
     device = current_device
@@ -487,11 +484,8 @@ def test_storage_retain_end_to_end(current_device):
     assert evk.numel() > 0, "a full-bucket overflow must have evicted something"
     assert evk.numel() == len(set(evk.tolist())), "pop must return unique keys"
 
-    name = storage._state.score_policy.name
-    _, founds, _ = storage.key_index_map.lookup(
-        evk, torch.zeros_like(evk), ScoreArg(name=name, policy=ScorePolicy.CONST)
-    )
-    assert not bool(founds.any()), "evicted keys must no longer be in the table"
+    rows = storage.index.lookup(evk, torch.zeros_like(evk))
+    assert bool((rows < 0).all()), "evicted keys must no longer be in the table"
 
     assert (
         storage.pop_evicted_keys(0).numel() == 0
