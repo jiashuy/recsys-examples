@@ -69,6 +69,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
+             std::optional<at::Tensor> ovf_storage = std::nullopt,
+             int64_t ovf_bucket_capacity = 0,
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
              int64_t num_scores = 1);
 
 at::Tensor table_insert(at::Tensor table_storage,

@@ -100,7 +100,8 @@ void bind_table_operation(py::module &m) {
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("keys"), py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
-        py::arg("num_scores") = 1);
+        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),

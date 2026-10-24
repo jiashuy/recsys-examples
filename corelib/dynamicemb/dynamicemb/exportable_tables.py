@@ -231,6 +231,9 @@ class InferenceLinearBucketTable(torch.nn.Module):
             table_ids,
             score_value,
             self.score_policy,
+            None,
+            0,
+            None,
         )
 
         return score_out, founds, indices

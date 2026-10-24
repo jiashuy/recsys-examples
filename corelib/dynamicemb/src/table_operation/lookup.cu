@@ -83,7 +83,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
-             int64_t num_scores) {
+             std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
+             std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores) {
+  // The overflow buffer no longer exists. The arguments stay in the signature so
+  // that the inference ops library, whose schema and callers (and any model already
+  // exported against it) pass them, is unchanged; nothing ever passed a buffer.
+  TORCH_CHECK(!(ovf_storage.has_value() && ovf_storage.value().defined()),
+              "table_lookup: the overflow buffer is no longer supported.");
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
