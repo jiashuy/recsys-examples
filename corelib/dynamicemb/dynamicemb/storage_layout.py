@@ -42,7 +42,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     align_to_table_size,
 )
-from dynamicemb.key_value_table import DynamicEmbCache
+from dynamicemb.cache import DynamicEmbCache
 from dynamicemb.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.row_exchange import RowExchange

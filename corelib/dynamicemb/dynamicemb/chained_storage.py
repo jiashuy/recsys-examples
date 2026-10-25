@@ -38,17 +38,13 @@ from .dynamicemb_config import (
     ReplayContent,
 )
 from .key_value_table import (
-    DynamicEmbTableState,
     _all_gather_dumped_columns,
-    _append_erased,
     _dump_table,
     _iter_batches_from_files,
     _load_key_values,
-    _pop_state_erased_keys,
     _replay_write_values,
     _split_value_row,
     _validate_load_meta,
-    create_table_state,
     export_keys_values_iter,
 )
 from .eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
@@ -56,6 +52,12 @@ from .lower_tier import LowerTier
 from .mixed_dim_buffers import MixedDimBuffers
 from .row_chunk import RowChunk
 from .score import ScoreRules, is_lru_lfu
+from .table_state import (
+    DynamicEmbTableState,
+    _append_erased,
+    _pop_state_erased_keys,
+    create_table_state,
+)
 from .types import SCORE_TYPE, CopyMode, MultiTableAdmitter, ReplayStats, Storage
 
 _SUPPORTED = (
@@ -577,7 +579,7 @@ class ChainedStorage(Storage):
                 self._state.values.store(rows, tid, values)
 
     def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
-        from .key_value_table import _pop_state_evicted_keys
+        from .table_state import _pop_state_evicted_keys
 
         return _pop_state_evicted_keys(self._state, table_id)
 

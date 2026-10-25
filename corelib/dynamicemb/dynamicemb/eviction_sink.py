@@ -29,7 +29,7 @@ import abc
 from typing import Optional
 
 import torch
-from dynamicemb.key_value_table import DynamicEmbTableState, _append_evicted
+from dynamicemb.table_state import DynamicEmbTableState, _append_evicted
 from dynamicemb.lower_tier import LowerTier
 from dynamicemb.types import Storage
 

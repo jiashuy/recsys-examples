@@ -10,7 +10,7 @@
 |---|---|
 | `ChainedStorage`（约 1200 行） | 索引 + 值缓冲 + score 策略 + 下一层（PS）+ 淘汰保留 + checkpoint + 增量 dump + replay + 扩容 |
 | `BatchedDynamicEmbeddingTablesV2`（约 2300 行） | 构造三种存储布局、forward / prefetch、dump / load、增量 dump、replay、内存报告 |
-| `key_value_table.py` | 状态 + checkpoint 读写 + 缓存 + eval 查找 |
+| `key_value_table.py` | 状态 + checkpoint 读写 + 缓存 + eval 查找（已拆：状态在 `table_state.py`，缓存在 `cache.py`，eval 查找在 `eval_lookup.py`，剩下的是 checkpoint 文件读写，等 step 5 重排） |
 | `batched_dynamicemb_function.py` | 去重、`PrefetchState`、prefetch、eval 前向、通用前向、autograd |
 | score 逻辑 | 分散在 `score_args`、`_scores_to_age`、`score_load_permutation`、`_fresh_score_block`、kernel 的模式码 |
 | checkpoint | `key_value_table.py`、`incremental_dump.py`、`batched_dynamicemb_tables.py` 三处 |

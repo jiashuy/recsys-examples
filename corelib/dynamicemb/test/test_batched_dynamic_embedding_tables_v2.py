@@ -40,7 +40,7 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
 )
 from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD, ScoreStrategy
-from dynamicemb.key_value_table import Storage
+from dynamicemb.types import Storage
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     DynamicEmbOptimType,

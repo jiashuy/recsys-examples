@@ -36,7 +36,7 @@ import torch
 from dynamicemb import DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.chained_storage import ChainedStorage
-from dynamicemb.key_value_table import _append_evicted, _pop_state_evicted_keys
+from dynamicemb.table_state import _append_evicted, _pop_state_evicted_keys
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy

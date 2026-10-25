@@ -47,7 +47,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
-from dynamicemb.key_value_table import Cache, Storage, flush_cache
+from dynamicemb.cache import flush_cache
 from dynamicemb.row_exchange import RowExchange
 from dynamicemb.memory_report import print_memory_consume
 from dynamicemb.storage_layout import build_storage
@@ -64,7 +64,7 @@ from dynamicemb.optimizer import (
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     SGDDynamicEmbeddingOptimizer,
 )
-from dynamicemb.types import ReplayStats
+from dynamicemb.types import Cache, ReplayStats, Storage
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,

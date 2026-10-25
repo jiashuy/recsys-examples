@@ -19,15 +19,17 @@ from typing import Optional, Tuple
 
 import torch
 from dynamicemb.initializer import MultiTableInitializer
-from dynamicemb.key_value_table import (
-    Cache,
-    Storage,
-    eval_lookup,
-)
+from dynamicemb.eval_lookup import eval_lookup
 from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import CopyMode, MultiTableAdmitter, counts_to_offsets
+from dynamicemb.types import (
+    Cache,
+    CopyMode,
+    MultiTableAdmitter,
+    Storage,
+    counts_to_offsets,
+)
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
