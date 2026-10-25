@@ -10,7 +10,7 @@
 |---|---|
 | `ChainedStorage`（约 1200 行） | 索引 + 值缓冲 + score 策略 + 下一层（PS）+ 淘汰保留 + checkpoint + 增量 dump + replay + 扩容 |
 | `BatchedDynamicEmbeddingTablesV2`（约 2300 行） | 构造三种存储布局、forward / prefetch、dump / load、增量 dump、replay、内存报告 |
-| `key_value_table.py` | 状态 + checkpoint 读写 + 缓存 + eval 查找（已拆：状态在 `table_state.py`，缓存在 `cache.py`，eval 查找在 `eval_lookup.py`，剩下的是 checkpoint 文件读写，等 step 5 重排） |
+| `key_value_table.py`（已不存在） | 状态 + checkpoint 读写 + 缓存 + eval 查找，已拆为 `storage/table_state.py`、`storage/cache.py`、`training/eval_lookup.py`、`storage/row_io.py`、`checkpoint/files.py` |
 | `batched_dynamicemb_function.py` | 去重、`PrefetchState`、prefetch、eval 前向、通用前向、autograd |
 | score 逻辑 | 分散在 `score_args`、`_scores_to_age`、`score_load_permutation`、`_fresh_score_block`、kernel 的模式码 |
 | checkpoint | `key_value_table.py`、`incremental_dump.py`、`batched_dynamicemb_tables.py` 三处 |
@@ -105,7 +105,7 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 
 淘汰排序最终要在 kernel 里执行，不能回调 Python，所以组件的接口是**声明式**的：给出 score 字数、更新模式、排序规则，由索引的 kernel 解释；其余问题由 Python 侧直接问它。
 
-### 2.7 checkpoint【`RowChunk` 已落地；文件格式层与 `Checkpointer` 待做】
+### 2.7 checkpoint【已实现，但 `export_chunks`/`import_chunk` 没有采用，见下】
 
 三层，中间有一个共同的数据单位：
 
@@ -161,10 +161,17 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 
 | 位置 | 内容 |
 |---|---|
-| `dynamicemb/storage/` | 行与索引、层级：`chained_table`、`chained_storage`、`storage_layout`、`table_state`、`mixed_dim_buffers`、`extendable_tensor`、`row_exchange`、`eviction_sink`、`lower_tier`、`cache`、`score`、`memory_report` |
-| `dynamicemb/checkpoint/` | `row_chunk`、`key_value_table`（checkpoint 文件读写；名字过时，step 5 重排时改） |
+| `dynamicemb/storage/` | 行与索引、层级：`chained_table`、`chained_storage`、`storage_layout`、`table_state`、`mixed_dim_buffers`、`extendable_tensor`、`row_exchange`、`eviction_sink`、`lower_tier`、`cache`、`score`、`memory_report`、`row_io`（一张表的行导出、写入，以及与文件的 dump/load 衔接） |
+| `dynamicemb/checkpoint/` | `row_chunk`（一批行）、`paths`（文件命名与查找）、`files`（meta JSON、值布局、读文件）、`checkpointer`（`ShardInfo` 与 `Checkpointer`：整份 dump/load、增量 dump、replay） |
 | `dynamicemb/training/` | 训练一步的编排：`chained_prefetch`、`batched_dynamicemb_function`、`eval_lookup`、`lookup_layout` |
 | 顶层（公开入口，路径不变） | `batched_dynamicemb_tables`、`dump_load`、`incremental_dump`、`dynamicemb_config`、`types`、`optimizer`、`initializer`、`embedding_admission`、`utils`、`batched_dynamicemb_compute_kernel`、`construct_twin_module`、`key_ownership` |
 | 顶层（推理，不动） | `exportable_tables`、`scored_hashtable`、`lookup_meta`、`index_range_meta`、`jit/` |
 
 新组件的单元测试在 `test/unit_tests/components/`。
+
+### 2.7 的落地情况
+
+- 文件格式层：`checkpoint/paths.py`（命名与查找）、`checkpoint/files.py`（meta JSON、dtype 与值布局、读文件分批）。
+- `Checkpointer`：`checkpoint/checkpointer.py`，持有存储、缓存、admission 计数器、各表 score 和 `ShardInfo`；`BatchedDynamicEmbeddingTablesV2` 的 `dump`/`load`/`incremental_dump`/`replay_increment` 等公开方法只转调它。
+- 存储一侧：`storage/row_io.py` 放一张表的行导出（`export_keys_values_iter`，产出 `RowChunk`）、写入（`_load_key_values`、`_replay_write_values`）以及 `_dump_table`、`_validate_load_meta`。
+- **没有做的**：把 `Storage.dump`/`Storage.load` 换成 `export_chunks`/`import_chunk` 两个原语，让 `Checkpointer` 自己驱动文件读写。`Storage` 抽象的 `dump`/`load` 是用户实现外部存储（`external_storage`）要实现的契约，换掉会破坏用户代码，所以保留；`row_io.py` 里的函数就是这个契约在内置存储上的实现。`dump_load.py` 与 `incremental_dump.py` 是公开入口（`dynamicemb.dump_load`、`dynamicemb.incremental_dump`），路径不变，留在顶层。

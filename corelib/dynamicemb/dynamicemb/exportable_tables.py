@@ -24,7 +24,7 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
     get_loading_files,
 )
-from dynamicemb.checkpoint.key_value_table import (
+from dynamicemb.checkpoint.files import (
     _iter_batches_from_files,
     load_from_json,
     resolve_checkpoint_value_layout,

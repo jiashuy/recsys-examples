@@ -37,10 +37,10 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
 )
-from dynamicemb.checkpoint.key_value_table import (
+from dynamicemb.checkpoint.files import _iter_batches_from_files
+from dynamicemb.storage.row_io import (
     _all_gather_dumped_columns,
     _dump_table,
-    _iter_batches_from_files,
     _load_key_values,
     _replay_write_values,
     _split_value_row,
