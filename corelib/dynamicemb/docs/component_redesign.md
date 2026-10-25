@@ -72,12 +72,14 @@
 
 准入是一个有状态的策略（计数器、阈值、自己的 checkpoint），**代码不并入存储，调用点并入存储**：存储内部在"这批 key 缺失"这一步调用 `admitter.filter(...)`，prefetch 流程里看不到它。有无 PS 的差异在存储里处理（PS 里已有的 key 视为已准入）。
 
-### 2.5 下一层（`lower`）与淘汰去向（`EvictionSink`）【已确定，待实现】
+### 2.5 下一层（`lower`）与淘汰去向（`EvictionSink`）【淘汰去向已实现；`lower` 的统一待做】
 
 PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们其实是两件事：
 
 - **下一层 `lower`**：找不到时去哪里取、被淘汰时往哪里放。PS、host 层（Hybrid）都是它的实现。接口：`find` / `insert` / `erase` / 导出。
 - **淘汰去向 `EvictionSink`**：丢弃、写到下一层、记录 key。**retain 是对任意去向的装饰**，不是单独的一种。
+
+实现：`dynamicemb/eviction_sink.py`，`EvictionSink.put(keys, table_ids, values, scores)` 加 `wants_values`（不要值的去向，调用方不去加载）；`Discard`、`ToLower(lower)`、`ToTier(tier)`（带 score 写到同类的旁边一层）、`Retain(state, inner)`（记录 key 后转给 `inner`）。`ChainedStorage` 构造时按 `spill_to` / `lower` / `evicted_item_mode` 选出 sink，`retain_and_spill` 改名为 `evict`，只加载值再交给 sink。还没做的是 `lower` 一侧：`find`/`insert`/`erase`/导出统一成接口，Hybrid 的 host 层与 PS 同接口。
 
 于是 Hybrid 是 `lower = HostTier`，PS 是 `lower = PSTier`，retain 是在去向外面包一层记录。`ChainedStorage` 里的 `retain_and_spill` 去掉。
 

@@ -243,7 +243,7 @@ def prefetch_cache_path(
                             ev_tids[cached],
                             copy_mode=CopyMode.VALUE,
                         )
-                storage.retain_and_spill(ev_keys, ev_tids, ev_rows, ev_values)
+                storage.evict(ev_keys, ev_tids, ev_rows, ev_values)
                 cache.invalidate(ev_nodes, ev_tids)
                 index.release_rows(ev_rows, ev_tids)
         else:
@@ -348,7 +348,7 @@ def prefetch_hbm_direct_path(
             storage.sync_value_buffers()
             # The victims' rows are intact until released, and the new keys have rows of
             # their own: what goes down a tier is read from where it is.
-            storage.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
+            storage.evict(out.victim_keys, out.victim_tables, out.victim_rows)
             index.release_rows(out.victim_rows, out.victim_tables)
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 state.values.store(out.rows, admitted_tids, init_values)

@@ -41,7 +41,6 @@ from .key_value_table import (
     DynamicEmbTableState,
     _all_gather_dumped_columns,
     _append_erased,
-    _append_evicted,
     _dump_table,
     _fill_from_lower,
     _iter_batches_from_files,
@@ -53,6 +52,7 @@ from .key_value_table import (
     create_table_state,
     export_keys_values_iter,
 )
+from .eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
 from .mixed_dim_buffers import MixedDimBuffers
 from .score import ScoreRules, is_lru_lfu
 from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
@@ -220,7 +220,7 @@ class _ChainedIndexView:
         s.sync_value_buffers()
         result = rows.clone()
         result[out.positions] = out.rows
-        s.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
+        s.evict(out.victim_keys, out.victim_tables, out.victim_rows)
         index.release_rows(out.victim_rows, out.victim_tables)
         return result
 
@@ -258,7 +258,6 @@ class ChainedStorage(Storage):
         rows = [s + max(s // 8, 1024) for s in slots]
 
         self._lower = lower
-        self._spill = spill_to
         self._score = ScoreRules(strategy)
         self._state: DynamicEmbTableState = create_table_state(
             options,
@@ -286,6 +285,14 @@ class ChainedStorage(Storage):
             num_scores=2 if lru_lfu else 1,
         )
         self._state.key_index_map = _ChainedIndexView(self)
+        if spill_to is not None:
+            self._sink: EvictionSink = ToTier(spill_to)
+        elif lower is not None:
+            self._sink = ToLower(lower)
+        elif EvictedItemMode.RETAIN_KEY in base.evicted_item_mode:
+            self._sink = Retain(self._state, Discard())
+        else:
+            self._sink = Discard()
         # An upper bound on the keys of each table, refreshed when it matters.
         self._estimated_size = [0] * len(options)
 
@@ -354,7 +361,7 @@ class ChainedStorage(Storage):
         keep = rows >= 0
         self._index.unpin(rows[keep], table_ids[keep])
 
-    def retain_and_spill(
+    def evict(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
@@ -362,31 +369,17 @@ class ChainedStorage(Storage):
         values: Optional[torch.Tensor] = None,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
-        """What was evicted: kept for ``pop_evicted_keys``, and sent down a tier.
+        """Hand what was evicted to the sink.
 
         ``rows`` still hold the victims' values; ``values`` overrides them (a key that
         is also cached has a newer one there). ``scores`` are the victims' own score
         words, which a tier of the same kind beside this one keeps them at.
         """
-        n = int(keys.numel())
-        if n == 0:
+        if keys.numel() == 0:
             return
-        if self._lower is None and self._spill is None:
-            if EvictedItemMode.RETAIN_KEY in self._state.evicted_item_mode:
-                _append_evicted(
-                    self._state,
-                    keys,
-                    table_ids,
-                    torch.tensor(n, dtype=torch.int64, device=keys.device),
-                )
-            return
-        if values is None:
-            values = self._state.values.load(rows, table_ids, copy_mode=CopyMode.VALUE
-            )
-        if self._spill is not None:
-            self._spill.insert(keys, table_ids, values, scores)
-        else:
-            self._lower.insert(keys, table_ids, values)
+        if values is None and self._sink.wants_values:
+            values = self._state.values.load(rows, table_ids, copy_mode=CopyMode.VALUE)
+        self._sink.put(keys, table_ids, values, scores)
 
     # -- Storage interface ----------------------------------------------------
 
@@ -507,7 +500,7 @@ class ChainedStorage(Storage):
                 unique_values[out.positions],
             )
             rows[out.positions] = out.rows
-            self.retain_and_spill(
+            self.evict(
                 out.victim_keys,
                 out.victim_tables,
                 out.victim_rows,
@@ -652,7 +645,7 @@ class ChainedStorage(Storage):
                 out = index.commit()
                 self.sync_value_buffers()
                 rows[out.positions] = out.rows
-                self.retain_and_spill(out.victim_keys, out.victim_tables, out.victim_rows)
+                self.evict(out.victim_keys, out.victim_tables, out.victim_rows)
                 index.release_rows(out.victim_rows, out.victim_tables)
             if pair:  # both words, for the keys that were there as well as the new ones
                 state.key_index_map.scatter_score_blocks(
