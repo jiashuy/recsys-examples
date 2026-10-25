@@ -118,6 +118,7 @@ class ChainedTables:
         no_eviction: Union[bool, Sequence[bool]] = False,
         device: Optional[torch.device] = None,
         num_scores: int = 1,
+        identity: Union[bool, Sequence[bool]] = False,
     ):
         if num_scores not in (1, 2):
             raise ValueError("a slot holds one score word, or two: (timestamp, frequency)")
@@ -142,6 +143,18 @@ class ChainedTables:
             no_eviction = [no_eviction] * self.num_tables
         self.no_eviction = [bool(x) for x in no_eviction]
         assert len(self.no_eviction) == self.num_tables
+        # A table with identity rows has each key as its own row: the keys are the integers
+        # below its capacity, no row is taken from the pool and none given back, and nothing
+        # is evicted, which a single bucket guarantees.
+        if isinstance(identity, bool):
+            identity = [identity] * self.num_tables
+        self.identity = [bool(x) for x in identity]
+        assert len(self.identity) == self.num_tables
+        for t, ident in enumerate(self.identity):
+            if ident and num_buckets[t] != 1:
+                raise ValueError(
+                    f"table {t}: identity rows need a single bucket, not {num_buckets[t]}"
+                )
 
         self._nb = [int(n) for n in num_buckets]
         rows = (
@@ -219,6 +232,7 @@ class ChainedTables:
             self._nb,
             self.bucket_capacity,
             self.num_scores,
+            [int(x) for x in self.identity],
         )
 
     def version(self, table: int = 0) -> int:
@@ -398,6 +412,11 @@ class ChainedTables:
             self._version[t] += 1
         victims, runs, failed_buckets, exhausted = stats.tolist()
         vscores = vscores[: victims * self.num_scores].view(victims, self.num_scores)
+        if exhausted == 2:
+            raise ValueError(
+                "a key is not a row of its table: with identity_row_mapping the keys are the "
+                "integers from 0 to the table's capacity - 1"
+            )
         if exhausted:
             per_table = (tstart[1:] - tstart[:-1]).tolist()
             tops = self._tops.tolist()
@@ -448,10 +467,12 @@ class ChainedTables:
         if rows.numel() == 0:
             return
         if self.num_tables == 1:
-            chained_release(self._views, 0, rows)
+            if not self.identity[0]:
+                chained_release(self._views, 0, rows)
             return
         for t in range(self.num_tables):
-            chained_release(self._views, t, rows[table_ids == t])
+            if not self.identity[t]:
+                chained_release(self._views, t, rows[table_ids == t])
 
     def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """Remove keys. Their rows go back to the pools; each key's row comes back, -1
@@ -626,6 +647,10 @@ class ChainedTables:
                     assert row < self._row_cap[t], f"row {row} out of range"
                     assert row not in seen_rows, f"row {row} used twice"
                     seen_rows.add(row)
+                    if self.identity[t]:
+                        assert row == key, f"key {key} is not in its own row, but in {row}"
+            if self.identity[t]:  # the pool is not used
+                continue
             assert (
                 int(self._tops[t].item()) + len(seen_rows) + pending[t] == self._row_cap[t]
             ), f"table {t}: rows are lost or duplicated"
@@ -643,6 +668,7 @@ class ChainedTable(ChainedTables):
         track_refs: bool = False,
         no_eviction: bool = False,
         num_scores: int = 1,
+        identity: bool = False,
     ):
         super().__init__(
             [num_buckets],
@@ -652,6 +678,7 @@ class ChainedTable(ChainedTables):
             [no_eviction],
             device,
             num_scores,
+            [identity],
         )
 
     @property

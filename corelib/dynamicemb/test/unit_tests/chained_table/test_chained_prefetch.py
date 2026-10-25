@@ -353,3 +353,34 @@ def test_host_only_scores_are_updated_by_a_training_find():
     uses = _train(module)
     bad, total = _mismatched_keys(module, uses)
     assert bad == 0, f"{bad} of {total} keys lost an update"
+
+
+@pytest.mark.parametrize("layout", ["hbm", "caching"])
+def test_with_identity_rows_a_key_trains_its_own_row(layout):
+    capacity = 4 * KEYS  # more rows than keys, and the keys are the rows
+    module = _module(
+        layout,
+        None,
+        capacity,
+        bucket_capacity=capacity,
+        identity_row_mapping=True,
+    )
+    uses = _train(module)
+    module.flush()
+    index = module._storage.index
+    used = (uses > 0).nonzero().squeeze(1).to(torch.device("cuda", torch.cuda.current_device()))
+    tids = torch.zeros_like(used)
+    assert index.lookup(used, tids).tolist() == used.tolist()  # row == key
+    assert _mismatched_keys(module, uses)[0] == 0
+
+
+def test_identity_rows_reject_a_key_that_is_not_a_row():
+    capacity = 1024
+    module = _module(
+        "hbm", None, capacity, bucket_capacity=capacity, identity_row_mapping=True
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    indices = torch.tensor([capacity + 5], dtype=torch.int64, device=device)
+    offsets = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    with pytest.raises(ValueError, match="not a row"):
+        module(indices, offsets)

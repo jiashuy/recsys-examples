@@ -266,7 +266,9 @@ class ChainedStorage(Storage):
         cap = int(base.bucket_capacity)
         num_buckets = [max(1, math.ceil(int(o.init_capacity) / cap)) for o in options]
         slots = [n * cap for n in num_buckets]
-        rows = [s + max(s // 8, 1024) for s in slots]
+        identity = [bool(o.identity_row_mapping) for o in options]
+        # A table with identity rows holds no row for a victim in flight: its rows are its slots.
+        rows = [s if ident else s + max(s // 8, 1024) for s, ident in zip(slots, identity)]
 
         self._lower = None if lower is None else LowerTier(lower)
         self._admitter: Optional[MultiTableAdmitter] = None
@@ -295,6 +297,7 @@ class ChainedStorage(Storage):
             no_eviction=[strategy == DynamicEmbScoreStrategy.NO_EVICTION] * len(options),
             device=self._state.device,
             num_scores=2 if lru_lfu else 1,
+            identity=identity,
         )
         self._state.key_index_map = _ChainedIndexView(self)
         if spill_to is not None:
@@ -379,6 +382,8 @@ class ChainedStorage(Storage):
     def grow_for(self, table: int, extra_keys: int) -> None:
         """Make room, within the table's maximum capacity, for ``extra_keys`` more."""
         if self._score.strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+            return
+        if self._index.identity[table]:  # one bucket, and the keys are its rows
             return
         opt = self._state.options_list[table]
         max_lf = float(opt.max_load_factor)

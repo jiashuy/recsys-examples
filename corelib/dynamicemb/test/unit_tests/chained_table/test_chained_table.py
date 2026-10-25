@@ -838,3 +838,62 @@ def test_links_are_two_bytes_unless_four_times_the_capacity_does_not_fit(device,
     table = ChainedTable(num_buckets=1, bucket_capacity=cap, device=device)
     assert table._link_dtype == dtype
     assert table._next[0].dtype == dtype and table._head[0].dtype == dtype
+
+
+# -- identity rows: a key is its own row ------------------------------------------
+
+
+def test_with_identity_rows_a_key_is_its_row(device):
+    table = ChainedTable(
+        num_buckets=1, bucket_capacity=64, row_capacity=64, device=device, identity=True
+    )
+    keys = [5, 63, 0, 17, 42]
+    table.find_and_stage(_t(keys, device))
+    out = table.commit()
+    assert out.rows.tolist() == keys
+    assert table.lookup(_t(keys, device)).tolist() == keys
+    # Neither a row taken from the pool, nor one given back, as the pool is not used.
+    assert table.free_rows() == 64
+    table.check_invariants()
+
+
+def test_identity_rows_survive_an_erase_and_a_reinsert(device):
+    table = ChainedTable(
+        num_buckets=1, bucket_capacity=16, row_capacity=16, device=device, identity=True
+    )
+    table.find_and_stage(_t(list(range(16)), device))
+    table.commit()
+    assert table.erase(_t([3, 4], device)).tolist() == [3, 4]
+    assert table.lookup(_t([3, 4, 5], device)).tolist() == [-1, -1, 5]
+    table.find_and_stage(_t([4, 3], device))
+    assert table.commit().rows.tolist() == [4, 3]
+    # The pool was never touched, so giving rows back did not push past its end.
+    assert table.free_rows() == 16
+
+
+@pytest.mark.parametrize("bad", [[16], [-1], [3, 100]])
+def test_a_key_that_is_not_a_row_is_an_error(device, bad):
+    table = ChainedTable(
+        num_buckets=1, bucket_capacity=16, row_capacity=16, device=device, identity=True
+    )
+    table.find_and_stage(_t(bad, device))
+    with pytest.raises(ValueError, match="not a row"):
+        table.commit()
+    assert table.size() == 0  # nothing was placed
+
+
+def test_identity_rows_need_a_single_bucket(device):
+    with pytest.raises(ValueError, match="single bucket"):
+        ChainedTable(num_buckets=2, bucket_capacity=16, device=device, identity=True)
+
+
+def test_identity_and_pooled_tables_share_an_index(device):
+    tables = ChainedTables([1, 1], 8, [8, 20], device=device, identity=[True, False])
+    keys = _t([3, 7, 3, 7], device)
+    tids = _t([0, 0, 1, 1], device)
+    tables.find_and_stage(keys, tids)
+    rows = tables.commit().rows
+    by_key = dict(zip(zip(keys.tolist(), tids.tolist()), rows.tolist()))
+    assert by_key[(3, 0)] == 3 and by_key[(7, 0)] == 7  # the identity table: its keys
+    assert len({by_key[(3, 1)], by_key[(7, 1)]}) == 2  # the pooled one: rows of its pool
+    assert tables.free_rows(0) == 8 and tables.free_rows(1) == 18

@@ -499,6 +499,13 @@ class DynamicEmbTableOptions:
         When the bucket is full, the key with the smallest score in the bucket will be evicted, and its row will be used to store a new key.
         The new keys of one step must fit the buckets they hash to, or the step raises ``ChainedTableFull``.
         The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
+    identity_row_mapping : bool
+        Default ``False``. When ``True`` the row of a key is the key itself: keys are the integers
+        ``0 .. capacity - 1`` and key ``k`` lives in row ``k`` of the value buffer, so the table can be
+        compared row by row with a dense table of the same size (a TorchRec table, say). Nothing is
+        ever evicted, so the table must be a single bucket (a ``bucket_capacity`` not smaller than
+        the per-rank rows). A key outside ``[0, capacity)`` raises ``ValueError``. Not supported with
+        the hybrid storage.
     global_hbm_for_values : int
         Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
         It has different meanings under `caching=True` and  `caching=False`.
@@ -570,6 +577,7 @@ class DynamicEmbTableOptions:
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
     score_strategy: Optional[ScoreStrategy] = DynamicEmbScoreStrategy.TIMESTAMP
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
+    identity_row_mapping: bool = False
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
