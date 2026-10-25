@@ -30,6 +30,7 @@ void bind_table_operation(py::module &m);
 void bind_vmm_op(py::module &m);
 void bind_embedding_cache(py::module &m);
 void bind_chained_table(py::module &m);
+void bind_row_exchange(py::module &m);
 
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
@@ -45,4 +46,5 @@ PYBIND11_MODULE(dynamicemb_extensions, m) {
   bind_vmm_op(m);
   bind_embedding_cache(m);
   bind_chained_table(m);
+  bind_row_exchange(m);
 }

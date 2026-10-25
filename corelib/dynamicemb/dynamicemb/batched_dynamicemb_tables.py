@@ -20,9 +20,7 @@ import os
 import re
 import warnings
 from collections import deque
-from copy import deepcopy
 from dataclasses import dataclass
-from enum import Enum
 from functools import partial
 from itertools import accumulate
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
@@ -37,7 +35,6 @@ from dynamicemb.batched_dynamicemb_function import (
 )
 from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.dynamicemb_config import (
-    align_to_table_size,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -50,8 +47,9 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
-from dynamicemb.key_value_table import Cache, DynamicEmbCache, Storage, flush_cache
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.key_value_table import Cache, Storage, flush_cache
+from dynamicemb.row_exchange import RowExchange
+from dynamicemb.storage_layout import StorageLayout, build_storage
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
@@ -247,13 +245,6 @@ def get_loading_files(
         counter_key_files,
         counter_freq_files,
     )
-
-
-class StorageLayout(Enum):
-    HBM_ONLY = "HBM-only (single tier, GPU)"
-    HOST_ONLY = "Host-only (single tier, CPU)"
-    HYBRID = "Hybrid (HBM + Host, disjoint partitions; total = HBM + Host)"
-    CACHING = "Caching (HBM cache + Host full backing; HBM rows duplicate Host)"
 
 
 def _tier_bytes(
@@ -754,6 +745,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _create_cache_storage(self) -> None:
         self._cache: Optional[Cache] = None
+        self._exchange: Optional[RowExchange] = None
         self._caching = any(option.caching for option in self._dynamicemb_options)
 
         for option in self._dynamicemb_options:
@@ -769,142 +761,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         UserWarning,
                     )
 
-        value_dims = [
-            option.dim + self._optimizer.get_state_dim(option.dim)
-            for option in self._dynamicemb_options
-        ]
-        total_memory = sum(
-            option.max_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
-            for option, value_dim in zip(self._dynamicemb_options, value_dims)
+        bundle = build_storage(
+            self._dynamicemb_options, self._optimizer, self.device_id
         )
-        local_hbm = sum(
-            option.local_hbm_for_values for option in self._dynamicemb_options
-        )
-
-        if total_memory > local_hbm:
-            # Data does not fit entirely in HBM.
-            if self._caching:
-                # Caching mode: HBM cache + host/PS storage
-                if local_hbm <= 0:
-                    raise ValueError(
-                        "Can't use caching mode as the reserved HBM size is too small."
-                    )
-
-                cache_options = deepcopy(self._dynamicemb_options)
-                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-                for cache_option in cache_options:
-                    cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * cap_scale))
-                    cache_option.max_capacity = min(cache_option.max_capacity, cap)
-                    cache_option.init_capacity = min(cache_option.max_capacity, cap)
-
-                # The cache holds no score and does no eviction of its own, so
-                # NO_EVICTION means nothing to it: its options carry TIMESTAMP/LRU,
-                # as the hybrid's HBM tier does, and the backing keeps NO_EVICTION.
-                if (
-                    self._dynamicemb_options[0].score_strategy
-                    == DynamicEmbScoreStrategy.NO_EVICTION
-                ):
-                    for cache_option in cache_options:
-                        cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
-                        cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
-
-                # Rounded up to a multiple of the bucket capacity, as the cache's index
-                # always was. A cache has to hold every key of a step at once, so a
-                # configuration smaller than a step would otherwise fail where it used
-                # to work.
-                cache_capacities = [
-                    align_to_table_size(int(o.init_capacity), int(o.bucket_capacity))
-                    for o in cache_options
-                ]
-                self._cache = DynamicEmbCache(
-                    cache_capacities,
-                    MixedDimBuffers(
-                        [o.dim for o in cache_options],
-                        [o.dim + self._optimizer.get_state_dim(o.dim) for o in cache_options],
-                        cache_capacities,
-                        cache_options[0].embedding_dtype,
-                        torch.device(f"cuda:{self.device_id}"),
-                        "fixed",
-                    ),
-                )
-
-                storage_options = deepcopy(self._dynamicemb_options)
-                for storage_option in storage_options:
-                    storage_option.local_hbm_for_values = 0
-                self._storage = self._make_storage(
-                    storage_options,
-                    lower=self._create_external_storage(storage_options),
-                )
-                self._storage_layout = StorageLayout.CACHING
-            else:
-                # No caching and no HBM budget for values: single-tier host/PS storage.
-                if local_hbm <= 0:
-                    storage_options = deepcopy(self._dynamicemb_options)
-                    for storage_option in storage_options:
-                        storage_option.local_hbm_for_values = 0
-                    self._storage = self._make_storage(
-                        storage_options,
-                        lower=self._create_external_storage(storage_options),
-                    )
-                    self._storage_layout = StorageLayout.HOST_ONLY
-                else:
-                    # No caching: ChainedHybridStorage (HBM tier + host tier)
-                    if any(
-                        opt.external_storage is not None
-                        for opt in self._dynamicemb_options
-                    ):
-                        warnings.warn(
-                            "external_storage is ignored in hybrid mode. "
-                            "Set caching=True to use external storage.",
-                            UserWarning,
-                        )
-                    cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-
-                    hbm_options = deepcopy(self._dynamicemb_options)
-                    for hbm_option in hbm_options:
-                        cap = max(1, int(hbm_option.max_capacity * cap_scale))
-                        hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
-                        hbm_option.init_capacity = hbm_option.max_capacity
-
-                    storage_cap_scale = 1.0 - cap_scale
-                    host_options = deepcopy(self._dynamicemb_options)
-                    for host_option in host_options:
-                        host_option.local_hbm_for_values = 0
-                        cap = max(1, int(host_option.max_capacity * storage_cap_scale))
-                        host_option.max_capacity = min(host_option.max_capacity, cap)
-                        host_option.init_capacity = min(host_option.init_capacity, cap)
-
-                    # A table that is one bucket (its bucket is as large as the table) is
-                    # one bucket in each tier, of the tier's size.
-                    for tier in (hbm_options, host_options):
-                        for opt, whole in zip(tier, self._dynamicemb_options):
-                            if opt.bucket_capacity >= whole.max_capacity:
-                                opt.bucket_capacity = opt.max_capacity
-
-                    # The hybrid does not support NO_EVICTION: its tiers hold disjoint keys and spill by eviction.
-                    if (
-                        self._dynamicemb_options[0].score_strategy
-                        == DynamicEmbScoreStrategy.NO_EVICTION
-                    ):
-                        raise ValueError(
-                            "NO_EVICTION is not supported with the hybrid storage "
-                            "(non-caching partial-HBM storage). Use caching=True "
-                            "(the backing store keeps NO_EVICTION) or a single-tier "
-                            "configuration."
-                        )
-
-                    self._storage = ChainedHybridStorage(
-                        hbm_options, host_options, self._optimizer
-                    )
-                    self._storage_layout = StorageLayout.HYBRID
-        else:
-            # HBM-only: everything fits in GPU memory.
-            self._storage = self._make_storage(
-                self._dynamicemb_options,
-                lower=self._create_external_storage(self._dynamicemb_options),
-            )
-            self._storage_layout = StorageLayout.HBM_ONLY
+        self._storage = bundle.storage
+        self._cache = bundle.cache
+        self._exchange = bundle.exchange
+        self._storage_layout = bundle.layout
 
         _print_memory_consume(
             self._table_names,
@@ -916,27 +779,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.device_id,
             self._optimizer_type,
         )
-
-    def _make_storage(
-        self, options: List[DynamicEmbTableOptions], lower: Optional[Storage]
-    ) -> Storage:
-        """The table of rows behind a cache, or the HBM-only or host-only one."""
-        return ChainedStorage(options, self._optimizer, lower=lower)
-
-    def _create_external_storage(
-        self, options: List[DynamicEmbTableOptions]
-    ) -> Optional[Storage]:
-        """The tier below the tables, if ``external_storage`` asks for one.
-
-        It holds what the tables evict, and is asked for what they do not have.
-        """
-        PS = options[0].external_storage
-        if PS is None:
-            return None
-        ps_options = deepcopy(options)
-        for ps_option in ps_options:
-            ps_option.local_hbm_for_values = 0
-        return PS(ps_options, self._optimizer)
 
     def _create_initializers(self) -> None:
         """One initializer per module, not per table.
@@ -1353,6 +1195,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._evict_strategy,
                 frequency_counters,
                 self._admitter,
+                exchange=self._exchange,
                 outstanding_keys_ref=self._prefetch_outstanding_keys
                 if self._cache is not None
                 else None,

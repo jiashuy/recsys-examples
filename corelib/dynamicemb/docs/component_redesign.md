@@ -104,7 +104,11 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - 持有各组件（存储、缓存、优化器、initializer、admitter）并把它们接起来；
 - 对外的少量模块接口（按表名的 `set`、`flush`、score 设置等）。
 
-它**不再**负责：构造三种存储布局（交给一个 builder）、checkpoint / 增量 dump / replay（交给 `Checkpointer`）、内存报告（独立的报告函数）。
+它**不再**负责：构造存储布局（交给 `storage_layout.py` 里的 builder，已实现）、checkpoint / 增量 dump / replay（交给 `Checkpointer`）、内存报告（独立的报告函数）。
+
+### 2.9 存储布局与 builder【已实现】
+
+`storage_layout.py` 持有 `StorageLayout`（HBM_ONLY / HOST_ONLY / HYBRID / CACHING）和 `build_storage(options, optimizer, device_id)`，后者按各表的 value 大小与 HBM 预算选定布局并构造出来，返回 `StorageBundle(layout, storage, cache, exchange)`。`BatchedDynamicEmbeddingTablesV2` 只是调用它，拿到各部分后接起来；各层的容量换算、桶容量规则、external storage 的挂接、NO_EVICTION 的限制都在这个文件里。
 
 ## 三、迭代顺序
 
@@ -120,4 +124,3 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - admitter 在有 PS 时的具体语义（PS 里已有的 key 是否一律绕过准入）。
 - `RowExchange` 是否也提供读缓存、写缓存的接口，还是继续留在 `MixedDimBuffers`。
 - `MixedDimBuffers` 按下标管理表、表名由 `BatchedDynamicEmbeddingTablesV2` 处理，这一点是否足够。
-- 存储布局的 builder 放在哪里，以及它和 `BatchedDynamicEmbeddingTablesV2` 的边界。

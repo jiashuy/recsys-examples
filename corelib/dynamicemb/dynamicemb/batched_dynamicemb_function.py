@@ -309,6 +309,7 @@ def dynamicemb_prefetch(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     admitter: Optional[MultiTableAdmitter] = None,
+    exchange=None,
     outstanding_keys_ref: Optional[torch.Tensor] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
@@ -399,6 +400,7 @@ def dynamicemb_prefetch(
             ) = prefetch_cache_path(
                 cache,
                 storage,
+                exchange,
                 unique_keys,
                 unique_table_ids,
                 unique_offsets,

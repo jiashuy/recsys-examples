@@ -71,6 +71,7 @@ def _admit(
 def prefetch_cache_path(
     cache,
     storage: ChainedStorage,
+    exchange,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
     unique_offsets: torch.Tensor,
@@ -181,33 +182,20 @@ def prefetch_cache_path(
             )
         new_rows = new_nodes.to(torch.int64)
 
-        # 5a. the cache's victims go back to the storage rows they already have
-        victim_nodes = new_rows[has_victim]
-        victim_keys = victim_keys[has_victim]
-        victim_tids = alloc_tids[has_victim]
-        if victim_keys.numel() > 0:
-            with torch.cuda.nvtx.range("op:load_from_flat"):
-                victim_values = values.load(victim_nodes, victim_tids, copy_mode=CopyMode.VALUE
-                )
-            v_rows = index.lookup(victim_keys, victim_tids)
+        # 5a. each node swaps with the storage: the victim's row goes back to the row
+        # the victim already has there, and a key with a history brings its row in
+        evict_rows = torch.full_like(new_rows, -1)
+        if _bool_item(has_victim.any()):
+            v_rows = index.lookup(victim_keys[has_victim], alloc_tids[has_victim])
             if not _bool_item((v_rows >= 0).all()):
                 raise RuntimeError(
                     "a key the cache held is not in the backing table: the two "
                     "have drifted apart"
                 )
-            with torch.cuda.nvtx.range("op:store_to_flat"):
-                sstate.values.store(v_rows, victim_tids, victim_values)
-
-        # 5b. rows with a history come in from the storage
+            evict_rows[has_victim] = v_rows
         alloc_in_storage = founds[alloc_positions]
-        if _bool_item(alloc_in_storage.any()):
-            old_positions = alloc_positions[alloc_in_storage]
-            old_tids = alloc_tids[alloc_in_storage]
-            with torch.cuda.nvtx.range("op:load_from_flat"):
-                old_values = sstate.values.load(rows[old_positions], old_tids, copy_mode=CopyMode.VALUE
-                )
-            with torch.cuda.nvtx.range("op:store_to_flat"):
-                values.store(new_rows[alloc_in_storage], old_tids, old_values)
+        with torch.cuda.nvtx.range("op:swap_rows"):
+            exchange.swap(new_rows, alloc_tids, evict_rows, rows[alloc_positions])
 
         # 5c. new keys are initialised in their cache rows
         alloc_is_new = ~alloc_in_storage
