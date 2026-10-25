@@ -1738,8 +1738,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         agree on where a slot write lands. They do not agree on the delta: the
         configured order is the column order of the score block a dump emits,
         and replay reads that block with the *target's* order, deciding which
-        columns are ages to rebase (:func:`_timestamp_score_columns`) and how to
-        permute them (:func:`score_load_permutation`) by logical position. Two
+        columns are ages to rebase and how to permute them (:class:`ScoreRules`) by
+        logical position. Two
         tables matching physically and differing logically would rebase the
         frequency as though it were a timestamp and write each word into the
         other's slot, with nothing to signal it. Requiring the configured order

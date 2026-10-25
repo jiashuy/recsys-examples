@@ -81,7 +81,7 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 
 于是 Hybrid 是 `lower = HostTier`，PS 是 `lower = PSTier`，retain 是在去向外面包一层记录。`ChainedStorage` 里的 `retain_and_spill` 去掉。
 
-### 2.6 score 组件【已确定，待实现】
+### 2.6 score 组件【Python 侧已实现，kernel 接口未动】
 
 一个单独的组件回答所有与 score 有关的问题，其他组件都来问它：
 
@@ -90,6 +90,10 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - 增量 dump 的阈值列、timestamp 到 age 的转换；
 - checkpoint 的列顺序（逻辑到物理的置换）；
 - replay 怎么重建 score。
+
+实现：`dynamicemb/score.py` 的 `ScoreRules(strategy)`，每个存储一个（`ChainedStorage._score`）。`access()` 给出一次访问的 score 值和更新模式（原 `score_args`）；`to_logical`/`to_physical`、`to_age`/`from_age`、`dump_block`/`replay_block`、`fresh_block` 负责 checkpoint 列顺序、timestamp 与 age 的转换和 replay 的 score 重建。原来散在 `key_value_table.py`（`_scores_to_age`、`_age_to_scores`、`_fresh_score_block`、`_dump_score_block`、`_replay_score_block`）和 `chained_storage.py`（`_is_lru_lfu`）的代码已删。`dynamicemb_config.py` 里的三个排列函数保留（`jit/score_jit.py` 和配置检查还在用），`ScoreRules` 在它们之上。
+
+实现：`dynamicemb/score.py` 的 `ScoreRules(strategy)`：`access`（一次访问给的值和更新模式）、`to_logical`/`to_physical`（列顺序）、`to_age`/`from_age`、`dump_block`/`replay_block`（含宽度检查）、`fresh_block`。原来散在 `chained_storage.score_args`、`key_value_table` 的 `_scores_to_age`、`_age_to_scores`、`_fresh_score_block`、`_dump_score_block`、`_replay_score_block`、`_timestamp_score_columns` 的逻辑都收到这里；配置里的 `get_physical_score_order` 和两个置换函数仍在 `dynamicemb_config.py`（`jit/score_jit.py` 也用）。
 
 淘汰排序最终要在 kernel 里执行，不能回调 Python，所以组件的接口是**声明式**的：给出 score 字数、更新模式、排序规则，由索引的 kernel 解释；其余问题由 Python 侧直接问它。
 

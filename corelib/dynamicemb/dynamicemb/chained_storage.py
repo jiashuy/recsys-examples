@@ -36,21 +36,17 @@ from .dynamicemb_config import (
     DynamicEmbScoreStrategy,
     EvictedItemMode,
     ReplayContent,
-    score_load_permutation,
 )
 from .key_value_table import (
     DynamicEmbTableState,
     _all_gather_dumped_columns,
     _append_erased,
     _append_evicted,
-    _dump_score_block,
     _dump_table,
     _fill_from_lower,
     _iter_batches_from_files,
-    _fresh_score_block,
     _load_key_values,
     _pop_state_erased_keys,
-    _replay_score_block,
     _replay_write_values,
     _split_value_row,
     _validate_load_meta,
@@ -58,6 +54,7 @@ from .key_value_table import (
     export_keys_values_iter,
 )
 from .mixed_dim_buffers import MixedDimBuffers
+from .score import ScoreRules, is_lru_lfu
 from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
 
 _SUPPORTED = (
@@ -228,12 +225,6 @@ class _ChainedIndexView:
         return result
 
 
-def _is_lru_lfu(strategy) -> bool:
-    return isinstance(strategy, tuple) and frozenset(strategy) == frozenset(
-        {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
-    )
-
-
 class ChainedStorage(Storage):
     def __init__(
         self,
@@ -248,7 +239,7 @@ class ChainedStorage(Storage):
         storage next to this one, whose keys are disjoint from ours."""
         base = options[0]
         strategy = base.score_strategy
-        lru_lfu = _is_lru_lfu(strategy)
+        lru_lfu = is_lru_lfu(strategy)
         if not lru_lfu and strategy not in _SUPPORTED:
             raise NotImplementedError(
                 f"the chained index supports {[s.name for s in _SUPPORTED]} and the "
@@ -268,7 +259,7 @@ class ChainedStorage(Storage):
 
         self._lower = lower
         self._spill = spill_to
-        self._strategy = strategy
+        self._score = ScoreRules(strategy)
         self._state: DynamicEmbTableState = create_table_state(
             options,
             optimizer,
@@ -311,29 +302,8 @@ class ChainedStorage(Storage):
     def score_args(
         self, n: int, device: torch.device, frequency: Optional[torch.Tensor] = None
     ) -> Tuple[Optional[torch.Tensor], str]:
-        """The score and policy that this step's accesses give the keys they touch.
-
-        Lower scores are evicted first, so a timestamp, a step, a user score and a
-        frequency all rank the way they should.
-        """
-        s = self._strategy
-        if s == DynamicEmbScoreStrategy.TIMESTAMP:
-            # The device clock, as the existing index uses, so that a checkpoint's ages
-            # (a timestamp minus a score) mean the same thing here.
-            return (
-                torch.full((n,), device_timestamp(), dtype=torch.int64, device=device),
-                "assign",
-            )
-        if _is_lru_lfu(s):
-            # the timestamp is the device clock at the access; the frequency grows by
-            # what the step counted, or by one
-            return (None if frequency is None else frequency.to(torch.int64)), "lru_lfu"
-        if s in (DynamicEmbScoreStrategy.STEP, DynamicEmbScoreStrategy.CUSTOMIZED):
-            value = int(self._state.score or 0)
-            return torch.full((n,), value, dtype=torch.int64, device=device), "assign"
-        if s == DynamicEmbScoreStrategy.LFU:
-            return (None if frequency is None else frequency.to(torch.int64)), "accumulate"
-        return None, "none"
+        """The score and policy that this step's accesses give the keys they touch."""
+        return self._score.access(n, device, int(self._state.score or 0), frequency)
 
     def sync_value_buffers(self) -> None:
         """Give the value buffers as many rows as the index has handed out."""
@@ -352,7 +322,7 @@ class ChainedStorage(Storage):
 
     def grow_for(self, table: int, extra_keys: int) -> None:
         """Make room, within the table's maximum capacity, for ``extra_keys`` more."""
-        if self._strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+        if self._score.strategy == DynamicEmbScoreStrategy.NO_EVICTION:
             return
         opt = self._state.options_list[table]
         max_lf = float(opt.max_load_factor)
@@ -427,7 +397,7 @@ class ChainedStorage(Storage):
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ):
-        if self._state.training and self._strategy != DynamicEmbScoreStrategy.NO_EVICTION:
+        if self._state.training and self._score.strategy != DynamicEmbScoreStrategy.NO_EVICTION:
             # a training step's access counts: it moves the score of what it finds
             scores, policy = self.score_args(
                 unique_keys.numel(), unique_keys.device, lfu_accumulated_frequency
@@ -656,12 +626,9 @@ class ChainedStorage(Storage):
         keys = keys.to(device=device, dtype=state.key_index_map.key_type)
         embeddings = values.to(device=device, dtype=state.values.dtype)
         if ReplayContent.SCORE in content and scores is not None:
-            score_vec = _replay_score_block(state, table_id, scores, timestamp)
+            score_vec = self._score.replay_block(scores.to(state.device), timestamp)
         else:
-            score_vec = _fresh_score_block(
-                state, table_id, torch.zeros(n, dtype=torch.int64, device=device),
-                timestamp, insert_score,
-            )  # fmt: skip
+            score_vec = self._score.fresh_block(n, device, timestamp, insert_score)
         score_vec = score_vec.to(torch.int64)
         pair = self._index.num_scores == 2
         index = self._index
@@ -760,11 +727,6 @@ class ChainedStorage(Storage):
         num_scores = self._state.key_index_map.num_scores_
         # The checkpoint stores multi-word scores in the configured (logical) order;
         # put each batch back into the physical device layout.
-        load_perm = (
-            score_load_permutation(self._state.options_list[table_id].score_strategy)
-            if num_scores > 1
-            else None
-        )
         for keys, embeddings, scores, opt_states in _iter_batches_from_files(
             emb_key_path,
             embedding_file_path,
@@ -780,12 +742,8 @@ class ChainedStorage(Storage):
             shard_index=shard_index,
             num_shards=num_shards,
         ):
-            if (
-                scores is not None
-                and load_perm is not None
-                and load_perm != list(range(scores.size(1)))
-            ):
-                scores = scores[:, load_perm].contiguous()
+            if scores is not None and num_scores > 1:
+                scores = self._score.to_physical(scores)
             if scores is not None and self._state.evict_strategy == EvictStrategy.KLru:
                 scores = torch.clamp(timestamp - scores, min=0)
             _load_key_values(
@@ -840,7 +798,13 @@ class ChainedStorage(Storage):
         values = state.values.load_table(rows, table_id)
         value, opt = _split_value_row(state, table_id, values)
         key = keys.to(device)
-        score_block = _dump_score_block(state, table_id, rows, scores_batch, timestamp)
+        if self._score.num_words > 1:
+            physical = state.key_index_map.gather_score_blocks(
+                table_id, rows.to(torch.int64)
+            )
+        else:
+            physical = scores_batch.to(device=device, dtype=SCORE_TYPE)
+        score_block = self._score.dump_block(physical, timestamp)
         if not gather:
             key, value, rows, score_block = (
                 key.cpu(), value.cpu(), rows.cpu(), score_block.cpu(),
