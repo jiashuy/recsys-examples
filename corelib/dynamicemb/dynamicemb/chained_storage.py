@@ -262,7 +262,10 @@ class ChainedStorage(Storage):
                 "the chained index ranks a (TIMESTAMP, LFU) table by frequency and then "
                 "age; a custom score_function is not supported"
             )
-        cap = int(base.bucket_capacity)
+        # The tables of a storage share one bucket capacity (it is part of what groups
+        # tables), which is no larger than the smallest table's maximum.
+        cap = max(1, min(int(o.max_capacity) for o in options))
+        cap = min(int(base.bucket_capacity), cap)
         num_buckets = [max(1, math.ceil(int(o.init_capacity) / cap)) for o in options]
         slots = [n * cap for n in num_buckets]
         rows = [s + max(s // 8, 1024) for s in slots]

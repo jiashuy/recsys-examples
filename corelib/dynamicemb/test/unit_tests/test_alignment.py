@@ -12,8 +12,8 @@
 # ``world_size`` is ``int(os.environ.get("WORLD_SIZE", "1"))``; it must match
 # ``dist.get_world_size()`` after init (``torchrun`` sets ``WORLD_SIZE``; default is 1).
 # Set ``DYNAMICEMB_ALIGNMENT_FULL=1`` to add extra single-table ``num_embeddings`` values.
-# ``bucket_capacity`` is parametrized over ``DEFAULT_BUCKET_CAPACITY`` and ``256`` (the chained index
-# takes at most 256 slots per bucket).
+# ``bucket_capacity`` is parametrized over ``DEFAULT_BUCKET_CAPACITY``, ``1024`` and
+# ``MAX_BUCKET_CAPACITY`` (the whole shard as one bucket).
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.key_value_table import DynamicEmbCache
 from dynamicemb.optimizer import DynamicEmbOptimType, OptimType, get_optimizer_state_dim
 from dynamicemb.planner import get_planner
+from dynamicemb.types import MAX_BUCKET_CAPACITY
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
@@ -253,7 +254,7 @@ def assert_cache_and_storage_shapes(
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize(
     "bucket_capacity",
-    [DEFAULT_BUCKET_CAPACITY, 256],
+    [DEFAULT_BUCKET_CAPACITY, 1024, MAX_BUCKET_CAPACITY],
 )
 @pytest.mark.parametrize(
     "optimizer_type",

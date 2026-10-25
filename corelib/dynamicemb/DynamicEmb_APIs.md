@@ -158,7 +158,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (validated by `check_bucket_capacity`). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (a positive multiple of **`BUCKET_ALIGNMENT` (16)**, at most **`MAX_BUCKET_CAPACITY`** = 256). `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (`bucket_capacity` must be positive). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (any positive number). **If `bucket_capacity` is not smaller than the per-rank rows** (`MAX_BUCKET_CAPACITY` = `2**63 - 1` always is) the layout is `(1, per_rank_rows)`: one bucket of exactly the shard, nothing added. **Otherwise** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
@@ -198,7 +198,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 
 - **`global_hbm_for_values`**: global HBM byte budget for the table’s values; the planner only splits it across ranks.
-- **`bucket_capacity`**: hashtable bucket size in rows (see rules above): a multiple of 16, at most `MAX_BUCKET_CAPACITY` (256).
+- **`bucket_capacity`**: hashtable bucket size in rows (see rules above): any positive number, or `MAX_BUCKET_CAPACITY` for one bucket per rank table.
 - **`initializer_args`**: optional partial bounds for `UNIFORM`; missing bounds are completed as in step 1.
 
 **Downstream (after planning, when modules are built):** the batched embedding path uses **`max_capacity`** from **`DynamicEmbTableOptions`** (e.g. allocation size and consistency checks against TorchREC shard row counts in `_get_dynamicemb_options_per_table` in `batched_dynamicemb_compute_kernel.py`).
@@ -208,7 +208,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 - `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
 - `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
 - `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
-- `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
+- `from dynamicemb import MAX_BUCKET_CAPACITY`
 
 ## DynamicEmbeddingCollectionSharder
 
@@ -809,7 +809,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 When `caching=True`, it decides the number of rows of the GPU cache.
             To match planner row counts and optimizer state width, size the **global** budget with
             ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
-            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``256``),
+            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
             then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
             ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
         external_storage: Storage

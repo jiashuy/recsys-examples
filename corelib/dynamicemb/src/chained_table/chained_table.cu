@@ -24,7 +24,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // A table is `num_buckets` buckets of `cap` slots. A key belongs to bucket
 // hash(key) % num_buckets and, inside it, to chain (hash >> 32) % cap. A bucket
 // has `cap` chain heads, one per slot, and every slot has a `next`; both are
-// bucket-local offsets (uint16, 0xFFFF for none), so a chain never leaves its
+// bucket-local offsets (2 or 4 bytes wide, all ones for none), so a chain never leaves its
 // bucket. The occupied slots of a bucket are always the prefix [0, bucket_size).
 // A slot holds (key, score, index): `index` is the row of the key's value, taken
 // from a pool of rows that is independent of where the key sits.
@@ -62,9 +62,30 @@ namespace py = pybind11;
 namespace dyn_emb {
 namespace chained {
 
-constexpr uint16_t kNull = 0xFFFF;
-constexpr int kMaxBucketCapacity = 256;
+constexpr uint32_t kNull = 0xFFFFFFFFu;
+// Buckets up to this many slots choose their victims out of registers; larger
+// ones rescan the bucket for each victim.
+constexpr int kRegisterBucket = 256;
+// A victim's slot is marked dead in the top bit of its row while it is unlinked.
+constexpr uint32_t kDeadBit = 0x80000000u;
 constexpr int kWarpsPerBlock = 4;
+
+// A chain link is 2 bytes (the default) or 4 wide; all ones means none.
+__device__ __forceinline__ uint32_t ld_link(const void *p, int wide,
+                                            int64_t i) {
+  if (wide) return static_cast<const uint32_t *>(p)[i];
+  const uint32_t x = static_cast<const uint16_t *>(p)[i];
+  return x == 0xFFFFu ? kNull : x;
+}
+
+__device__ __forceinline__ void st_link(void *p, int wide, int64_t i,
+                                        uint32_t x) {
+  if (wide) {
+    static_cast<uint32_t *>(p)[i] = x;
+  } else {
+    static_cast<uint16_t *>(p)[i] = x == kNull ? uint16_t(0xFFFFu) : uint16_t(x);
+  }
+}
 
 __host__ __device__ __forceinline__ uint64_t hash64(int64_t key) {
   uint64_t x = static_cast<uint64_t>(key);
@@ -80,8 +101,8 @@ struct TableView {
   int64_t *keys;
   uint64_t *scores;
   uint32_t *index;
-  uint16_t *next;
-  uint16_t *head;
+  void *next;
+  void *head;
   int32_t *bucket_size;
   int32_t *refs;     // pin count of each row, or null when the table does not pin
   uint32_t *free_rows;  // the stack of free rows ...
@@ -90,8 +111,10 @@ struct TableView {
   int64_t gid_base;  // buckets of the tables before this one: a bucket's global id
   int32_t cap;
   int32_t num_scores;  // score words per slot: 1, or 2 for (timestamp, frequency)
+  int32_t wide;        // chain links are 4 bytes wide rather than 2
+  int32_t pad;
 };
-static_assert(sizeof(TableView) == 96, "the layout is built on the host");
+static_assert(sizeof(TableView) == 104, "the layout is built on the host");
 
 __global__ void gid_kernel(const TableView *__restrict__ views,
                            const int64_t *__restrict__ keys,
@@ -137,7 +160,7 @@ __global__ void find_kernel(const TableView *__restrict__ views,
     const int c = static_cast<int>((h >> 32) % uint32_t(v.cap));
     const int64_t base = b * v.cap;
     int64_t row = -1;
-    uint16_t cur = v.head[base + c];
+    uint32_t cur = ld_link(v.head, v.wide, base + c);
     // The walk is bounded by the bucket size: a chain can hold no more nodes.
     for (int step = 0; cur != kNull && step < v.cap; ++step) {
       const int64_t s = base + cur;
@@ -155,7 +178,7 @@ __global__ void find_kernel(const TableView *__restrict__ views,
         if (pin && v.refs != nullptr) atomicAdd(&v.refs[row], 1);
         break;
       }
-      cur = v.next[s];
+      cur = ld_link(v.next, v.wide, s);
     }
     rows[i] = row;
   }
@@ -241,14 +264,7 @@ __global__ void place_kernel(
     int64_t *__restrict__ vtabs, int64_t *__restrict__ vscores,
     int32_t *__restrict__ seg_fail, unsigned long long *__restrict__ nfail,
     embedding_cache::EvictionGuardView guard, int pin_new) {
-  __shared__ uint8_t dead[kWarpsPerBlock][kMaxBucketCapacity];
-
   if (*abort != 0) return;
-  for (int j = threadIdx.x; j < kWarpsPerBlock * kMaxBucketCapacity;
-       j += blockDim.x) {
-    (&dead[0][0])[j] = 0;
-  }
-  __syncthreads();
 
   constexpr unsigned kFull = 0xffffffffu;
   const int64_t num_segments = *nseg_ptr;
@@ -271,7 +287,60 @@ __global__ void place_kernel(
 
     // 1. victims
     bool fail = false;
-    if (k > 0) {
+    if (k > 0 && v.cap > kRegisterBucket) {
+      // A bucket too large for registers: each victim is found by a scan of the
+      // bucket for the smallest rank above the one chosen before it, so a member
+      // the guard or a reference refuses is passed over without being marked.
+      const int S = v.num_scores;
+      uint64_t last_hi = 0, last_lo = 0;
+      int64_t last_slot = -1;
+      int64_t sel = 0;
+      while (sel < k) {
+        uint64_t bs = ~0ULL, bt = ~0ULL;
+        uint32_t bl = 0xFFFFFFFFu;
+        for (int64_t j = lane; j < s0; j += 32) {
+          uint64_t hi, lo;
+          if (S == 1) {
+            hi = v.scores[base + j];
+            lo = 0;
+          } else {
+            lo = v.scores[(base + j) * S];
+            hi = v.scores[(base + j) * S + 1];
+          }
+          if (last_slot >= 0 &&
+              !(hi > last_hi || (hi == last_hi && (lo > last_lo || (lo == last_lo && j > last_slot))))) {
+            continue;
+          }
+          if (hi < bs || (hi == bs && (lo < bt || (lo == bt && uint32_t(j) < bl)))) {
+            bs = hi;
+            bt = lo;
+            bl = uint32_t(j);
+          }
+        }
+        warp_min3(bs, bt, bl);
+        if (bl == 0xFFFFFFFFu) {
+          fail = true;
+          break;
+        }
+        last_hi = bs;
+        last_lo = bt;
+        last_slot = bl;
+        const int owner = int(bl & 31u);
+        bool refused = false;
+        if (lane == owner) {
+          if (v.refs != nullptr && v.refs[v.index[base + bl]] > 0) {
+            refused = true;
+          } else if (guard.tables != nullptr) {
+            refused = guard.refuses(v.keys[base + bl], t);
+          }
+        }
+        refused = __shfl_sync(kFull, refused, owner);
+        if (!refused) {
+          if (lane == 0) vict_slot[voff + sel] = int32_t(bl);
+          ++sel;
+        }
+      }
+    } else if (k > 0) {
       // The rank of a member: its score, or for a (timestamp, frequency) pair the
       // frequency first and then the timestamp -- the least used goes first, the
       // oldest of those first.
@@ -368,7 +437,7 @@ __global__ void place_kernel(
               static_cast<int64_t>(v.scores[sl * v.num_scores + w3]);
         }
         chv = static_cast<int>((hash64(vkey) >> 32) % uint32_t(v.cap));
-        dead[w][slot] = 1;
+        v.index[sl] |= kDeadBit;
       }
       __syncwarp();
       const unsigned vmask = __ballot_sync(kFull, victim);
@@ -380,20 +449,20 @@ __global__ void place_kernel(
         }
         if (leader) {
           int prev = -1;
-          uint16_t cur = v.head[base + chv];
+          uint32_t cur = ld_link(v.head, v.wide, base + chv);
           while (cur != kNull) {
-            const uint16_t nx = v.next[base + cur];
-            if (dead[w][cur]) {
-              if (prev < 0) v.head[base + chv] = nx; else v.next[base + prev] = nx;
+            const uint32_t nx = ld_link(v.next, v.wide, base + cur);
+            if (v.index[base + cur] & kDeadBit) {
+              if (prev < 0) st_link(v.head, v.wide, base + chv, nx);
+              else st_link(v.next, v.wide, base + prev, nx);
             } else {
-              prev = cur;
+              prev = int(cur);
             }
             cur = nx;
           }
         }
       }
       __syncwarp();
-      if (victim) dead[w][slot] = 0;
 
       // 2b. the records
       int chn = 0;
@@ -424,8 +493,8 @@ __global__ void place_kernel(
       }
       for (int r = 0; r <= maxrank; ++r) {
         if (active && rank == r) {
-          v.next[base + slot] = v.head[base + chn];
-          v.head[base + chn] = uint16_t(slot);
+          st_link(v.next, v.wide, base + slot, ld_link(v.head, v.wide, base + chn));
+          st_link(v.head, v.wide, base + chn, uint32_t(slot));
         }
         __syncwarp();
       }
@@ -458,10 +527,10 @@ __global__ void erase_kernel(const TableView *__restrict__ views,
       const int64_t key = skeys[begin + j];
       const int ch = static_cast<int>((hash64(key) >> 32) % uint32_t(v.cap));
       int prev = -1;
-      uint16_t cur = v.head[base + ch];
+      uint32_t cur = ld_link(v.head, v.wide, base + ch);
       while (cur != kNull && v.keys[base + cur] != key) {
-        prev = cur;
-        cur = v.next[base + cur];
+        prev = int(cur);
+        cur = ld_link(v.next, v.wide, base + cur);
       }
       if (cur == kNull) {
         srows[begin + j] = -1;
@@ -469,21 +538,21 @@ __global__ void erase_kernel(const TableView *__restrict__ views,
       }
       const int64_t slot = cur;
       srows[begin + j] = static_cast<int64_t>(v.index[base + slot]);
-      if (prev < 0) v.head[base + ch] = v.next[base + slot];
-      else v.next[base + prev] = v.next[base + slot];
+      if (prev < 0) st_link(v.head, v.wide, base + ch, ld_link(v.next, v.wide, base + slot));
+      else st_link(v.next, v.wide, base + prev, ld_link(v.next, v.wide, base + slot));
       const int32_t last = v.bucket_size[b] - 1;
       if (slot != last) {
         const int64_t lk = v.keys[base + last];
         const int lch = static_cast<int>((hash64(lk) >> 32) % uint32_t(v.cap));
         int p = -1;
-        uint16_t c2 = v.head[base + lch];
-        while (c2 != kNull && c2 != uint16_t(last)) {
-          p = c2;
-          c2 = v.next[base + c2];
+        uint32_t c2 = ld_link(v.head, v.wide, base + lch);
+        while (c2 != kNull && c2 != uint32_t(last)) {
+          p = int(c2);
+          c2 = ld_link(v.next, v.wide, base + c2);
         }
-        if (p < 0) v.head[base + lch] = uint16_t(slot);
-        else v.next[base + p] = uint16_t(slot);
-        v.next[base + slot] = v.next[base + last];
+        if (p < 0) st_link(v.head, v.wide, base + lch, uint32_t(slot));
+        else st_link(v.next, v.wide, base + p, uint32_t(slot));
+        st_link(v.next, v.wide, base + slot, ld_link(v.next, v.wide, base + last));
         v.keys[base + slot] = lk;
         for (int k = 0; k < v.num_scores; ++k) {
           v.scores[(base + slot) * v.num_scores + k] =
@@ -704,13 +773,12 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
                               std::vector<int64_t> num_buckets, int64_t cap,
                               int64_t num_scores) {
   const size_t nt = keys.size();
+  TORCH_CHECK(cap > 0, "bucket capacity must be positive");
   TORCH_CHECK(scores.size() == nt && index.size() == nt && next.size() == nt &&
                   head.size() == nt && bucket_size.size() == nt &&
                   refs.size() == nt && free_rows.size() == nt &&
                   num_buckets.size() == nt,
               "one entry per table in every list");
-  TORCH_CHECK(cap > 0 && cap <= kMaxBucketCapacity,
-              "bucket capacity must be in [1, ", kMaxBucketCapacity, "]");
   check_cuda(tops, "tops");
   TORCH_CHECK(tops.scalar_type() == at::kInt && tops.numel() == int64_t(nt),
               "tops must be one int32 per table");
@@ -727,8 +795,15 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
                 "keys and scores must be 8 bytes wide");
     TORCH_CHECK(num_scores == 1 || num_scores == 2, "one or two score words");
     TORCH_CHECK(index[t].element_size() == 4, "index must be 4 bytes wide");
-    TORCH_CHECK(next[t].element_size() == 2 && head[t].element_size() == 2,
-                "next and head must be 2 bytes wide");
+    // Links are as wide in every array of every table: 2 bytes, or 4.
+    TORCH_CHECK(next[t].element_size() == head[t].element_size() &&
+                    next[t].element_size() == next[0].element_size() &&
+                    (next[t].element_size() == 2 || next[t].element_size() == 4),
+                "next and head must be 2 or 4 bytes wide, the same in every table");
+    // A link has to hold every offset below 4 * cap and the value that means none.
+    TORCH_CHECK(next[t].element_size() == 4 ||
+                    4 * cap < int64_t(0xFFFF),
+                "bucket capacity ", cap, " needs 4 byte links");
     TORCH_CHECK(bucket_size[t].scalar_type() == at::kInt,
                 "bucket_size must be int32");
     const int64_t slots = num_buckets[t] * cap;
@@ -742,8 +817,10 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     v.keys = reinterpret_cast<int64_t *>(keys[t].data_ptr());
     v.scores = reinterpret_cast<uint64_t *>(scores[t].data_ptr());
     v.index = reinterpret_cast<uint32_t *>(index[t].data_ptr());
-    v.next = reinterpret_cast<uint16_t *>(next[t].data_ptr());
-    v.head = reinterpret_cast<uint16_t *>(head[t].data_ptr());
+    v.next = next[t].data_ptr();
+    v.head = head[t].data_ptr();
+    v.wide = next[t].element_size() == 4 ? 1 : 0;
+    v.pad = 0;
     v.bucket_size = bucket_size[t].data_ptr<int32_t>();
     if (refs[t].has_value() && refs[t]->defined()) {
       check_cuda(*refs[t], "table refs");
@@ -754,10 +831,14 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     }
     check_cuda(free_rows[t], "free rows");
     TORCH_CHECK(free_rows[t].element_size() == 4, "free rows must be 4 bytes wide");
+    // The top bit of a row marks a slot whose key is leaving while a step places.
+    TORCH_CHECK(free_rows[t].numel() < (int64_t(1) << 31),
+                "a table of at most 2^31 - 1 rows");
     v.free_rows = reinterpret_cast<uint32_t *>(free_rows[t].data_ptr());
     v.top = tops.data_ptr<int32_t>() + t;
     v.num_buckets = num_buckets[t];
     v.gid_base = gid_base;
+    TORCH_CHECK(cap < (int64_t(1) << 31), "bucket capacity must fit in 31 bits");
     v.cap = static_cast<int32_t>(cap);
     v.num_scores = static_cast<int32_t>(num_scores);
     gid_base += num_buckets[t];

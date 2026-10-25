@@ -46,7 +46,6 @@ from .incremental_dump import (
 )
 from .optimizer import DynamicEmbOptimType, EmbOptimType, OptimizerArgs
 from .types import (
-    BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
     MAX_BUCKET_CAPACITY,
     AdmissionStrategy,
@@ -60,7 +59,6 @@ from .utils import torch_to_dyn_emb
 
 __all__ = [
     "AdmissionStrategy",
-    "BUCKET_ALIGNMENT",
     "DEMB_TABLE_ALIGN_SIZE",
     "MAX_BUCKET_CAPACITY",
     "align_to_table_size",

@@ -122,13 +122,21 @@ class ChainedTables:
         if num_scores not in (1, 2):
             raise ValueError("a slot holds one score word, or two: (timestamp, frequency)")
         self.num_scores = int(num_scores)
-        if not 1 <= bucket_capacity <= 256:
-            raise ValueError("bucket_capacity must be in [1, 256]")
         self.num_tables = len(num_buckets)
         if self.num_tables < 1 or min(num_buckets) < 1:
             raise ValueError("every table needs at least one bucket")
-        self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.bucket_capacity = int(bucket_capacity)
+        if self.bucket_capacity < 1:
+            raise ValueError("bucket_capacity must be positive")
+        # A link is an offset in a bucket, and the offsets below 4 * capacity have to
+        # fit it with the value that means none: 2 bytes unless a bucket is large.
+        if 4 * self.bucket_capacity < 0xFFFF:
+            self._link_dtype = torch.int16
+        elif 4 * self.bucket_capacity < 0xFFFFFFFF:
+            self._link_dtype = torch.int32
+        else:
+            raise ValueError("a bucket takes at most 2^30 - 1 slots")
+        self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.track_refs = bool(track_refs)
         if isinstance(no_eviction, bool):
             no_eviction = [no_eviction] * self.num_tables
@@ -155,8 +163,8 @@ class ChainedTables:
             slots = nb * self.bucket_capacity
             if rows[t] < slots:
                 raise ValueError("row_capacity must cover every slot")
-            if rows[t] >= 1 << 32:
-                raise ValueError("row_capacity must fit in 32 bits")
+            if rows[t] >= 1 << 31:
+                raise ValueError("row_capacity must fit in 31 bits")
             self._append_arrays(nb)
             self._refs.append(
                 torch.zeros(rows[t], dtype=torch.int32, device=dev)
@@ -183,8 +191,8 @@ class ChainedTables:
             torch.zeros(slots, dtype=torch.int64, device=dev),
             torch.zeros(slots * self.num_scores, dtype=torch.int64, device=dev),
             torch.zeros(slots, dtype=torch.int32, device=dev),
-            torch.full((slots,), -1, dtype=torch.int16, device=dev),
-            torch.full((slots,), -1, dtype=torch.int16, device=dev),
+            torch.full((slots,), -1, dtype=self._link_dtype, device=dev),
+            torch.full((slots,), -1, dtype=self._link_dtype, device=dev),
             torch.zeros(nb, dtype=torch.int32, device=dev),
         )
 
@@ -587,8 +595,8 @@ class ChainedTables:
         for t in range(self.num_tables):
             keys = self._keys[t].cpu().tolist()
             index = self._index[t].cpu().tolist()
-            nxt = (self._next[t].cpu().to(torch.int32) & 0xFFFF).tolist()
-            head = (self._head[t].cpu().to(torch.int32) & 0xFFFF).tolist()
+            nxt = self._next[t].cpu().to(torch.int64).tolist()
+            head = self._head[t].cpu().to(torch.int64).tolist()
             sizes = self._bsize[t].cpu().tolist()
             seen_keys = set()
             seen_rows = set()
@@ -599,7 +607,7 @@ class ChainedTables:
                 for c in range(cap):
                     cur = head[b * cap + c]
                     steps = 0
-                    while cur != 0xFFFF:
+                    while cur != -1:
                         assert cur < size, f"bucket {b}: chain {c} reaches slot {cur}"
                         key = keys[b * cap + cur]
                         h = hash_py(key)

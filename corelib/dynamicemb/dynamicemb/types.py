@@ -150,12 +150,9 @@ OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
 DEMB_TABLE_ALIGN_SIZE = 16
 
-# Per-bucket row alignment for hashtable backends (same as :data:`DEMB_TABLE_ALIGN_SIZE`).
-BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
-
-# The largest ``bucket_capacity`` a table takes: slots of a bucket are addressed by a
-# byte in the chained key index.
-MAX_BUCKET_CAPACITY: int = 256
+# ``bucket_capacity`` that makes the whole per-rank table one bucket; any
+# ``bucket_capacity`` not smaller than the per-rank row count does the same.
+MAX_BUCKET_CAPACITY: int = 2**63 - 1
 
 torch_dtype_to_np_dtype = {
     torch.uint64: np.uint64,

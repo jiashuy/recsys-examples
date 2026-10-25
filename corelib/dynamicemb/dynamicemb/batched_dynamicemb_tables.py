@@ -833,7 +833,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
                     hbm_options = deepcopy(self._dynamicemb_options)
                     for hbm_option in hbm_options:
-                        hbm_option.bucket_capacity = 1024
                         cap = max(1, int(hbm_option.max_capacity * cap_scale))
                         hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
                         hbm_option.init_capacity = hbm_option.max_capacity
@@ -858,11 +857,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             "configuration."
                         )
 
-                    for hbm_option in hbm_options:
-                        # the chained index takes buckets of at most 256 slots
-                        hbm_option.bucket_capacity = min(
-                            int(hbm_option.bucket_capacity), 128
-                        )
                     self._storage = ChainedHybridStorage(
                         hbm_options, host_options, self._optimizer
                     )

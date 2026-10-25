@@ -261,7 +261,14 @@ def test_the_row_pool_can_run_out(device):
 # on one chain that several victims and several new keys share it.
 @pytest.mark.parametrize(
     "shape",
-    [(1, 8, 6), (4, 16, 24), (16, 32, 150), (64, 128, 800), (1, 128, 100), (2, 256, 200), (1, 64, 60)],
+    [
+        (1, 8, 6), (4, 16, 24), (16, 32, 150), (64, 128, 800), (1, 128, 100), (2, 256, 200),
+        (1, 64, 60),
+        # Buckets too large for the registers of a warp: a victim is found by a scan.
+        (1, 600, 500), (3, 300, 400), (2, 1000, 900),
+        # Links of 4 bytes: four times the capacity does not fit in 2.
+        (1, 17000, 3000),
+    ],
 )
 def test_matches_the_model_over_many_steps(device, shape, policy):
     nb, cap, per_step = shape
@@ -422,9 +429,9 @@ def _multi_state(tables, t):
     return list(zip(keys.tolist(), scores.tolist(), rows.tolist()))
 
 
-def test_several_tables_match_one_model_each(device):
+@pytest.mark.parametrize("cap", [16, 300])
+def test_several_tables_match_one_model_each(device, cap):
     nbs = [4, 8, 2]
-    cap = 16
     tables = ChainedTables(nbs, bucket_capacity=cap, device=device)
     models = [Model(nb, cap, tables.row_capacity_of(t)) for t, nb in enumerate(nbs)]
     rng = random.Random(7)
@@ -608,7 +615,9 @@ def _model_erase(model, keys):
     return freed
 
 
-@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100)])
+@pytest.mark.parametrize(
+    "shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100), (2, 700, 300), (1, 17000, 2000)]
+)
 def test_erase_matches_the_model(device, shape):
     nb, cap, per_step = shape
     rng = random.Random(99 + nb)
@@ -746,7 +755,9 @@ def _pair_state(table):
     return list(zip(keys.tolist(), scores[:, 0].tolist(), scores[:, 1].tolist(), rows.tolist()))
 
 
-@pytest.mark.parametrize("shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100)])
+@pytest.mark.parametrize(
+    "shape", [(1, 8, 6), (4, 16, 24), (16, 32, 150), (1, 128, 100), (1, 600, 500)]
+)
 def test_a_timestamp_and_frequency_pair_matches_the_model(device, shape):
     nb, cap, per_step = shape
     rng = random.Random(321 + nb)
@@ -813,3 +824,13 @@ def test_erase_and_growth_keep_both_words(device):
         else:
             assert got[key] == [500, key * 3]
     table.check_invariants()
+
+
+@pytest.mark.parametrize(
+    "cap, dtype",
+    [(1, torch.int16), (128, torch.int16), (16383, torch.int16), (16384, torch.int32), (100000, torch.int32)],
+)
+def test_links_are_two_bytes_unless_four_times_the_capacity_does_not_fit(device, cap, dtype):
+    table = ChainedTable(num_buckets=1, bucket_capacity=cap, device=device)
+    assert table._link_dtype == dtype
+    assert table._next[0].dtype == dtype and table._head[0].dtype == dtype

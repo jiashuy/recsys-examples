@@ -25,11 +25,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
 from dynamicemb.types import (
-    BUCKET_ALIGNMENT,
     DEFAULT_UNIFORM_LOWER,
     DEFAULT_UNIFORM_UPPER,
     DEMB_TABLE_ALIGN_SIZE,
-    MAX_BUCKET_CAPACITY,
     AdmissionStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -493,9 +491,11 @@ class DynamicEmbTableOptions:
         strategies without a timestamp column, ``incremental_dump`` instead thresholds
         on the absolute score value.
     bucket_capacity : int
-        Capacity of each bucket in the hash table, default 128: a positive multiple of ``BUCKET_ALIGNMENT``,
-        at most ``MAX_BUCKET_CAPACITY`` (256); anything else raises ``ValueError``.
-        A key will only be mapped to one bucket.
+        Capacity of each bucket in the hash table, default 128: any positive number.
+        A value not smaller than the per-rank row count (``MAX_BUCKET_CAPACITY`` for one) makes the
+        whole table a single bucket of exactly the per-rank rows; otherwise the per-rank rows are
+        rounded up to a multiple of it. A bucket is scanned to choose its victims, so large buckets
+        suit small tables. A key will only be mapped to one bucket.
         When the bucket is full, the key with the smallest score in the bucket will be evicted, and its row will be used to store a new key.
         The new keys of one step must fit the buckets they hash to, or the step raises ``ChainedTableFull``.
         The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
@@ -723,6 +723,8 @@ class DynamicEmbTableOptions:
         # per-storage choice, so tables differing in it must not share storage.
         grouped_key["evicted_item_mode"] = self.evicted_item_mode
         grouped_key["optimizer_state_dtype"] = self.optimizer_state_dtype
+        # The tables of a storage share the capacity of their buckets.
+        grouped_key["bucket_capacity"] = self.bucket_capacity
         return grouped_key
 
     def __hash__(self):
@@ -905,17 +907,9 @@ def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
 
 
 def check_bucket_capacity(bucket_capacity: int) -> None:
-    """A bucket holds a multiple of :data:`BUCKET_ALIGNMENT` rows, at most
-    :data:`MAX_BUCKET_CAPACITY`."""
-    if not 0 < bucket_capacity <= MAX_BUCKET_CAPACITY:
-        raise ValueError(
-            f"bucket_capacity must be in (0, {MAX_BUCKET_CAPACITY}], got {bucket_capacity}"
-        )
-    if bucket_capacity % BUCKET_ALIGNMENT != 0:
-        raise ValueError(
-            f"bucket_capacity ({bucket_capacity}) must be a multiple of "
-            f"BUCKET_ALIGNMENT ({BUCKET_ALIGNMENT})."
-        )
+    """A bucket holds any positive number of rows."""
+    if bucket_capacity <= 0:
+        raise ValueError(f"bucket_capacity must be positive, got {bucket_capacity}")
 
 
 def _sharded_table_bucket_layout(
@@ -936,6 +930,9 @@ def _sharded_table_bucket_layout(
     shard_rows = math.ceil(num_global / world_size)
 
     check_bucket_capacity(bucket_capacity)
+    if bucket_capacity >= shard_rows:
+        # One bucket as large as the shard; no rows are added to align it.
+        return 1, shard_rows
 
     table_capacity = align_to_table_size(shard_rows, bucket_capacity)
     num_buckets = table_capacity // bucket_capacity
@@ -961,8 +958,10 @@ def get_sharded_table_capacity(
     world_size
         Number of ranks (must be positive).
     bucket_capacity
-        Bucket size in rows: a positive multiple of :data:`BUCKET_ALIGNMENT`, at most
-        :data:`dynamicemb.types.MAX_BUCKET_CAPACITY`.
+        Bucket size in rows, any positive number. If it is not smaller than the per-rank
+        row count (as :data:`dynamicemb.types.MAX_BUCKET_CAPACITY` never is) the table is
+        one bucket of exactly that many rows; otherwise the per-rank rows are rounded up
+        to a multiple of it.
 
     Returns
     -------
