@@ -21,8 +21,13 @@ for its own ``value_dim``, and the kernels that read and write rows are given th
 set at once: the base pointers of the buffers, the dimensions of every table, the widest
 of them. :class:`MixedDimBuffers` keeps those together, so nothing outside has to keep
 them in step -- when a buffer grows its pointer is refreshed here.
+
+What an optimizer needs to know about the rows -- where each table's rows are, how wide the
+embedding and the whole row are -- is :class:`RowLayout`, taken from :attr:`MixedDimBuffers.layout`.
+The optimizer works on rows through it; the buffers themselves know nothing of optimizers.
 """
 
+from dataclasses import dataclass
 from typing import List, Sequence
 
 import torch
@@ -38,6 +43,25 @@ from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
 from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
 from dynamicemb_extensions import store_to_flat_table_value as _store_value
+
+
+@dataclass(frozen=True)
+class RowLayout:
+    """A view of the rows of :class:`MixedDimBuffers`, for the optimizer.
+
+    A row is the embedding (``emb_dims[t]`` wide for table ``t``) followed by the optimizer
+    state, ``value_dims[t]`` wide in all. In a padded buffer (the output of ``load``) the
+    state of every row starts at ``max_emb_dim``, whatever the table. ``ptrs`` are the base
+    pointers of the buffers, valid until one of them grows.
+    """
+
+    ptrs: torch.Tensor
+    dtype: torch.dtype
+    value_dims: torch.Tensor
+    emb_dims: torch.Tensor
+    max_emb_dim: int
+    max_value_dim: int
+    all_dims_vec4: bool
 
 
 class MixedDimBuffers:
@@ -91,6 +115,18 @@ class MixedDimBuffers:
         self.ptrs = self._base_pointers()
 
     # -- layout ---------------------------------------------------------------
+
+    @property
+    def layout(self) -> RowLayout:
+        return RowLayout(
+            self.ptrs,
+            self.dtype,
+            self.value_dims,
+            self.emb_dims,
+            self.max_emb_dim,
+            self.max_value_dim,
+            self.all_dims_vec4,
+        )
 
     def _base_pointers(self) -> torch.Tensor:
         return torch.tensor(
@@ -200,57 +236,4 @@ class MixedDimBuffers:
             self.emb_dims,
             self.max_emb_dim,
             self.all_dims_vec4,
-        )
-
-    # -- optimizer ------------------------------------------------------------
-
-    def update_rows(
-        self,
-        optimizer,
-        grads: torch.Tensor,
-        rows: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Apply the optimizer to the stored rows in place: one gradient per (row, table)."""
-        optimizer.fused_update_for_flat_table(
-            grads.to(self.dtype),
-            rows,
-            self.ptrs,
-            table_ids,
-            self.value_dims,
-            self.emb_dims,
-            self.max_emb_dim,
-            self.all_dims_vec4,
-            self.dtype,
-        )
-
-    def update_padded(
-        self,
-        optimizer,
-        grads: torch.Tensor,
-        padded: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Apply the optimizer to value rows already loaded into ``padded`` (the output of
-        :meth:`load`, as wide as the widest table): each row's optimizer state sits after
-        its own table's embedding, at offset ``max_emb_dim``."""
-        optimizer.update_for_padded_buffer(
-            grads,
-            padded,
-            table_ids,
-            self.emb_dims,
-            self.max_emb_dim,
-            self.max_value_dim,
-            self.all_dims_vec4,
-        )
-
-    def reset_optimizer_states(
-        self, optimizer, padded: torch.Tensor, table_ids: torch.Tensor
-    ) -> None:
-        """Give the rows of ``padded`` the optimizer's initial state, each as wide as its
-        own table's. A no-op when no table keeps any."""
-        if self.max_value_dim == self.max_emb_dim:
-            return
-        optimizer.reset_optimizer_states(
-            padded[:, self.max_emb_dim :], emb_dims=self.emb_dims[table_ids]
         )

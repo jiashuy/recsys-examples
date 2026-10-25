@@ -18,7 +18,7 @@ import copy
 import enum
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch  # usort:skip
 from dynamicemb.utils import DTYPE_NUM_BYTES, torch_to_dyn_emb
@@ -35,6 +35,9 @@ from dynamicemb_extensions import (
     sgd_update_for_padded_buffer,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+if TYPE_CHECKING:
+    from dynamicemb.mixed_dim_buffers import RowLayout
 
 
 class DynamicEmbOptimType(enum.Enum):
@@ -197,6 +200,57 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         all_dims_vec4: bool,
     ) -> None:
         ...
+
+    def update_rows(
+        self,
+        layout: "RowLayout",
+        grads: torch.Tensor,
+        rows: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Apply the update in place to the stored rows: one gradient per (row, table)."""
+        self.fused_update_for_flat_table(
+            grads.to(layout.dtype),
+            rows,
+            layout.ptrs,
+            table_ids,
+            layout.value_dims,
+            layout.emb_dims,
+            layout.max_emb_dim,
+            layout.all_dims_vec4,
+            layout.dtype,
+        )
+
+    def update_padded(
+        self,
+        layout: "RowLayout",
+        grads: torch.Tensor,
+        padded: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Apply the update to value rows already loaded into ``padded``, as wide as the
+        widest table; each row's state sits after its own table's embedding, at
+        ``layout.max_emb_dim``."""
+        self.update_for_padded_buffer(
+            grads,
+            padded,
+            table_ids,
+            layout.emb_dims,
+            layout.max_emb_dim,
+            layout.max_value_dim,
+            layout.all_dims_vec4,
+        )
+
+    def init_states(
+        self, layout: "RowLayout", padded: torch.Tensor, table_ids: torch.Tensor
+    ) -> None:
+        """Give the rows of ``padded`` the initial state, each as wide as its own table's.
+        A no-op when no table keeps any."""
+        if layout.max_value_dim == layout.max_emb_dim:
+            return
+        self.reset_optimizer_states(
+            padded[:, layout.max_emb_dim :], emb_dims=layout.emb_dims[table_ids]
+        )
 
     @abc.abstractmethod
     def get_opt_args(self) -> Dict[str, Any]:

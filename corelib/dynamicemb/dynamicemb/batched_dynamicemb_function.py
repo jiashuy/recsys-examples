@@ -864,8 +864,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         # Writes into the value buffer -> rows.
-                        values.update_rows(
-                            optimizer,
+                        optimizer.update_rows(
+                            values.layout,
                             unique_grads,
                             ctx.update_value_rows,
                             unique_table_ids,
@@ -882,8 +882,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
                 if not ctx.use_counter and ctx.unique_values is not None:
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
-                        storage.values.update_padded(
-                            optimizer,
+                        optimizer.update_padded(
+                            storage.values.layout,
                             unique_grads,
                             ctx.unique_values,
                             unique_table_ids,

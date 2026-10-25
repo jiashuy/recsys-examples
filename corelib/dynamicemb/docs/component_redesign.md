@@ -23,7 +23,7 @@
 |---|---|---|
 | `ChainedTables` | key 到 row 的索引：桶、链、行的归属、桶内淘汰、引用保护。只管 key，不碰 value | 已实现 |
 | `CacheCore` | 缓存的 key 到 node 的放置、引用计数、回收队列。一次发射处理所有表，offsets 在设备上 | 已实现 |
-| `MixedDimBuffers` | 各表维度不同的 value 缓冲：缓冲本身、各表维度、基址数组、行读写、增长。**不含优化器** | 已实现，待收窄（见 2.2） |
+| `MixedDimBuffers` | 各表维度不同的 value 缓冲：缓冲本身、各表维度、基址数组、行读写、增长。**不含优化器** | 已实现，已不含优化器（见 2.2） |
 | `RowExchange` | 缓存的 node 与存储的 row 之间的数据交换，核心是 **swap** | 已实现 |
 | `RowAllocator` | row 的生命周期：干净行 / 脏行、预初始化、1:1 映射 | 待实现（最后做） |
 
@@ -46,12 +46,13 @@
 
 读缓存（forward 的 `load`）和写缓存（优化器更新）仍然是对 `MixedDimBuffers` 的操作，不经过 `RowExchange`；它只管**两个缓冲之间**的搬运。
 
-### 2.2 优化器与 `MixedDimBuffers`【已确定，待实现】
+### 2.2 优化器与 `MixedDimBuffers`【已实现】
 
 优化器本身（超参数、step 计数）没有逐行状态；权重和优化器状态统一存在底层存储的 value 行里。所以：
 
 - **所有涉及优化器的操作都不走 `MixedDimBuffers`**，由优化器处理。现在 `MixedDimBuffers` 里的 `update_rows`、`update_padded`、`reset_optimizer_states` 要移到优化器那一侧。
 - `MixedDimBuffers` 提供一个**布局视图**：每张表的 embedding 宽度、状态区的位置、行基址、是否按 4 对齐。优化器据此准确分出哪些是 embedding、哪些是状态。
+- 实现：`MixedDimBuffers.layout` 返回冻结的 `RowLayout`（基址、dtype、各表 value/emb 宽度、最宽值、是否按 4 对齐）；优化器基类有 `update_rows(layout, grads, rows, table_ids)`、`update_padded(layout, grads, padded, table_ids)`、`init_states(layout, padded, table_ids)`，内部转调各优化器已有的 kernel 入口。`RowLayout` 里的基址在某个缓冲增长后失效，所以每次调用现取。
 - 优化器的输入有两种：直接作用于存储里的行（行号加基址），或作用于已经读出的补齐缓冲；两种都用同一个布局对象描述，不再用 7 个散参数。
 - **一行的初始化 = initializer 填 embedding + `optimizer.init_states` 填状态**。初始状态归优化器。
 

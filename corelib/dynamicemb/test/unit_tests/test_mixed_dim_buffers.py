@@ -134,7 +134,7 @@ def test_update_rows_applies_the_optimizer_in_place(device):
     start = torch.randn(rows.numel(), buf.max_value_dim, device=device)
     buf.store(rows, tids, start)
     grads = torch.ones(rows.numel(), buf.max_emb_dim, device=device)
-    buf.update_rows(opt, grads, rows, tids)
+    opt.update_rows(buf.layout, grads, rows, tids)
     got = buf.load(rows, tids, CopyMode.VALUE)
     for t, d in enumerate(DIMS):
         sel = tids == t
@@ -149,18 +149,18 @@ def test_the_padded_path_and_the_stored_path_agree(device):
     init = torch.zeros(rows.numel(), buf.max_value_dim, device=device)
     init[:, : buf.max_emb_dim] = torch.randn(rows.numel(), buf.max_emb_dim, device=device)
     padded = init.clone()
-    buf.reset_optimizer_states(opt, padded, tids)
+    opt.init_states(buf.layout, padded, tids)
     buf.store(rows, tids, padded)
 
     grads = torch.randn(rows.numel(), buf.max_emb_dim, device=device)
     opt.step()
-    buf.update_rows(opt, grads, rows, tids)
+    opt.update_rows(buf.layout, grads, rows, tids)
     stored = buf.load(rows, tids, CopyMode.VALUE)
 
     through_padded = padded.clone()
     opt2 = AdamDynamicEmbeddingOptimizer(OptimizerArgs(learning_rate=0.1))
     opt2.step()
-    buf.update_padded(opt2, grads, through_padded, tids)
+    opt2.update_padded(buf.layout, grads, through_padded, tids)
     for t, d in enumerate(DIMS):
         sel = tids == t
         torch.testing.assert_close(
@@ -168,10 +168,10 @@ def test_the_padded_path_and_the_stored_path_agree(device):
         )
 
 
-def test_reset_optimizer_states_is_a_no_op_without_state(device):
+def test_init_states_is_a_no_op_without_state(device):
     opt = SGDDynamicEmbeddingOptimizer(OptimizerArgs())
     buf = _buffers(device, opt)
     padded = torch.randn(6, buf.max_value_dim, device=device)
     before = padded.clone()
-    buf.reset_optimizer_states(opt, padded, torch.zeros(6, dtype=torch.int64, device=device))
+    opt.init_states(buf.layout, padded, torch.zeros(6, dtype=torch.int64, device=device))
     assert torch.equal(padded, before)

@@ -207,7 +207,7 @@ def prefetch_cache_path(
             new_tids = alloc_tids[alloc_is_new]
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(init_vals[:, :max_emb_dim], new_keys, new_tids, init_indices)
-            sstate.values.reset_optimizer_states(sstate.optimizer, init_vals, new_tids)
+            sstate.optimizer.init_states(sstate.values.layout, init_vals, new_tids)
             if from_lower is not None and _bool_item(from_lower.any()):
                 lower_row = torch.full((h_num_total,), -1, dtype=torch.int64, device=device)
                 lower_row[missing_positions[from_lower]] = torch.arange(
@@ -335,7 +335,7 @@ def prefetch_hbm_direct_path(
                 initializer(
                     init_values[:, :max_emb_dim], admitted_keys, admitted_tids, init_idx
                 )
-            state.values.reset_optimizer_states(state.optimizer, init_values, admitted_tids)
+            state.optimizer.init_states(state.values.layout, init_values, admitted_tids)
             if from_lower is not None:
                 if admit_mask is None:
                     in_lower, lower_rows = from_lower, lower_values
