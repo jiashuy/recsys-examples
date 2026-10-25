@@ -34,8 +34,8 @@ from dynamicemb import (
     get_table_value_bytes,
 )
 from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTablesV2,
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.checkpoint.paths import (
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
