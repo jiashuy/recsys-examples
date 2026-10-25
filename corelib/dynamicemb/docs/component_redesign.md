@@ -68,9 +68,13 @@
 - **`MixedDimBuffers` 的 set 接口**：按表设置一张表的 value（把 TorchRec 的权重灌进来）。表名由 `BatchedDynamicEmbeddingTablesV2` 处理：它提供一个按表名的 `set` 接口，把表名换成下标再调用 `MixedDimBuffers`；`MixedDimBuffers` 自己不记表名。
 - **和索引的关系**：现在空闲行栈在 `ChainedTables` 里，commit 的 kernel 直接从栈上取行。抽成独立的 `RowAllocator` 需要 commit 改成向它要行，会动 C++，所以放在最后。
 
-### 2.4 准入（admitter）【已确定方向，细节待讨论】
+### 2.4 准入（admitter）【调用点已并入存储】
 
 准入是一个有状态的策略（计数器、阈值、自己的 checkpoint），**代码不并入存储，调用点并入存储**：存储内部在"这批 key 缺失"这一步调用 `admitter.filter(...)`，prefetch 流程里看不到它。有无 PS 的差异在存储里处理（PS 里已有的 key 视为已准入）。
+
+实现：`ChainedStorage.set_admitter(admitter)`（模块创建 admitter 后挂上）和 `resolve_missing(keys, table_ids, frequency) -> Missing(from_lower, lower_values, admit_mask)`：先问下一层，再对下一层没有的 key 问 admitter。`prefetch_cache_path` 和 `prefetch_hbm_direct_path` 不再接收 admitter，只调 `storage.resolve_missing`。Hybrid 与通用路径里的 `_apply_admission` 没动。
+
+实现：`ChainedStorage.set_admitter(admitter)`（`BatchedDynamicEmbeddingTablesV2._create_admitter` 创建后设置）和 `ChainedStorage.resolve_missing(keys, table_ids, frequency) -> Missing(from_lower, lower_values, admit_mask)`：对存储里没有的 key，先问下一层，再对下一层也没有的 key 问 admitter。两条 prefetch 路径（`prefetch_cache_path`、`prefetch_hbm_direct_path`）不再接收 admitter，也不再自己拼这两步。Hybrid 与通用路径（`batched_dynamicemb_function` 里的 `_apply_admission`）仍沿用函数链里传下来的 admitter，没有并入。
 
 ### 2.5 下一层（`lower`）与淘汰去向（`EvictionSink`）【已实现】
 
@@ -101,13 +105,24 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 
 淘汰排序最终要在 kernel 里执行，不能回调 Python，所以组件的接口是**声明式**的：给出 score 字数、更新模式、排序规则，由索引的 kernel 解释；其余问题由 Python 侧直接问它。
 
-### 2.7 checkpoint【已确定，待实现】
+### 2.7 checkpoint【`RowChunk` 已落地；文件格式层与 `Checkpointer` 待做】
 
 三层，中间有一个共同的数据单位：
 
 - **`RowChunk`**：（keys、emb、opt、scores，加可选的被删除 key）。存储只提供两个原语：`export_chunks(filter)` 和 `import_chunk(chunk, mode)`。
 - **文件格式层**：命名、meta、列布局、dtype、`dist_type`、旧版兼容。只管读写 `RowChunk`，不碰表。
 - **`Checkpointer`**：多表、按 rank 分片、跨 rank 汇聚、计数器；用 score 组件处理列顺序，用优化器处理状态的存盘形式。
+
+进度：`dynamicemb/row_chunk.py` 的 `RowChunk(keys, embeddings, opt_states, scores)` 是 `NamedTuple`，所以元组解包的旧调用点照常工作。`export_keys_values_iter`、`Storage.export_keys_values`、`ChainedHybridStorage.export_keys_values` 现在产出 `RowChunk`，`_dump_table` 按字段名使用。
+
+现有函数与三层的对应（接下来的拆分按这张表做，每一步可单独测试）：
+
+| 现有 | 去向 |
+|---|---|
+| `export_keys_values_iter`、`incremental_dump` 的取行、`_split_value_row` | 存储的 `export_chunks(filter)` |
+| `_load_key_values`、`_replay_write_values`、`_replay_score_block`（已并入 `ScoreRules`） | 存储的 `import_chunk(chunk, mode)`，mode 区分整表加载（覆盖）与 replay（合并） |
+| `_dump_table` 里的文件写、`_iter_batches_from_files`、meta json、`encode_*_path`、`find_files`、`get_loading_files` | 文件格式层，只读写 `RowChunk` |
+| `BatchedDynamicEmbeddingTablesV2.dump/load/incremental_dump/replay_increment` 与 `_plan_replay`、`_apply_replay`、`_check_delta_shapes`、跨 rank 的 `_all_gather_dumped_columns` | `Checkpointer` |
 
 整份 dump 是"不过滤"的导出，增量 dump 是"score 大于阈值"的导出，replay 是带合并语义的导入；三者共用同一组原语，现在分散的三处逻辑合成一条路径。
 
@@ -119,7 +134,7 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - 持有各组件（存储、缓存、优化器、initializer、admitter）并把它们接起来；
 - 对外的少量模块接口（按表名的 `set`、`flush`、score 设置等）。
 
-它**不再**负责：构造存储布局（交给 `storage_layout.py` 里的 builder，已实现）、checkpoint / 增量 dump / replay（交给 `Checkpointer`）、内存报告（独立的报告函数）。
+它**不再**负责：构造存储布局（交给 `storage_layout.py` 里的 builder，已实现）、checkpoint / 增量 dump / replay（交给 `Checkpointer`）、内存报告（已拆到 `dynamicemb/memory_report.py` 的 `print_memory_consume`）。
 
 ### 2.9 存储布局与 builder【已实现】
 

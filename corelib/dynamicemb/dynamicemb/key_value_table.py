@@ -30,6 +30,7 @@ from dynamicemb.dynamicemb_config import (
     ReplayContent,
 )
 from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.row_chunk import RowChunk
 from dynamicemb.score import ScoreRules
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
@@ -594,7 +595,7 @@ def export_keys_values_iter(
     device: torch.device,
     batch_size: int = 65536,
     table_id: int = 0,
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+) -> Iterator[RowChunk]:
     """Export keys, embeddings, opt_states, scores for a logical table.
 
     Embeddings and optimizer states come out at the table's own precision
@@ -643,7 +644,7 @@ def export_keys_values_iter(
             ).to_logical(out_scores)
         else:
             out_scores = scores.to(SCORE_TYPE)
-        yield (
+        yield RowChunk(
             keys.to(device),
             embeddings.to(device),
             opt_states,
@@ -696,17 +697,16 @@ def _dump_table(
     fscore = open(score_file_path, mode)
     fopt_states = open(opt_file_path, mode) if include_optim else None
 
-    for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
-        state, device=device, table_id=table_id
-    ):
-        fkey.write(keys.cpu().numpy().tobytes())
-        fembedding.write(_raw_bytes(embeddings))
+    for chunk in export_keys_values_iter(state, device=device, table_id=table_id):
+        fkey.write(chunk.keys.cpu().numpy().tobytes())
+        fembedding.write(_raw_bytes(chunk.embeddings))
+        scores = chunk.scores
         if state.evict_strategy == EvictStrategy.KLru:
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
-        if fopt_states and opt_states_batch is not None:
+        if fopt_states and chunk.opt_states is not None:
             to_write = state.optimizer.states_for_checkpoint(
-                opt_states_batch,
+                chunk.opt_states,
                 state.values.emb_dims_list[table_id],
             )
             fopt_states.write(_raw_bytes(to_write))

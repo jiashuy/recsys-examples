@@ -410,7 +410,6 @@ def dynamicemb_prefetch(
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admitter,
             )
             # The cache addresses its own value buffer by node, which is the row.
             # There is no separate hash slot to tell apart from it: the cache keeps
@@ -432,7 +431,6 @@ def dynamicemb_prefetch(
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admitter,
             )
 
         return PrefetchState(

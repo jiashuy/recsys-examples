@@ -32,40 +32,11 @@ read where it is; nothing has to be copied out ahead of a write.
 from typing import Optional, Tuple
 
 import torch
-from dynamicemb.types import CopyMode, MultiTableAdmitter, counts_to_offsets
+from dynamicemb.types import CopyMode, counts_to_offsets
 from dynamicemb_extensions import EvictStrategy, flagged_compact
 
 from .batched_dynamicemb_function import _bool_item, _scalar_item
 from .chained_storage import ChainedStorage
-
-
-def _admit(
-    admitter: Optional[MultiTableAdmitter],
-    missing_keys: torch.Tensor,
-    missing_tids: torch.Tensor,
-    missing_positions: torch.Tensor,
-    accumulated_frequency: Optional[torch.Tensor],
-    from_lower: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Which of the missing keys stay (``None``: all). A key the tier below has is not
-    new to the system, so it is not put to the admitter, and stays."""
-    if admitter is None:
-        return None
-    freq = (
-        accumulated_frequency[missing_positions]
-        if accumulated_frequency is not None
-        else None
-    )
-    if from_lower is None:
-        return admitter.admit(missing_keys, missing_tids, freq)
-    new_to_system = ~from_lower
-    mask = from_lower.clone()
-    mask[new_to_system] = admitter.admit(
-        missing_keys[new_to_system],
-        missing_tids[new_to_system],
-        freq[new_to_system] if freq is not None else None,
-    )
-    return mask
 
 
 def prefetch_cache_path(
@@ -81,7 +52,6 @@ def prefetch_cache_path(
     initializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
-    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Cache prefetch where the storage is the authority on every key.
 
@@ -126,27 +96,16 @@ def prefetch_cache_path(
 
         # 3.
         lower = storage.lower
-        from_lower: Optional[torch.Tensor] = None
-        lower_values: Optional[torch.Tensor] = None
-        if lower is not None and h_num_missing > 0:
-            missing_freq = (
-                accumulated_frequency[missing_positions]
-                if accumulated_frequency is not None
-                else None
-            )
-            fetched = lower.fetch(missing_keys, missing_tids, missing_freq)
-            from_lower, lower_values = fetched.found, fetched.values
-        admit_mask = (
-            _admit(
-                admitter,
+        from_lower, lower_values, admit_mask = (
+            storage.resolve_missing(
                 missing_keys,
                 missing_tids,
-                missing_positions,
-                accumulated_frequency,
-                from_lower,
+                accumulated_frequency[missing_positions]
+                if accumulated_frequency is not None
+                else None,
             )
             if h_num_missing > 0
-            else None
+            else (None, None, None)
         )
         non_admitted_positions: Optional[torch.Tensor] = None
         admitted_positions = missing_positions
@@ -263,7 +222,6 @@ def prefetch_hbm_direct_path(
     initializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
-    admitter: Optional[MultiTableAdmitter],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """HBM-direct prefetch: the rows the step uses are pinned in the index.
 
@@ -293,25 +251,12 @@ def prefetch_hbm_direct_path(
         missing_keys = unique_keys[missing_positions]
         missing_tids = unique_table_ids[missing_positions]
 
-        lower = storage.lower
-        from_lower: Optional[torch.Tensor] = None
-        lower_values: Optional[torch.Tensor] = None
-        if lower is not None:
-            missing_freq = (
-                accumulated_frequency[missing_positions]
-                if accumulated_frequency is not None
-                else None
-            )
-            fetched = lower.fetch(missing_keys, missing_tids, missing_freq)
-            from_lower, lower_values = fetched.found, fetched.values
-
-        admit_mask = _admit(
-            admitter,
+        from_lower, lower_values, admit_mask = storage.resolve_missing(
             missing_keys,
             missing_tids,
-            missing_positions,
-            accumulated_frequency,
-            from_lower,
+            accumulated_frequency[missing_positions]
+            if accumulated_frequency is not None
+            else None,
         )
         non_admitted_positions: Optional[torch.Tensor] = None
         if admit_mask is None:

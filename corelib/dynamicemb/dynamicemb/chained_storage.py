@@ -25,7 +25,7 @@ a host tier.
 """
 
 import math
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -54,8 +54,9 @@ from .key_value_table import (
 from .eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
 from .lower_tier import LowerTier
 from .mixed_dim_buffers import MixedDimBuffers
+from .row_chunk import RowChunk
 from .score import ScoreRules, is_lru_lfu
-from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
+from .types import SCORE_TYPE, CopyMode, MultiTableAdmitter, ReplayStats, Storage
 
 _SUPPORTED = (
     DynamicEmbScoreStrategy.TIMESTAMP,
@@ -225,6 +226,14 @@ class _ChainedIndexView:
         return result
 
 
+class Missing(NamedTuple):
+    """What the storage settles about the keys it does not have (all ``None`` if none)."""
+
+    from_lower: Optional[torch.Tensor]  # bool per key: the tier below has it
+    lower_values: Optional[torch.Tensor]  # its values, a row per key
+    admit_mask: Optional[torch.Tensor]  # bool per key: stays; None: all stay
+
+
 class ChainedStorage(Storage):
     def __init__(
         self,
@@ -258,6 +267,7 @@ class ChainedStorage(Storage):
         rows = [s + max(s // 8, 1024) for s in slots]
 
         self._lower = None if lower is None else LowerTier(lower)
+        self._admitter: Optional[MultiTableAdmitter] = None
         self._score = ScoreRules(strategy)
         self._state: DynamicEmbTableState = create_table_state(
             options,
@@ -301,6 +311,43 @@ class ChainedStorage(Storage):
     @property
     def index(self) -> ChainedTables:
         return self._index
+
+    def set_admitter(self, admitter: Optional[MultiTableAdmitter]) -> None:
+        """The policy that decides which of the keys this storage lacks are let in."""
+        self._admitter = admitter
+
+    def resolve_missing(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequency: Optional[torch.Tensor],
+    ) -> Missing:
+        """Ask the tier below for ``keys`` the storage does not have, then the admitter.
+
+        A key the tier below has is not new to the system, so it is not put to the
+        admitter, and stays. ``frequency`` is what the step counted for each key.
+        """
+        if keys.numel() == 0:
+            return Missing(None, None, None)
+        from_lower = lower_values = None
+        if self._lower is not None:
+            fetched = self._lower.fetch(keys, table_ids, frequency)
+            from_lower, lower_values = fetched.found, fetched.values
+        admitter = self._admitter
+        if admitter is None:
+            return Missing(from_lower, lower_values, None)
+        if from_lower is None:
+            return Missing(
+                from_lower, lower_values, admitter.admit(keys, table_ids, frequency)
+            )
+        new_to_system = ~from_lower
+        mask = from_lower.clone()
+        mask[new_to_system] = admitter.admit(
+            keys[new_to_system],
+            table_ids[new_to_system],
+            frequency[new_to_system] if frequency is not None else None,
+        )
+        return Missing(from_lower, lower_values, mask)
 
     @property
     def lower(self) -> Optional[LowerTier]:
@@ -745,7 +792,7 @@ class ChainedStorage(Storage):
 
     def export_keys_values(
         self, device: torch.device, batch_size: int = 65536, table_id: int = 0
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+    ) -> Iterator[RowChunk]:
         yield from export_keys_values_iter(self._state, device, batch_size, table_id)
 
     def incremental_dump(
@@ -1080,7 +1127,7 @@ class ChainedHybridStorage(Storage):
 
     def export_keys_values(
         self, device: torch.device, batch_size: int = 65536, table_id: int = 0
-    ):
+    ) -> Iterator[RowChunk]:
         for tier in self._tiers:
             yield from tier.export_keys_values(device, batch_size, table_id)
 

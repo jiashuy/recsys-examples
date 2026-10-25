@@ -20,6 +20,7 @@ from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+from dynamicemb.row_chunk import RowChunk
 
 
 @enum.unique
@@ -366,9 +367,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         device: torch.device,
         batch_size: int = 65536,
         table_id: int = 0,
-    ) -> Iterator[
-        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
-    ]:
+    ) -> Iterator[RowChunk]:
         pass
 
 
