@@ -30,6 +30,7 @@ from typing import Optional
 
 import torch
 from dynamicemb.key_value_table import DynamicEmbTableState, _append_evicted
+from dynamicemb.lower_tier import LowerTier
 from dynamicemb.types import Storage
 
 
@@ -56,7 +57,7 @@ class Discard(EvictionSink):
 class ToLower(EvictionSink):
     wants_values = True
 
-    def __init__(self, lower: Storage) -> None:
+    def __init__(self, lower: LowerTier) -> None:
         self._lower = lower
 
     def put(self, keys, table_ids, values, scores) -> None:

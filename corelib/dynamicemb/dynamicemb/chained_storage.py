@@ -42,7 +42,6 @@ from .key_value_table import (
     _all_gather_dumped_columns,
     _append_erased,
     _dump_table,
-    _fill_from_lower,
     _iter_batches_from_files,
     _load_key_values,
     _pop_state_erased_keys,
@@ -53,6 +52,7 @@ from .key_value_table import (
     export_keys_values_iter,
 )
 from .eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
+from .lower_tier import LowerTier
 from .mixed_dim_buffers import MixedDimBuffers
 from .score import ScoreRules, is_lru_lfu
 from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
@@ -257,7 +257,7 @@ class ChainedStorage(Storage):
         slots = [n * cap for n in num_buckets]
         rows = [s + max(s // 8, 1024) for s in slots]
 
-        self._lower = lower
+        self._lower = None if lower is None else LowerTier(lower)
         self._score = ScoreRules(strategy)
         self._state: DynamicEmbTableState = create_table_state(
             options,
@@ -288,7 +288,7 @@ class ChainedStorage(Storage):
         if spill_to is not None:
             self._sink: EvictionSink = ToTier(spill_to)
         elif lower is not None:
-            self._sink = ToLower(lower)
+            self._sink = ToLower(self._lower)
         elif EvictedItemMode.RETAIN_KEY in base.evicted_item_mode:
             self._sink = Retain(self._state, Discard())
         else:
@@ -303,7 +303,7 @@ class ChainedStorage(Storage):
         return self._index
 
     @property
-    def lower(self) -> Optional[Storage]:
+    def lower(self) -> Optional[LowerTier]:
         return self._lower
 
     def score_args(
@@ -418,8 +418,7 @@ class ChainedStorage(Storage):
                 missing_scores,
                 founds,
                 scores,
-            ) = _fill_from_lower(
-                self._lower,
+            ) = self._lower.fill(
                 copy_mode,
                 values,
                 n_missing,

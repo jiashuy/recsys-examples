@@ -72,14 +72,16 @@
 
 准入是一个有状态的策略（计数器、阈值、自己的 checkpoint），**代码不并入存储，调用点并入存储**：存储内部在"这批 key 缺失"这一步调用 `admitter.filter(...)`，prefetch 流程里看不到它。有无 PS 的差异在存储里处理（PS 里已有的 key 视为已准入）。
 
-### 2.5 下一层（`lower`）与淘汰去向（`EvictionSink`）【淘汰去向已实现；`lower` 的统一待做】
+### 2.5 下一层（`lower`）与淘汰去向（`EvictionSink`）【已实现】
 
 PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们其实是两件事：
 
 - **下一层 `lower`**：找不到时去哪里取、被淘汰时往哪里放。PS、host 层（Hybrid）都是它的实现。接口：`find` / `insert` / `erase` / 导出。
 - **淘汰去向 `EvictionSink`**：丢弃、写到下一层、记录 key。**retain 是对任意去向的装饰**，不是单独的一种。
 
-实现：`dynamicemb/eviction_sink.py`，`EvictionSink.put(keys, table_ids, values, scores)` 加 `wants_values`（不要值的去向，调用方不去加载）；`Discard`、`ToLower(lower)`、`ToTier(tier)`（带 score 写到同类的旁边一层）、`Retain(state, inner)`（记录 key 后转给 `inner`）。`ChainedStorage` 构造时按 `spill_to` / `lower` / `evicted_item_mode` 选出 sink，`retain_and_spill` 改名为 `evict`，只加载值再交给 sink。还没做的是 `lower` 一侧：`find`/`insert`/`erase`/导出统一成接口，Hybrid 的 host 层与 PS 同接口。
+实现：`dynamicemb/eviction_sink.py`，`EvictionSink.put(keys, table_ids, values, scores)` 加 `wants_values`（不要值的去向，调用方不去加载）；`Discard`、`ToLower(lower)`、`ToTier(tier)`（带 score 写到同类的旁边一层）、`Retain(state, inner)`（记录 key 后转给 `inner`）。`ChainedStorage` 构造时按 `spill_to` / `lower` / `evicted_item_mode` 选出 sink，`retain_and_spill` 改名为 `evict`，只加载值再交给 sink。`lower` 一侧：`dynamicemb/lower_tier.py` 的 `LowerTier(storage)` 把用户传入的 `external_storage`（任何 `Storage`）包成窄接口：`fetch(keys, table_ids, frequency) -> Fetched(found, scores, values)`、`insert`、`fill`（原 `_fill_from_lower`）。其余代码不再按位置去取 `Storage.find` 返回元组的第 5、7 项。`ChainedStorage.lower` 返回 `LowerTier`，底层的 `Storage` 在 `.storage`。Hybrid 的 host 层不是 `lower`，而是 `ToTier` 的去向，另有自己的查找路径，没有并进来：它和 PS 的语义不同（host 层的 key 与 HBM 层不相交，查找要带 score 和行号，更新就地进行）。
+
+用户实现的 `Storage` 抽象（`external_storage` 的契约）没有改。
 
 于是 Hybrid 是 `lower = HostTier`，PS 是 `lower = PSTier`，retain 是在去向外面包一层记录。`ChainedStorage` 里的 `retain_and_spill` 去掉。
 

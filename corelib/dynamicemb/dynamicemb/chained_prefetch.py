@@ -134,8 +134,8 @@ def prefetch_cache_path(
                 if accumulated_frequency is not None
                 else None
             )
-            out = lower.find(missing_keys, missing_tids, CopyMode.VALUE, missing_freq)
-            from_lower, lower_values = out[5], out[7]
+            fetched = lower.fetch(missing_keys, missing_tids, missing_freq)
+            from_lower, lower_values = fetched.found, fetched.values
         admit_mask = (
             _admit(
                 admitter,
@@ -302,8 +302,8 @@ def prefetch_hbm_direct_path(
                 if accumulated_frequency is not None
                 else None
             )
-            out = lower.find(missing_keys, missing_tids, CopyMode.VALUE, missing_freq)
-            from_lower, lower_values = out[5], out[7]
+            fetched = lower.fetch(missing_keys, missing_tids, missing_freq)
+            from_lower, lower_values = fetched.found, fetched.values
 
         admit_mask = _admit(
             admitter,

@@ -158,7 +158,7 @@ def test_what_the_table_evicts_comes_back_from_the_storage_below(layout, determi
 
     uses = _train(module)
     assert int((uses > 0).sum()) > 2 * MAX_CAPACITY, "the run must overflow the table"
-    assert storage.lower.size() > 0, "nothing was evicted into the storage below"
+    assert storage.lower.storage.size() > 0, "nothing was evicted into the storage below"
 
     bad, total = _mismatched_keys(module, uses)
     assert bad == 0, f"{bad} of {total} keys lost an update on the way down or back"

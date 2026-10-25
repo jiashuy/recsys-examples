@@ -1284,56 +1284,6 @@ class DynamicEmbCache(Cache):
 # ---------------------------------------------------------------------------
 
 
-def _fill_from_lower(
-    lower: Storage,
-    copy_mode: CopyMode,
-    values: torch.Tensor,
-    num_missing: int,
-    missing_keys: torch.Tensor,
-    missing_positions: torch.Tensor,
-    missing_table_ids: torch.Tensor,
-    missing_scores: Optional[torch.Tensor],
-    founds: torch.Tensor,
-    scores: torch.Tensor,
-):
-    """Ask ``lower`` for the keys a table does not have.
-
-    What it finds is written into ``values`` (at the keys' positions) and marked
-    found; the rest stays missing. Returns the missing description and ``founds``
-    and ``scores`` as they are afterwards. Only the found mask, the scores and
-    the values of ``lower.find`` are used, so ``lower`` need not describe its
-    misses the way a table does.
-    """
-    out = lower.find(missing_keys, missing_table_ids, copy_mode, missing_scores)
-    l_founds, l_scores, l_values = out[5], out[6], out[7]
-    if not bool(l_founds.any()):
-        return (
-            num_missing,
-            missing_keys,
-            missing_positions,
-            missing_table_ids,
-            missing_scores,
-            founds,
-            scores,
-        )
-    hit = missing_positions[l_founds]
-    values[hit] = l_values[l_founds]
-    founds = founds.clone()
-    founds[hit] = True
-    scores = scores.clone()
-    scores[hit] = l_scores[l_founds].to(scores.dtype)
-    keep = ~l_founds
-    return (
-        int(keep.sum().item()),
-        missing_keys[keep],
-        missing_positions[keep],
-        missing_table_ids[keep],
-        missing_scores[keep] if missing_scores is not None else None,
-        founds,
-        scores,
-    )
-
-
 def flush_cache(cache: DynamicEmbCache, storage) -> None:
     """Write every resident row back to the storage.
 
