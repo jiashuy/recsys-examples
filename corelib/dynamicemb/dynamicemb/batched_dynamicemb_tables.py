@@ -263,10 +263,10 @@ def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
     """
     rows = []
     for t in range(state.num_tables):
-        buf = state.tables[t]
+        buf = state.values.buffers[t]
         opt = state.options_list[t]
-        value_dim = state.table_value_dims_cpu[t]
-        emb_dim = state.table_emb_dims_cpu[t]
+        value_dim = state.values.value_dims_list[t]
+        emb_dim = state.values.emb_dims_list[t]
         elem = DTYPE_NUM_BYTES[opt.embedding_dtype]
         init_total = buf.num_bytes()
         init_emb = init_total * emb_dim // value_dim
@@ -844,6 +844,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         cap = max(1, int(host_option.max_capacity * storage_cap_scale))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
+
+                    # A table that is one bucket (its bucket is as large as the table) is
+                    # one bucket in each tier, of the tier's size.
+                    for tier in (hbm_options, host_options):
+                        for opt, whole in zip(tier, self._dynamicemb_options):
+                            if opt.bucket_capacity >= whole.max_capacity:
+                                opt.bucket_capacity = opt.max_capacity
 
                     # The hybrid does not support NO_EVICTION: its tiers hold disjoint keys and spill by eviction.
                     if (
@@ -2287,9 +2294,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         matching total would say nothing about either.
 
         Note the two meanings of ``tables`` in play: a storage's tiers, each of
-        which has its own ``tables`` of value buffers indexed by logical table.
+        which has its own ``values``, a buffer per logical table.
         """
-        return tuple(s.tables[table_id].shape[0] for s in storage.tables)
+        return tuple(s.values.rows(table_id) for s in storage.tables)
 
     @staticmethod
     def _capacity_of(

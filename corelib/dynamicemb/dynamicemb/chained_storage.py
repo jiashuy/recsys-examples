@@ -56,11 +56,8 @@ from .key_value_table import (
     _validate_load_meta,
     create_table_state,
     export_keys_values_iter,
-    get_table_ptrs,
-    load_from_flat,
-    load_from_flat_single_table,
-    store_to_flat,
 )
+from .mixed_dim_buffers import MixedDimBuffers
 from .types import SCORE_TYPE, CopyMode, ReplayStats, Storage
 
 _SUPPORTED = (
@@ -262,10 +259,9 @@ class ChainedStorage(Storage):
                 "the chained index ranks a (TIMESTAMP, LFU) table by frequency and then "
                 "age; a custom score_function is not supported"
             )
-        # The tables of a storage share one bucket capacity (it is part of what groups
-        # tables), which is no larger than the smallest table's maximum.
-        cap = max(1, min(int(o.max_capacity) for o in options))
-        cap = min(int(base.bucket_capacity), cap)
+        # The tables of a storage share one bucket capacity: it is part of what groups
+        # tables.
+        cap = int(base.bucket_capacity)
         num_buckets = [max(1, math.ceil(int(o.init_capacity) / cap)) for o in options]
         slots = [n * cap for n in num_buckets]
         rows = [s + max(s // 8, 1024) for s in slots]
@@ -287,7 +283,7 @@ class ChainedStorage(Storage):
         )
         # Without a cache in front, the rows in use have to be protected by a count.
         hbm_direct = (
-            self._state.tables[0].is_device_buffer() if track_refs is None else track_refs
+            self._state.values.on_device if track_refs is None else track_refs
         )
         self._index = ChainedTables(
             num_buckets,
@@ -341,16 +337,8 @@ class ChainedStorage(Storage):
 
     def sync_value_buffers(self) -> None:
         """Give the value buffers as many rows as the index has handed out."""
-        state = self._state
-        grew = False
-        for t in range(state.num_tables):
-            have = int(state.tables[t].tensor().size(0))
-            want = self._index.row_capacity_of(t)
-            if want > have:
-                state.tables[t].extend((want - have, state.table_value_dims_cpu[t]))
-                grew = True
-        if grew:
-            state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
+        for t in range(self._state.num_tables):
+            self._state.values.ensure_rows(t, self._index.row_capacity_of(t))
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Grow a table whose load would pass its maximum, up to its maximum capacity.
@@ -423,8 +411,7 @@ class ChainedStorage(Storage):
                 )
             return
         if values is None:
-            values = load_from_flat(
-                self._state, rows, table_ids, copy_mode=CopyMode.VALUE
+            values = self._state.values.load(rows, table_ids, copy_mode=CopyMode.VALUE
             )
         if self._spill is not None:
             self._spill.insert(keys, table_ids, values, scores)
@@ -449,7 +436,7 @@ class ChainedStorage(Storage):
         else:
             rows = self._index.lookup(unique_keys, table_ids)
         founds = rows >= 0
-        values = load_from_flat(self._state, rows, table_ids, copy_mode=copy_mode)
+        values = self._state.values.load(rows, table_ids, copy_mode=copy_mode)
         n_missing, miss_idx, (missing_keys, missing_tids) = flagged_compact(
             ~founds, [unique_keys, table_ids]
         )
@@ -502,8 +489,7 @@ class ChainedStorage(Storage):
         rows = self._index.lookup(unique_keys, table_ids)
         found = rows >= 0
         if bool(found.any()):
-            store_to_flat(
-                self._state, rows[found], table_ids[found], unique_values[found]
+            self._state.values.store(rows[found], table_ids[found], unique_values[found]
             )
         return found
 
@@ -541,15 +527,12 @@ class ChainedStorage(Storage):
         rows = index.find_and_stage(unique_keys, table_ids, sc, policy)
         found = rows >= 0
         if bool(found.any()):
-            store_to_flat(
-                self._state, rows[found], table_ids[found], unique_values[found]
+            self._state.values.store(rows[found], table_ids[found], unique_values[found]
             )
         if index.num_staged:
             out = index.commit()
             self.sync_value_buffers()
-            store_to_flat(
-                self._state,
-                out.rows,
+            self._state.values.store(out.rows,
                 table_ids[out.positions],
                 unique_values[out.positions],
             )
@@ -576,15 +559,14 @@ class ChainedStorage(Storage):
                 tid = torch.full(
                     (chunk_keys.numel(),), t, dtype=torch.int64, device=chunk_keys.device
                 )
-                values = load_from_flat(
-                    cstate, chunk_nodes, tid, copy_mode=CopyMode.VALUE
+                values = cstate.values.load(chunk_nodes, tid, copy_mode=CopyMode.VALUE
                 )
                 rows = self._index.lookup(chunk_keys, tid)
                 if not bool((rows >= 0).all()):
                     raise RuntimeError(
                         "the cache holds a key that the backing table does not"
                     )
-                store_to_flat(self._state, rows, tid, values)
+                self._state.values.store(rows, tid, values)
 
     def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
         from .key_value_table import _pop_state_evicted_keys
@@ -673,7 +655,7 @@ class ChainedStorage(Storage):
         device = state.device
         timestamp = device_timestamp() if timestamp is None else timestamp
         keys = keys.to(device=device, dtype=state.key_index_map.key_type)
-        embeddings = values.to(device=device, dtype=state.emb_dtype)
+        embeddings = values.to(device=device, dtype=state.values.dtype)
         if ReplayContent.SCORE in content and scores is not None:
             score_vec = _replay_score_block(state, table_id, scores, timestamp)
         else:
@@ -856,7 +838,7 @@ class ChainedStorage(Storage):
         device = state.device
         rows = rows.to(device)
         scores_batch = named_scores[state.incremental_score_name]
-        values = load_from_flat_single_table(state, rows, table_id)
+        values = state.values.load_table(rows, table_id)
         value, opt = _split_value_row(state, table_id, values)
         key = keys.to(device)
         score_block = _dump_score_block(state, table_id, rows, scores_batch, timestamp)
@@ -878,28 +860,32 @@ class ChainedStorage(Storage):
 
     # -- accessors ------------------------------------------------------------
 
+    @property
+    def values(self) -> MixedDimBuffers:
+        return self._state.values
+
     def embedding_dtype(self) -> torch.dtype:
-        return self._state.emb_dtype
+        return self._state.values.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._state.table_emb_dims_cpu[table_id]
+        return self._state.values.emb_dim(table_id)
 
     def value_dim(self, table_id: int) -> int:
-        return self._state.table_value_dims_cpu[table_id]
+        return self._state.values.value_dim(table_id)
 
     def max_embedding_dim(self) -> int:
-        return self._state.emb_dim
+        return self._state.values.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._state.value_dim
+        return self._state.values.max_value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
         return (
-            self._state.table_emb_dims if on_device else self._state.table_emb_dims_host
+            self._state.values.emb_dims if on_device else self._state.values.emb_dims_host
         )
 
     def all_dims_vec4(self) -> bool:
-        return self._state.all_dims_vec4
+        return self._state.values.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
         return self._state.optimizer.get_initial_optimizer_state()
@@ -976,26 +962,31 @@ class ChainedHybridStorage(Storage):
     def evict_strategy(self):
         return self._hbm.evict_strategy
 
+    @property
+    def values(self) -> MixedDimBuffers:
+        """The HBM tier's; both tiers hold tables of the same dimensions."""
+        return self._hbm.values
+
     def embedding_dtype(self) -> torch.dtype:
-        return self._hbm.emb_dtype
+        return self._hbm.values.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._hbm.table_emb_dims_cpu[table_id]
+        return self._hbm.values.emb_dim(table_id)
 
     def value_dim(self, table_id: int) -> int:
-        return self._hbm.table_value_dims_cpu[table_id]
+        return self._hbm.values.value_dim(table_id)
 
     def max_embedding_dim(self) -> int:
-        return self._hbm.emb_dim
+        return self._hbm.values.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._hbm.value_dim
+        return self._hbm.values.max_value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
-        return self._hbm.table_emb_dims if on_device else self._hbm.table_emb_dims_host
+        return self._hbm.values.emb_dims if on_device else self._hbm.values.emb_dims_host
 
     def all_dims_vec4(self) -> bool:
-        return self._hbm.all_dims_vec4
+        return self._hbm.values.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
         return self._hbm.optimizer.get_initial_optimizer_state()

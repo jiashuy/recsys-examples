@@ -169,8 +169,8 @@ def _assert_value_buffer_matches_hashtable(state: object, table_id: int) -> None
     keys new in a step take before the rows of their victims are released."""
     km = state.key_index_map
     expected_rows = int(km.per_table_capacity_[table_id])
-    t = state.tables[table_id].tensor()
-    vd = int(state.table_value_dims_cpu[table_id])
+    t = state.values.tensor(table_id)
+    vd = int(state.values.value_dims_list[table_id])
     assert t.shape[0] > expected_rows and t.shape[1] == vd, (
         f"table {table_id}: value buffer shape {tuple(t.shape)} should have more than "
         f"{expected_rows} rows of width {vd}"
@@ -189,8 +189,8 @@ def _assert_cache_pool_matches_capacity(cache: object, table_id: int) -> None:
         f"table {table_id}: cache capacity {cache.capacity(table_id)} != "
         f"{expected_rows}"
     )
-    t = state.tables[table_id].tensor()
-    vd = int(state.table_value_dims_cpu[table_id])
+    t = state.values.tensor(table_id)
+    vd = int(state.values.value_dims_list[table_id])
     assert t.shape == (expected_rows, vd), (
         f"table {table_id}: cache pool shape {tuple(t.shape)} != "
         f"expected ({expected_rows}, {vd})"
@@ -338,6 +338,6 @@ def test_alignment_cache_storage_shapes(
         for tid, name in enumerate(batched.table_names):
             ec = by_name[name]
             assert int(batched._dynamicemb_options[tid].dim) == ec.embedding_dim
-            assert vd_state.table_value_dims_cpu[tid] == int(ec.embedding_dim) + int(
+            assert vd_state.values.value_dims_list[tid] == int(ec.embedding_dim) + int(
                 st_dim
             )

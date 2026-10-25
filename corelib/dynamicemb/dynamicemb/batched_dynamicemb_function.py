@@ -23,7 +23,6 @@ from dynamicemb.key_value_table import (
     Cache,
     Storage,
     eval_lookup,
-    load_from_flat,
 )
 from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.lookup_layout import EmbeddingLayout
@@ -362,7 +361,7 @@ def dynamicemb_prefetch(
             storage_mode = StorageMode.CACHE
         elif (
             isinstance(storage, ChainedStorage)
-            and storage._state.tables[0].is_device_buffer()
+            and storage.values.on_device
         ):
             storage_mode = StorageMode.HBM_DIRECT
         else:
@@ -703,9 +702,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     else storage._state
                 )
                 with torch.cuda.nvtx.range("op:load_from_flat"):
-                    unique_embs = load_from_flat(
-                        state,
-                        # Value buffer: address by row, which is the slot for
+                    unique_embs = state.values.load(# Value buffer: address by row, which is the slot for
                         # every strategy except NO_EVICTION.
                         prefetch_state.value_row_indices,
                         prefetch_state.unique_table_ids,
@@ -866,17 +863,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         else storage._state
                     )
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
-                        optimizer.fused_update_for_flat_table(
-                            unique_grads.to(ctx.emb_dtype),
-                            # Writes into the value buffer -> rows.
+                        # Writes into the value buffer -> rows.
+                        state.values.update_rows(
+                            optimizer,
+                            unique_grads,
                             ctx.update_value_rows,
-                            state.table_ptrs_dev,
                             unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
                         )
 
                     if ctx.storage_mode == StorageMode.CACHE:
@@ -889,25 +881,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    # Per-table embedding dims (on the CUDA device) let the
-                    # padded-buffer kernel place each row's optimizer state at the
-                    # max_emb_dim offset using the row's own width. Provided
-                    # uniformly across storage types via embedding_dims().
-                    table_emb_dims = storage.embedding_dims(on_device=True)
-                    # all_dims_vec4 must reflect per-table dims, not just
-                    # max_emb_dim: a vec4 store on a row whose edim % 4 != 0 would
-                    # run past its m region into v. storage.all_dims_vec4() is the
-                    # per-table-correct flag used by load/store too.
-                    all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
-                        optimizer.update_for_padded_buffer(
+                        storage.values.update_padded(
+                            optimizer,
                             unique_grads,
                             ctx.unique_values,
                             unique_table_ids,
-                            table_emb_dims,
-                            ctx.max_emb_dim,
-                            ctx.max_val_dim,
-                            all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None

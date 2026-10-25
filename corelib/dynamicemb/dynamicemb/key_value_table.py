@@ -34,12 +34,7 @@ from dynamicemb.dynamicemb_config import (
     score_dump_permutation,
     score_load_permutation,
 )
-from dynamicemb.extendable_tensor import (
-    DeviceExtendableBuffer,
-    ExtendableBuffer,
-    FixedDeviceBuffer,
-    HostExtendableBuffer,
-)
+from dynamicemb.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
@@ -63,11 +58,6 @@ from dynamicemb_extensions import (
     EvictStrategy,
     flagged_compact,
 )
-from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
-from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
-from dynamicemb_extensions import load_from_flat_table_value as _load_value
-from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
-from dynamicemb_extensions import store_to_flat_table_value as _store_value
 from torch import Tensor, nn  # usort:skip
 
 # ---------------------------------------------------------------------------
@@ -156,7 +146,7 @@ def load_from_json(file_path: str) -> Dict[str, Any]:
 # Key / embedding / score / optimizer-state files are bare row-major blobs with
 # no header, so the table's meta JSON is the only record of how to read them
 # back. Embeddings and optimizer states are dumped at the table's own precision
-# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
+# (``MixedDimBuffers.dtype``) rather than being upcast to fp32, which
 # makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
 # decorative. Checkpoints written before those keys existed are always fp32, and
 # their dim is recoverable from the file size -- see
@@ -318,22 +308,6 @@ def get_score_policy(score_strategy):
         raise RuntimeError("Not supported score strategy.")
 
 
-def get_table_ptrs(
-    tables: List[ExtendableBuffer], device: torch.device
-) -> torch.Tensor:
-    """Build a device tensor of current value-buffer base pointers for *tables*.
-
-    Uses ``buffer.tensor().data_ptr()`` so results stay valid until the next
-    ``ExtendableBuffer.extend()``; after extend, rebuild into ``table_ptrs_dev``
-    (or another buffer) via this function.
-    """
-    return torch.tensor(
-        [b.tensor().data_ptr() for b in tables],
-        dtype=torch.int64,
-        device=device,
-    )
-
-
 # ---------------------------------------------------------------------------
 # DynamicEmbTableState – shared state dataclass
 # ---------------------------------------------------------------------------
@@ -348,21 +322,8 @@ class DynamicEmbTableState:
     evict_strategy: EvictStrategy
     key_index_map: Any
     capacity: int
-    tables: List[ExtendableBuffer]
-    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
-    table_ptrs_dev: torch.Tensor
-    table_emb_dims: torch.Tensor
-    # Persistent host (CPU) copy of table_emb_dims as a tensor (the ``_cpu`` field
-    # below is the Python int list); long-lived so callers get a stable host tensor.
-    table_emb_dims_host: torch.Tensor
-    table_value_dims: torch.Tensor
-    table_emb_dims_cpu: List[int]
-    table_value_dims_cpu: List[int]
-    max_emb_dim: int
-    emb_dim: int
-    value_dim: int
-    emb_dtype: torch.dtype
-    all_dims_vec4: bool
+    # The value rows of the tables, which may differ in dimension.
+    values: MixedDimBuffers
     optimizer: BaseDynamicEmbeddingOptimizer
     threads_in_wave: int
     score: Optional[int] = None
@@ -464,20 +425,7 @@ def create_table_state(
         capacity = int(sum(row_capacities))
 
     dims = [opt.dim for opt in options]
-    max_emb_dim = max(dims)
-    emb_dtype = base_opt.embedding_dtype
-    emb_dim = max(dims)
-
-    optim_state_dims = [optimizer.get_state_dim(d) for d in dims]
-    value_dims = [d + s for d, s in zip(dims, optim_state_dims)]
-    value_dim = max(value_dims)
-    all_dims_vec4 = all((d % 4) == 0 for d in dims) and all(
-        (v % 4) == 0 for v in value_dims
-    )
-
-    table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)
-    table_emb_dims_host = torch.tensor(dims, dtype=torch.int64)
-    table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)
+    value_dims = [d + optimizer.get_state_dim(d) for d in dims]
 
     key_index_map_caps = (
         key_index_map.per_table_capacity_ if build_index else list(row_capacities)
@@ -497,13 +445,14 @@ def create_table_state(
     else:
         table_caps = list(key_index_map_caps)
 
-    tables: List[ExtendableBuffer] = []
-    for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
-        shape = (cap, vd)
-        if base_opt.local_hbm_for_values == 0:
-            tables.append(HostExtendableBuffer(shape, emb_dtype, device))
-        else:
-            tables.append(DeviceExtendableBuffer(shape, emb_dtype, device))
+    values = MixedDimBuffers(
+        dims,
+        value_dims,
+        table_caps,
+        base_opt.embedding_dtype,
+        device,
+        "host" if base_opt.local_hbm_for_values == 0 else "device",
+    )
 
     props = torch.cuda.get_device_properties(device_idx)
     threads_in_wave = (
@@ -519,18 +468,7 @@ def create_table_state(
         evict_strategy=evict_strategy,
         key_index_map=key_index_map,
         capacity=capacity,
-        tables=tables,
-        table_ptrs_dev=get_table_ptrs(tables, device),
-        table_emb_dims=table_emb_dims,
-        table_emb_dims_host=table_emb_dims_host,
-        table_value_dims=table_value_dims,
-        table_emb_dims_cpu=dims,
-        table_value_dims_cpu=value_dims,
-        max_emb_dim=max_emb_dim,
-        emb_dim=emb_dim,
-        value_dim=value_dim,
-        emb_dtype=emb_dtype,
-        all_dims_vec4=all_dims_vec4,
+        values=values,
         optimizer=optimizer,
         threads_in_wave=threads_in_wave,
         score=None,
@@ -561,18 +499,10 @@ def create_cache_state(
     score_policy = get_score_policy(base_opt.score_strategy)
 
     dims = [opt.dim for opt in options]
-    max_emb_dim = max(dims)
-    optim_state_dims = [optimizer.get_state_dim(d) for d in dims]
-    value_dims = [d + s for d, s in zip(dims, optim_state_dims)]
-    value_dim = max(value_dims)
-    all_dims_vec4 = all((d % 4) == 0 for d in dims) and all(
-        (v % 4) == 0 for v in value_dims
+    value_dims = [d + optimizer.get_state_dim(d) for d in dims]
+    values = MixedDimBuffers(
+        dims, value_dims, capacities, base_opt.embedding_dtype, device, "fixed"
     )
-
-    tables: List[ExtendableBuffer] = [
-        FixedDeviceBuffer((cap, vd), base_opt.embedding_dtype, device)
-        for cap, vd in zip(capacities, value_dims)
-    ]
 
     props = torch.cuda.get_device_properties(device_idx)
     threads_in_wave = props.multi_processor_count * props.max_threads_per_multi_processor
@@ -586,18 +516,7 @@ def create_cache_state(
         evict_strategy=base_opt.evict_strategy.value,
         key_index_map=None,
         capacity=sum(capacities),
-        tables=tables,
-        table_ptrs_dev=get_table_ptrs(tables, device),
-        table_emb_dims=torch.tensor(dims, dtype=torch.int64, device=device),
-        table_emb_dims_host=torch.tensor(dims, dtype=torch.int64),
-        table_value_dims=torch.tensor(value_dims, dtype=torch.int64, device=device),
-        table_emb_dims_cpu=dims,
-        table_value_dims_cpu=value_dims,
-        max_emb_dim=max_emb_dim,
-        emb_dim=max_emb_dim,
-        value_dim=value_dim,
-        emb_dtype=base_opt.embedding_dtype,
-        all_dims_vec4=all_dims_vec4,
+        values=values,
         optimizer=optimizer,
         threads_in_wave=threads_in_wave,
         score=None,
@@ -651,7 +570,7 @@ def _split_value_row(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Split a loaded ``[N, value_dim]`` row into (embedding, optimizer state).
 
-    ``load_from_flat_single_table`` returns the table's own compact row, so the
+    ``MixedDimBuffers.load_table`` returns the table's own compact row, so the
     optimizer state is the trailing ``value_dim - emb_dim`` columns. That runtime
     width is not all payload: rowwise Adagrad reserves a fixed 16 bytes per row
     in the fused FBGEMM layout but only ever fills one accumulator scalar. The
@@ -664,9 +583,9 @@ def _split_value_row(
     Tables whose optimizer keeps no per-row state (e.g. plain SGD) get ``None``
     rather than a zero-width tensor, matching :func:`export_keys_values_iter`.
     """
-    emb_dim = state.table_emb_dims_cpu[table_id]
-    optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim
-    emb = values[:, :emb_dim].to(dtype=state.emb_dtype)
+    emb_dim = state.values.emb_dims_list[table_id]
+    optim_state_dim = state.values.value_dims_list[table_id] - emb_dim
+    emb = values[:, :emb_dim].to(dtype=state.values.dtype)
     if optim_state_dim <= 0:
         return emb, None
     opt = values[:, -optim_state_dim:]
@@ -795,101 +714,6 @@ def _replay_score_block(
     return block.contiguous()
 
 
-def load_from_flat(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_ids: torch.Tensor,
-    copy_mode: CopyMode,
-) -> torch.Tensor:
-    N = indices.numel()
-    if copy_mode == CopyMode.EMBEDDING:
-        max_dim = state.emb_dim
-        _load = _load_emb
-    else:
-        max_dim = state.value_dim
-        _load = _load_value
-    output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
-    if N > 0:
-        _load(
-            state.table_ptrs_dev,
-            indices,
-            table_ids,
-            output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
-        )
-    return output
-
-
-def store_to_flat(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_ids: torch.Tensor,
-    values: torch.Tensor,
-) -> None:
-    if values.dim() == 1:
-        values = values.unsqueeze(1)
-    _store_value(
-        state.table_ptrs_dev,
-        indices,
-        table_ids,
-        values.to(state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
-    )
-
-
-def load_from_flat_single_table(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_id: int,
-) -> torch.Tensor:
-    """Load full values for a single table. Returns compact [N, value_dim_t]."""
-    N = indices.numel()
-    vdim = state.table_value_dims_cpu[table_id]
-    output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
-    if N > 0:
-        _load_contiguous(
-            state.table_ptrs_dev,
-            indices,
-            table_id,
-            output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
-        )
-    return output
-
-
-def store_to_flat_single_table(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_id: int,
-    values: torch.Tensor,
-) -> None:
-    """Store full values for a single table. Expects compact [N, value_dim_t]."""
-    N = indices.numel()
-    if N == 0:
-        return
-    if values.dim() == 1:
-        values = values.unsqueeze(1)
-    _store_contiguous(
-        state.table_ptrs_dev,
-        indices,
-        table_id,
-        values.to(state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
-    )
-
-
 def _append_evicted(
     state: DynamicEmbTableState,
     evicted_keys: torch.Tensor,
@@ -984,15 +808,15 @@ def export_keys_values_iter(
     """Export keys, embeddings, opt_states, scores for a logical table.
 
     Embeddings and optimizer states come out at the table's own precision
-    (``state.emb_dtype``), matching what ``incremental_dump`` yields, so a
+    (``state.values.dtype``), matching what ``incremental_dump`` yields, so a
     checkpoint stores what the table actually holds instead of an fp32 widening
     of it. Callers that want fp32 cast on their own.
 
     NO_EVICTION tables load flat values by stored score (logical row index), not by
     hash slot ``indices`` from export.
     """
-    emb_dim_t = state.table_emb_dims_cpu[table_id]
-    vdim = state.table_value_dims_cpu[table_id]
+    emb_dim_t = state.values.emb_dims_list[table_id]
+    vdim = state.values.value_dims_list[table_id]
     optim_state_dim = vdim - emb_dim_t
 
     for (
@@ -1008,7 +832,7 @@ def export_keys_values_iter(
     ):
         scores = named_scores[state.score_policy.name]
         flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
-        values = load_from_flat_single_table(state, flat_rows, table_id)
+        values = state.values.load_table(flat_rows, table_id)
         embeddings = values[:, :emb_dim_t].contiguous()
         if optim_state_dim != 0:
             opt_states = values[:, -optim_state_dim:].contiguous().to(device)
@@ -1065,12 +889,12 @@ def _dump_table(
         # whole on every dump (by rank 0 only, and not by the appending second
         # tier of a hybrid dump): anything a loader needs has to be contributed
         # here, because there is no later pass that merges into the file.
-        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(state.emb_dtype)
-        meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
+        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(state.values.dtype)
+        meta_data[META_EMBEDDING_DIM] = int(state.values.emb_dims_list[table_id])
         # Recorded separately from the embedding dtype because the two can
         # differ: rowwise Adagrad keeps its accumulator in fp32 in any table.
         meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(
-            state.optimizer.get_state_dtype(state.emb_dtype)
+            state.optimizer.get_state_dtype(state.values.dtype)
         )
 
         if current_score is not None:
@@ -1095,7 +919,7 @@ def _dump_table(
         if fopt_states and opt_states_batch is not None:
             to_write = state.optimizer.states_for_checkpoint(
                 opt_states_batch,
-                state.table_emb_dims_cpu[table_id],
+                state.values.emb_dims_list[table_id],
             )
             fopt_states.write(_raw_bytes(to_write))
 
@@ -1290,7 +1114,7 @@ def _validate_load_meta(
             f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
         )
 
-    dim = state.table_emb_dims_cpu[table_id]
+    dim = state.values.emb_dims_list[table_id]
     runtime_optstate_dim = state.optimizer.get_state_dim(dim)
 
     if runtime_optstate_dim == 0:
@@ -1308,13 +1132,13 @@ def _validate_load_meta(
             f"Embedding dim mismatch: {embedding_file_path} holds rows of "
             f"{ckpt_emb_dim} but the runtime table is configured with dim {dim}."
         )
-    if emb_dtype != state.emb_dtype:
+    if emb_dtype != state.values.dtype:
         # Not fatal: the insert path casts, so this is a deliberate precision
         # migration as often as it is a mistake. Say which way it goes, since
         # narrowing loses bits that the checkpoint still has.
         warnings.warn(
             f"Checkpoint {embedding_file_path} stores {emb_dtype} embeddings but "
-            f"the runtime table is {state.emb_dtype}; values will be converted on "
+            f"the runtime table is {state.values.dtype}; values will be converted on "
             "load.",
             UserWarning,
             stacklevel=2,
@@ -1374,7 +1198,7 @@ def _load_key_values(
     table_id: int = 0,
 ) -> None:
     dim = embeddings.size(1)
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
+    emb_dim_cfg = state.values.emb_dims_list[table_id]
     runtime_optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     if not keys.is_cuda:
         raise RuntimeError("Keys must be on GPU")
@@ -1392,13 +1216,13 @@ def _load_key_values(
     # be the table's dtype (rowwise Adagrad keeps an fp32 accumulator), and an
     # elementwise cast here would round that accumulator away. The branch below
     # only calls it when the state is non-empty, which is the case it casts.
-    embeddings = embeddings.to(state.emb_dtype)
+    embeddings = embeddings.to(state.values.dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
         opt_states = torch.empty(
             keys.numel(),
             runtime_optstate_dim,
-            dtype=state.emb_dtype,
+            dtype=state.values.dtype,
             device=embeddings.device,
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
@@ -1406,11 +1230,11 @@ def _load_key_values(
         opt_states = state.optimizer.states_from_checkpoint(
             opt_states,
             emb_dim_cfg,
-            state.emb_dtype,
+            state.values.dtype,
             embeddings.device,
         )
 
-    # Both halves are already state.emb_dtype (normalized above), so this cat
+    # Both halves are already state.values.dtype (normalized above), so this cat
     # cannot silently widen the row via type promotion.
     values = (
         torch.cat(
@@ -1450,7 +1274,7 @@ def _load_key_values(
         state.key_index_map.scatter_score_blocks(
             table_id, indices, scores.to(SCORE_TYPE).contiguous()
         )
-        store_to_flat_single_table(state, indices, table_id, values)
+        state.values.store_table(indices, table_id, values)
         return
 
     policy = ScorePolicy.ASSIGN
@@ -1473,7 +1297,7 @@ def _load_key_values(
     )
 
     indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
-    store_to_flat_single_table(state, indices, table_id, values)
+    state.values.store_table(indices, table_id, values)
 
 
 # ---------------------------------------------------------------------------
@@ -1493,7 +1317,7 @@ def _replay_write_values(
     """Write a replayed row's value columns, per :class:`ReplayContent`.
 
     A value row is an embedding followed by the optimizer state, and the two are
-    written together or not at all -- ``store_to_flat_single_table`` copies from
+    written together or not at all -- ``MixedDimBuffers.store_table`` copies from
     the row base, so there is no way to write the tail without the head. The
     embedding is therefore always written, and the only choice is what the tail
     gets:
@@ -1507,13 +1331,13 @@ def _replay_write_values(
     """
     if rows.numel() == 0:
         return
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
+    emb_dim_cfg = state.values.emb_dims_list[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
-    embeddings = embeddings.to(dtype=state.emb_dtype)
+    embeddings = embeddings.to(dtype=state.values.dtype)
     want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
 
     if optstate_dim == 0:
-        store_to_flat_single_table(state, rows, table_id, embeddings)
+        state.values.store_table(rows, table_id, embeddings)
         return
 
     if want_opt:
@@ -1535,29 +1359,26 @@ def _replay_write_values(
         opt = state.optimizer.states_from_checkpoint(
             optimizer_states.to(device=embeddings.device),
             emb_dim_cfg,
-            state.emb_dtype,
+            state.values.dtype,
             embeddings.device,
         )
-        store_to_flat_single_table(
-            state, rows, table_id, torch.cat([embeddings, opt], dim=-1)
+        state.values.store_table(rows, table_id, torch.cat([embeddings, opt], dim=-1)
         )
         return
 
     keep = keep_optimizer
     if bool(keep.any()):
-        store_to_flat_single_table(state, rows[keep], table_id, embeddings[keep])
+        state.values.store_table(rows[keep], table_id, embeddings[keep])
     fresh = torch.logical_not(keep)
     if bool(fresh.any()):
         fresh_emb = embeddings[fresh]
         opt_states = torch.empty(
             (fresh_emb.size(0), optstate_dim),
-            dtype=state.emb_dtype,
+            dtype=state.values.dtype,
             device=fresh_emb.device,
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
-        store_to_flat_single_table(
-            state,
-            rows[fresh],
+        state.values.store_table(rows[fresh],
             table_id,
             torch.cat([fresh_emb, opt_states], dim=-1),
         )
@@ -1567,9 +1388,9 @@ class DynamicEmbCache(Cache):
     """The GPU cache: placement and reference protection, from ``EmbeddingCacheCore``.
 
     It holds no score and decides nothing about which keys stay in the system.
-    The rows live in ``_state.tables``, one fixed pool per table addressed by node,
+    The rows live in ``_state.values``, one fixed pool per table addressed by node,
     and everything that reads or writes them goes through the same
-    ``table_ptrs_dev`` the backing's rows do. See docs/lightweight_cache_design.md.
+    ``values.ptrs`` the backing's rows do. See docs/lightweight_cache_design.md.
     """
 
     def __init__(
@@ -1670,19 +1491,19 @@ class DynamicEmbCache(Cache):
         return self._state.num_tables
 
     def embedding_dtype(self) -> torch.dtype:
-        return self._state.emb_dtype
+        return self._state.values.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._state.table_emb_dims_cpu[table_id]
+        return self._state.values.emb_dims_list[table_id]
 
     def value_dim(self, table_id: int) -> int:
-        return self._state.table_value_dims_cpu[table_id]
+        return self._state.values.value_dims_list[table_id]
 
     def max_embedding_dim(self) -> int:
-        return self._state.emb_dim
+        return self._state.values.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._state.value_dim
+        return self._state.values.max_value_dim
 
     def init_optimizer_state(self) -> float:
         return self._state.optimizer.get_initial_optimizer_state()
@@ -1806,8 +1627,7 @@ def _eval_lookup_cached(
     nodes = cache.find_nodes(keys, table_ids)
     founds = nodes >= 0
 
-    embs = load_from_flat(
-        cache._state, nodes.to(torch.int64), table_ids, copy_mode=CopyMode.EMBEDDING
+    embs = cache._state.values.load(nodes.to(torch.int64), table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
     missing_mask = ~founds

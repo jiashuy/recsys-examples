@@ -568,3 +568,15 @@ value 行: 全局行池, 与槽位无关
 **测试的处理**：依赖旧实现内部的用例删除——`test_no_eviction_row_indexing`、`test_hybrid_storage_export`、`test_expansion_value_capacity`、`test_deterministic_insert`、`test_table_expansion_capacity_growth`、`test_fill_tables`、以及"链式对旧索引逐步比对"的差分用例（旧索引已不存在）；其余改用 `ChainedStorage`。`test_alignment` 的桶容量参数改为 128 / 256（链式上限 256），值缓冲的行数断言改为"大于索引容量"（缓冲含每步新 key 用的备用行）。
 
 **迁移时测出并修掉的缺陷**：`ChainedStorage.load` 对两字 score 的 checkpoint 把 `num_scores` 写死为 1，且没有把按用户配置顺序存的列换回物理顺序（`score_load_permutation`）——LFU 在前的复合策略 dump → load 后两个字互换。主测试文件没有覆盖这一点，由 `test_lru_lfu_storage_dump_load_roundtrip` 测出。
+
+### 桶容量与链接宽度（已实现）
+
+- **`bucket_capacity` 取任意正整数**。不小于每卡行数时（`MAX_BUCKET_CAPACITY = 2**63 - 1` 总是如此）整张表就是一个桶，大小正好是每卡行数，不补齐；否则每卡行数向上补到 `bucket_capacity` 的倍数。16 的倍数、不超过 256 这两条限制都已去掉（16 的倍数只是旧 `ScoredHashTable` 的要求，它自己会取整）。`BUCKET_ALIGNMENT` 一并删除。
+- **同一存储内的表共用 `bucket_capacity`**：它进了表的分组键，所以"整表一个桶"时规模不同的表会分到不同模块。hybrid 的两层各自的桶：用户的桶容量不小于整表的 `max_capacity` 时，每层是一个桶、大小为该层的行数，否则沿用用户的值。
+- **链接（`head` / `next`）宽度**：默认 2 字节；`4 × bucket_capacity` 放不下 2 字节（含"无"这个值）时用 4 字节，即桶容量超过 16383。所有表同宽。
+- **大桶的淘汰**：桶容量不超过 256 时仍在寄存器里选 victim（快路径不变）；更大的桶每选一个 victim 就扫一遍桶，找排名在上一个之后的最小者，所以被守卫或引用拒绝的成员不用额外标记。代价是一步里每个桶的淘汰开销约为 `victims × 桶大小 / 32`，大桶适合小表。
+- **淘汰标记**：离开的 key 的槽位用其行号的最高位标记（原来是按 256 开的共享内存数组），所以行数上限变为 2^31 - 1，没有东西再按桶大小开辟。
+
+### 混合维度的值缓冲（`MixedDimBuffers`）
+
+一个模块合并的表维度可以不同，每张表有自己的 `[行数, value_dim]` 缓冲。`dynamicemb/mixed_dim_buffers.py` 的 `MixedDimBuffers` 把这些缓冲、每张表的维度（设备、host、列表三份）、最宽维度、是否都能按 4 对齐、各缓冲基址的设备数组，以及对它们的操作和 kernel 调用放在一起：`load` / `store`（整行或只取 embedding，补齐到最宽）、`load_table` / `store_table`（单表紧凑行）、`ensure_rows`（缓冲增长并刷新基址）、`update_rows`（优化器原地更新存储的行）、`update_padded`（对已读出的补齐行更新）、`reset_optimizer_states`。`DynamicEmbTableState` 只持有一个 `values`；原来散在状态里的 11 个字段和 `load_from_flat` 等模块函数、`get_table_ptrs` 都没有了，缓冲增长时基址的刷新只在这一处。有单独的单元测试 `test_mixed_dim_buffers.py`。
