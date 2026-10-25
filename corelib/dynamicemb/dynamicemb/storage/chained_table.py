@@ -46,11 +46,12 @@ from dynamicemb_extensions import (
     chained_pin,
     chained_place,
     chained_plan,
-    chained_release,
     chained_segment_need,
     chained_stage,
     device_timestamp,
 )
+
+from .row_allocator import RowAllocator
 
 # How find treats the score of a key it finds.
 SCORE_NONE = 0  # leave it alone
@@ -162,7 +163,6 @@ class ChainedTables:
             if row_capacities is None
             else [int(r) for r in row_capacities]
         )
-        self._row_cap = rows
         dev = self.device
         self._keys: List[torch.Tensor] = []
         self._scores: List[torch.Tensor] = []
@@ -171,7 +171,6 @@ class ChainedTables:
         self._head: List[torch.Tensor] = []
         self._bsize: List[torch.Tensor] = []
         self._refs: List[Optional[torch.Tensor]] = []
-        self._free: List[torch.Tensor] = []
         for t, nb in enumerate(self._nb):
             slots = nb * self.bucket_capacity
             if rows[t] < slots:
@@ -184,9 +183,12 @@ class ChainedTables:
                 if self.track_refs
                 else None
             )
-            # The pool of free rows is a stack; _tops[t] is how many are on it.
-            self._free.append(torch.arange(rows[t], dtype=torch.int32, device=dev))
-        self._tops = torch.tensor(rows, dtype=torch.int32, device=dev)
+        self.allocator = RowAllocator(
+            rows,
+            self.identity,
+            [nb * self.bucket_capacity for nb in self._nb],
+            dev,
+        )
         self._version = [0] * self.num_tables
         self._rebuild_views()
 
@@ -227,12 +229,9 @@ class ChainedTables:
             self._head,
             self._bsize,
             self._refs,
-            self._free,
-            self._tops,
             self._nb,
             self.bucket_capacity,
             self.num_scores,
-            [int(x) for x in self.identity],
         )
 
     def version(self, table: int = 0) -> int:
@@ -247,7 +246,7 @@ class ChainedTables:
 
     def row_capacity_of(self, table: int) -> int:
         """Rows the table's value pool has to have."""
-        return self._row_cap[table]
+        return self.allocator.row_capacity_of(table)
 
     def capacity_of(self, table: int) -> int:
         return self._nb[table] * self.bucket_capacity
@@ -256,7 +255,7 @@ class ChainedTables:
         return int(self._bsize[table].sum().item())
 
     def free_rows(self, table: int = 0) -> int:
-        return int(self._tops[table].item())
+        return self.allocator.free_rows(table)
 
     def touch(
         self,
@@ -403,10 +402,11 @@ class ChainedTables:
             total_buckets = sum(self._nb)
 
         g_ptr, g_n = guard if guard is not None else (0, 0)
+        srows_in, abort = self.allocator.take(skeys, stids, tstart)
         (rows, srows, _vict_slot, vkeys, vrows, vtabs, seg_fail, stats, vscores) = chained_apply(
             self._views, perm, skeys, stids, sscores, seg_table, seg_bucket,
             seg_begin, counts, need, voff, num_runs, tstart, g_ptr, g_n, pin,
-            self.num_tables, self.num_scores,
+            self.num_tables, self.num_scores, srows_in, abort,
         )  # fmt: skip
         for t in range(self.num_tables):
             self._version[t] += 1
@@ -419,7 +419,7 @@ class ChainedTables:
             )
         if exhausted:
             per_table = (tstart[1:] - tstart[:-1]).tolist()
-            tops = self._tops.tolist()
+            tops = self.allocator.free_counts()
             short = [(t, tops[t], c) for t, c in enumerate(per_table) if c > tops[t]]
             t, have, need_rows = short[0]
             raise RuntimeError(
@@ -464,15 +464,7 @@ class ChainedTables:
 
     def release_rows(self, rows: torch.Tensor, table_ids: torch.Tensor) -> None:
         """Give rows back to their pools, once nothing needs what they hold."""
-        if rows.numel() == 0:
-            return
-        if self.num_tables == 1:
-            if not self.identity[0]:
-                chained_release(self._views, 0, rows)
-            return
-        for t in range(self.num_tables):
-            if not self.identity[t]:
-                chained_release(self._views, t, rows[table_ids == t])
+        self.allocator.release(rows, table_ids)
 
     def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """Remove keys. Their rows go back to the pools; each key's row comes back, -1
@@ -520,7 +512,7 @@ class ChainedTables:
             arrays = self._new_arrays(new_nb)
             tmp = chained_make_views(
                 [arrays[0]], [arrays[1]], [arrays[2]], [arrays[3]], [arrays[4]],
-                [arrays[5]], [None], [self._free[table]], self._tops[table : table + 1],
+                [arrays[5]], [None],
                 [new_nb], cap, self.num_scores,
             )  # fmt: skip
             local = chained_bucket_ids(keys, new_nb)
@@ -566,25 +558,16 @@ class ChainedTables:
 
         # The pool has to cover every slot; the new rows go on the free stack.
         slots = new_nb * cap
-        if slots > self._row_cap[table]:
-            old_r = self._row_cap[table]
+        old_r = self.allocator.row_capacity_of(table)
+        if slots > old_r:
             new_r = _default_rows(slots)
-            top = int(self._tops[table].item())
-            free = torch.empty(new_r, dtype=torch.int32, device=dev)
-            free[:top] = self._free[table][:top]
-            added = new_r - old_r
-            free[top : top + added] = torch.arange(
-                old_r, new_r, dtype=torch.int32, device=dev
-            )
-            self._free[table] = free
-            self._tops[table] = top + added
-            self._row_cap[table] = new_r
+            self.allocator.grow(table, new_r)
             if self.track_refs:
                 refs = torch.zeros(new_r, dtype=torch.int32, device=dev)
                 refs[:old_r] = self._refs[table]
                 self._refs[table] = refs
         self._rebuild_views()
-        return self._row_cap[table]
+        return self.allocator.row_capacity_of(table)
 
     # -- inspection -----------------------------------------------------------
 
@@ -644,7 +627,7 @@ class ChainedTables:
                     assert key not in seen_keys, f"key {key} stored twice"
                     seen_keys.add(key)
                     row = index[b * cap + s] & 0xFFFFFFFF
-                    assert row < self._row_cap[t], f"row {row} out of range"
+                    assert row < self.allocator.row_capacity_of(t), f"row {row} out of range"
                     assert row not in seen_rows, f"row {row} used twice"
                     seen_rows.add(row)
                     if self.identity[t]:
@@ -652,7 +635,8 @@ class ChainedTables:
             if self.identity[t]:  # the pool is not used
                 continue
             assert (
-                int(self._tops[t].item()) + len(seen_rows) + pending[t] == self._row_cap[t]
+                self.allocator.free_rows(t) + len(seen_rows) + pending[t]
+                == self.allocator.row_capacity_of(t)
             ), f"table {t}: rows are lost or duplicated"
 
 
@@ -687,7 +671,7 @@ class ChainedTable(ChainedTables):
 
     @property
     def row_capacity(self) -> int:
-        return self._row_cap[0]
+        return self.allocator.row_capacity_of(0)
 
     @property
     def capacity(self) -> int:

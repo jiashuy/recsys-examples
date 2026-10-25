@@ -690,8 +690,9 @@ def test_two_runs_of_the_same_steps_end_identically(device):
         return table
 
     a, b = run(), run()
-    for name in ("_keys", "_scores", "_index", "_next", "_head", "_bsize", "_free"):
+    for name in ("_keys", "_scores", "_index", "_next", "_head", "_bsize"):
         assert torch.equal(getattr(a, name)[0], getattr(b, name)[0]), name
+    assert torch.equal(a.allocator._free[0], b.allocator._free[0]), "the free stack"
     assert a.free_rows() == b.free_rows()
 
 

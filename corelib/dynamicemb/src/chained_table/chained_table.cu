@@ -105,16 +105,26 @@ struct TableView {
   void *head;
   int32_t *bucket_size;
   int32_t *refs;     // pin count of each row, or null when the table does not pin
-  uint32_t *free_rows;  // the stack of free rows ...
-  int32_t *top;         // ... and how many are on it (on the device)
   int64_t num_buckets;
   int64_t gid_base;  // buckets of the tables before this one: a bucket's global id
   int32_t cap;
   int32_t num_scores;  // score words per slot: 1, or 2 for (timestamp, frequency)
   int32_t wide;        // chain links are 4 bytes wide rather than 2
-  int32_t identity;    // a key is its own row: no row is taken from the stack
+  int32_t pad;
 };
-static_assert(sizeof(TableView) == 104, "the layout is built on the host");
+static_assert(sizeof(TableView) == 88, "the layout is built on the host");
+
+// The rows of a table, apart from the index that places keys in them: the stack of free
+// rows and how many are on it (on the device), or, for identity rows, the number of keys
+// there can be, each being its own row.
+struct PoolView {
+  uint32_t *free_rows;
+  int32_t *top;
+  int64_t limit;     // identity rows: the keys are 0 .. limit - 1
+  int32_t identity;  // a key is its own row: no row is taken from the stack
+  int32_t pad;
+};
+static_assert(sizeof(PoolView) == 32, "the layout is built on the host");
 
 __global__ void gid_kernel(const TableView *__restrict__ views,
                            const int64_t *__restrict__ keys,
@@ -672,28 +682,27 @@ __global__ void table_start_kernel(const TableView *__restrict__ views,
 
 // abort = 1: a table's pool has fewer free rows than it has new keys.
 // abort = 2: a key of a table with identity rows is not a row of it. 2 wins.
-__global__ void check_pool_kernel(const TableView *__restrict__ views,
+__global__ void check_pool_kernel(const PoolView *__restrict__ pools,
                                   const int64_t *__restrict__ tstart,
                                   int64_t num_tables, int32_t *__restrict__ abort) {
   const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= num_tables || views[t].identity) return;
+  if (t >= num_tables || pools[t].identity) return;
   const int64_t c = tstart[t + 1] - tstart[t];
-  if (c > int64_t(*views[t].top)) atomicMax(abort, 1);
+  if (c > int64_t(*pools[t].top)) atomicMax(abort, 1);
 }
 
-__global__ void check_identity_kernel(const TableView *__restrict__ views,
+__global__ void check_identity_kernel(const PoolView *__restrict__ pools,
                                       const int64_t *__restrict__ skeys,
                                       const int64_t *__restrict__ stids, int64_t n,
                                       int32_t *__restrict__ abort) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
-    const TableView &v = views[stids[i]];
-    if (v.identity && (skeys[i] < 0 || skeys[i] >= v.num_buckets * int64_t(v.cap)))
-      atomicMax(abort, 2);
+    const PoolView &p = pools[stids[i]];
+    if (p.identity && (skeys[i] < 0 || skeys[i] >= p.limit)) atomicMax(abort, 2);
   }
 }
 
-__global__ void assign_rows_kernel(const TableView *__restrict__ views,
+__global__ void assign_rows_kernel(const PoolView *__restrict__ pools,
                                    const int64_t *__restrict__ skeys,
                                    const int64_t *__restrict__ stids,
                                    const int64_t *__restrict__ tstart,
@@ -703,23 +712,23 @@ __global__ void assign_rows_kernel(const TableView *__restrict__ views,
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
     const int64_t t = stids[i];
-    const TableView &v = views[t];
-    if (v.identity) {
+    const PoolView &p = pools[t];
+    if (p.identity) {
       srows[i] = skeys[i];
       continue;
     }
     const int64_t c = tstart[t + 1] - tstart[t];
-    srows[i] = static_cast<int64_t>(v.free_rows[int64_t(*v.top) - c + (i - tstart[t])]);
+    srows[i] = static_cast<int64_t>(p.free_rows[int64_t(*p.top) - c + (i - tstart[t])]);
   }
 }
 
-__global__ void pop_rows_kernel(const TableView *__restrict__ views,
+__global__ void pop_rows_kernel(const PoolView *__restrict__ pools,
                                 const int64_t *__restrict__ tstart,
                                 int64_t num_tables,
                                 const int32_t *__restrict__ abort) {
   const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= num_tables || *abort != 0 || views[t].identity) return;
-  *views[t].top -= int32_t(tstart[t + 1] - tstart[t]);
+  if (t >= num_tables || *abort != 0 || pools[t].identity) return;
+  *pools[t].top -= int32_t(tstart[t + 1] - tstart[t]);
 }
 
 __global__ void unpermute_kernel(const int64_t *__restrict__ perm,
@@ -741,19 +750,19 @@ __global__ void stats_kernel(const int64_t *__restrict__ voff,
   stats[3] = *abort;
 }
 
-__global__ void release_kernel(const TableView *__restrict__ views, int64_t table,
+__global__ void release_kernel(const PoolView *__restrict__ pools, int64_t table,
                                const int64_t *__restrict__ rows, int64_t n) {
-  const TableView &v = views[table];
-  const int64_t top = *v.top;
+  const PoolView &p = pools[table];
+  const int64_t top = *p.top;
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int64_t(gridDim.x) * blockDim.x) {
-    v.free_rows[top + i] = static_cast<uint32_t>(rows[i]);
+    p.free_rows[top + i] = static_cast<uint32_t>(rows[i]);
   }
 }
 
-__global__ void push_rows_kernel(const TableView *__restrict__ views,
-                                 int64_t table, int64_t n) {
-  *views[table].top += int32_t(n);
+__global__ void push_rows_kernel(const PoolView *__restrict__ pools, int64_t table,
+                                 int64_t n) {
+  *pools[table].top += int32_t(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -787,23 +796,15 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
                               std::vector<at::Tensor> head,
                               std::vector<at::Tensor> bucket_size,
                               std::vector<c10::optional<at::Tensor>> refs,
-                              std::vector<at::Tensor> free_rows,
-                              at::Tensor tops,
                               std::vector<int64_t> num_buckets, int64_t cap,
-                              int64_t num_scores,
-                              std::vector<int64_t> identity) {
+                              int64_t num_scores) {
   const size_t nt = keys.size();
-  TORCH_CHECK(identity.empty() || identity.size() == nt,
-              "identity is empty, or has one entry per table");
   TORCH_CHECK(cap > 0, "bucket capacity must be positive");
   TORCH_CHECK(scores.size() == nt && index.size() == nt && next.size() == nt &&
                   head.size() == nt && bucket_size.size() == nt &&
-                  refs.size() == nt && free_rows.size() == nt &&
+                  refs.size() == nt &&
                   num_buckets.size() == nt,
               "one entry per table in every list");
-  check_cuda(tops, "tops");
-  TORCH_CHECK(tops.scalar_type() == at::kInt && tops.numel() == int64_t(nt),
-              "tops must be one int32 per table");
   std::vector<TableView> host(nt);
   int64_t gid_base = 0;
   for (size_t t = 0; t < nt; ++t) {
@@ -850,19 +851,12 @@ at::Tensor chained_make_views(std::vector<at::Tensor> keys,
     } else {
       v.refs = nullptr;
     }
-    check_cuda(free_rows[t], "free rows");
-    TORCH_CHECK(free_rows[t].element_size() == 4, "free rows must be 4 bytes wide");
-    // The top bit of a row marks a slot whose key is leaving while a step places.
-    TORCH_CHECK(free_rows[t].numel() < (int64_t(1) << 31),
-                "a table of at most 2^31 - 1 rows");
-    v.free_rows = reinterpret_cast<uint32_t *>(free_rows[t].data_ptr());
-    v.top = tops.data_ptr<int32_t>() + t;
     v.num_buckets = num_buckets[t];
     v.gid_base = gid_base;
     TORCH_CHECK(cap < (int64_t(1) << 31), "bucket capacity must fit in 31 bits");
     v.cap = static_cast<int32_t>(cap);
     v.num_scores = static_cast<int32_t>(num_scores);
-    v.identity = identity.empty() ? 0 : static_cast<int32_t>(identity[t] != 0);
+    v.pad = 0;
     gid_base += num_buckets[t];
   }
   auto out = at::empty({int64_t(nt * sizeof(TableView))},
@@ -1170,26 +1164,100 @@ std::vector<at::Tensor> chained_plan(at::Tensor views, at::Tensor keys,
           seg_begin, counts, need,  voff,  num_runs, tstart};
 }
 
-// Take the rows, place the keys, put every key's row back in input order. Returns
+inline const PoolView *pools_ptr(const at::Tensor &pools) {
+  check_cuda(pools, "pools");
+  TORCH_CHECK(pools.scalar_type() == at::kByte &&
+                  pools.numel() % sizeof(PoolView) == 0,
+              "pools must be a byte tensor built by row_pool_make_views");
+  return reinterpret_cast<const PoolView *>(pools.data_ptr());
+}
+
+// One PoolView per table, built on the host and copied over. Call again, and keep the
+// new tensor, whenever a table's free stack is replaced. ``identity`` has one entry per
+// table: a table of identity rows holds the keys 0 .. limit - 1, each in the row of its
+// own number, and takes nothing from its stack.
+at::Tensor row_pool_make_views(std::vector<at::Tensor> free_rows, at::Tensor tops,
+                               std::vector<int64_t> identity,
+                               std::vector<int64_t> limits) {
+  const size_t nt = free_rows.size();
+  TORCH_CHECK(identity.size() == nt && limits.size() == nt,
+              "one entry per table in every list");
+  check_cuda(tops, "tops");
+  TORCH_CHECK(tops.scalar_type() == at::kInt && tops.numel() == int64_t(nt),
+              "tops must be one int32 per table");
+  std::vector<PoolView> host(nt);
+  for (size_t t = 0; t < nt; ++t) {
+    check_cuda(free_rows[t], "free rows");
+    TORCH_CHECK(free_rows[t].element_size() == 4, "free rows must be 4 bytes wide");
+    // The top bit of a row marks a slot whose key is leaving while a step places.
+    TORCH_CHECK(free_rows[t].numel() < (int64_t(1) << 31),
+                "a table of at most 2^31 - 1 rows");
+    PoolView &p = host[t];
+    p.free_rows = reinterpret_cast<uint32_t *>(free_rows[t].data_ptr());
+    p.top = tops.data_ptr<int32_t>() + t;
+    p.limit = limits[t];
+    p.identity = static_cast<int32_t>(identity[t] != 0);
+    p.pad = 0;
+  }
+  auto out = at::empty({int64_t(nt * sizeof(PoolView))},
+                       at::TensorOptions().dtype(at::kByte).device(at::kCUDA));
+  if (nt > 0) {
+    C10_CUDA_CHECK(cudaMemcpyAsync(out.data_ptr(), host.data(), nt * sizeof(PoolView),
+                                   cudaMemcpyHostToDevice,
+                                   at::cuda::getCurrentCUDAStream()));
+    C10_CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+  }
+  return out;
+}
+
+// Take the rows of the sorted staged keys: the first ``counts`` of each table's stack
+// in the order of the keys, or the keys themselves for identity rows. Returns
+//   srows (sorted order), abort
+// abort (on the device, read by chained_apply) is 0, 1 (a pool has fewer free rows than
+// its table has new keys) or 2 (a key is not a row of a table with identity rows). With
+// an abort nothing is taken. No host synchronisation.
+std::vector<at::Tensor> row_pool_take(at::Tensor pools, at::Tensor skeys,
+                                      at::Tensor stids, at::Tensor tstart,
+                                      int64_t num_tables) {
+  const int64_t n = skeys.numel();
+  auto o64 = skeys.options().dtype(at::kLong);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto abort = at::zeros({1}, o64.dtype(at::kInt));
+  auto srows = at::empty({n}, o64);
+  const PoolView *pools_d = pools_ptr(pools);
+  check_pool_kernel<<<1, 128, 0, stream>>>(pools_d, tstart.data_ptr<int64_t>(),
+                                           num_tables, abort.data_ptr<int32_t>());
+  if (n > 0) {
+    check_identity_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+        pools_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
+        stids.data_ptr<int64_t>(), n, abort.data_ptr<int32_t>());
+    assign_rows_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
+        pools_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
+        stids.data_ptr<int64_t>(), tstart.data_ptr<int64_t>(),
+        abort.data_ptr<int32_t>(), n, srows.data_ptr<int64_t>());
+  }
+  pop_rows_kernel<<<1, 128, 0, stream>>>(pools_d, tstart.data_ptr<int64_t>(),
+                                         num_tables, abort.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {srows, abort};
+}
+
+// Place the keys in the rows taken for them, put every key's row back in input order. Returns
 //   rows (input order), srows (sorted order), vict_slot, vkeys, vrows, vtabs,
 //   seg_fail, stats
-// where stats (on the host) is [victims, runs, failed buckets, abort], abort being
-// 0, 1 (a pool is exhausted) or 2 (a key is not a row of a table with identity rows).
-// If the pool is exhausted nothing is taken and nothing placed. One host
-// synchronisation, for stats.
+// where stats (on the host) is [victims, runs, failed buckets, abort], abort being what
+// row_pool_take set. If it set one nothing is placed. One host synchronisation, for stats.
 std::vector<at::Tensor> chained_apply(
     at::Tensor views, at::Tensor perm, at::Tensor skeys, at::Tensor stids,
     at::Tensor sscores, at::Tensor seg_table, at::Tensor seg_bucket,
     at::Tensor seg_begin, at::Tensor counts, at::Tensor need, at::Tensor voff,
     at::Tensor num_runs, at::Tensor tstart, int64_t guard_tables,
     int64_t guard_num_tables, bool pin_new, int64_t num_tables,
-    int64_t num_scores) {
+    int64_t num_scores, at::Tensor srows, at::Tensor abort) {
   const int64_t n = perm.numel();
   auto o64 = perm.options();
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto abort = at::zeros({1}, o64.dtype(at::kInt));
   auto stats = at::zeros({4}, o64);
-  auto srows = at::empty({n}, o64);
   auto rows = at::empty({n}, o64);
   auto vict_slot = at::empty({n}, o64.dtype(at::kInt));
   auto vkeys = at::empty({n}, o64);
@@ -1202,17 +1270,6 @@ std::vector<at::Tensor> chained_apply(
       static_cast<int32_t>(guard_num_tables)};
   const TableView *views_d = views_ptr(views);
 
-  check_pool_kernel<<<1, 128, 0, stream>>>(views_d, tstart.data_ptr<int64_t>(),
-                                           num_tables, abort.data_ptr<int32_t>());
-  check_identity_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
-      views_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
-      stids.data_ptr<int64_t>(), n, abort.data_ptr<int32_t>());
-  assign_rows_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
-      views_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
-      stids.data_ptr<int64_t>(), tstart.data_ptr<int64_t>(),
-      abort.data_ptr<int32_t>(), n, srows.data_ptr<int64_t>());
-  pop_rows_kernel<<<1, 128, 0, stream>>>(views_d, tstart.data_ptr<int64_t>(),
-                                         num_tables, abort.data_ptr<int32_t>());
   place_kernel<<<grid_for(n, kWarpsPerBlock), kWarpsPerBlock * 32, 0, stream>>>(
       views_d, reinterpret_cast<const int64_t *>(skeys.data_ptr()),
       reinterpret_cast<const uint64_t *>(sscores.data_ptr()),
@@ -1239,15 +1296,15 @@ std::vector<at::Tensor> chained_apply(
 }
 
 // Put rows back on a table's stack, in the order given.
-void chained_release(at::Tensor views, int64_t table, at::Tensor rows) {
+void row_pool_release(at::Tensor pools, int64_t table, at::Tensor rows) {
   check_cuda(rows, "rows");
   TORCH_CHECK(rows.scalar_type() == at::kLong, "rows must be int64");
   const int64_t n = rows.numel();
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream();
   release_kernel<<<grid_for(n, 256), 256, 0, stream>>>(
-      views_ptr(views), table, rows.data_ptr<int64_t>(), n);
-  push_rows_kernel<<<1, 1, 0, stream>>>(views_ptr(views), table, n);
+      pools_ptr(pools), table, rows.data_ptr<int64_t>(), n);
+  push_rows_kernel<<<1, 1, 0, stream>>>(pools_ptr(pools), table, n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1294,10 +1351,16 @@ void bind_chained_table(py::module &m) {
   m.def("chained_make_views", &dyn_emb::chained::chained_make_views,
         "build the device array of table views", py::arg("keys"),
         py::arg("scores"), py::arg("index"), py::arg("next"), py::arg("head"),
-        py::arg("bucket_size"), py::arg("refs"), py::arg("free_rows"), py::arg("tops"),
+        py::arg("bucket_size"), py::arg("refs"),
         py::arg("num_buckets"), py::arg("bucket_capacity"),
-        py::arg("num_scores") = 1,
-        py::arg("identity") = std::vector<int64_t>{});
+        py::arg("num_scores") = 1);
+  m.def("row_pool_make_views", &dyn_emb::chained::row_pool_make_views,
+        "build the device array of row pools, one per table", py::arg("free_rows"),
+        py::arg("tops"), py::arg("identity"), py::arg("limits"));
+  m.def("row_pool_take", &dyn_emb::chained::row_pool_take,
+        "take the rows of the sorted staged keys: (rows in sorted order, abort)",
+        py::arg("pools"), py::arg("skeys"), py::arg("stids"), py::arg("tstart"),
+        py::arg("num_tables"));
   m.def("chained_bucket_ids", &dyn_emb::chained::chained_bucket_ids,
         "bucket of each key: hash(key) % num_buckets", py::arg("keys"),
         py::arg("num_buckets"));
@@ -1338,15 +1401,16 @@ void bind_chained_table(py::module &m) {
         py::arg("scores"), py::arg("total_buckets"), py::arg("num_tables"),
         py::arg("num_scores") = 1);
   m.def("chained_apply", &dyn_emb::chained::chained_apply,
-        "take the rows, place the planned keys, return rows in input order",
+        "place the planned keys in the rows taken for them, return rows in input order",
         py::arg("views"), py::arg("perm"), py::arg("skeys"), py::arg("stids"),
         py::arg("sscores"), py::arg("seg_table"), py::arg("seg_bucket"),
         py::arg("seg_begin"), py::arg("counts"), py::arg("need"),
         py::arg("voff"), py::arg("num_runs"), py::arg("tstart"),
         py::arg("guard_tables"), py::arg("guard_num_tables"),
-        py::arg("pin_new"), py::arg("num_tables"), py::arg("num_scores") = 1);
-  m.def("chained_release", &dyn_emb::chained::chained_release,
-        "put rows back on a table's stack", py::arg("views"), py::arg("table"),
+        py::arg("pin_new"), py::arg("num_tables"), py::arg("num_scores"),
+        py::arg("srows"), py::arg("abort"));
+  m.def("row_pool_release", &dyn_emb::chained::row_pool_release,
+        "put rows back on a table's stack", py::arg("pools"), py::arg("table"),
         py::arg("rows"));
   m.def("chained_erase", &dyn_emb::chained::chained_erase,
         "remove keys; the row of each (-1 if absent), in input order",
