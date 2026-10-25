@@ -372,6 +372,32 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         pass
 
 
+def counts_to_offsets(counts: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Where each table starts, with the total last, from how many keys each has: an
+    int64 tensor on ``device``."""
+    counts = counts.to(device=device, dtype=torch.int64)
+    return torch.cat([torch.zeros(1, dtype=torch.int64, device=device), torch.cumsum(counts, 0)])
+
+
+@dataclass
+class CacheMetrics:
+    """What a cache did in its last lookup and its last allocation: each call overwrites
+    the figures of the one before."""
+
+    unique_keys: int = 0  # keys the last lookup was asked for
+    hits: int = 0  # of them, how many the cache held
+    allocated: int = 0  # keys the last allocation gave a node
+    evicted: int = 0  # of those, how many took the node of a key that was resident
+
+    @property
+    def misses(self) -> int:
+        return self.unique_keys - self.hits
+
+    @property
+    def hit_rate(self) -> float:
+        return self.hits / self.unique_keys if self.unique_keys > 0 else 0.0
+
+
 class Cache(abc.ABC):
     """Where the hot rows live on the GPU, and which of them a step is using.
 
@@ -382,12 +408,15 @@ class Cache(abc.ABC):
     takes. Rows are addressed by *node*: the row of a table's pool.
 
     Keys come in unique within a table and grouped by table. ``offsets`` is the
-    position at which each table starts, with the total last, as host integers.
+    position at which each table starts, with the total last: an int64 tensor on the
+    device, ``num_tables + 1`` entries, which :func:`counts_to_offsets` makes of the
+    count of each table. It is read by the kernels and never on the host
+
     """
 
     @abc.abstractmethod
     def lookup_pin(
-        self, unique_keys: torch.Tensor, offsets: List[int]
+        self, unique_keys: torch.Tensor, offsets: torch.Tensor
     ) -> torch.Tensor:
         """The node holding each key, with a reference taken, or ``-1``."""
 
@@ -396,7 +425,7 @@ class Cache(abc.ABC):
         self,
         keys: torch.Tensor,
         positions: torch.Tensor,
-        offsets: List[int],
+        offsets: torch.Tensor,
         nodes: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Take a node for each key, evicting an idle one if needed.
@@ -408,11 +437,11 @@ class Cache(abc.ABC):
         """
 
     @abc.abstractmethod
-    def publish(self, new_nodes: torch.Tensor, offsets: List[int]) -> None:
+    def publish(self, new_nodes: torch.Tensor, offsets: torch.Tensor) -> None:
         """Make the rows the caller has just written visible as cache hits."""
 
     @abc.abstractmethod
-    def release(self, nodes: torch.Tensor, offsets: List[int]) -> None:
+    def release(self, nodes: torch.Tensor, offsets: torch.Tensor) -> None:
         """Give back the reference a step took on each node (``-1`` holds none)."""
 
     @abc.abstractmethod
@@ -434,8 +463,8 @@ class Cache(abc.ABC):
     @abc.abstractmethod
     def cache_metrics(
         self,
-    ) -> torch.Tensor:
-        pass
+    ) -> Optional["CacheMetrics"]:
+        """What the last lookup and the last allocation did, or ``None`` when not recording."""
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:

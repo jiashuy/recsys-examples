@@ -29,7 +29,6 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     ScoreStrategy,
-    align_to_table_size,
     get_physical_score_order,
     score_dump_permutation,
     score_load_permutation,
@@ -49,12 +48,13 @@ from dynamicemb.types import (
     OPT_STATE_TYPE,
     SCORE_TYPE,
     Cache,
+    CacheMetrics,
     CopyMode,
     Storage,
     torch_dtype_to_np_dtype,
 )
 from dynamicemb_extensions import (
-    EmbeddingCacheCore,
+    CacheCore,
     EvictStrategy,
     flagged_compact,
 )
@@ -1338,74 +1338,55 @@ def _replay_write_values(
 
 
 class DynamicEmbCache(Cache):
-    """The GPU cache: placement and reference protection, from ``EmbeddingCacheCore``.
+    """The GPU cache: placement and reference protection, from ``CacheCore``.
 
     It holds no score and decides nothing about which keys stay in the system.
     The rows live in ``values``, one fixed pool per table addressed by node, and
     everything that reads or writes them goes through the same
     ``values.ptrs`` the backing's rows do. The cache knows nothing of the optimizer:
-    it is given the width of each table's value row, and what is done to the values
-    is up to its user. See docs/lightweight_cache_design.md.
+    it is given the buffers, and what is done to the values is up to its user. See docs/lightweight_cache_design.md.
     """
 
-    def __init__(self, options: List[DynamicEmbTableOptions], value_dims: List[int]):
-        assert len(value_dims) == len(options)
-        # Rounded up to a multiple of the bucket capacity, as the cache's index
-        # always was. A cache has to hold every key of a step at once, so a
-        # configuration smaller than a step would otherwise fail where it used to
-        # work.
-        capacities = [
-            align_to_table_size(int(opt.init_capacity), int(opt.bucket_capacity))
-            for opt in options
-        ]
-        device_idx = torch.cuda.current_device()
-        self.options = options
-        self.values = MixedDimBuffers(
-            [opt.dim for opt in options],
-            value_dims,
-            capacities,
-            options[0].embedding_dtype,
-            torch.device(f"cuda:{device_idx}"),
-            "fixed",
-        )
-        props = torch.cuda.get_device_properties(device_idx)
-        self.threads_in_wave = (
-            props.multi_processor_count * props.max_threads_per_multi_processor
-        )
-        self._core = EmbeddingCacheCore(capacities)
-        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
+    def __init__(self, capacities: List[int], values: MixedDimBuffers):
+        """``capacities`` is how many nodes each table has; ``values`` holds that many rows
+        of each."""
+        assert len(capacities) == values.num_tables
+        assert all(values.rows(t) == c for t, c in enumerate(capacities))
+        self.values = values
+        self._core = CacheCore(list(capacities))
+        self._cache_metrics = CacheMetrics()
         self._record_cache_metrics = False
 
     # -- Cache interface --
 
     def lookup_pin(
-        self, unique_keys: torch.Tensor, offsets: List[int]
+        self, unique_keys: torch.Tensor, offsets: torch.Tensor
     ) -> torch.Tensor:
         nodes = self._core.lookup_pin(unique_keys.to(KEY_TYPE), offsets)
         if self._record_cache_metrics:
-            self._cache_metrics[0] = unique_keys.size(0)
-            self._cache_metrics[1] = int((nodes >= 0).sum().item())
+            self._cache_metrics.unique_keys = unique_keys.size(0)
+            self._cache_metrics.hits = int((nodes >= 0).sum().item())
         return nodes
 
     def allocate(
         self,
         keys: torch.Tensor,
         positions: torch.Tensor,
-        offsets: List[int],
+        offsets: torch.Tensor,
         nodes: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         victim_keys, has_victim, new_nodes = self._core.allocate(
             keys.to(KEY_TYPE), positions, offsets, nodes
         )
         if self._record_cache_metrics:
-            self._cache_metrics[2] = keys.numel()
-            self._cache_metrics[3] = int(has_victim.sum().item())
+            self._cache_metrics.allocated = keys.numel()
+            self._cache_metrics.evicted = int(has_victim.sum().item())
         return victim_keys, has_victim.to(torch.bool), new_nodes
 
-    def publish(self, new_nodes: torch.Tensor, offsets: List[int]) -> None:
+    def publish(self, new_nodes: torch.Tensor, offsets: torch.Tensor) -> None:
         self._core.publish(new_nodes, offsets)
 
-    def release(self, nodes: torch.Tensor, offsets: List[int]) -> None:
+    def release(self, nodes: torch.Tensor, offsets: torch.Tensor) -> None:
         self._core.release(nodes, offsets)
 
     def find_nodes(
@@ -1443,7 +1424,7 @@ class DynamicEmbCache(Cache):
         return self._core.guard()
 
     @property
-    def cache_metrics(self) -> Optional[torch.Tensor]:
+    def cache_metrics(self) -> Optional[CacheMetrics]:
         return self._cache_metrics if self._record_cache_metrics else None
 
     def set_record_cache_metrics(self, record: bool) -> None:

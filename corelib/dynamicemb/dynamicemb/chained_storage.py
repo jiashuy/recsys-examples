@@ -549,7 +549,7 @@ class ChainedStorage(Storage):
 
     def flush_from(self, cache) -> None:
         """Write every row the cache holds back to this table's own row of the key."""
-        batch_size = cache.threads_in_wave
+        batch_size = self._state.threads_in_wave
         for t in range(cache.num_tables):
             nodes, keys, _referenced = cache.resident(t)
             for start in range(0, nodes.numel(), batch_size):

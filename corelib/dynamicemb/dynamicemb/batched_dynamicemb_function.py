@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass, fields
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from dynamicemb.initializer import MultiTableInitializer
@@ -27,7 +27,7 @@ from dynamicemb.key_value_table import (
 from dynamicemb.chained_storage import ChainedStorage
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import CopyMode, MultiTableAdmitter
+from dynamicemb.types import CopyMode, MultiTableAdmitter, counts_to_offsets
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -186,7 +186,7 @@ class PrefetchState:
     # key holds (int32, -1 for none), which is what the reference to give back in
     # the backward is indexed by. ``unique_size_per_table`` is the per-table count
     # the outstanding-key tally is kept in.
-    unique_offsets: Optional[List[int]] = None
+    unique_offsets: Optional[torch.Tensor] = None
     cache_nodes: Optional[torch.Tensor] = None
     unique_size_per_table: Optional[torch.Tensor] = None
 
@@ -367,14 +367,12 @@ def dynamicemb_prefetch(
         else:
             storage_mode = StorageMode.DEFAULT
 
-        unique_offsets: Optional[List[int]] = None
+        unique_offsets: Optional[torch.Tensor] = None
         cache_nodes: Optional[torch.Tensor] = None
         if storage_mode == StorageMode.CACHE:
             # Where each table starts in the unique arrays: the cache is driven
             # table by table, and the per-table counts are already on the host.
-            unique_offsets = [0]
-            for n in unique_size_per_table.tolist():
-                unique_offsets.append(unique_offsets[-1] + int(n))
+            unique_offsets = counts_to_offsets(unique_size_per_table, unique_keys.device)
 
             if outstanding_keys_ref is not None:
                 # A table's rows are all taken once the keys of the steps in flight

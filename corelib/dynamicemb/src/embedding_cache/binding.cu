@@ -79,9 +79,9 @@ inline void check_cuda_tensor(const at::Tensor& t, const char* name,
   TORCH_CHECK(t.scalar_type() == type, name, " has the wrong dtype");
 }
 
-class EmbeddingCacheCore {
+class CacheCore {
  public:
-  explicit EmbeddingCacheCore(std::vector<int64_t> capacities)
+  explicit CacheCore(std::vector<int64_t> capacities)
       : capacities_(std::move(capacities)) {
     TORCH_CHECK(!capacities_.empty(), "at least one table is needed");
     device_ = at::cuda::current_device();
@@ -105,13 +105,13 @@ class EmbeddingCacheCore {
         cudaEventCreateWithFlags(&snapshot_done_, cudaEventDisableTiming));
   }
 
-  ~EmbeddingCacheCore() {
+  ~CacheCore() {
     cudaEventDestroy(release_done_);
     cudaEventDestroy(snapshot_done_);
   }
 
-  EmbeddingCacheCore(const EmbeddingCacheCore&) = delete;
-  EmbeddingCacheCore& operator=(const EmbeddingCacheCore&) = delete;
+  CacheCore(const CacheCore&) = delete;
+  CacheCore& operator=(const CacheCore&) = delete;
 
   int64_t num_tables() const { return static_cast<int64_t>(maps_.size()); }
 
@@ -141,35 +141,20 @@ class EmbeddingCacheCore {
 
   // -- the per-step calls -----------------------------------------------------
 
-  // For each key, the node holding it in its table — pinned, one reference taken —
-  // or -1. Keys are unique within a table and grouped by table.
-  at::Tensor lookup_pin(const at::Tensor& keys,
-                        const std::vector<int64_t>& offsets) {
+  // For each key, the node holding it in its table -- pinned, one reference taken --
+  // or -1. Keys are unique within a table and grouped by table; `offsets` is on the
+  // device, int64, where each table's keys start and the total last.
+  at::Tensor lookup_pin(const at::Tensor& keys, const at::Tensor& offsets) {
     check_cuda_tensor(keys, "keys", at::kLong);
-    check_offsets(offsets, keys.numel());
+    check_offsets(offsets);
     const c10::cuda::CUDAGuard guard(keys.device());
-    const cudaStream_t stream = current_stream();
     const int64_t n_total = keys.numel();
+    at::Tensor nodes = at::empty({n_total}, keys.options().dtype(at::kInt));
+    if (n_total == 0) return nodes;
 
-    // The kernel compacts misses on the way out. Nothing here uses them — the
-    // caller derives its misses from the -1s, after deciding which get a node —
-    // but the kernel writes them, so they need somewhere to go.
-    const auto opts_i64 = keys.options();
-    at::Tensor nodes = at::empty({n_total}, opts_i64.dtype(at::kInt));
-    at::Tensor miss_keys = at::empty({n_total}, opts_i64);
-    at::Tensor miss_src = at::empty({n_total}, opts_i64);
-    at::Tensor miss_count = at::zeros({num_tables()}, opts_i64);
-
-    for (int64_t t = 0; t < num_tables(); ++t) {
-      const int64_t b = offsets[t], n = offsets[t + 1] - offsets[t];
-      if (n == 0) continue;
-      lookup_pin_kernel<Map, Node><<<grid_for(n), kBlock, 0, stream>>>(
-          maps_[t]->map(), maps_[t]->nodes(), keys.data_ptr<int64_t>() + b, n,
-          nodes.data_ptr<int32_t>() + b, miss_keys.data_ptr<int64_t>() + b,
-          miss_src.data_ptr<int64_t>() + b,
-          reinterpret_cast<unsigned long long*>(miss_count.data_ptr<int64_t>()) +
-              t);
-    }
+    lookup_pin_kernel<Map><<<step_grid(n_total), kBlock, 0, current_stream()>>>(
+        views_ptr(), offsets.data_ptr<int64_t>(), keys.data_ptr<int64_t>(),
+        nodes.data_ptr<int32_t>());
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     return nodes;
   }
@@ -180,20 +165,20 @@ class EmbeddingCacheCore {
   // one's answer goes in `nodes` (the array lookup_pin returned), which is written
   // in place. Returns, per key and in the same order: the key the node held, if
   // it held one; whether it did; and the node it now is. A node of -1 means the
-  // queue ran dry — every node of that table is held by a step in flight — which
+  // queue ran dry -- every node of that table is held by a step in flight -- which
   // is a capacity error and the caller's to report.
   //
   // The nodes are left LOADING and referenced once. Rows are moved by the caller,
   // and publish() is what makes them hits.
   std::tuple<at::Tensor, at::Tensor, at::Tensor> allocate(
       const at::Tensor& keys, const at::Tensor& positions,
-      const std::vector<int64_t>& offsets, at::Tensor nodes) {
+      const at::Tensor& offsets, at::Tensor nodes) {
     check_cuda_tensor(keys, "keys", at::kLong);
     check_cuda_tensor(positions, "positions", at::kLong);
     check_cuda_tensor(nodes, "nodes", at::kInt);
     TORCH_CHECK(positions.numel() == keys.numel(),
                 "positions must say where each key's answer goes");
-    check_offsets(offsets, keys.numel());
+    check_offsets(offsets);
     const c10::cuda::CUDAGuard guard(keys.device());
     const cudaStream_t stream = current_stream();
     const int64_t m_total = keys.numel();
@@ -204,31 +189,19 @@ class EmbeddingCacheCore {
     at::Tensor new_nodes = at::empty({m_total}, opts_i64.dtype(at::kInt));
     if (m_total == 0) return {victim_keys, has_victim, new_nodes};
 
-    std::vector<int64_t> counts(num_tables());
-    for (int64_t t = 0; t < num_tables(); ++t) counts[t] = offsets[t + 1] - offsets[t];
-    const at::Tensor d_counts =
-        at::tensor(counts, at::TensorOptions().dtype(at::kLong)).to(keys.device());
     at::Tensor slots = at::empty(
         {m_total * static_cast<int64_t>(sizeof(Slot))}, opts_i64.dtype(at::kByte));
 
     // The phase boundary between pushing and popping the queue: see the header.
     DEMB_CUDA_CHECK(cudaStreamWaitEvent(stream, release_done_, 0));
-    for (int64_t t = 0; t < num_tables(); ++t) {
-      if (counts[t] > 0) queues_[t]->take_snapshot(stream);
-    }
+    for (auto& q : queues_) q->take_snapshot(stream);
     DEMB_CUDA_CHECK(cudaEventRecord(snapshot_done_, stream));
 
-    for (int64_t t = 0; t < num_tables(); ++t) {
-      const int64_t b = offsets[t], n = counts[t];
-      if (n == 0) continue;
-      allocate_kernel<Queue, Map, Node><<<grid_for(n), kBlock, 0, stream>>>(
-          queues_[t]->queue(), maps_[t]->map(), maps_[t]->nodes(),
-          keys.data_ptr<int64_t>() + b, positions.data_ptr<int64_t>() + b,
-          reinterpret_cast<const unsigned long long*>(d_counts.data_ptr<int64_t>()) +
-              t,
-          reinterpret_cast<Slot*>(slots.data_ptr<uint8_t>()) + b,
-          nodes.data_ptr<int32_t>());
-    }
+    allocate_kernel<Queue, Map><<<step_grid(m_total), kBlock, 0, stream>>>(
+        d_queues_ptr(), views_ptr(), offsets.data_ptr<int64_t>(),
+        keys.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
+        reinterpret_cast<Slot*>(slots.data_ptr<uint8_t>()),
+        nodes.data_ptr<int32_t>());
     unpack_slots_kernel<Map><<<grid_for(m_total), kBlock, 0, stream>>>(
         reinterpret_cast<const Slot*>(slots.data_ptr<uint8_t>()), m_total,
         victim_keys.data_ptr<int64_t>(), has_victim.data_ptr<uint8_t>(),
@@ -239,36 +212,31 @@ class EmbeddingCacheCore {
 
   // LOADING -> RESIDENT for the nodes allocate returned, once their rows are
   // written.
-  void publish(const at::Tensor& new_nodes, const std::vector<int64_t>& offsets) {
+  void publish(const at::Tensor& new_nodes, const at::Tensor& offsets) {
     check_cuda_tensor(new_nodes, "new_nodes", at::kInt);
-    check_offsets(offsets, new_nodes.numel());
+    check_offsets(offsets);
     const c10::cuda::CUDAGuard guard(new_nodes.device());
-    const cudaStream_t stream = current_stream();
-    for (int64_t t = 0; t < num_tables(); ++t) {
-      const int64_t b = offsets[t], n = offsets[t + 1] - offsets[t];
-      if (n == 0) continue;
-      publish_nodes_kernel<Map, Node><<<grid_for(n), kBlock, 0, stream>>>(
-          maps_[t]->nodes(), new_nodes.data_ptr<int32_t>() + b, n);
-    }
+    if (new_nodes.numel() == 0) return;
+    publish_nodes_kernel<Map><<<step_grid(new_nodes.numel()), kBlock, 0,
+                                current_stream()>>>(
+        views_ptr(), offsets.data_ptr<int64_t>(), new_nodes.data_ptr<int32_t>());
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // Give back the reference each step took, node by node; a node of -1 holds none.
-  void release(const at::Tensor& nodes, const std::vector<int64_t>& offsets) {
+  void release(const at::Tensor& nodes, const at::Tensor& offsets) {
     check_cuda_tensor(nodes, "nodes", at::kInt);
-    check_offsets(offsets, nodes.numel());
+    check_offsets(offsets);
     const c10::cuda::CUDAGuard guard(nodes.device());
     const cudaStream_t stream = current_stream();
 
     DEMB_CUDA_CHECK(cudaStreamWaitEvent(stream, snapshot_done_, 0));
-    for (int64_t t = 0; t < num_tables(); ++t) {
-      const int64_t b = offsets[t], n = offsets[t + 1] - offsets[t];
-      if (n == 0) continue;
-      release_kernel<Queue, Node><<<grid_for(n), kBlock, 0, stream>>>(
-          queues_[t]->queue(), maps_[t]->nodes(), nodes.data_ptr<int32_t>() + b,
-          n);
+    if (nodes.numel() > 0) {
+      release_kernel<Queue, Map><<<step_grid(nodes.numel()), kBlock, 0, stream>>>(
+          d_queues_ptr(), views_ptr(), offsets.data_ptr<int64_t>(),
+          nodes.data_ptr<int32_t>());
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     DEMB_CUDA_CHECK(cudaEventRecord(release_done_, stream));
   }
 
@@ -359,14 +327,18 @@ class EmbeddingCacheCore {
   }
 
  private:
-  void check_offsets(const std::vector<int64_t>& offsets, int64_t total) const {
-    TORCH_CHECK(static_cast<int64_t>(offsets.size()) == num_tables() + 1,
+  // `offsets` stays on the device, where its values are read, so only its shape is
+  // checked here: one entry per table, and the total at the end.
+  void check_offsets(const at::Tensor& offsets) const {
+    check_cuda_tensor(offsets, "offsets", at::kLong);
+    TORCH_CHECK(offsets.numel() == num_tables() + 1,
                 "offsets needs one entry per table, and the total at the end");
-    TORCH_CHECK(offsets.front() == 0 && offsets.back() == total,
-                "offsets must run from 0 to the number of keys");
-    for (size_t t = 0; t + 1 < offsets.size(); ++t) {
-      TORCH_CHECK(offsets[t] <= offsets[t + 1], "offsets must not decrease");
-    }
+  }
+
+  // One launch for every table: `x` covers the keys, `y` is the table.
+  dim3 step_grid(int64_t n_total) const {
+    return dim3(static_cast<unsigned>(grid_for(n_total)),
+                static_cast<unsigned>(num_tables()));
   }
 
   // The tables' maps as the array the fused kernels take.
@@ -379,6 +351,18 @@ class EmbeddingCacheCore {
                                       .device(at::kCUDA, device_));
     DEMB_CUDA_CHECK(cudaMemcpy(d_views_.data_ptr(), views.data(), bytes,
                                cudaMemcpyHostToDevice));
+
+    std::vector<Queue> queues;
+    for (const auto& q : queues_) queues.push_back(q->queue());
+    const auto qbytes = static_cast<int64_t>(queues.size() * sizeof(Queue));
+    d_queues_ = at::empty({qbytes}, at::TensorOptions()
+                                        .dtype(at::kByte)
+                                        .device(at::kCUDA, device_));
+    DEMB_CUDA_CHECK(cudaMemcpy(d_queues_.data_ptr(), queues.data(), qbytes,
+                               cudaMemcpyHostToDevice));
+  }
+  const Queue* d_queues_ptr() const {
+    return reinterpret_cast<const Queue*>(d_queues_.data_ptr());
   }
   const Map* views_ptr() const {
     return reinterpret_cast<const Map*>(d_views_.data_ptr());
@@ -389,6 +373,7 @@ class EmbeddingCacheCore {
   std::vector<std::unique_ptr<MapStore>> maps_;
   std::vector<std::unique_ptr<QStore>> queues_;
   at::Tensor d_views_;
+  at::Tensor d_queues_;
   cudaEvent_t release_done_ = nullptr;
   cudaEvent_t snapshot_done_ = nullptr;
 };
@@ -397,26 +382,26 @@ class EmbeddingCacheCore {
 }  // namespace embedding_cache
 
 void bind_embedding_cache(py::module& m) {
-  using embedding_cache::EmbeddingCacheCore;
-  py::class_<EmbeddingCacheCore>(m, "EmbeddingCacheCore")
+  using embedding_cache::CacheCore;
+  py::class_<CacheCore>(m, "CacheCore")
       .def(py::init<std::vector<int64_t>>(), py::arg("capacities"))
-      .def("num_tables", &EmbeddingCacheCore::num_tables)
-      .def("guard", &EmbeddingCacheCore::guard)
-      .def("capacity", &EmbeddingCacheCore::capacity, py::arg("table"))
-      .def("reset", &EmbeddingCacheCore::reset)
-      .def("lookup_pin", &EmbeddingCacheCore::lookup_pin, py::arg("keys"),
+      .def("num_tables", &CacheCore::num_tables)
+      .def("guard", &CacheCore::guard)
+      .def("capacity", &CacheCore::capacity, py::arg("table"))
+      .def("reset", &CacheCore::reset)
+      .def("lookup_pin", &CacheCore::lookup_pin, py::arg("keys"),
            py::arg("offsets"))
-      .def("allocate", &EmbeddingCacheCore::allocate, py::arg("keys"),
+      .def("allocate", &CacheCore::allocate, py::arg("keys"),
            py::arg("positions"), py::arg("offsets"), py::arg("nodes"))
-      .def("publish", &EmbeddingCacheCore::publish, py::arg("new_nodes"),
+      .def("publish", &CacheCore::publish, py::arg("new_nodes"),
            py::arg("offsets"))
-      .def("release", &EmbeddingCacheCore::release, py::arg("nodes"),
+      .def("release", &CacheCore::release, py::arg("nodes"),
            py::arg("offsets"))
-      .def("find_nodes", &EmbeddingCacheCore::find_nodes, py::arg("keys"),
+      .def("find_nodes", &CacheCore::find_nodes, py::arg("keys"),
            py::arg("table_ids"))
-      .def("invalidate", &EmbeddingCacheCore::invalidate, py::arg("nodes"),
+      .def("invalidate", &CacheCore::invalidate, py::arg("nodes"),
            py::arg("table_ids"))
-      .def("resident", &EmbeddingCacheCore::resident, py::arg("table"))
-      .def("num_resident", &EmbeddingCacheCore::num_resident, py::arg("table"))
-      .def("queue_audit", &EmbeddingCacheCore::queue_audit, py::arg("table"));
+      .def("resident", &CacheCore::resident, py::arg("table"))
+      .def("num_resident", &CacheCore::num_resident, py::arg("table"))
+      .def("queue_audit", &CacheCore::queue_audit, py::arg("table"));
 }

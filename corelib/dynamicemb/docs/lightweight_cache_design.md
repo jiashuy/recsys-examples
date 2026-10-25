@@ -946,7 +946,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 ### 17.2 方案
 
 - 保留类名与导入路径：`DynamicEmbCache` 仍在 `dynamicemb.key_value_table`，只换内部实现。这样 `isinstance(cache, DynamicEmbCache)` 一类的检查不变。
-- 新增 C++ 绑定 `EmbeddingCacheCore`（`src/embedding_cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
+- 新增 C++ 绑定 `CacheCore`（`src/embedding_cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
 - 分两阶段做（阶段 1 是为了能先验证绑定与编排，已在阶段 2 完成后删除）：
   - **阶段 1：通用流程（拷贝式）。** 数据搬运沿用 `storage.find` / `storage.insert`，后端在缓存淘汰时才被插入（惰性）。当时用来承载 PS 后端；PS 改为第三层之后没有调用方，已删除。
   - **阶段 2：行可寻址流程（§6.5）。** 每步所有 key 先过 backing（更新 score），新 key 准入后立刻插入 backing，淘汰前用 `EvictionGuard` 保护。需要改后端的 `insert` kernel 与 LruLfu cubin（§17.4）。现在是唯一的流程。
@@ -1009,7 +1009,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 在 EOS 上建立构建与测试流程，记录基线 | 完成 |
-| 1a | C++ 绑定 `EmbeddingCacheCore` | 完成 |
+| 1a | C++ 绑定 `CacheCore` | 完成 |
 | 1b | Python：新 `DynamicEmbCache`，通用流程 | 完成 |
 | 1c | 现有测试跑通，更新直接依赖旧内部结构的测试 | 主测试文件与大部分单测通过，见下 |
 | 2a | 后端 `insert` 的守卫与 cubin 入口 | 完成 |

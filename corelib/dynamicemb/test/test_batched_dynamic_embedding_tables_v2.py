@@ -1293,7 +1293,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
         cache = bdeb.cache
         if cache is not None:
             metrics = cache.cache_metrics
-            assert metrics[0].item() == metrics[1].item()
+            assert metrics.unique_keys == metrics.hits
 
     with torch.no_grad():
         bdeb.flush()
@@ -1333,7 +1333,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
         cache = bdeb.cache
         if cache is not None:
             metrics = cache.cache_metrics
-            assert metrics[0].item() == metrics[1].item()
+            assert metrics.unique_keys == metrics.hits
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
@@ -2449,8 +2449,8 @@ def test_dump_optimizer_states_ckpt_width(
 def test_multi_table_caching_flush(opt_type, opt_params):
     """Multi-table caching mode: prefetch, forward, flush, verify cache metrics.
 
-    ``DynamicEmbCache`` updates ``cache_metrics[0]`` (last lookup unique count) and
-    ``[1]`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
+    ``DynamicEmbCache`` updates ``cache_metrics.unique_keys`` (last lookup unique count) and
+    ``hits`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
     Prefetch calls ``lookup``; training forward with cache loads from flat via
     ``slot_indices`` and does not call ``lookup`` again. The first prefetch is thus
     cold (all misses); a second prefetch on the same keys should record all hits.
@@ -2523,8 +2523,8 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     cache = bdeb.cache
     assert cache is not None
     metrics = cache.cache_metrics
-    assert metrics[0].item() == 4
-    assert metrics[1].item() == 0
+    assert metrics.unique_keys == 4
+    assert metrics.hits == 0
 
     with torch.cuda.stream(prefetch_stream):
         bdeb.prefetch(indices, offsets, forward_stream)
@@ -2535,7 +2535,7 @@ def test_multi_table_caching_flush(opt_type, opt_params):
         _ = embs2.mean()
 
     torch.cuda.synchronize()
-    assert metrics[0].item() == metrics[1].item() == 4
+    assert metrics.unique_keys == metrics.hits == 4
 
     bdeb.flush()
     bdeb.reset_cache_states()

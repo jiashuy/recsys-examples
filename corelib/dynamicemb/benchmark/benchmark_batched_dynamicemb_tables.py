@@ -762,10 +762,9 @@ def run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg):
         cache_info = ""
         if cfg.caching:
             cache_metrics = dynamic_emb.cache.cache_metrics
-            unique_num = cache_metrics[0].item()
-            cache_hit = cache_metrics[1].item()
-            hit_rate = cache_hit / unique_num if unique_num > 0 else 0.0
-            cache_miss = unique_num - cache_hit
+            unique_num = cache_metrics.unique_keys
+            hit_rate = cache_metrics.hit_rate
+            cache_miss = cache_metrics.misses
             cache_info = (
                 f"  hit_rate={hit_rate:.4f} unique={unique_num} miss={int(cache_miss)}"
             )

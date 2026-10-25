@@ -27,9 +27,13 @@ and the LruLfu one in the separately built cubin.
 import pytest
 import torch
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
-from dynamicemb_extensions import EmbeddingCacheCore, InsertResult, ScorePolicy
+from dynamicemb_extensions import CacheCore, InsertResult, ScorePolicy
 
 BUCKET = 128
+
+def _offs(values):
+    """Offsets as the cache takes them: int64, on the device."""
+    return torch.tensor(values, dtype=torch.int64, device="cuda")
 
 
 @pytest.fixture
@@ -88,15 +92,15 @@ def _cache_keys(core, keys, device, hold):
     """Bind `keys` in the cache's only table and publish them. The first `hold` of
     them keep the reference a step in flight would; the rest are released, idle."""
     n = keys.numel()
-    nodes = core.lookup_pin(keys, [0, n])
+    nodes = core.lookup_pin(keys, _offs([0, n]))
     _, _, new_nodes = core.allocate(
-        keys, torch.arange(n, dtype=torch.int64, device=device), [0, n], nodes
+        keys, torch.arange(n, dtype=torch.int64, device=device), _offs([0, n]), nodes
     )
     assert bool((new_nodes >= 0).all())
-    core.publish(new_nodes, [0, n])
+    core.publish(new_nodes, _offs([0, n]))
     if n > hold:
         idle = new_nodes[hold:].contiguous()
-        core.release(idle, [0, idle.numel()])
+        core.release(idle, _offs([0, idle.numel()]))
     torch.cuda.synchronize()
 
 
@@ -104,7 +108,7 @@ def _cache_keys(core, keys, device, hold):
 @pytest.mark.parametrize("collect", [False, True])
 def test_referenced_keys_are_not_evicted(device, kind, collect):
     table = _table(kind)
-    core = EmbeddingCacheCore([4 * BUCKET])
+    core = CacheCore([4 * BUCKET])
 
     stored = torch.arange(1, 101, dtype=torch.int64, device=device)  # 100 of 128 slots
     _insert(table, kind, stored, device)
@@ -147,7 +151,7 @@ def test_without_the_guard_the_same_keys_go(device, kind):
 @pytest.mark.parametrize("kind", ["timestamp", "lru_lfu"])
 def test_a_bucket_of_referenced_keys_refuses_the_insert(device, kind):
     table = _table(kind)
-    core = EmbeddingCacheCore([4 * BUCKET])
+    core = CacheCore([4 * BUCKET])
 
     stored = torch.arange(1, BUCKET + 1, dtype=torch.int64, device=device)  # full
     _insert(table, kind, stored, device)
@@ -161,7 +165,7 @@ def test_a_bucket_of_referenced_keys_refuses_the_insert(device, kind):
 
     # Give the references back and the same insert goes through.
     nodes = core.find_nodes(stored, torch.zeros_like(stored))
-    core.release(nodes.contiguous(), [0, nodes.numel()])
+    core.release(nodes.contiguous(), _offs([0, nodes.numel()]))
     torch.cuda.synchronize()
     indices = _insert(table, kind, extra, device, guard=core.guard())
     assert bool((indices >= 0).all())
@@ -170,7 +174,7 @@ def test_a_bucket_of_referenced_keys_refuses_the_insert(device, kind):
 @pytest.mark.parametrize("kind", ["timestamp", "lru_lfu"])
 def test_a_key_that_is_not_cached_is_evicted_as_before(device, kind):
     table = _table(kind)
-    core = EmbeddingCacheCore([4 * BUCKET])  # empty: nothing to protect
+    core = CacheCore([4 * BUCKET])  # empty: nothing to protect
 
     stored = torch.arange(1, BUCKET + 1, dtype=torch.int64, device=device)
     _insert(table, kind, stored, device)

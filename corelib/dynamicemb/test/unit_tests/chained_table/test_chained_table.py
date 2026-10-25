@@ -31,7 +31,11 @@ from dynamicemb.chained_table import (
     ChainedTableFull,
     hash_py,
 )
-from dynamicemb_extensions import EmbeddingCacheCore
+from dynamicemb_extensions import CacheCore
+
+def _offs(values):
+    """Offsets as the cache takes them: int64, on the device."""
+    return torch.tensor(values, dtype=torch.int64, device="cuda")
 
 
 @pytest.fixture
@@ -317,21 +321,21 @@ def _cache_keys(core, keys, device, hold):
     """Bind `keys` in the cache's only table. The first `hold` keep the reference a
     step in flight would; the rest are released, idle."""
     n = keys.numel()
-    nodes = core.lookup_pin(keys, [0, n])
+    nodes = core.lookup_pin(keys, _offs([0, n]))
     _, _, new_nodes = core.allocate(
-        keys, torch.arange(n, dtype=torch.int64, device=device), [0, n], nodes
+        keys, torch.arange(n, dtype=torch.int64, device=device), _offs([0, n]), nodes
     )
     assert bool((new_nodes >= 0).all())
-    core.publish(new_nodes, [0, n])
+    core.publish(new_nodes, _offs([0, n]))
     if n > hold:
         idle = new_nodes[hold:].contiguous()
-        core.release(idle, [0, idle.numel()])
+        core.release(idle, _offs([0, idle.numel()]))
     torch.cuda.synchronize()
 
 
 def test_a_referenced_key_is_never_evicted(device):
     table = ChainedTable(num_buckets=1, bucket_capacity=128, device=device)
-    core = EmbeddingCacheCore([4 * 128])
+    core = CacheCore([4 * 128])
     stored = torch.arange(1, 101, dtype=torch.int64, device=device)
     table.find_and_stage(stored, stored.clone())  # score == key: 1 is the lowest
     table.commit()
@@ -366,7 +370,7 @@ def test_without_the_guard_the_same_keys_go(device):
 
 def test_a_bucket_of_protected_members_is_an_error(device):
     table = ChainedTable(num_buckets=1, bucket_capacity=128, device=device)
-    core = EmbeddingCacheCore([4 * 128])
+    core = CacheCore([4 * 128])
     stored = torch.arange(1, 129, dtype=torch.int64, device=device)
     table.find_and_stage(stored, stored.clone())
     table.commit()
@@ -400,7 +404,7 @@ def test_other_buckets_still_place_when_one_is_full(device):
     assert table.size() == nb * cap
 
     # Hold all of bucket 0 in the cache.
-    core = EmbeddingCacheCore([4 * 128])
+    core = CacheCore([4 * 128])
     held = take(0, cap)
     _cache_keys(core, held, device, hold=cap)
 

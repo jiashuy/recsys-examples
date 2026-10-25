@@ -29,10 +29,10 @@ they are released, and the new keys have rows of their own, so a victim's value 
 read where it is; nothing has to be copied out ahead of a write.
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
-from dynamicemb.types import CopyMode, MultiTableAdmitter
+from dynamicemb.types import CopyMode, MultiTableAdmitter, counts_to_offsets
 from dynamicemb_extensions import EvictStrategy, flagged_compact
 
 from .batched_dynamicemb_function import _bool_item, _scalar_item
@@ -73,7 +73,7 @@ def prefetch_cache_path(
     storage: ChainedStorage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    unique_offsets: List[int],
+    unique_offsets: torch.Tensor,
     max_emb_dim: int,
     max_val_dim: int,
     emb_dtype: torch.dtype,
@@ -166,10 +166,9 @@ def prefetch_cache_path(
             _, alloc_positions, (alloc_keys, alloc_tids) = flagged_compact(
                 need_node, [unique_keys, unique_table_ids]
             )
-        counts = torch.bincount(alloc_tids, minlength=cache.num_tables).tolist()
-        alloc_offsets = [0]
-        for n in counts:
-            alloc_offsets.append(alloc_offsets[-1] + int(n))
+        alloc_offsets = counts_to_offsets(
+            torch.bincount(alloc_tids, minlength=cache.num_tables), device
+        )
         with torch.cuda.nvtx.range("op:cache_allocate"):
             victim_keys, has_victim, new_nodes = cache.allocate(
                 alloc_keys, alloc_positions, alloc_offsets, nodes

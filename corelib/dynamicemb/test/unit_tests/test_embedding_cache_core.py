@@ -22,7 +22,11 @@ events that order allocate on one stream against release on another.
 
 import pytest
 import torch
-from dynamicemb_extensions import EmbeddingCacheCore
+from dynamicemb_extensions import CacheCore
+
+def _offs(values):
+    """Offsets as the cache takes them: int64, on the device."""
+    return torch.tensor(values, dtype=torch.int64, device="cuda")
 
 
 @pytest.fixture
@@ -49,19 +53,19 @@ def _bind(core, keys, offsets, device):
     miss_offsets = [0]
     for c in counts:
         miss_offsets.append(miss_offsets[-1] + c)
-    _, _, new_nodes = core.allocate(miss_keys, miss, miss_offsets, nodes)
-    core.publish(new_nodes, miss_offsets)
+    _, _, new_nodes = core.allocate(miss_keys, miss, _offs(miss_offsets), nodes)
+    core.publish(new_nodes, _offs(miss_offsets))
     return nodes
 
 
 def test_tables_are_independent(device):
-    core = EmbeddingCacheCore([8, 4])
+    core = CacheCore([8, 4])
     assert core.num_tables() == 2
     assert core.capacity(0) == 8 and core.capacity(1) == 4
 
     # key 5 is in both tables
     keys = _keys([5, 6, 7, 5, 9], device)
-    offsets = [0, 3, 5]
+    offsets = _offs([0, 3, 5])
     nodes = _bind(core, keys, offsets, device)
     assert bool((nodes >= 0).all())
     core.release(nodes, offsets)
@@ -77,48 +81,48 @@ def test_tables_are_independent(device):
 
 
 def test_eviction_order_and_victims(device):
-    core = EmbeddingCacheCore([4])
+    core = CacheCore([4])
     first = _keys([1, 2, 3, 4], device)
-    nodes = _bind(core, first, [0, 4], device)
-    core.release(nodes, [0, 4])
+    nodes = _bind(core, first, _offs([0, 4]), device)
+    core.release(nodes, _offs([0, 4]))
 
     new = _keys([10, 11], device)
     pos = torch.arange(2, dtype=torch.int64, device=device)
     n = torch.full((2,), -1, dtype=torch.int32, device=device)
-    victims, has_victim, new_nodes = core.allocate(new, pos, [0, 2], n)
+    victims, has_victim, new_nodes = core.allocate(new, pos, _offs([0, 2]), n)
     assert bool(has_victim.all())
     # the queue is first in, first out: the two oldest keys go
     assert sorted(victims.tolist()) == [1, 2]
     assert bool((new_nodes >= 0).all())
-    core.publish(new_nodes, [0, 2])
-    core.release(new_nodes, [0, 2])
+    core.publish(new_nodes, _offs([0, 2]))
+    core.release(new_nodes, _offs([0, 2]))
 
 
 def test_a_table_with_every_row_held_cannot_serve_another_key(device):
-    core = EmbeddingCacheCore([4])
+    core = CacheCore([4])
     keys = _keys([1, 2, 3, 4], device)
-    held = _bind(core, keys, [0, 4], device)  # all four referenced
+    held = _bind(core, keys, _offs([0, 4]), device)  # all four referenced
 
     extra = _keys([5], device)
-    n = core.lookup_pin(extra, [0, 1])
+    n = core.lookup_pin(extra, _offs([0, 1]))
     _, _, new_nodes = core.allocate(
-        extra, torch.zeros(1, dtype=torch.int64, device=device), [0, 1], n
+        extra, torch.zeros(1, dtype=torch.int64, device=device), _offs([0, 1]), n
     )
     assert new_nodes.tolist() == [-1]
 
-    core.release(held, [0, 4])
-    n = core.lookup_pin(extra, [0, 1])
+    core.release(held, _offs([0, 4]))
+    n = core.lookup_pin(extra, _offs([0, 1]))
     _, _, new_nodes = core.allocate(
-        extra, torch.zeros(1, dtype=torch.int64, device=device), [0, 1], n
+        extra, torch.zeros(1, dtype=torch.int64, device=device), _offs([0, 1]), n
     )
     assert new_nodes.tolist()[0] >= 0
 
 
 def test_invalidate_and_resident(device):
-    core = EmbeddingCacheCore([8])
+    core = CacheCore([8])
     keys = _keys([1, 2, 3], device)
-    nodes = _bind(core, keys, [0, 3], device)
-    core.release(nodes, [0, 3])
+    nodes = _bind(core, keys, _offs([0, 3]), device)
+    core.release(nodes, _offs([0, 3]))
 
     tids = torch.zeros(2, dtype=torch.int64, device=device)
     victims = _keys([2, 3], device)
@@ -135,12 +139,12 @@ def test_invalidate_and_resident(device):
 
 
 def test_resident_counts_references(device):
-    core = EmbeddingCacheCore([8])
+    core = CacheCore([8])
     keys = _keys([1, 2, 3], device)
-    nodes = _bind(core, keys, [0, 3], device)  # three references held
+    nodes = _bind(core, keys, _offs([0, 3]), device)  # three references held
     _, res_keys, referenced = core.resident(0)
     assert referenced == 3 and sorted(res_keys.tolist()) == [1, 2, 3]
-    core.release(nodes, [0, 3])
+    core.release(nodes, _offs([0, 3]))
     assert core.resident(0)[2] == 0
 
 
@@ -170,7 +174,7 @@ def test_two_streams_never_reuse_a_held_node(device, depth, keys_per_step):
     # kernels: they have to run long enough for the two streams to really overlap,
     # or the ordering between them is never tested.
     capacity = (depth + 2) * k
-    core = EmbeddingCacheCore([capacity])
+    core = CacheCore([capacity])
     pool = torch.zeros(capacity, dtype=torch.int64, device=device)
     bad = torch.zeros(1, dtype=torch.int64, device=device)
 
@@ -186,7 +190,7 @@ def test_two_streams_never_reuse_a_held_node(device, depth, keys_per_step):
             keys.record_stream(compute)
             # What the forward and backward of the step would read and write.
             bad.add_((pool[nodes.long()] != keys).sum())
-            core.release(nodes, [0, nodes.numel()])
+            core.release(nodes, _offs([0, nodes.numel()]))
 
     for step in range(60 * depth):
         # a skewed draw so keys come back and the cache both hits and evicts
@@ -195,15 +199,15 @@ def test_two_streams_never_reuse_a_held_node(device, depth, keys_per_step):
         if keys.numel() < k:
             continue
         with torch.cuda.stream(prefetch):
-            nodes = core.lookup_pin(keys, [0, k])
+            nodes = core.lookup_pin(keys, _offs([0, k]))
             miss = (nodes < 0).nonzero().squeeze(1)
             if miss.numel() > 0:
                 miss_keys = keys[miss]
                 _, _, new_nodes = core.allocate(
-                    miss_keys, miss, [0, miss.numel()], nodes
+                    miss_keys, miss, _offs([0, miss.numel()]), nodes
                 )
                 pool[new_nodes.long()] = miss_keys  # the row is filled...
-                core.publish(new_nodes, [0, miss.numel()])  # ...then visible
+                core.publish(new_nodes, _offs([0, miss.numel()]))  # ...then visible
             ready = torch.cuda.Event()
             ready.record(prefetch)
         pending.append((nodes, keys, ready))

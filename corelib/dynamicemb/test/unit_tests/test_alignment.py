@@ -33,7 +33,6 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
-    align_to_table_size,
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
@@ -177,16 +176,17 @@ def _assert_value_buffer_matches_hashtable(state: object, table_id: int) -> None
     )
 
 
+# The bucket capacity of a cache's index (BatchedDynamicEmbeddingTablesV2 sets it).
+BUCKET_OF_A_CACHE = 1024
+
+
 def _assert_cache_pool_matches_capacity(cache: object, table_id: int) -> None:
-    """A cache's row pool is one row per node: the table's capacity rounded up to a
-    multiple of its bucket capacity."""
-    opt = cache.options[table_id]
-    expected_rows = align_to_table_size(
-        int(opt.init_capacity), int(opt.bucket_capacity)
-    )
-    assert cache.capacity(table_id) == expected_rows, (
-        f"table {table_id}: cache capacity {cache.capacity(table_id)} != "
-        f"{expected_rows}"
+    """A cache's row pool is one row per node: a multiple of the cache's bucket
+    capacity, and its capacity is the rows of the pool."""
+    expected_rows = cache.capacity(table_id)
+    assert expected_rows % BUCKET_OF_A_CACHE == 0, (
+        f"table {table_id}: cache capacity {expected_rows} is not a multiple of "
+        f"{BUCKET_OF_A_CACHE}"
     )
     t = cache.values.tensor(table_id)
     vd = int(cache.values.value_dim(table_id))

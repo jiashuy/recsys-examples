@@ -277,6 +277,66 @@ static void test_queue_round_trip() {
 // 4. The whole bookkeeping pipeline, many steps
 // ---------------------------------------------------------------------------
 
+// The cache kernels take their tables as device arrays and their work as offsets on
+// the device. This runs them with one table, and does the compaction of the misses
+// that allocate's caller is responsible for.
+__global__ void compact_misses_kernel(const int32_t* node_ids,
+                                      const int64_t* keys, int64_t n,
+                                      int64_t* miss_keys, int64_t* miss_src,
+                                      unsigned long long* miss_count) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const bool is_miss = node_ids[i] == Map::kNoNode;
+    const unsigned long long j = warp_reserve(is_miss, miss_count);
+    if (is_miss) {
+      miss_keys[j] = keys[i];
+      miss_src[j] = i;
+    }
+  }
+}
+
+__global__ void miss_offsets_kernel(const unsigned long long* count,
+                                    int64_t* offsets) {
+  offsets[0] = 0;
+  offsets[1] = static_cast<int64_t>(*count);
+}
+
+struct OneTable {
+  Dev<Map> maps;
+  Dev<Queue> queues;
+  Dev<int64_t> all, misses;  // [0, n) and [0, number of misses)
+
+  OneTable(MapStore& m, QStore& q) : maps(1), queues(1), all(2), misses(2) {
+    maps.put(std::vector<Map>{m.map()});
+    queues.put(std::vector<Queue>{q.queue()});
+  }
+
+  // Look the n keys up, pin the hits, and collect the misses.
+  void lookup(const int64_t* keys, int64_t n, int32_t* node_ids,
+              int64_t* miss_keys, int64_t* miss_src,
+              unsigned long long* miss_count) {
+    all.put({0, n});
+    CU(cudaMemset(miss_count, 0, sizeof(unsigned long long)));
+    lookup_pin_kernel<Map><<<grid_for(n), kBlock>>>(maps.p, all.p, keys, node_ids);
+    compact_misses_kernel<<<grid_for(n), kBlock>>>(node_ids, keys, n, miss_keys,
+                                                   miss_src, miss_count);
+    miss_offsets_kernel<<<1, 1>>>(miss_count, misses.p);
+  }
+
+  // Bind a node to each miss; at most n of them.
+  void allocate(const int64_t* miss_keys, const int64_t* miss_src, int64_t n,
+                Slot* slots, int32_t* node_ids) {
+    allocate_kernel<Queue, Map><<<grid_for(n), kBlock>>>(
+        queues.p, maps.p, misses.p, miss_keys, miss_src, slots, node_ids);
+  }
+
+  void release(const int32_t* node_ids, int64_t n) {
+    all.put({0, n});
+    release_kernel<Queue, Map><<<grid_for(n), kBlock>>>(queues.p, maps.p, all.p,
+                                                        node_ids);
+  }
+};
+
 __global__ void fill_stub_kernel(Node* nodes, const Slot* slots,
                                  const unsigned long long* count,
                                  int64_t* rows) {
@@ -323,6 +383,7 @@ static void test_pipeline(int steps, int64_t capacity, int64_t per_step,
   Dev<int32_t> node_ids(per_step);
   Dev<Slot> slots(per_step);
   Dev<unsigned long long> miss_count(1), wrong(1), dry(1);
+  OneTable one(map_store, qs);
 
   std::mt19937_64 rng(seed);
   // Skewed, so the same keys come back and the cache is actually exercised.
@@ -342,17 +403,13 @@ static void test_pipeline(int steps, int64_t capacity, int64_t per_step,
       h_keys.push_back(k);
     }
     keys.put(h_keys);
-    CU(cudaMemset(miss_count.p, 0, sizeof(unsigned long long)));
 
-    lookup_pin_kernel<Map, Node><<<grid, kBlock>>>(
-        map_store.map(), nodes, keys.p, per_step, node_ids.p, miss_keys.p,
-        miss_src.p, miss_count.p);
+    one.lookup(keys.p, per_step, node_ids.p, miss_keys.p, miss_src.p,
+               miss_count.p);
     CU(cudaGetLastError());
 
     qs.take_snapshot(nullptr);
-    allocate_kernel<Queue, Map, Node><<<grid, kBlock>>>(
-        qs.queue(), map_store.map(), nodes, miss_keys.p, miss_src.p,
-        miss_count.p, slots.p, node_ids.p);
+    one.allocate(miss_keys.p, miss_src.p, per_step, slots.p, node_ids.p);
     CU(cudaGetLastError());
 
     fill_stub_kernel<<<grid, kBlock>>>(nodes, slots.p, miss_count.p, rows.p);
@@ -362,8 +419,7 @@ static void test_pipeline(int steps, int64_t capacity, int64_t per_step,
                                     wrong.p, dry.p);
     CU(cudaGetLastError());
 
-    release_kernel<Queue, Node><<<grid, kBlock>>>(qs.queue(), nodes,
-                                                  node_ids.p, per_step);
+    one.release(node_ids.p, per_step);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
 
@@ -585,6 +641,7 @@ struct Harness {
   Dev<Slot> slots;
   Dev<unsigned long long> miss_count, wrong, dry;
   Dev<Map> d_map;  // this one table, as the one-element array the kernels take
+  OneTable one;
   int64_t held = 0;
 
   Harness(int64_t capacity_, int64_t per_step_)
@@ -592,7 +649,7 @@ struct Harness {
         qs(capacity_), nodes(map_store.nodes()), rows(capacity_),
         keys(per_step_), miss_keys(per_step_), miss_src(per_step_),
         node_ids(per_step_), slots(per_step_), miss_count(1), wrong(1), dry(1),
-        d_map(1) {
+        d_map(1), one(map_store, qs) {
     init_states_kernel<<<64, 256>>>(nodes, capacity);
     CU(cudaDeviceSynchronize());
     d_map.put(std::vector<Map>{map_store.map()});
@@ -604,14 +661,9 @@ struct Harness {
     held = static_cast<int64_t>(h_keys.size());
     const int grid = grid_for(held);
     keys.put(h_keys);
-    CU(cudaMemset(miss_count.p, 0, sizeof(unsigned long long)));
-    lookup_pin_kernel<Map, Node><<<grid, kBlock>>>(
-        map_store.map(), nodes, keys.p, held, node_ids.p, miss_keys.p,
-        miss_src.p, miss_count.p);
+    one.lookup(keys.p, held, node_ids.p, miss_keys.p, miss_src.p, miss_count.p);
     qs.take_snapshot(nullptr);
-    allocate_kernel<Queue, Map, Node><<<grid, kBlock>>>(
-        qs.queue(), map_store.map(), nodes, miss_keys.p, miss_src.p,
-        miss_count.p, slots.p, node_ids.p);
+    one.allocate(miss_keys.p, miss_src.p, held, slots.p, node_ids.p);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
   }
@@ -631,8 +683,7 @@ struct Harness {
   int grid_slots() const { return grid_for(per_step); }
 
   void release() {
-    release_kernel<Queue, Node><<<grid_for(held), kBlock>>>(qs.queue(), nodes,
-                                                            node_ids.p, held);
+    one.release(node_ids.p, held);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
     held = 0;

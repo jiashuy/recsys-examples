@@ -37,6 +37,7 @@ from dynamicemb.batched_dynamicemb_function import (
 )
 from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.dynamicemb_config import (
+    align_to_table_size,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -50,6 +51,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import Cache, DynamicEmbCache, Storage, flush_cache
+from dynamicemb.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
@@ -255,7 +257,7 @@ class StorageLayout(Enum):
 
 
 def _tier_bytes(
-    values, options_list: List[DynamicEmbTableOptions]
+    values, options_list: Optional[List[DynamicEmbTableOptions]] = None
 ) -> List[Tuple[int, int, int, int, int, int]]:
     """Per-table value bytes for a built tier: (init total/emb/opt, peak total/emb/opt).
 
@@ -266,14 +268,18 @@ def _tier_bytes(
     rows = []
     for t in range(values.num_tables):
         buf = values.buffers[t]
-        opt = options_list[t]
         value_dim = values.value_dim(t)
         emb_dim = values.emb_dim(t)
-        elem = DTYPE_NUM_BYTES[opt.embedding_dtype]
+        elem = DTYPE_NUM_BYTES[values.dtype]
         init_total = buf.num_bytes()
         init_emb = init_total * emb_dim // value_dim
         init_opt = init_total - init_emb
-        peak_total = opt.max_capacity * value_dim * elem
+        # A buffer that does not grow is as big at its peak as it is now.
+        peak_total = (
+            init_total
+            if options_list is None
+            else options_list[t].max_capacity * value_dim * elem
+        )
         peak_emb = peak_total * emb_dim // value_dim
         peak_opt = peak_total - peak_emb
         rows.append((init_total, init_emb, init_opt, peak_total, peak_emb, peak_opt))
@@ -426,7 +432,7 @@ def _print_memory_consume(
         tiers.append(("host (CPU)", _tier_bytes_of(storage._host)))
     elif layout == StorageLayout.CACHING:
         tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes(cache.values, cache.options))
+            (f"hbm cache/cuda:{device_id}", _tier_bytes(cache.values))
         )
         tiers.append(("host backing (full)", _tier_bytes_of(storage._state)))
     else:
@@ -803,9 +809,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
                         cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
 
+                # Rounded up to a multiple of the bucket capacity, as the cache's index
+                # always was. A cache has to hold every key of a step at once, so a
+                # configuration smaller than a step would otherwise fail where it used
+                # to work.
+                cache_capacities = [
+                    align_to_table_size(int(o.init_capacity), int(o.bucket_capacity))
+                    for o in cache_options
+                ]
                 self._cache = DynamicEmbCache(
-                    cache_options,
-                    [o.dim + self._optimizer.get_state_dim(o.dim) for o in cache_options],
+                    cache_capacities,
+                    MixedDimBuffers(
+                        [o.dim for o in cache_options],
+                        [o.dim + self._optimizer.get_state_dim(o.dim) for o in cache_options],
+                        cache_capacities,
+                        cache_options[0].embedding_dtype,
+                        torch.device(f"cuda:{self.device_id}"),
+                        "fixed",
+                    ),
                 )
 
                 storage_options = deepcopy(self._dynamicemb_options)

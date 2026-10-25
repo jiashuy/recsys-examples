@@ -372,7 +372,7 @@ value 行: 全局行池, 与槽位无关
 
 做了什么：单表，`find_and_stage` / `commit` / `release_rows`，守卫沿用 `EvictionGuardView`，分区内一次规约选出全部 victim，行池空闲栈，出现残留时抛 `ChainedTableFull`（带上已放置部分的 `partial` 结果，未放置的行已归还）。
 
-测试：以几行 python 写的模型为对照（桶内槽位、行号、victim 及其顺序逐项比较），覆盖 4 种规模、3 种 score 策略、随机 admission 掩码；另有守卫（用真实的 `EmbeddingCacheCore`）、全部被保护的桶、行池耗尽、uint64 key、链结构不变量检查。EOS（H100）上 26 个全部通过；与之相邻的 `test_eviction_guard`、`test_ps_tier`、`test_embedding_cache_core` 仍通过。
+测试：以几行 python 写的模型为对照（桶内槽位、行号、victim 及其顺序逐项比较），覆盖 4 种规模、3 种 score 策略、随机 admission 掩码；另有守卫（用真实的 `CacheCore`）、全部被保护的桶、行池耗尽、uint64 key、链结构不变量检查。EOS（H100）上 26 个全部通过；与之相邻的 `test_eviction_guard`、`test_ps_tier`、`test_embedding_cache_core` 仍通过。
 
 与设计相比的差别（有意为之，后续阶段再收口）：
 - **`find` 没有按桶排序**：key 已去重，每个线程只写自己命中的那个槽，没有写冲突，所以直接一个线程一个 key。按桶排序只用在 `commit`（放置阶段）。§4.1 说的"`find_and_stage` 前排序"在这一阶段没有做，是否值得做取决于后面的实测。
