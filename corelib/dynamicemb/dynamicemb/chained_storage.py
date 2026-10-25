@@ -549,9 +549,8 @@ class ChainedStorage(Storage):
 
     def flush_from(self, cache) -> None:
         """Write every row the cache holds back to this table's own row of the key."""
-        cstate = cache._state
-        batch_size = cstate.threads_in_wave
-        for t in range(cstate.num_tables):
+        batch_size = cache.threads_in_wave
+        for t in range(cache.num_tables):
             nodes, keys, _referenced = cache.resident(t)
             for start in range(0, nodes.numel(), batch_size):
                 chunk_nodes = nodes[start : start + batch_size].to(torch.int64)
@@ -559,7 +558,7 @@ class ChainedStorage(Storage):
                 tid = torch.full(
                     (chunk_keys.numel(),), t, dtype=torch.int64, device=chunk_keys.device
                 )
-                values = cstate.values.load(chunk_nodes, tid, copy_mode=CopyMode.VALUE
+                values = cache.values.load(chunk_nodes, tid, copy_mode=CopyMode.VALUE
                 )
                 rows = self._index.lookup(chunk_keys, tid)
                 if not bool((rows >= 0).all()):

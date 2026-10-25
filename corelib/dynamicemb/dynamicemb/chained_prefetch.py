@@ -96,7 +96,7 @@ def prefetch_cache_path(
     """
     with torch.cuda.nvtx.range("_prefetch_cache_path_chained"):
         device = unique_keys.device
-        state = cache._state
+        values = cache.values
         sstate = storage._state
         index = storage.index
         h_num_total = unique_keys.numel()
@@ -166,7 +166,7 @@ def prefetch_cache_path(
             _, alloc_positions, (alloc_keys, alloc_tids) = flagged_compact(
                 need_node, [unique_keys, unique_table_ids]
             )
-        counts = torch.bincount(alloc_tids, minlength=state.num_tables).tolist()
+        counts = torch.bincount(alloc_tids, minlength=cache.num_tables).tolist()
         alloc_offsets = [0]
         for n in counts:
             alloc_offsets.append(alloc_offsets[-1] + int(n))
@@ -188,7 +188,7 @@ def prefetch_cache_path(
         victim_tids = alloc_tids[has_victim]
         if victim_keys.numel() > 0:
             with torch.cuda.nvtx.range("op:load_from_flat"):
-                victim_values = state.values.load(victim_nodes, victim_tids, copy_mode=CopyMode.VALUE
+                victim_values = values.load(victim_nodes, victim_tids, copy_mode=CopyMode.VALUE
                 )
             v_rows = index.lookup(victim_keys, victim_tids)
             if not _bool_item((v_rows >= 0).all()):
@@ -208,7 +208,7 @@ def prefetch_cache_path(
                 old_values = sstate.values.load(rows[old_positions], old_tids, copy_mode=CopyMode.VALUE
                 )
             with torch.cuda.nvtx.range("op:store_to_flat"):
-                state.values.store(new_rows[alloc_in_storage], old_tids, old_values)
+                values.store(new_rows[alloc_in_storage], old_tids, old_values)
 
         # 5c. new keys are initialised in their cache rows
         alloc_is_new = ~alloc_in_storage
@@ -220,7 +220,7 @@ def prefetch_cache_path(
             new_tids = alloc_tids[alloc_is_new]
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(init_vals[:, :max_emb_dim], new_keys, new_tids, init_indices)
-            state.values.reset_optimizer_states(state.optimizer, init_vals, new_tids)
+            sstate.values.reset_optimizer_states(sstate.optimizer, init_vals, new_tids)
             if from_lower is not None and _bool_item(from_lower.any()):
                 lower_row = torch.full((h_num_total,), -1, dtype=torch.int64, device=device)
                 lower_row[missing_positions[from_lower]] = torch.arange(
@@ -230,7 +230,7 @@ def prefetch_cache_path(
                 has_row = row_of_new >= 0
                 init_vals[has_row] = lower_values[from_lower][row_of_new[has_row]]
             with torch.cuda.nvtx.range("op:store_to_flat"):
-                state.values.store(new_rows[alloc_is_new], new_tids, init_vals)
+                values.store(new_rows[alloc_is_new], new_tids, init_vals)
 
         # 6. the admitted keys are placed; whatever the storage evicts leaves the cache
         if h_num_missing > 0 and admitted_positions.numel() > 0:
@@ -252,7 +252,7 @@ def prefetch_cache_path(
                     )
                     cached = ev_nodes >= 0
                     if _bool_item(cached.any()):
-                        ev_values[cached] = state.values.load(ev_nodes[cached].to(torch.int64),
+                        ev_values[cached] = values.load(ev_nodes[cached].to(torch.int64),
                             ev_tids[cached],
                             copy_mode=CopyMode.VALUE,
                         )

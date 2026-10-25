@@ -254,7 +254,9 @@ class StorageLayout(Enum):
     CACHING = "Caching (HBM cache + Host full backing; HBM rows duplicate Host)"
 
 
-def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
+def _tier_bytes(
+    values, options_list: List[DynamicEmbTableOptions]
+) -> List[Tuple[int, int, int, int, int, int]]:
     """Per-table value bytes for a built tier: (init total/emb/opt, peak total/emb/opt).
 
     ``init`` is the current ``ExtendableBuffer`` logical size (post bucket-align,
@@ -262,11 +264,11 @@ def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
     the buffer grows to after rehashing fully.
     """
     rows = []
-    for t in range(state.num_tables):
-        buf = state.values.buffers[t]
-        opt = state.options_list[t]
-        value_dim = state.values.value_dims_list[t]
-        emb_dim = state.values.emb_dims_list[t]
+    for t in range(values.num_tables):
+        buf = values.buffers[t]
+        opt = options_list[t]
+        value_dim = values.value_dim(t)
+        emb_dim = values.emb_dim(t)
         elem = DTYPE_NUM_BYTES[opt.embedding_dtype]
         init_total = buf.num_bytes()
         init_emb = init_total * emb_dim // value_dim
@@ -276,6 +278,10 @@ def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
         peak_opt = peak_total - peak_emb
         rows.append((init_total, init_emb, init_opt, peak_total, peak_emb, peak_opt))
     return rows
+
+
+def _tier_bytes_of(state) -> List[Tuple[int, int, int, int, int, int]]:
+    return _tier_bytes(state.values, state.options_list)
 
 
 def _tier_bytes_from_options(
@@ -412,17 +418,17 @@ def _print_memory_consume(
     # Build (tier_label, per-table rows) list. Each row is the 6-tuple above.
     tiers: List[Tuple[str, List[Tuple]]] = []
     if layout == StorageLayout.HBM_ONLY:
-        tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_from_state(storage._state)))
+        tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_of(storage._state)))
     elif layout == StorageLayout.HOST_ONLY:
-        tiers.append(("host (CPU)", _tier_bytes_from_state(storage._state)))
+        tiers.append(("host (CPU)", _tier_bytes_of(storage._state)))
     elif layout == StorageLayout.HYBRID:
-        tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_from_state(storage._hbm)))
-        tiers.append(("host (CPU)", _tier_bytes_from_state(storage._host)))
+        tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_of(storage._hbm)))
+        tiers.append(("host (CPU)", _tier_bytes_of(storage._host)))
     elif layout == StorageLayout.CACHING:
         tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
+            (f"hbm cache/cuda:{device_id}", _tier_bytes(cache.values, cache.options))
         )
-        tiers.append(("host backing (full)", _tier_bytes_from_state(storage._state)))
+        tiers.append(("host backing (full)", _tier_bytes_of(storage._state)))
     else:
         raise ValueError(f"Unhandled StorageLayout: {layout!r}")
     if getattr(storage, "lower", None) is not None:
@@ -797,7 +803,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
                         cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
 
-                self._cache = DynamicEmbCache(cache_options, self._optimizer)
+                self._cache = DynamicEmbCache(
+                    cache_options,
+                    [o.dim + self._optimizer.get_state_dim(o.dim) for o in cache_options],
+                )
 
                 storage_options = deepcopy(self._dynamicemb_options)
                 for storage_option in storage_options:

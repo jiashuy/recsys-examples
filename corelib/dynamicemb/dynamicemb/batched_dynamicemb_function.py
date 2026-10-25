@@ -696,13 +696,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             use_counter = prefetch_state.slot_indices is not None
             if use_counter:
-                state = (
-                    cache._state
+                buffers = (
+                    cache.values
                     if prefetch_state.storage_mode == StorageMode.CACHE
-                    else storage._state
+                    else storage.values
                 )
                 with torch.cuda.nvtx.range("op:load_from_flat"):
-                    unique_embs = state.values.load(# Value buffer: address by row, which is the slot for
+                    unique_embs = buffers.load(# Value buffer: address by row, which is the slot for
                         # every strategy except NO_EVICTION.
                         prefetch_state.value_row_indices,
                         prefetch_state.unique_table_ids,
@@ -857,14 +857,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             with torch.cuda.nvtx.range("DynamicEmbeddingFunction.update"):
                 if ctx.use_counter:
-                    state = (
-                        cache._state
+                    values = (
+                        cache.values
                         if ctx.storage_mode == StorageMode.CACHE
-                        else storage._state
+                        else storage.values
                     )
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         # Writes into the value buffer -> rows.
-                        state.values.update_rows(
+                        values.update_rows(
                             optimizer,
                             unique_grads,
                             ctx.update_value_rows,

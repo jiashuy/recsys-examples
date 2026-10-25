@@ -180,8 +180,7 @@ def _assert_value_buffer_matches_hashtable(state: object, table_id: int) -> None
 def _assert_cache_pool_matches_capacity(cache: object, table_id: int) -> None:
     """A cache's row pool is one row per node: the table's capacity rounded up to a
     multiple of its bucket capacity."""
-    state = cache._state
-    opt = state.options_list[table_id]
+    opt = cache.options[table_id]
     expected_rows = align_to_table_size(
         int(opt.init_capacity), int(opt.bucket_capacity)
     )
@@ -189,8 +188,8 @@ def _assert_cache_pool_matches_capacity(cache: object, table_id: int) -> None:
         f"table {table_id}: cache capacity {cache.capacity(table_id)} != "
         f"{expected_rows}"
     )
-    t = state.values.tensor(table_id)
-    vd = int(state.values.value_dims_list[table_id])
+    t = cache.values.tensor(table_id)
+    vd = int(cache.values.value_dim(table_id))
     assert t.shape == (expected_rows, vd), (
         f"table {table_id}: cache pool shape {tuple(t.shape)} != "
         f"expected ({expected_rows}, {vd})"

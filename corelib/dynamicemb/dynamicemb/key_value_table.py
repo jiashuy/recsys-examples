@@ -477,53 +477,6 @@ def create_table_state(
     )
 
 
-def create_cache_state(
-    options: List[DynamicEmbTableOptions],
-    optimizer: BaseDynamicEmbeddingOptimizer,
-    capacities: List[int],
-) -> DynamicEmbTableState:
-    """The value side of a cache: one fixed row pool per table, addressed by node.
-
-    The same state the kernels that gather and update rows read (value buffers and
-    their pointers, per-table dims, dtype, optimizer), without a key index: the
-    cache keeps its own, in :class:`EmbeddingCacheCore`.
-    """
-    if not options:
-        raise ValueError("options must be non-empty")
-    assert len(capacities) == len(options)
-
-    base_opt = options[0]
-    num_tables = len(options)
-    device_idx = torch.cuda.current_device()
-    device = torch.device(f"cuda:{device_idx}")
-    score_policy = get_score_policy(base_opt.score_strategy)
-
-    dims = [opt.dim for opt in options]
-    value_dims = [d + optimizer.get_state_dim(d) for d in dims]
-    values = MixedDimBuffers(
-        dims, value_dims, capacities, base_opt.embedding_dtype, device, "fixed"
-    )
-
-    props = torch.cuda.get_device_properties(device_idx)
-    threads_in_wave = props.multi_processor_count * props.max_threads_per_multi_processor
-
-    return DynamicEmbTableState(
-        options_list=options,
-        num_tables=num_tables,
-        device=device,
-        score_policy=score_policy,
-        incremental_score_name=score_policy.name,
-        evict_strategy=base_opt.evict_strategy.value,
-        key_index_map=None,
-        capacity=sum(capacities),
-        values=values,
-        optimizer=optimizer,
-        threads_in_wave=threads_in_wave,
-        score=None,
-        training=False,
-    )
-
-
 def _all_gather_dumped_columns(
     columns: List[Tensor],
     pg: dist.ProcessGroup,
@@ -1388,16 +1341,15 @@ class DynamicEmbCache(Cache):
     """The GPU cache: placement and reference protection, from ``EmbeddingCacheCore``.
 
     It holds no score and decides nothing about which keys stay in the system.
-    The rows live in ``_state.values``, one fixed pool per table addressed by node,
-    and everything that reads or writes them goes through the same
-    ``values.ptrs`` the backing's rows do. See docs/lightweight_cache_design.md.
+    The rows live in ``values``, one fixed pool per table addressed by node, and
+    everything that reads or writes them goes through the same
+    ``values.ptrs`` the backing's rows do. The cache knows nothing of the optimizer:
+    it is given the width of each table's value row, and what is done to the values
+    is up to its user. See docs/lightweight_cache_design.md.
     """
 
-    def __init__(
-        self,
-        options: List[DynamicEmbTableOptions],
-        optimizer: BaseDynamicEmbeddingOptimizer,
-    ):
+    def __init__(self, options: List[DynamicEmbTableOptions], value_dims: List[int]):
+        assert len(value_dims) == len(options)
         # Rounded up to a multiple of the bucket capacity, as the cache's index
         # always was. A cache has to hold every key of a step at once, so a
         # configuration smaller than a step would otherwise fail where it used to
@@ -1406,7 +1358,20 @@ class DynamicEmbCache(Cache):
             align_to_table_size(int(opt.init_capacity), int(opt.bucket_capacity))
             for opt in options
         ]
-        self._state = create_cache_state(options, optimizer, capacities)
+        device_idx = torch.cuda.current_device()
+        self.options = options
+        self.values = MixedDimBuffers(
+            [opt.dim for opt in options],
+            value_dims,
+            capacities,
+            options[0].embedding_dtype,
+            torch.device(f"cuda:{device_idx}"),
+            "fixed",
+        )
+        props = torch.cuda.get_device_properties(device_idx)
+        self.threads_in_wave = (
+            props.multi_processor_count * props.max_threads_per_multi_processor
+        )
         self._core = EmbeddingCacheCore(capacities)
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
@@ -1488,28 +1453,7 @@ class DynamicEmbCache(Cache):
 
     @property
     def num_tables(self) -> int:
-        return self._state.num_tables
-
-    def embedding_dtype(self) -> torch.dtype:
-        return self._state.values.dtype
-
-    def embedding_dim(self, table_id: int) -> int:
-        return self._state.values.emb_dims_list[table_id]
-
-    def value_dim(self, table_id: int) -> int:
-        return self._state.values.value_dims_list[table_id]
-
-    def max_embedding_dim(self) -> int:
-        return self._state.values.max_emb_dim
-
-    def max_value_dim(self) -> int:
-        return self._state.values.max_value_dim
-
-    def init_optimizer_state(self) -> float:
-        return self._state.optimizer.get_initial_optimizer_state()
-
-    def evict_strategy(self) -> EvictStrategy:
-        return self._state.evict_strategy
+        return self.values.num_tables
 
     def capacity(self, table_id: int) -> int:
         """How many rows table ``table_id`` has."""
@@ -1627,7 +1571,7 @@ def _eval_lookup_cached(
     nodes = cache.find_nodes(keys, table_ids)
     founds = nodes >= 0
 
-    embs = cache._state.values.load(nodes.to(torch.int64), table_ids, copy_mode=CopyMode.EMBEDDING
+    embs = cache.values.load(nodes.to(torch.int64), table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
     missing_mask = ~founds
