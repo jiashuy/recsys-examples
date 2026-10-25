@@ -39,7 +39,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import export_keys_values_iter
+from dynamicemb.checkpoint.key_value_table import export_keys_values_iter
 from dynamicemb.optimizer import (
     DynamicEmbOptimType,
     FTRLDynamicEmbeddingOptimizer,

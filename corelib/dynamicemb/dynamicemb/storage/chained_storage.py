@@ -31,13 +31,13 @@ import torch
 import torch.distributed as dist
 from dynamicemb_extensions import EvictStrategy, ScorePolicy, device_timestamp, flagged_compact
 
-from .chained_table import ChainedTables
-from .dynamicemb_config import (
+from dynamicemb.storage.chained_table import ChainedTables
+from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     EvictedItemMode,
     ReplayContent,
 )
-from .key_value_table import (
+from dynamicemb.checkpoint.key_value_table import (
     _all_gather_dumped_columns,
     _dump_table,
     _iter_batches_from_files,
@@ -47,18 +47,18 @@ from .key_value_table import (
     _validate_load_meta,
     export_keys_values_iter,
 )
-from .eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
-from .lower_tier import LowerTier
-from .mixed_dim_buffers import MixedDimBuffers
-from .row_chunk import RowChunk
-from .score import ScoreRules, is_lru_lfu
-from .table_state import (
+from dynamicemb.storage.eviction_sink import Discard, EvictionSink, Retain, ToLower, ToTier
+from dynamicemb.storage.lower_tier import LowerTier
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.checkpoint.row_chunk import RowChunk
+from dynamicemb.storage.score import ScoreRules, is_lru_lfu
+from dynamicemb.storage.table_state import (
     DynamicEmbTableState,
     _append_erased,
     _pop_state_erased_keys,
     create_table_state,
 )
-from .types import SCORE_TYPE, CopyMode, MultiTableAdmitter, ReplayStats, Storage
+from dynamicemb.types import SCORE_TYPE, CopyMode, MultiTableAdmitter, ReplayStats, Storage
 
 _SUPPORTED = (
     DynamicEmbScoreStrategy.TIMESTAMP,
@@ -579,7 +579,7 @@ class ChainedStorage(Storage):
                 self._state.values.store(rows, tid, values)
 
     def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
-        from .table_state import _pop_state_evicted_keys
+        from dynamicemb.storage.table_state import _pop_state_evicted_keys
 
         return _pop_state_evicted_keys(self._state, table_id)
 

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import List, Sequence
 
 import torch
-from dynamicemb.extendable_tensor import (
+from dynamicemb.storage.extendable_tensor import (
     DeviceExtendableBuffer,
     ExtendableBuffer,
     FixedDeviceBuffer,

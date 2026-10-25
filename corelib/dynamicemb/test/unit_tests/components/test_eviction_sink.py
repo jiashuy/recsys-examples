@@ -16,7 +16,7 @@
 from types import SimpleNamespace
 
 import torch
-from dynamicemb.eviction_sink import Discard, Retain, ToLower, ToTier
+from dynamicemb.storage.eviction_sink import Discard, Retain, ToLower, ToTier
 
 
 class _Recorder:

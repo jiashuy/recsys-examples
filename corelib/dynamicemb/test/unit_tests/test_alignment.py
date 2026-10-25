@@ -36,8 +36,8 @@ from dynamicemb.dynamicemb_config import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
-from dynamicemb.cache import DynamicEmbCache
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.storage.cache import DynamicEmbCache
 from dynamicemb.optimizer import DynamicEmbOptimType, OptimType, get_optimizer_state_dim
 from dynamicemb.planner import get_planner
 from dynamicemb.types import MAX_BUCKET_CAPACITY

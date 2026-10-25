@@ -37,7 +37,7 @@ from dynamicemb_extensions import (
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
 if TYPE_CHECKING:
-    from dynamicemb.mixed_dim_buffers import RowLayout
+    from dynamicemb.storage.mixed_dim_buffers import RowLayout
 
 
 class DynamicEmbOptimType(enum.Enum):

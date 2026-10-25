@@ -25,7 +25,7 @@ import random
 
 import pytest
 import torch
-from dynamicemb.chained_table import (
+from dynamicemb.storage.chained_table import (
     ChainedTable,
     ChainedTables,
     ChainedTableFull,

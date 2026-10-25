@@ -19,9 +19,9 @@ from typing import Optional, Tuple
 
 import torch
 from dynamicemb.initializer import MultiTableInitializer
-from dynamicemb.eval_lookup import eval_lookup
-from dynamicemb.chained_storage import ChainedStorage
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.training.eval_lookup import eval_lookup
+from dynamicemb.storage.chained_storage import ChainedStorage
+from dynamicemb.training.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import (
     Cache,
@@ -393,7 +393,7 @@ def dynamicemb_prefetch(
                             "Reduce prefetch pipeline depth or increase "
                             "cache size."
                         )
-            from dynamicemb.chained_prefetch import prefetch_cache_path
+            from dynamicemb.training.chained_prefetch import prefetch_cache_path
 
             (
                 slot_indices,
@@ -418,7 +418,7 @@ def dynamicemb_prefetch(
             # no ref counter beside a hash table, so the two index spaces coincide.
             value_row_indices = slot_indices
         elif storage_mode == StorageMode.HBM_DIRECT:
-            from dynamicemb.chained_prefetch import prefetch_hbm_direct_path
+            from dynamicemb.training.chained_prefetch import prefetch_hbm_direct_path
 
             (
                 slot_indices,

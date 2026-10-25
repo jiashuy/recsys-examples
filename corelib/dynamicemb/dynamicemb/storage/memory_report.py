@@ -23,7 +23,7 @@ from dynamicemb.optimizer import (
     OptimType,
     get_optimizer_state_dim,
 )
-from dynamicemb.storage_layout import StorageLayout
+from dynamicemb.storage.storage_layout import StorageLayout
 from dynamicemb.types import Cache, Storage
 from dynamicemb.utils import DTYPE_NUM_BYTES
 

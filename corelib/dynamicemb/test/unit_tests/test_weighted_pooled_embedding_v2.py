@@ -32,7 +32,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedStorage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.types import BoundsCheckMode
 from torchrec.modules.embedding_configs import PoolingType

@@ -28,7 +28,7 @@ import sys
 import pytest
 import torch
 from dynamicemb import DynamicEmbScoreStrategy
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedStorage
 from dynamicemb.dynamicemb_config import EvictedItemMode
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))

@@ -25,9 +25,9 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
     ReplayContent,
 )
-from dynamicemb.row_chunk import RowChunk
-from dynamicemb.score import ScoreRules
-from dynamicemb.table_state import DynamicEmbTableState
+from dynamicemb.checkpoint.row_chunk import RowChunk
+from dynamicemb.storage.score import ScoreRules
+from dynamicemb.storage.table_state import DynamicEmbTableState
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.scored_hashtable import (
     ScoreArg,

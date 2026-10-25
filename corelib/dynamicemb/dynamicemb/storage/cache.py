@@ -19,7 +19,7 @@
 from typing import List, Optional, Tuple
 
 import torch  # usort:skip
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.types import (
     KEY_TYPE,
     Cache,

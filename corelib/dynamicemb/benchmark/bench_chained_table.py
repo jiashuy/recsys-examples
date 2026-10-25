@@ -30,7 +30,7 @@ Usage: python bench_chained_table.py [--slots 16777216] [--batches 65536,524288]
 import argparse
 
 import torch
-from dynamicemb.chained_table import ChainedTable
+from dynamicemb.storage.chained_table import ChainedTable
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
 

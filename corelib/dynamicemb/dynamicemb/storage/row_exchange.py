@@ -34,7 +34,7 @@ are busy at once. See ``benchmark/bench_row_exchange.py`` on the branch
 """
 
 import torch
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.types import CopyMode
 from dynamicemb_extensions import swap_staged as _swap_staged
 

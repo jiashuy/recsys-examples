@@ -154,3 +154,17 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - admitter 在有 PS 时的具体语义（PS 里已有的 key 是否一律绕过准入）。
 - `RowExchange` 是否也提供读缓存、写缓存的接口，还是继续留在 `MixedDimBuffers`。
 - `MixedDimBuffers` 按下标管理表、表名由 `BatchedDynamicEmbeddingTablesV2` 处理，这一点是否足够。
+
+## 五、代码的目录组织
+
+内部的训练组件按职责放进三个子包，对外的入口模块留在顶层：
+
+| 位置 | 内容 |
+|---|---|
+| `dynamicemb/storage/` | 行与索引、层级：`chained_table`、`chained_storage`、`storage_layout`、`table_state`、`mixed_dim_buffers`、`extendable_tensor`、`row_exchange`、`eviction_sink`、`lower_tier`、`cache`、`score`、`memory_report` |
+| `dynamicemb/checkpoint/` | `row_chunk`、`key_value_table`（checkpoint 文件读写；名字过时，step 5 重排时改） |
+| `dynamicemb/training/` | 训练一步的编排：`chained_prefetch`、`batched_dynamicemb_function`、`eval_lookup`、`lookup_layout` |
+| 顶层（公开入口，路径不变） | `batched_dynamicemb_tables`、`dump_load`、`incremental_dump`、`dynamicemb_config`、`types`、`optimizer`、`initializer`、`embedding_admission`、`utils`、`batched_dynamicemb_compute_kernel`、`construct_twin_module`、`key_ownership` |
+| 顶层（推理，不动） | `exportable_tables`、`scored_hashtable`、`lookup_meta`、`index_range_meta`、`jit/` |
+
+新组件的单元测试在 `test/unit_tests/components/`。

@@ -29,7 +29,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     ScoreStrategy,
 )
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedStorage
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy

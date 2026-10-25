@@ -26,8 +26,8 @@ Usage: python bench_row_exchange.py [--storage-rows 26843545] [--swaps 100000,20
 import argparse
 
 import torch
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
-from dynamicemb.row_exchange import RowExchange
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.row_exchange import RowExchange
 
 
 def _time(fn, iters=20, warmup=3):

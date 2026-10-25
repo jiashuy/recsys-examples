@@ -27,13 +27,13 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, 
 
 import torch  # usort:skip
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_function import (
+from dynamicemb.training.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
 )
-from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
@@ -47,11 +47,11 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
-from dynamicemb.cache import flush_cache
-from dynamicemb.row_exchange import RowExchange
-from dynamicemb.memory_report import print_memory_consume
-from dynamicemb.storage_layout import build_storage
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.storage.cache import flush_cache
+from dynamicemb.storage.row_exchange import RowExchange
+from dynamicemb.storage.memory_report import print_memory_consume
+from dynamicemb.storage.storage_layout import build_storage
+from dynamicemb.training.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,

@@ -33,7 +33,7 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,

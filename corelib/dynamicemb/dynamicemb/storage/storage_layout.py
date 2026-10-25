@@ -35,17 +35,17 @@ from typing import List, Optional
 import warnings
 
 import torch
-from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     align_to_table_size,
 )
-from dynamicemb.cache import DynamicEmbCache
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.cache import DynamicEmbCache
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.row_exchange import RowExchange
+from dynamicemb.storage.row_exchange import RowExchange
 from dynamicemb.types import Cache, Storage
 from dynamicemb.utils import DTYPE_NUM_BYTES
 

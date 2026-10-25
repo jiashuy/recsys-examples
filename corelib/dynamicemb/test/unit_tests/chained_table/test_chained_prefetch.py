@@ -36,8 +36,8 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.storage_layout import StorageLayout
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.storage.storage_layout import StorageLayout
+from dynamicemb.storage.chained_storage import ChainedStorage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -288,7 +288,7 @@ def test_a_timestamp_and_frequency_table_evicts_and_loses_nothing(layout):
 
 
 def test_hybrid_the_hbm_tier_spills_into_the_host_tier_and_nothing_is_lost():
-    from dynamicemb.chained_storage import ChainedHybridStorage
+    from dynamicemb.storage.chained_storage import ChainedHybridStorage
 
     module = _module("hybrid", None, 16384)
     storage = module._storage

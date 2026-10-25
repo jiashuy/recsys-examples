@@ -17,8 +17,8 @@
 
 import pytest
 import torch
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
-from dynamicemb.row_exchange import RowExchange
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.row_exchange import RowExchange
 from dynamicemb.types import CopyMode
 
 

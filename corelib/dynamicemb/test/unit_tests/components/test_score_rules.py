@@ -16,7 +16,7 @@
 import pytest
 import torch
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy as S
-from dynamicemb.score import ScoreRules
+from dynamicemb.storage.score import ScoreRules
 from dynamicemb.types import SCORE_TYPE
 
 LRU_LFU = (S.TIMESTAMP, S.LFU)

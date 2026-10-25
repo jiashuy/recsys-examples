@@ -17,7 +17,7 @@
 
 import pytest
 import torch
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.optimizer import (
     AdamDynamicEmbeddingOptimizer,
     OptimizerArgs,

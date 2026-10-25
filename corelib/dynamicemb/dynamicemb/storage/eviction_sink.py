@@ -29,8 +29,8 @@ import abc
 from typing import Optional
 
 import torch
-from dynamicemb.table_state import DynamicEmbTableState, _append_evicted
-from dynamicemb.lower_tier import LowerTier
+from dynamicemb.storage.table_state import DynamicEmbTableState, _append_evicted
+from dynamicemb.storage.lower_tier import LowerTier
 from dynamicemb.types import Storage
 
 

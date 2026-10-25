@@ -20,7 +20,7 @@ from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
-from dynamicemb.row_chunk import RowChunk
+from dynamicemb.checkpoint.row_chunk import RowChunk
 
 
 @enum.unique

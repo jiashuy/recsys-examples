@@ -35,8 +35,8 @@ import torch
 from dynamicemb.types import CopyMode, counts_to_offsets
 from dynamicemb_extensions import EvictStrategy, flagged_compact
 
-from .batched_dynamicemb_function import _bool_item, _scalar_item
-from .chained_storage import ChainedStorage
+from dynamicemb.training.batched_dynamicemb_function import _bool_item, _scalar_item
+from dynamicemb.storage.chained_storage import ChainedStorage
 
 
 def prefetch_cache_path(

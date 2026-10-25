@@ -41,8 +41,8 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.storage_layout import StorageLayout
-from dynamicemb.chained_storage import ChainedStorage
+from dynamicemb.storage.storage_layout import StorageLayout
+from dynamicemb.storage.chained_storage import ChainedStorage
 from torchrec.modules.embedding_configs import EmbeddingConfig  # noqa: F401
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 

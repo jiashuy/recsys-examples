@@ -43,7 +43,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.key_ownership import murmur3_fmix64
-from dynamicemb.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
 from dynamicemb.planner import get_planner
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder

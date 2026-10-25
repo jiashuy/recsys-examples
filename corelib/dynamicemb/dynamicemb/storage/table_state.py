@@ -26,7 +26,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     EvictedItemMode,
 )
-from dynamicemb.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.storage.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScorePolicy,
@@ -131,7 +131,7 @@ def create_table_state(
     row_capacities: Optional[List[int]] = None,
 ) -> DynamicEmbTableState:
     """``build_index=False`` makes the value buffers only, ``row_capacities`` rows each:
-    the key index lives elsewhere (see :mod:`dynamicemb.chained_table`)."""
+    the key index lives elsewhere (see :mod:`dynamicemb.storage.chained_table`)."""
     if not options:
         raise ValueError("options must be non-empty")
     if not build_index and row_capacities is None:
