@@ -29,14 +29,20 @@
 
 ### 2.1 `RowExchange` 与 swap【已实现】
 
-缓存里一个 node 存着某个 key 的 value 副本。把 node 让给新 key 是两件作用在**同一个 node** 上的事：旧 key 的行（缓存里可能已经被训练）写回它在存储里的行；新 key 的行（如果有）从存储读进 node。读旧值必须先于写新值。
+缓存里一个 node 存着某个 key 的 value 副本。把 node 让给新 key 是两件作用在**同一个 node** 上的事：旧 key 的行（缓存里可能已经被训练）写回它在存储里的行；新 key 的行（如果有）从存储读进 node。
 
-做成一个 kernel，一个 block 处理一个 node：每个线程先读旧行和新行的各自那几列，再写。这样：
-- 不需要为所有 victim 准备临时缓冲；
-- 两个方向（写回、读入）同时在 PCIe 上传输，用满双向带宽；
-- 行按 16、4 或 2 字节的字拷贝（取所有表行字节数的最大公约字），和元素类型无关。
+**最终做法：排序暂存。** 先把被顶掉的行从缓存（HBM）按它们存储行号的顺序 gather 到暂存区（同时腾出 node）；一个融合 kernel 取写回和读入两条列表各自按存储行号排序后的第 i 项：第 i 个被顶掉的行写到它的存储行，同时第 i 个读入的存储行写进它的 node。两个方向在同一个 kernel 里同时进行，访问存储都是有序的。接口 `swap(nodes, table_ids, evict_rows, fetch_rows)`：`-1` 跳过该半边，没有要读入的 node 保持原样，node 为 -1 整项跳过；存储缓冲增长后无需重建。
 
-接口：`swap(nodes, table_ids, evict_rows, fetch_rows)`，`-1` 表示跳过该半边；存储缓冲增长后无需重建（每次调用读当前指针）。
+**为什么是这个做法（H100 上的测量，host 存储 2680 万行，20 万行一步）：**
+- 链路峰值：`cudaMemcpy` 单向约 52 GiB/s，双向 94 GiB/s；kernel 零拷贝双向 78 GiB/s。连续 pinned 缓冲上的配对 kernel 能到 84 GB/s 双向。
+- GPU 访问 host 表的随机行很慢：host 表 256 MB 以内随机读每行 10 ns（链路满速），13 GB 时 33.7 ns，是 TLB 受限（翻译缓存覆盖约 1 GB 量级）。排序后降到 16.6 ns。大页、`cuMemCreate` host 分配、NUMA 绑定都没有效果；`cudaMemcpyBatchAsync`（让 DMA 引擎搬随机行）每行 544 ns，不可行。
+- 融合 swap 把一个 node 的写回行和读入行配对，没法同时让两个列表都有序，所以随机访问；两个方向也不重叠（swap 时间等于读加写之和）。
+- CPU 做随机行的 gather / scatter、GPU 只访问连续缓冲：窄行上略好（约 10%），宽行上更差。CPU 的 scatter 用非临时写比普通写快 2.5 倍；CUDA 驱动把所有 stream 的 host 回调放在一个线程上，gather 和 scatter 不能并行，换成专用线程后两者又会争抢 CPU 内存带宽（总量到连续拷贝峰值约 99 GB/s 就到顶）；adam 一步 600 MB 负载，CPU 路径比 GPU 排序暂存慢约 45%。
+- 结果（有效双向带宽，写回加读入字节数除以时间）：sgd 20 万行 融合 16 GB/s、排序暂存 38 GB/s；adam 20 万行 融合 41 GB/s、排序暂存 **68 GB/s（约 64 GiB/s，约 68% 双向峰值）**。
+
+完整的实验代码（融合 kernel 变体、CPU 路径、分块流水线、专用线程加标志位等待、各类微基准和探针）在分支 `row-exchange-experiments` 上，不在主线。
+
+与上游（同一台 H100，同样的 benchmark 配置）相比，训练一步：缓存 adam 命中率 0.8 快 2.0 倍、命中率 1.0 快 3.5 倍，sgd 快 2.3 和 3.8 倍；hybrid 快 1.2 到 1.3 倍；全 HBM 快 1.05 倍。
 
 读缓存（forward 的 `load`）和写缓存（优化器更新）仍然是对 `MixedDimBuffers` 的操作，不经过 `RowExchange`；它只管**两个缓冲之间**的搬运。
 

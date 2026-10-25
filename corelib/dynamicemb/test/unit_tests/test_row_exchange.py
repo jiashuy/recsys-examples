@@ -171,3 +171,45 @@ def test_through_the_loads_a_swap_agrees_with_load_and_store(device):
     for t in range(2):
         assert torch.equal(cache.tensor(t), cache2.tensor(t))
         assert torch.equal(storage.tensor(t), storage2.tensor(t))
+
+
+def test_many_steps_match_a_model(device):
+    """Back-to-back swaps with rows that overlap from one step to the next, and two tables
+    of different widths. A model in plain Python says what the cache and the storage hold at
+    the end."""
+    dims = [8, 12]
+    n_tables, cache_rows, store_rows, steps, per_step = len(dims), 200, 400, 40, 120
+    cache, storage = _pair(device, dims, torch.float32, "host", cache_rows, store_rows)
+    ex = RowExchange(cache, storage)
+    # a key's value is its identity, so a row that moves can be recognised wherever it lands
+    store_model = [torch.arange(store_rows, dtype=torch.float32) * 1000 + t for t in range(n_tables)]
+    cache_model = [torch.arange(cache_rows, dtype=torch.float32) * 1000 + 500 + t for t in range(n_tables)]
+    for t in range(n_tables):
+        storage.tensor(t).copy_(store_model[t].to(device)[:, None].expand(store_rows, dims[t]))
+        cache.tensor(t).copy_(cache_model[t].to(device)[:, None].expand(cache_rows, dims[t]))
+    rng = torch.Generator(device="cpu").manual_seed(11)
+    for _ in range(steps):
+        tids = torch.sort(torch.randint(0, n_tables, (per_step,), generator=rng)).values
+        nodes = torch.zeros(per_step, dtype=torch.int64)
+        evict = torch.zeros(per_step, dtype=torch.int64)
+        fetch = torch.zeros(per_step, dtype=torch.int64)
+        for t in range(n_tables):
+            sel = (tids == t).nonzero().squeeze(1)
+            k = sel.numel()
+            nodes[sel] = torch.randperm(cache_rows, generator=rng)[:k]
+            rows = torch.randperm(store_rows, generator=rng)[: 2 * k]
+            evict[sel], fetch[sel] = rows[:k], rows[k:]
+        evict[0::7] = -1
+        fetch[3::5] = -1
+        for i in range(per_step):
+            t, nd, ev, fe = int(tids[i]), int(nodes[i]), int(evict[i]), int(fetch[i])
+            old, new = cache_model[t][nd].clone(), store_model[t][fe].clone()
+            if ev >= 0:
+                store_model[t][ev] = old
+            if fe >= 0:
+                cache_model[t][nd] = new
+        ex.swap(*(x.to(device) for x in (nodes, tids, evict, fetch)))
+    torch.cuda.synchronize()
+    for t in range(n_tables):
+        assert torch.equal(storage.tensor(t)[:, 0].cpu(), store_model[t]), f"storage of table {t}"
+        assert torch.equal(cache.tensor(t)[:, 0].cpu(), cache_model[t]), f"cache of table {t}"

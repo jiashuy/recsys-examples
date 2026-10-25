@@ -18,15 +18,25 @@
 A cache node holds a copy of the value row of a key that the storage also holds.
 Giving a node to another key is a *swap*: the old key's row goes back to the row it has
 in the storage, and the new key's row, if it has one, comes from the storage into the
-node. :class:`RowExchange` does the two together, node by node, in one kernel. The old
-row has to be read before the new one is written, and doing it per node is what makes
-that so, without a staging copy of every victim; and when the storage is in host memory
-the write-back and the fetch cross the link in opposite directions at once.
+node. :class:`RowExchange` does a step's swaps together.
+
+What the swap is built around is what reaching host memory costs. A GPU pays a fixed
+price for each random row it touches across the link, whatever the width of the row, and
+reaches rows in order about twice as fast; the CPU does not do better once its own memory
+bandwidth is the limit, and the driver runs the host functions of all streams on one
+thread, so a CPU gather and scatter cannot overlap. What works at every row width is to
+visit the storage's rows in order, each side on its own: the victims are first gathered
+from the cache (in HBM) into a staging buffer, in the order of the storage rows they go
+back to, and one kernel then pairs the i-th victim with the i-th fetched row, writing the
+one out and reading the other in, in the same pass, so that both directions of the link
+are busy at once. See ``benchmark/bench_row_exchange.py`` on the branch
+``row-exchange-experiments`` for what was measured.
 """
 
 import torch
 from dynamicemb.mixed_dim_buffers import MixedDimBuffers
-from dynamicemb_extensions import swap_rows as _swap_rows
+from dynamicemb.types import CopyMode
+from dynamicemb_extensions import swap_staged as _swap_staged
 
 
 class RowExchange:
@@ -56,14 +66,30 @@ class RowExchange:
     ) -> None:
         """For the i-th node of table ``table_ids[i]``: its row goes to the storage row
         ``evict_rows[i]``, and the storage row ``fetch_rows[i]`` comes into it. Either is
-        skipped for -1; a node of -1 is skipped altogether."""
-        _swap_rows(
-            self.cache.ptrs,
+        skipped for -1, and a node of -1 is skipped altogether; a node that has nothing
+        to fetch keeps its row."""
+        if nodes.numel() == 0:
+            return
+        cache = self.cache
+        gone = nodes < 0
+        evict_rows = torch.where(gone, -1, evict_rows)
+        fetch_rows = torch.where(gone, -1, fetch_rows)
+        safe_nodes = nodes.clamp(min=0)
+        evict_order = torch.argsort(evict_rows)
+        fetch_order = torch.argsort(fetch_rows)
+        staging = cache.load(
+            safe_nodes[evict_order], table_ids[evict_order], CopyMode.VALUE
+        )
+        _swap_staged(
+            cache.ptrs,
             self.storage.ptrs,
             self._row_bytes,
-            table_ids,
-            nodes,
-            evict_rows,
-            fetch_rows,
+            table_ids[evict_order],
+            table_ids[fetch_order],
+            evict_rows[evict_order],
+            fetch_rows[fetch_order],
+            safe_nodes[fetch_order],
+            staging,
+            staging.shape[1] * staging.element_size(),
             self._word_bytes,
         )
