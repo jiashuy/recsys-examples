@@ -81,7 +81,7 @@ def _layout(name):
     return True, VALUE_BYTES // 2  # caching: an HBM cache of half the table
 
 
-def _module(layout, ps):
+def _module(layout, ps, **extra):
     caching, local_hbm = _layout(layout)
     device_id = torch.cuda.current_device()
     options = DynamicEmbTableOptions(
@@ -98,6 +98,7 @@ def _module(layout, ps):
         initializer_args=DynamicEmbInitializerArgs(
             mode=DynamicEmbInitializerMode.CONSTANT, value=1.0
         ),
+        **extra,
     )
     return BatchedDynamicEmbeddingTablesV2(
         table_names=["t"],
@@ -174,3 +175,15 @@ def test_control_a_storage_that_drops_what_it_is_given_fails_the_check(layout):
         "with a lower tier that forgets everything the check still passes, so it "
         "does not show that evicted values reach the storage below"
     )
+
+
+@pytest.mark.parametrize("layout", ["hbm", "host", "caching"])
+def test_rows_that_are_initialised_before_a_key_takes_them_train_the_same(layout):
+    module = _module(layout, PyDictStorage, preinitialize_rows=True)
+    storage = module._storage
+    assert isinstance(storage, ChainedStorage) and storage.preinitialized
+    uses = _train(module)
+    assert int((uses > 0).sum()) > 2 * MAX_CAPACITY, "the run must overflow the table"
+    assert storage.lower.storage.size() > 0, "nothing was evicted into the storage below"
+    bad, total = _mismatched_keys(module, uses)
+    assert bad == 0, f"{bad} of {total} keys lost an update on the way down or back"

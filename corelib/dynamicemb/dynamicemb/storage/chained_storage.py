@@ -267,6 +267,7 @@ class ChainedStorage(Storage):
         num_buckets = [max(1, math.ceil(int(o.init_capacity) / cap)) for o in options]
         slots = [n * cap for n in num_buckets]
         identity = [bool(o.identity_row_mapping) for o in options]
+        self._preinitialized = any(identity) or any(o.preinitialize_rows for o in options)
         # A table with identity rows holds no row for a victim in flight: its rows are its slots.
         rows = [s if ident else s + max(s // 8, 1024) for s, ident in zip(slots, identity)]
 
@@ -298,6 +299,7 @@ class ChainedStorage(Storage):
             device=self._state.device,
             num_scores=2 if lru_lfu else 1,
             identity=identity,
+            preinitialize=self._preinitialized,
         )
         self._state.key_index_map = _ChainedIndexView(self)
         if spill_to is not None:
@@ -316,6 +318,41 @@ class ChainedStorage(Storage):
     @property
     def index(self) -> ChainedTables:
         return self._index
+
+    @property
+    def preinitialized(self) -> bool:
+        """Whether the rows hold their initial value before a key takes them."""
+        return self._preinitialized
+
+    def set_row_initializer(self, initializer) -> None:
+        """How the rows of this storage get their initial value (a module's initializer)."""
+        from dynamicemb.initializer import DebugInitializer
+
+        if isinstance(initializer, DebugInitializer) and not all(
+            self._index.identity
+        ):
+            raise ValueError(
+                "the debug initializer gives a row the value of its key, which a row that is "
+                "initialised before it has a key cannot have: use identity_row_mapping, "
+                "where the key is the row"
+            )
+        values = self._state.values
+        optimizer = self._state.optimizer
+
+        def init_rows(rows: torch.Tensor, table: int) -> None:
+            n = rows.numel()
+            buf = torch.empty(n, values.max_value_dim, dtype=values.dtype, device=rows.device)
+            tids = torch.full((n,), table, dtype=torch.int64, device=rows.device)
+            initializer(
+                buf[:, : values.max_emb_dim],
+                rows,
+                tids,
+                torch.arange(n, dtype=torch.int64, device=rows.device),
+            )
+            optimizer.init_states(values.layout, buf, tids)
+            values.store(rows, tids, buf)
+
+        self._index.allocator.set_initializer(init_rows)
 
     def set_admitter(self, admitter: Optional[MultiTableAdmitter]) -> None:
         """The policy that decides which of the keys this storage lacks are let in."""

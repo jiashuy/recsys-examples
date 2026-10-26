@@ -167,6 +167,8 @@ def _hybrid(
             "identity_row_mapping is not supported with the hybrid storage: its tiers "
             "hold disjoint keys, and a key's row is its own."
         )
+    if any(o.preinitialize_rows for o in options):
+        raise ValueError("preinitialize_rows is not supported with the hybrid storage")
     hbm_options = deepcopy(options)
     for hbm_option in hbm_options:
         cap = max(1, int(hbm_option.max_capacity * cap_scale))

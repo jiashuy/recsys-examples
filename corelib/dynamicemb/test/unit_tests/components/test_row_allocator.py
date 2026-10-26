@@ -80,3 +80,70 @@ def test_growing_puts_the_new_rows_on_top(device):
     assert alloc.row_capacity_of(0) == 7
     assert alloc.free_rows(0) == 7
     assert _take(alloc, [1, 2], [0, 0], device) == ([5, 6], 0)
+
+
+# -- rows initialised before they are taken ------------------------------------
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, rows, table):
+        self.calls.append((table, rows.tolist()))
+
+
+def _preinit(device, rows=10, chunk=4, identity=False):
+    alloc = RowAllocator(
+        [rows], [identity], [rows], device, preinitialize=True, chunk=chunk
+    )
+    rec = _Recorder()
+    alloc.set_initializer(rec)
+    return alloc, rec
+
+
+def test_rows_are_initialised_a_chunk_at_a_time_when_they_are_needed(device):
+    alloc, rec = _preinit(device)
+    assert rec.calls == []  # nothing before it is wanted
+    alloc.ensure([3])
+    assert rec.calls == [(0, [0, 1, 2, 3])]  # a chunk, not three rows
+    rows, abort = _take(alloc, [1, 2, 3], [0, 0, 0], device)
+    alloc.note_taken([3])
+    assert abort == 0 and rows == [1, 2, 3]  # the top of the stack, initialised
+    alloc.ensure([1])  # one clean row is left
+    assert len(rec.calls) == 1
+
+
+def test_a_released_row_is_initialised_again_before_it_is_taken(device):
+    alloc, rec = _preinit(device)
+    alloc.ensure([4])
+    _take(alloc, [1, 2, 3, 4], [0] * 4, device)
+    alloc.note_taken([4])
+    alloc.release(_t([2], device), _t([0], device))
+    assert alloc.free_rows(0) == 7  # the dirty row and the six never handed out
+    alloc.ensure([3])
+    # the dirty row first, then fresh ones, up to a chunk
+    assert rec.calls[-1] == (0, [2, 4, 5, 6])
+
+
+def test_more_rows_wanted_than_there_are_is_an_error(device):
+    alloc, _ = _preinit(device, rows=6)
+    with pytest.raises(RuntimeError, match="free rows"):
+        alloc.ensure([7])
+
+
+def test_identity_rows_are_all_initialised_at_once(device):
+    alloc, rec = _preinit(device, rows=10, chunk=4, identity=True)
+    assert [r for _, chunk in rec.calls for r in chunk] == list(range(10))
+    alloc.ensure([5])  # nothing more to initialise
+    assert len(rec.calls) == 3
+
+
+def test_growing_leaves_the_new_rows_to_be_initialised_when_wanted(device):
+    alloc, rec = _preinit(device, rows=4, chunk=8)
+    alloc.ensure([2])
+    assert rec.calls == [(0, [0, 1, 2, 3])]
+    alloc.grow(0, 8)
+    assert alloc.free_rows(0) == 8  # four clean, four never handed out
+    alloc.ensure([6])
+    assert rec.calls[-1] == (0, [4, 5, 6, 7])

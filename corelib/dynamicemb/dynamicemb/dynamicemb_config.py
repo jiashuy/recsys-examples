@@ -506,6 +506,14 @@ class DynamicEmbTableOptions:
         ever evicted, so the table must be a single bucket (a ``bucket_capacity`` not smaller than
         the per-rank rows). A key outside ``[0, capacity)`` raises ``ValueError``. Not supported with
         the hybrid storage.
+    preinitialize_rows : bool
+        Default ``False``. When ``True`` the rows of the value buffer are given their initial
+        value before a key takes them, in chunks, instead of the key's value being initialised
+        when the key arrives: a key found nowhere is then brought to the cache from its row like
+        any other. The initial value of a row cannot depend on the key, so the debug initializer
+        needs ``identity_row_mapping``, where the key is the row. Implied by ``identity_row_mapping``
+        (the whole table is initialised when the module is built). Not supported with the hybrid
+        storage.
     global_hbm_for_values : int
         Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
         It has different meanings under `caching=True` and  `caching=False`.
@@ -578,6 +586,7 @@ class DynamicEmbTableOptions:
     score_strategy: Optional[ScoreStrategy] = DynamicEmbScoreStrategy.TIMESTAMP
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     identity_row_mapping: bool = False
+    preinitialize_rows: bool = False
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
@@ -733,6 +742,7 @@ class DynamicEmbTableOptions:
         grouped_key["optimizer_state_dtype"] = self.optimizer_state_dtype
         # The tables of a storage share the capacity of their buckets.
         grouped_key["bucket_capacity"] = self.bucket_capacity
+        grouped_key["preinitialize_rows"] = self.preinitialize_rows or self.identity_row_mapping
         return grouped_key
 
     def __hash__(self):

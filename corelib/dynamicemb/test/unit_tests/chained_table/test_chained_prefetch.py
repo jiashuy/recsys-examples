@@ -384,3 +384,12 @@ def test_identity_rows_reject_a_key_that_is_not_a_row():
     offsets = torch.tensor([0, 1], dtype=torch.int64, device=device)
     with pytest.raises(ValueError, match="not a row"):
         module(indices, offsets)
+
+
+@pytest.mark.parametrize("layout", ["hbm", "host", "caching"])
+def test_preinitialised_rows_hold_every_update_when_nothing_is_evicted(layout):
+    capacity = 4 * KEYS
+    module = _module(layout, None, capacity, preinitialize_rows=True)
+    assert module._storage.preinitialized
+    uses = _train(module)
+    assert _mismatched_keys(module, uses)[0] == 0

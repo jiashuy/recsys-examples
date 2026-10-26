@@ -120,6 +120,7 @@ class ChainedTables:
         device: Optional[torch.device] = None,
         num_scores: int = 1,
         identity: Union[bool, Sequence[bool]] = False,
+        preinitialize: bool = False,
     ):
         if num_scores not in (1, 2):
             raise ValueError("a slot holds one score word, or two: (timestamp, frequency)")
@@ -188,6 +189,7 @@ class ChainedTables:
             self.identity,
             [nb * self.bucket_capacity for nb in self._nb],
             dev,
+            preinitialize,
         )
         self._version = [0] * self.num_tables
         self._rebuild_views()
@@ -401,6 +403,10 @@ class ChainedTables:
                 self.expand(t)
             total_buckets = sum(self._nb)
 
+        if self.allocator.preinitialize:
+            # The rows a step takes are initialised before it takes them.
+            taken = (tstart[1:] - tstart[:-1]).tolist()
+            self.allocator.ensure(taken)
         g_ptr, g_n = guard if guard is not None else (0, 0)
         srows_in, abort = self.allocator.take(skeys, stids, tstart)
         (rows, srows, _vict_slot, vkeys, vrows, vtabs, seg_fail, stats, vscores) = chained_apply(
@@ -426,6 +432,9 @@ class ChainedTables:
                 f"table {t} has {have} free rows and {need_rows} keys need one; "
                 "increase row_capacity or release the victims of earlier steps"
             )
+
+        if self.allocator.preinitialize:
+            self.allocator.note_taken(taken)
 
         if failed_buckets:
             failed = seg_fail[:runs].to(torch.bool)

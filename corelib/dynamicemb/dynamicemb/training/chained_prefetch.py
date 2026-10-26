@@ -156,9 +156,10 @@ def prefetch_cache_path(
         with torch.cuda.nvtx.range("op:swap_rows"):
             exchange.swap(new_rows, alloc_tids, evict_rows, rows[alloc_positions])
 
-        # 5c. new keys are initialised in their cache rows
+        # 5c. new keys are initialised in their cache rows (unless their rows were: then
+        # they come from there, once the storage has given them)
         alloc_is_new = ~alloc_in_storage
-        if _bool_item(alloc_is_new.any()):
+        if not storage.preinitialized and _bool_item(alloc_is_new.any()):
             n_new = int(_scalar_item(alloc_is_new.sum()))
             init_vals = torch.empty(n_new, max_val_dim, dtype=emb_dtype, device=device)
             init_indices = torch.arange(n_new, dtype=torch.int64, device=device)
@@ -183,6 +184,20 @@ def prefetch_cache_path(
             with torch.cuda.nvtx.range("op:storage_commit"):
                 out = index.commit(admit_mask, guard=cache.eviction_guard)
             storage.sync_value_buffers()
+            if storage.preinitialized:
+                # The new keys' rows were initialised before they were taken.
+                node_of = new_rows[torch.searchsorted(alloc_positions, out.positions)]
+                new_values = sstate.values.load(out.rows, out.tables, copy_mode=CopyMode.VALUE)
+                if from_lower is not None and _bool_item(from_lower.any()):
+                    lower_row = torch.full((h_num_total,), -1, dtype=torch.int64, device=device)
+                    lower_row[missing_positions[from_lower]] = torch.arange(
+                        int(_scalar_item(from_lower.sum())), dtype=torch.int64, device=device
+                    )
+                    row_of_new = lower_row[out.positions]
+                    has_row = row_of_new >= 0
+                    new_values[has_row] = lower_values[from_lower][row_of_new[has_row]]
+                with torch.cuda.nvtx.range("op:store_to_flat"):
+                    values.store(node_of, out.tables, new_values)
             if out.victim_keys.numel() > 0:
                 ev_keys, ev_tids, ev_rows = (
                     out.victim_keys,
@@ -272,21 +287,26 @@ def prefetch_hbm_direct_path(
 
         if admitted_keys.numel() > 0:
             n_admitted = admitted_keys.numel()
-            init_values = torch.empty(
-                n_admitted, max_val_dim, dtype=state.values.dtype, device=device
-            )
-            init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
-            with torch.cuda.nvtx.range("op:initializer"):
-                initializer(
-                    init_values[:, :max_emb_dim], admitted_keys, admitted_tids, init_idx
+            preinit = storage.preinitialized
+            init_values = None
+            if not preinit:
+                init_values = torch.empty(
+                    n_admitted, max_val_dim, dtype=state.values.dtype, device=device
                 )
-            state.optimizer.init_states(state.values.layout, init_values, admitted_tids)
+                init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
+                with torch.cuda.nvtx.range("op:initializer"):
+                    initializer(
+                        init_values[:, :max_emb_dim], admitted_keys, admitted_tids, init_idx
+                    )
+                state.optimizer.init_states(state.values.layout, init_values, admitted_tids)
+            in_lower = lower_rows = None
             if from_lower is not None:
                 if admit_mask is None:
                     in_lower, lower_rows = from_lower, lower_values
                 else:
                     in_lower, lower_rows = from_lower[admit_mask], lower_values[admit_mask]
-                init_values[in_lower] = lower_rows[in_lower]
+                if init_values is not None:
+                    init_values[in_lower] = lower_rows[in_lower]
 
             with torch.cuda.nvtx.range("op:storage_commit"):
                 out = index.commit(admit_mask, pin=True)
@@ -296,7 +316,13 @@ def prefetch_hbm_direct_path(
             storage.evict(out.victim_keys, out.victim_tables, out.victim_rows)
             index.release_rows(out.victim_rows, out.victim_tables)
             with torch.cuda.nvtx.range("op:store_to_flat"):
-                state.values.store(out.rows, admitted_tids, init_values)
+                if init_values is not None:
+                    state.values.store(out.rows, admitted_tids, init_values)
+                elif in_lower is not None and _bool_item(in_lower.any()):
+                    # the rows are initialised: only what the tier below had is written
+                    state.values.store(
+                        out.rows[in_lower], admitted_tids[in_lower], lower_rows[in_lower]
+                    )
             rows[admitted_positions] = out.rows
         else:
             index.discard_staged()

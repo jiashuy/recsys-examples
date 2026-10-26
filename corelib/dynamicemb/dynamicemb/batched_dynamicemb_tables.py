@@ -287,6 +287,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
         self._create_initializers()
+        if isinstance(self._storage, ChainedStorage) and self._storage.preinitialized:
+            self._storage.set_row_initializer(self._initializer)
         self._create_admitter()
         self._prefetch_states: Deque[PrefetchState] = deque()
         self._checkpointer = Checkpointer(
