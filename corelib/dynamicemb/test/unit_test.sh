@@ -34,6 +34,9 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/chained_table/test_chained_table.py"
     "test/unit_tests/chained_table/test_chained_prefetch.py"
     "test/unit_tests/test_ps_tier.py"
+    # The C++ tests of the cache: the value types, the map, and the placement kernels
+    # under contention on a device. Builds with nvcc, about 20 seconds.
+    "test/cache/run_tests.sh"
 )
 
 LOAD_DUMP_TEST_FILES=(
