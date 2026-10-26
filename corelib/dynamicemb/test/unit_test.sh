@@ -21,12 +21,26 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
+    # The components of the storage and the checkpoint, the chained index, and the
+    # storage below the tables. They run alone, on one GPU.
+    "test/unit_tests/components/test_row_exchange.py"
+    "test/unit_tests/components/test_mixed_dim_buffers.py"
+    "test/unit_tests/components/test_score_rules.py"
+    "test/unit_tests/components/test_eviction_sink.py"
+    "test/unit_tests/components/test_row_chunk.py"
+    "test/unit_tests/components/test_row_allocator.py"
+    "test/unit_tests/components/test_shard_info.py"
+    "test/unit_tests/components/test_embedding_cache_core.py"
+    "test/unit_tests/chained_table/test_chained_table.py"
+    "test/unit_tests/chained_table/test_chained_prefetch.py"
+    "test/unit_tests/test_ps_tier.py"
 )
 
 LOAD_DUMP_TEST_FILES=(
     "test/unit_tests/admission/test_embedding_admission.sh"
     "test/unit_tests/test_embedding_dump_load.sh"
     "test/unit_tests/incremental_dump/test_incremental_dump.sh"
+    "test/unit_tests/chained_table/test_chained_incremental.py"
     # Registered in both groups: it covers forward and checkpoints, and runs
     # only the half named by the group it is passed.
     "test/unit_tests/test_table_row_wise.sh"
