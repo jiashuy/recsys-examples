@@ -157,6 +157,12 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 - admitter 在有 PS 时的具体语义（PS 里已有的 key 是否一律绕过准入）。
 - `RowExchange` 是否也提供读缓存、写缓存的接口，还是继续留在 `MixedDimBuffers`。
 - `MixedDimBuffers` 按下标管理表、表名由 `BatchedDynamicEmbeddingTablesV2` 处理，这一点是否足够。
+- **`DynamicEmbEvictStrategy` 的清理**（暂不处理）。它在训练路径里已经不是输入：`BatchedDynamicEmbeddingTablesV2._create_score` 按 `score_strategy` 覆盖每张表的 `evict_strategy`（时间戳对应 LRU，LFU 对应 LFU，STEP、CUSTOMIZED、NO_EVICTION 对应 CUSTOMIZED），用户设的值被丢掉；只有两个测旧哈希表的测试还显式传它。覆盖后的值还有三处在用：
+  1. `training/batched_dynamicemb_function.py` 里 `evict_strategy == KLfu` 决定 unique 这一步要不要累计访问频率，可改成问 `ScoreRules`；
+  2. checkpoint 的时间戳转年龄（`storage/row_io.py` 的 `KLru` 判断、`chained_storage.py` 加载时的 `KLru` 判断），与 `ScoreRules.to_age`/`from_age` 重复，可统一；
+  3. checkpoint meta 的 `evict_strategy` 字段及加载时的比对，旧文件里有这个字段，要保留。
+
+  `training/chained_prefetch.py` 里两个预取函数的 `evict_strategy` 参数在函数体里没有用，可以直接删（调用点同步改）。`DynamicEmbEvictStrategy` 是公开 API（`__init__` 导出、选项里有这个字段），不能直接删：保留就要在文档里写明"训练路径里由 `score_strategy` 决定，此选项会被覆盖"，弃用就要加弃用警告。
 
 ## 五、代码的目录组织
 
