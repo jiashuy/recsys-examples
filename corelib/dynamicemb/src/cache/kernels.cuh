@@ -98,7 +98,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "node_state.h"
 #include "reclaim_queue.h"
 
-namespace embedding_cache {
+namespace cache {
 
 // ---------------------------------------------------------------------------
 // What allocate hands to the row-moving kernels
@@ -467,4 +467,4 @@ __global__ void release_kernel(const QueueT* queues, const MapT* maps,
   }
 }
 
-}  // namespace embedding_cache
+}  // namespace cache

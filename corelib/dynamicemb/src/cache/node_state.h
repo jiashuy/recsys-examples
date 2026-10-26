@@ -88,7 +88,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //
 // pinned() and released() assert that the resulting count is representable.
-// They are EC_ASSERT, so a release build has no check at all — see ec_assert.h
+// They are CACHE_ASSERT, so a release build has no check at all — see cache_assert.h
 // for why a device-side assert must not survive into a real run.
 //
 // They are therefore a development aid and not a guard. In a release build a
@@ -107,9 +107,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "ec_assert.h"
+#include "cache_assert.h"
 
-namespace embedding_cache {
+namespace cache {
 
 class NodeState {
  public:
@@ -173,7 +173,7 @@ class NodeState {
   // where the reason for it belongs.
   [[nodiscard]] static constexpr __forceinline__ __host__ __device__ NodeState
   make(Residency r, uint32_t refs, bool in_ring, bool used) {
-    EC_ASSERT(refs <= kMaxRefs);
+    CACHE_ASSERT(refs <= kMaxRefs);
     return NodeState((static_cast<Raw>(r) << kResidencyShift) |
                      (in_ring ? kInRingMask : 0u) | (used ? kUsedMask : 0u) |
                      (refs & kRefsMask));
@@ -223,20 +223,20 @@ class NodeState {
   // long as it does not overflow, which is what the assertion covers.
   [[nodiscard]] constexpr __forceinline__ __host__ __device__ NodeState pinned()
       const {
-    EC_ASSERT(refs() < kMaxRefs);
+    CACHE_ASSERT(refs() < kMaxRefs);
     return NodeState((w_ | kUsedMask) + 1u);
   }
 
   // The state after a release: one fewer reference.
   [[nodiscard]] constexpr __forceinline__ __host__ __device__ NodeState
   released() const {
-    EC_ASSERT(has_refs());
+    CACHE_ASSERT(has_refs());
     return NodeState(w_ - 1u);
   }
 
   [[nodiscard]] constexpr __forceinline__ __host__ __device__ NodeState
   with_refs(uint32_t n) const {
-    EC_ASSERT(n <= kMaxRefs);
+    CACHE_ASSERT(n <= kMaxRefs);
     return NodeState((w_ & ~kRefsMask) | (n & kRefsMask));
   }
   [[nodiscard]] constexpr __forceinline__ __host__ __device__ NodeState
@@ -468,7 +468,7 @@ class AtomicNodeState {
     auto a = ref();
     const NodeState s = NodeState::from_raw(
         a.load(cuda::std::memory_order_relaxed));
-    EC_ASSERT(s.residency() == NodeState::kLoading);
+    CACHE_ASSERT(s.residency() == NodeState::kLoading);
     a.store(s.with_residency(NodeState::kResident).raw(),
             cuda::std::memory_order_release);
   }
@@ -495,7 +495,7 @@ class AtomicNodeState {
     auto a = ref();
     const NodeState s = NodeState::from_raw(
         a.load(cuda::std::memory_order_relaxed));
-    EC_ASSERT(s.residency() == NodeState::kResident && !s.has_refs());
+    CACHE_ASSERT(s.residency() == NodeState::kResident && !s.has_refs());
     a.store(s.with_residency(NodeState::kEmpty).with_used(false).raw(),
             cuda::std::memory_order_release);
   }
@@ -514,4 +514,4 @@ class AtomicNodeState {
 static_assert(sizeof(AtomicNodeState) == sizeof(NodeState::Raw),
               "AtomicNodeState is the word and nothing else");
 
-}  // namespace embedding_cache
+}  // namespace cache

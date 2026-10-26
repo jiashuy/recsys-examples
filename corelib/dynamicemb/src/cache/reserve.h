@@ -66,7 +66,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-namespace embedding_cache {
+namespace cache {
 
 namespace cg = cooperative_groups;
 
@@ -133,4 +133,4 @@ struct BlockReserve {
   }
 };
 
-}  // namespace embedding_cache
+}  // namespace cache

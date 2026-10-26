@@ -137,9 +137,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <type_traits>
 
-#include "ec_assert.h"
+#include "cache_assert.h"
 
-namespace embedding_cache {
+namespace cache {
 
 
 // This header must be compiled by nvcc. It launches kernels, and there is no
@@ -148,7 +148,7 @@ namespace embedding_cache {
 // a second thing to keep correct.
 #ifndef __CUDACC__
 #error \
-    "embedding_cache/hashmap.h launches kernels and must be compiled by nvcc. \
+    "cache/hashmap.h launches kernels and must be compiled by nvcc. \
 Including it from a .cpp will not work; make the translation unit a .cu."
 #endif
 
@@ -356,7 +356,7 @@ struct HashMap {
   // one that is still linked would splice a second bucket onto its chain.
   __forceinline__ __device__ void insert(NodeId node, Key key) {
     Node& n = nodes[node];
-    EC_ASSERT(n.prev == kNoNode && n.next == kNoNode &&
+    CACHE_ASSERT(n.prev == kNoNode && n.next == kNoNode &&
               "HashMap::insert: the node is still linked into a bucket; "
               "remove() it before rebinding");
     n.key = key;
@@ -400,7 +400,7 @@ struct HashMap {
     // no bucket at all, and the head is what tells the two apart. This catches
     // a second remove() of the same node, which would otherwise quietly write
     // some other bucket's head back over itself and look like it worked.
-    EC_ASSERT((p != kNoNode || nx != kNoNode || head == node) &&
+    CACHE_ASSERT((p != kNoNode || nx != kNoNode || head == node) &&
               "HashMap::remove: the node is not linked into the bucket its key "
               "hashes to — removed twice, or never inserted");
 
@@ -483,4 +483,4 @@ struct HashMap {
 };
 
 
-}  // namespace embedding_cache
+}  // namespace cache

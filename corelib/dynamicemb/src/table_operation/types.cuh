@@ -32,7 +32,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-#include "../embedding_cache/guard.h"
+#include "../cache/guard.h"
 #include "score.cuh"
 
 extern "C" __device__ size_t __cvta_generic_to_shared(const void *);
@@ -400,8 +400,8 @@ struct LinearBucket {
   reduce(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
          ScoreType *sm_buffers, int32_t const *__restrict__ counter,
          int64_t counter_offset,
-         embedding_cache::EvictionGuardView guard =
-             embedding_cache::EvictionGuardView{nullptr, 0},
+         cache::EvictionGuardView guard =
+             cache::EvictionGuardView{nullptr, 0},
          int64_t table_id = 0) const {
 
     static_assert(GroupSize == 1);
@@ -485,8 +485,8 @@ struct LinearBucket {
   reduce_ranked(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
                 ScoreType *sm_buffers, int32_t const *__restrict__ counter,
                 int64_t counter_offset, uint64_t cur_ts,
-                embedding_cache::EvictionGuardView guard =
-                    embedding_cache::EvictionGuardView{nullptr, 0},
+                cache::EvictionGuardView guard =
+                    cache::EvictionGuardView{nullptr, 0},
                 int64_t table_id = 0) const {
     static_assert(GroupSize == 1);
     bool succeed = false;

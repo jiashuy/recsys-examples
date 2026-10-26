@@ -12,7 +12,7 @@
 
 #include "node_state.h"
 
-using namespace embedding_cache;
+using namespace cache;
 using R = NodeState::Residency;
 
 static int failures = 0;

@@ -36,7 +36,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // (src/utils.h), the same singleton those call sites use, which reads
 // cudaGetDeviceProperties once and holds the result.
 //
-// That include is the one place embedding_cache reaches outside itself. utils.h
+// That include is the one place cache reaches outside itself. utils.h
 // brings check.h, <cuda.h>, <cuda_fp16.h> and <cuda_bf16.h> with it.
 // ---------------------------------------------------------------------------
 
@@ -46,7 +46,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "../utils.h"
 
-namespace embedding_cache {
+namespace cache {
 
 // 256 is what every other kernel in this tree uses.
 constexpr int kBlock = 256;
@@ -68,4 +68,4 @@ static_assert(kBlock <= 1024,
   return static_cast<int>(want < cap ? want : cap);
 }
 
-}  // namespace embedding_cache
+}  // namespace cache

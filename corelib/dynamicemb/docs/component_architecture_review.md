@@ -12,7 +12,7 @@
 | 2 | 哈希索引 | `scored_hashtable.py` + `src/table_operation` | 1582 + C++ | key 到 slot 的映射，带 score 和 ref_counter |
 | 3 | 表状态 | `DynamicEmbTableState`（`key_value_table.py`） | dataclass | 索引、值缓冲、维度、optimizer、score、淘汰保留缓冲 |
 | 4 | 分层存储 | `DynamicEmbStorage`（可带 `lower`）、`HybridStorage`（`key_value_table.py`） | 与其他内容共 4418 | HBM、host、PS 三层 |
-| 5 | GPU 缓存 | `DynamicEmbCache` + `src/embedding_cache` | Python 薄封装 + C++ | `lookup_pin` / `allocate` / `publish` / `release` |
+| 5 | GPU 缓存 | `DynamicEmbCache` + `src/cache` | Python 薄封装 + C++ | `lookup_pin` / `allocate` / `publish` / `release` |
 | 6 | 编排 | `batched_dynamicemb_function.py` | 1505 | prefetch 两条路径、forward/backward、准入 |
 | 7 | 模块 | `BatchedDynamicEmbeddingTablesV2`（`batched_dynamicemb_tables.py`） | 2325 | 构造、forward、dump/load、replay、内存打印 |
 | 8 | 周边 | admission、optimizer、initializer、incremental_dump、exportable_tables、dump_load | 各 300 到 1000 | |

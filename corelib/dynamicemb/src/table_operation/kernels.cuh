@@ -202,7 +202,7 @@ struct DefaultEvictor {
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
              int64_t counter_offset, uint64_t /*cur_ts*/,
-             embedding_cache::EvictionGuardView guard,
+             cache::EvictionGuardView guard,
              int64_t table_id) const {
     return bucket.template reduce<ReductionGroupSize, BufferDim>(
         iter, evict_key, evict_score, sm_scores, counter, counter_offset, guard,
@@ -217,7 +217,7 @@ template <typename Comparator> struct RankedEvictor {
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
              int64_t counter_offset, uint64_t cur_ts,
-             embedding_cache::EvictionGuardView guard,
+             cache::EvictionGuardView guard,
              int64_t table_id) const {
     return bucket.template reduce_ranked<Comparator, ReductionGroupSize,
                                          BufferDim>(
@@ -236,8 +236,8 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
        InsertResult *result_out, KeyType *evict_key_out,
        ScoreType *evict_score_out, int32_t *__restrict__ counter,
        int64_t counter_offset, uint64_t cur_ts = 0,
-       embedding_cache::EvictionGuardView guard =
-           embedding_cache::EvictionGuardView{nullptr, 0},
+       cache::EvictionGuardView guard =
+           cache::EvictionGuardView{nullptr, 0},
        int64_t table_id = 0) {
   auto iter = iter_in;
   auto result = result_in;
@@ -329,8 +329,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             int64_t *__restrict__ evicted_table_ids = nullptr,
             IndexType *__restrict__ evicted_indices = nullptr,
             CounterType *evicted_counter = nullptr,
-            embedding_cache::EvictionGuardView guard =
-                embedding_cache::EvictionGuardView{nullptr, 0}) {
+            cache::EvictionGuardView guard =
+                cache::EvictionGuardView{nullptr, 0}) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -462,7 +462,7 @@ __global__ void table_insert_kernel(
     InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
     ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
     typename Table::KeyType **__restrict__ table_key_slots,
-    int32_t *__restrict__ counter, embedding_cache::EvictionGuardView guard) {
+    int32_t *__restrict__ counter, cache::EvictionGuardView guard) {
   insert_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
@@ -486,7 +486,7 @@ __global__ void table_insert_collect_kernel(
     typename Table::KeyType *__restrict__ evicted_keys,
     int64_t *__restrict__ evicted_table_ids,
     IndexType *__restrict__ evicted_indices,
-    embedding_cache::EvictionGuardView guard) {
+    cache::EvictionGuardView guard) {
   insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,

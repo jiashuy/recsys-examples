@@ -38,7 +38,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "types.h"
 
-namespace embedding_cache {
+namespace cache {
 
 struct EvictionGuardView {
   // The cache's per-table maps, an array on the device, or null for no guard.
@@ -62,4 +62,4 @@ static_assert(sizeof(EvictionGuardView) == 16,
               "two fields and nothing else: it is passed to a kernel by value and "
               "written into a launch-parameter struct");
 
-}  // namespace embedding_cache
+}  // namespace cache

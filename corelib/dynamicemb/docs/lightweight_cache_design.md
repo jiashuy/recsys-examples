@@ -3,7 +3,7 @@
 > 状态：已实现并接入 `DynamicEmbCache`（见 §17）；其余章节是设计依据，与实现不一致处以 §17 和各节顶部的说明为准
 > 适用范围：DynamicEmb **训练**路径的 GPU 侧 embedding 缓存（不覆盖推理部署，见 §2.2）
 > 关联代码：`corelib/dynamicemb/`
-> 实现：`src/embedding_cache/`。与本文的差异，以实现为准，已回写到各节：
+> 实现：`src/cache/`。与本文的差异，以实现为准，已回写到各节：
 > 去掉 `EVICTING` 状态（§4.3）；Step 4 合并为一个 kernel，靠桶锁（§6.1）；去掉 pin 后的身份复查（§6.3）；
 > ring 的槽位数取 `2C`，tail 快照在 kernel 启动前取，并作为 push/pop 两个阶段的屏障（§6.4、§7）。
 > 行号不存进 node；可在同一次 prefetch 调用内携带，但不得跨 `expand_if_need`（§4.5）。backing 是 score、准入、key 淘汰的唯一权威（§6.5）。
@@ -920,9 +920,9 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 
 ## 16. 被取代的原型：`lw_cache`
 
-本文最初对应 `src/lw_cache/` 与 `test/lw_cache/`，现已由 `src/embedding_cache/` 取代并删除。完整代码在提交 `0c2ee1a` 里（`git show 0c2ee1a:corelib/dynamicemb/src/lw_cache/...`；若历史被改写，用 `git log --all -S lw_cache` 找）。取代的原因与取走了什么：
+本文最初对应 `src/lw_cache/` 与 `test/lw_cache/`，现已由 `src/cache/` 取代并删除。完整代码在提交 `0c2ee1a` 里（`git show 0c2ee1a:corelib/dynamicemb/src/lw_cache/...`；若历史被改写，用 `git log --all -S lw_cache` 找）。取代的原因与取走了什么：
 
-- **取代的原因**：`embedding_cache` 在同一设计上把并发协议收得更紧（`release` 与 `claim` 各为一次 CAS，节点一行、桶锁带 acquire/release 内存序，lookup 与压紧融合，ring 的聚合原子），并避开了读 `lw_cache` 代码时发现的两处问题（未复现，是按代码推出来的）：`release_ref` 先减后置位的两步窗口，以及桶锁成功后无 acquire 就读 `prev/next`。
+- **取代的原因**：`src/cache`（原名 `embedding_cache`）在同一设计上把并发协议收得更紧（`release` 与 `claim` 各为一次 CAS，节点一行、桶锁带 acquire/release 内存序，lookup 与压紧融合，ring 的聚合原子），并避开了读 `lw_cache` 代码时发现的两处问题（未复现，是按代码推出来的）：`release_ref` 先减后置位的两步窗口，以及桶锁成功后无 acquire 就读 `prev/next`。
 - **还没有对应实现、需要时从历史里取的**：
   - **CLOCK**（`absorb_retry_kernel`、retry buffer）。有意推迟：先用 `used` 位占比测出是否值得做。取的时候带上它 README 里记的"计数没清零"缺陷，以及"CLOCK 的容量需求是 FIFO 的 `(1+k)` 倍"。
   - **指标**（`metrics.h`）与**容量校验**（`CacheConfig::validate`）。
@@ -934,7 +934,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 
 ## 17. 接入现有系统：方案、假设与待定项
 
-目标：用 `src/embedding_cache/` 替换现有的 `DynamicEmbCache`。这一节记录接入的方案、做出的假设，以及目前不确定、先按假设推进的点。每完成一个阶段就更新状态。
+目标：用 `src/cache/` 替换现有的 `DynamicEmbCache`。这一节记录接入的方案、做出的假设，以及目前不确定、先按假设推进的点。每完成一个阶段就更新状态。
 
 ### 17.1 现有系统里缓存是怎么被使用的（读代码得到）
 
@@ -946,7 +946,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 ### 17.2 方案
 
 - 保留类名与导入路径：`DynamicEmbCache` 仍在 `dynamicemb.key_value_table`，只换内部实现。这样 `isinstance(cache, DynamicEmbCache)` 一类的检查不变。
-- 新增 C++ 绑定 `CacheCore`（`src/embedding_cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
+- 新增 C++ 绑定 `CacheCore`（`src/cache/binding.cu`），持有每表的桶链、node、ring，提供：`lookup_pin`、`allocate`、`publish`、`release`、`find_nodes`、`invalidate`、`resident_slots`、`reset`。行池由 Python 持有（每表一个张量，沿用 `table_ptrs_dev`），绑定只拿指针。
 - 分两阶段做（阶段 1 是为了能先验证绑定与编排，已在阶段 2 完成后删除）：
   - **阶段 1：通用流程（拷贝式）。** 数据搬运沿用 `storage.find` / `storage.insert`，后端在缓存淘汰时才被插入（惰性）。当时用来承载 PS 后端；PS 改为第三层之后没有调用方，已删除。
   - **阶段 2：行可寻址流程（§6.5）。** 每步所有 key 先过 backing（更新 score），新 key 准入后立刻插入 backing，淘汰前用 `EvictionGuard` 保护。需要改后端的 `insert` kernel 与 LruLfu cubin（§17.4）。现在是唯一的流程。
@@ -981,7 +981,7 @@ copy engine 拿到 1.82×，说明链路本身接近理想全双工。但缓存�
 - **取值交给保留逻辑**（§6.5 第 8 步）：目前 `EvictedItemMode` 只有 `RETAIN_KEY`，只需要 key，所以急切流程里只把被后端淘汰的 key 交给 `_append_evicted`，没有取值。`rows.cuh` 的 `fetch_rows_kernel` 已备好，但没有任何调用者，所以没有暴露到绑定里；等 `EvictedItemMode` 增加保留值的标志时再接。
 - **`DEMB_DETERMINISM_MODE`**：新缓存里哪个 key 占哪个 node 取决于线程到达 reclaim queue 的顺序，不固定，也不影响任何 key 的值。急切流程下后端的插入顺序与缓存无关，由后端的确定性插入决定，所以后端的淘汰是确定的。
 
-- **事件接线没有测试证明**：绑定里用两个 CUDA event 实现 §6.4 的快照屏障（allocate 等已发起的 release，release 等已取的快照）。`test_embedding_cache_core.py` 里的两流压力测试检查了"被持有的节点没有被复用"和"静止时队列条目数等于带标志的节点数"，但**去掉这两个事件后它仍然通过**（五次），因为那个窗口只有几条指令宽。所以事件是否必要，只有 `test/embedding_cache/gpu` 里显式控制流序的设备测试在覆盖；绑定层的接线是按设计写的，没有被变异检验证明。
+- **事件接线没有测试证明**：绑定里用两个 CUDA event 实现 §6.4 的快照屏障（allocate 等已发起的 release，release 等已取的快照）。`test_embedding_cache_core.py` 里的两流压力测试检查了"被持有的节点没有被复用"和"静止时队列条目数等于带标志的节点数"，但**去掉这两个事件后它仍然通过**（五次），因为那个窗口只有几条指令宽。所以事件是否必要，只有 `test/cache/gpu` 里显式控制流序的设备测试在覆盖；绑定层的接线是按设计写的，没有被变异检验证明。
 
 ### 17.6 后端的守卫（已完成）
 

@@ -30,7 +30,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/components/test_row_chunk.py"
     "test/unit_tests/components/test_row_allocator.py"
     "test/unit_tests/components/test_shard_info.py"
-    "test/unit_tests/components/test_embedding_cache_core.py"
+    "test/unit_tests/components/test_cache_core.py"
     "test/unit_tests/chained_table/test_chained_table.py"
     "test/unit_tests/chained_table/test_chained_prefetch.py"
     "test/unit_tests/test_ps_tier.py"

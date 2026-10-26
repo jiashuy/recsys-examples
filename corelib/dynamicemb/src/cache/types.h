@@ -28,7 +28,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hashmap_view.h"
 #include "node_state.h"
 
-namespace embedding_cache {
+namespace cache {
 
 struct Node : HashMapNode<int64_t, int32_t> {
   AtomicNodeState state;
@@ -36,4 +36,4 @@ struct Node : HashMapNode<int64_t, int32_t> {
 
 static_assert(sizeof(Node) == 24, "key 8 + links 8 + state 4, padded to 24");
 
-}  // namespace embedding_cache
+}  // namespace cache

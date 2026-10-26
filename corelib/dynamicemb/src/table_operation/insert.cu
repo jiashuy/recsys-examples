@@ -29,7 +29,7 @@ void launch_table_insert_kernel(
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
     int32_t *counter_ptr, int64_t score_fn_key,
-    embedding_cache::EvictionGuardView guard, cudaStream_t stream) {
+    cache::EvictionGuardView guard, cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
@@ -87,7 +87,7 @@ void launch_table_insert_collect_kernel(
     int32_t *counter_ptr, CounterType *evicted_counter_ptr,
     typename Table::KeyType *evicted_keys_ptr, int64_t *evicted_table_ids_ptr,
     IndexType *evicted_indices_ptr, int64_t score_fn_key,
-    embedding_cache::EvictionGuardView guard, cudaStream_t stream) {
+    cache::EvictionGuardView guard, cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
@@ -144,7 +144,7 @@ void table_insert_single_score(at::Tensor table_storage,
                                int64_t score_fn_key, int64_t guard_tables,
                                int64_t guard_num_tables) {
 
-  const embedding_cache::EvictionGuardView guard{
+  const cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
       static_cast<int32_t>(guard_num_tables)};
   auto key_type = get_data_type(keys);
@@ -259,7 +259,7 @@ void table_insert_collect_single_score(
     at::Tensor evicted_indices, int64_t guard_tables,
     int64_t guard_num_tables) {
 
-  const embedding_cache::EvictionGuardView guard{
+  const cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
       static_cast<int32_t>(guard_num_tables)};
   auto key_type = get_data_type(keys);

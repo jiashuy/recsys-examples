@@ -33,11 +33,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <vector>
 
 #include "allocator.h"
-#include "ec_assert.h"
+#include "cache_assert.h"
 #include "hashmap_view.h"
 #include "launch.h"
 
-namespace embedding_cache {
+namespace cache {
 
 // ---------------------------------------------------------------------------
 // Initialisation kernels
@@ -287,4 +287,4 @@ class HashMapStorage {
   Buffer heads_, nodes_;
 };
 
-}  // namespace embedding_cache
+}  // namespace cache

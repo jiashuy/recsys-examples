@@ -12,7 +12,7 @@
 
 #include "hashmap.h"
 
-using namespace embedding_cache;
+using namespace cache;
 
 static int failures = 0;
 #define CHECK(cond, msg)                                             \
@@ -220,7 +220,7 @@ int main() {
   // HashMapStorage::grid_for is private and stays that way — the grid is a
   // launch detail, not part of anything a caller decides. What is worth
   // checking here is only that the singleton it reads answers at all, since
-  // linking utils.cpp into this build is the one dependency embedding_cache has
+  // linking utils.cpp into this build is the one dependency cache has
   // on the wider tree. The values below come from the shim, not a device.
   {
     const auto& p = dyn_emb::DeviceProp::getDeviceProp();

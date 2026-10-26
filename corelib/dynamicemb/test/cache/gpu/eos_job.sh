@@ -7,9 +7,9 @@
 #SBATCH --job-name=emb_cache
 #SBATCH --output=%x-%j.log
 # ---------------------------------------------------------------------------
-# Compile and run the embedding_cache tests on EOS.
+# Compile and run the cache tests on EOS.
 #
-# Nothing in src/embedding_cache has ever been through nvcc, so step 2 is the
+# Nothing in src/cache has ever been through nvcc, so step 2 is the
 # first thing worth knowing: <cuda/atomic>, cuda::atomic_ref, __nanosleep,
 # cooperative_groups and the launch syntax are all taken on trust until it runs.
 #
@@ -37,15 +37,15 @@ ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -
 
 echo
 echo "=== 1. host tests (value types only) ==="
-( cd test/embedding_cache && ./run_tests.sh 2>&1 | grep -E "PASS|FAIL|error:" ) || FAILED=1
+( cd test/cache && ./run_tests.sh 2>&1 | grep -E "PASS|FAIL|error:" ) || FAILED=1
 
 echo
 echo "=== 2. nvcc compile ==="
-cd test/embedding_cache/gpu
+cd test/cache/gpu
 rm -f test_gpu
 nvcc -O2 -std=c++17 -arch=sm_${ARCH} -lineinfo \
      --expt-relaxed-constexpr --expt-extended-lambda \
-     -I../../../src/embedding_cache \
+     -I../../../src/cache \
      -o test_gpu test_gpu.cu ../../../src/utils.cpp 2>&1 | head -60
 if [ ! -x ./test_gpu ]; then echo "COMPILE FAILED"; exit 1; fi
 echo "compile OK"
@@ -62,7 +62,7 @@ echo "=== 4. racecheck ==="
 #
 # Scaled down: the detector instruments every access, and the full run takes
 # longer than any sensible limit. A timeout is a failure — silence is not a pass.
-EC_TEST_SCALE=10 timeout 1800 compute-sanitizer --tool racecheck \
+CACHE_TEST_SCALE=10 timeout 1800 compute-sanitizer --tool racecheck \
   --racecheck-report analysis ./test_gpu > /tmp/racecheck.log 2>&1; RC=$?
 grep -E "RACECHECK SUMMARY|hazard|Error|FAIL|passed" /tmp/racecheck.log | head -30
 [ $RC -eq 124 ] && { echo "racecheck TIMED OUT: no verdict"; FAILED=1; }
@@ -92,11 +92,11 @@ echo "=== 7. does nvcc already aggregate the warp-level atomics? ==="
 # reserve.h bets that warp_reserve is worth writing. If nvcc already emits a
 # warp-aggregated RED/ATOM for a plain atomicAdd of a constant, it is not.
 nvcc -O2 -std=c++17 -arch=sm_${ARCH} --expt-relaxed-constexpr \
-     --expt-extended-lambda -I../../../src/embedding_cache \
+     --expt-extended-lambda -I../../../src/cache \
      -ptx -o /tmp/probe.ptx test_gpu.cu 2>/dev/null \
   && grep -cE "red\.|atom\." /tmp/probe.ptx | sed "s/^/  atomic ops in PTX: /"
 nvcc -O2 -std=c++17 -arch=sm_${ARCH} --expt-relaxed-constexpr \
-     --expt-extended-lambda -I../../../src/embedding_cache \
+     --expt-extended-lambda -I../../../src/cache \
      -cubin -o /tmp/probe.cubin test_gpu.cu 2>/dev/null
 if [ -f /tmp/probe.cubin ]; then
   cuobjdump -sass /tmp/probe.cubin 2>/dev/null \

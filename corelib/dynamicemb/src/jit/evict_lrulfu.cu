@@ -93,7 +93,7 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
       cur_ts, nullptr, nullptr, nullptr, nullptr,
-      embedding_cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
+      cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
 }
 
 extern "C" __global__ void dyn_emb_insert_entry(EvictParams p) {
@@ -122,7 +122,7 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
       cur_ts, p.evicted_keys, p.evicted_table_ids, p.evicted_indices,
       p.evicted_counter,
-      embedding_cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
+      cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
 }
 
 extern "C" __global__ void dyn_emb_insert_collect_entry(EvictParams p) {

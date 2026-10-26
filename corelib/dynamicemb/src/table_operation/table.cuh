@@ -85,7 +85,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         int64_t num_scores = 1, int64_t score_fn_key = 0,
                         // The cache's eviction guard: a device pointer to its
                         // per-table maps and how many, or 0 for none. See
-                        // embedding_cache/guard.h.
+                        // cache/guard.h.
                         int64_t guard_tables = 0, int64_t guard_num_tables = 0);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns

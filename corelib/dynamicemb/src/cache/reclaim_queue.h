@@ -137,17 +137,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <vector>
 
 #include "allocator.h"
-#include "ec_assert.h"
+#include "cache_assert.h"
 #include "launch.h"
 #include "reserve.h"
 
 #ifndef __CUDACC__
 #error \
-    "embedding_cache/reclaim_queue.h launches kernels and must be compiled by \
+    "cache/reclaim_queue.h launches kernels and must be compiled by \
 nvcc. Including it from a .cpp will not work; make the translation unit a .cu."
 #endif
 
-namespace embedding_cache {
+namespace cache {
 
 namespace cg = cooperative_groups;
 
@@ -505,4 +505,4 @@ class ReclaimQueueStorage {
   Buffer slots_, counters_;
 };
 
-}  // namespace embedding_cache
+}  // namespace cache

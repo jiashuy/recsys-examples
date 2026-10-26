@@ -67,10 +67,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "ec_assert.h"
+#include "cache_assert.h"
 #include "kernels.cuh"
 
-namespace embedding_cache {
+namespace cache {
 
 // Lanes cooperating on one row. A whole warp, always: the loops below hold no
 // barrier, but a partial warp would let lanes of one row and the next take
@@ -126,7 +126,7 @@ __global__ void writeback_kernel(
     const auto slot = slots[s];
     if (slot.node == MapT::kNoNode || !slot.has_victim) continue;
     const int64_t r = victim_row[s];
-    EC_ASSERT(r >= 0 && "writeback: an evicted key has no row in the backing");
+    CACHE_ASSERT(r >= 0 && "writeback: an evicted key has no row in the backing");
     if (r < 0) continue;
     detail::copy_row(backing.row(r), cache.row(slot.node), cache.row_elems, lane);
   }
@@ -199,4 +199,4 @@ __global__ void fetch_rows_kernel(const Rows<ValueT>* cache,
   }
 }
 
-}  // namespace embedding_cache
+}  // namespace cache

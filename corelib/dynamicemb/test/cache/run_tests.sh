@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and run the embedding_cache tests.
+# Build and run the cache tests.
 #
 # These need nvcc to build and a GPU to run. They used to build with a plain C++
 # compiler against a stand-in for the CUDA runtime, which let them run anywhere;
@@ -16,14 +16,14 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-out="${1:-${TMPDIR:-/tmp}/embedding_cache_tests}"
+out="${1:-${TMPDIR:-/tmp}/cache_tests}"
 mkdir -p "$out"
 
 NVCC="${NVCC:-nvcc}"
 
 # HashMapStorage::grid_for reads dyn_emb::DeviceProp for the SM count, and that
 # singleton is defined in utils.cpp rather than the header. This is the only
-# piece of the wider tree embedding_cache links against; if the list grows, that
+# piece of the wider tree cache links against; if the list grows, that
 # is a signal worth noticing rather than a build file to keep extending.
 deps=("$here/../../src/utils.cpp")
 
@@ -39,7 +39,7 @@ deps=("$here/../../src/utils.cpp")
 # `-i 0` rather than piping through `head`: under `set -e` with `pipefail`, head
 # closing the pipe kills nvidia-smi with SIGPIPE and takes the whole script with
 # it, before it has printed anything.
-ARCH="${EC_ARCH:-}"
+ARCH="${CACHE_ARCH:-}"
 if [ -z "$ARCH" ] && command -v nvidia-smi >/dev/null 2>&1; then
   ARCH=$(nvidia-smi -i 0 --query-gpu=compute_cap --format=csv,noheader \
          2>/dev/null | tr -d '.' || true)
@@ -49,7 +49,7 @@ ARCH="${ARCH:-90}"
 flags=(-std=c++17 -O1 -g -lineinfo
        -arch="sm_${ARCH}"
        --expt-relaxed-constexpr --expt-extended-lambda
-       -I"$here/../../src/embedding_cache" -I"$here")
+       -I"$here/../../src/cache" -I"$here")
 
 status=0
 shopt -s nullglob
@@ -71,7 +71,7 @@ run() {  # run <name> <binary>
 # and the shipped build defines it. Once each way means neither form rots.
 CXX="${CXX:-g++}"
 cxx_flags=(-std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter
-           -I"$here/../../src/embedding_cache" -I"$here"
+           -I"$here/../../src/cache" -I"$here"
            -I"$here/host_shim")
 for src in "$here"/test_*.cpp; do
   name="$(basename "$src" .cpp)"

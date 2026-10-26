@@ -34,10 +34,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // sweep such as HashMapStorage::check_bindings, or a counter — not this.
 //
 // The #ifndef lets a project with an assertion macro it prefers define
-// EC_ASSERT before including this and keep it.
+// CACHE_ASSERT before including this and keep it.
 //
 // Named with a prefix rather than reusing something generic: this header sits
-// on the include path as ec_assert.h precisely so that neither the file name
+// on the include path as cache_assert.h precisely so that neither the file name
 // nor the macro can be captured by, or capture, anything else.
 // ---------------------------------------------------------------------------
 
@@ -45,6 +45,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cassert>
 
-#ifndef EC_ASSERT
-#define EC_ASSERT(cond) assert(cond)
+#ifndef CACHE_ASSERT
+#define CACHE_ASSERT(cond) assert(cond)
 #endif

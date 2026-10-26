@@ -56,7 +56,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace py = pybind11;
 
-namespace embedding_cache {
+namespace cache {
 namespace {
 
 using MapStore =
@@ -379,10 +379,10 @@ class CacheCore {
 };
 
 }  // namespace
-}  // namespace embedding_cache
+}  // namespace cache
 
-void bind_embedding_cache(py::module& m) {
-  using embedding_cache::CacheCore;
+void bind_cache(py::module& m) {
+  using cache::CacheCore;
   py::class_<CacheCore>(m, "CacheCore")
       .def(py::init<std::vector<int64_t>>(), py::arg("capacities"))
       .def("num_tables", &CacheCore::num_tables)

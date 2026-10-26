@@ -209,7 +209,7 @@ value 行: 全局行池, 与槽位无关
 
 | 模式 | pin 的来源 | 额外内存 |
 |---|---|---|
-| 缓存路径（存储在缓存之后） | 缓存节点的引用计数，经 `EvictionGuard`（`src/embedding_cache/guard.h`）查询 | **0** |
+| 缓存路径（存储在缓存之后） | 缓存节点的引用计数，经 `EvictionGuard`（`src/cache/guard.h`）查询 | **0** |
 | HBM_DIRECT（没有缓存） | `refs[row]`，按**行号**索引的 int32 | 每行 4 B，**只在该模式分配** |
 
 `refs` 按行号而不是槽位：行号是稳定的，trim 搬动记录（活动空间节点占用 victim 槽位、补洞）不会让它失效。
@@ -239,7 +239,7 @@ value 行: 全局行池, 与槽位无关
 ## 6. 与现有组件的关系
 
 - **与现有 `key_index_map` 并存**：不改 `exportable_tables.py`、`INFERENCE_EMB::table_lookup`、`lookup_meta.py`，推理导出路径不受影响。
-- **与 `embedding_cache` 共用底层**：`allocator.h`（显存分配契约）等可以复用。**不能**直接复用 `reclaim_queue`：它是无 score 的 FIFO，而存储要按 score 选 victim。
+- **与 `src/cache`（原名 `embedding_cache`）共用底层**：`allocator.h`（显存分配契约）等可以复用。**不能**直接复用 `reclaim_queue`：它是无 score 的 FIFO，而存储要按 score 选 victim。
 - **与缓存叠用时**：第一版沿用 `EvictionGuard`（§5），缓存的 `invalidate` 在 trim 之后对被淘汰的 key 调用（与现有流程一致）。
 - **与下层 PS**：victim 在 trim 之后、`release_rows` 之前读出并写到下层；这一步新插入的 key 都被 pin，不可能成为本步 victim。
 

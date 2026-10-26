@@ -15,7 +15,7 @@
 
 """The cache's placement core, driven from Python.
 
-The kernels have their own device tests (test/embedding_cache/gpu). These cover
+The kernels have their own device tests (test/cache/gpu). These cover
 what only the binding does: slicing by table, the per-step call sequence, and the
 events that order allocate on one stream against release on another.
 """
@@ -165,7 +165,7 @@ def test_two_streams_never_reuse_a_held_node(device, depth, keys_per_step):
     needed. With them removed from the binding it still passes (checked, five runs):
     the window they close is a few instructions wide, and kernels of this size
     from a Python loop do not land in it. The ordering itself is exercised, with
-    the stream order explicit, by the device tests in test/embedding_cache/gpu;
+    the stream order explicit, by the device tests in test/cache/gpu;
     this checks the invariants a correct ordering has to preserve.
     """
     torch.manual_seed(0)

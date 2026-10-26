@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// embedding_cache on a device.
+// cache on a device.
 //
 // Everything the host tests cannot reach: whether these headers compile with
 // nvcc at all, and whether the protocol survives real contention. The host
@@ -25,18 +25,18 @@
 #include "kernels.cuh"
 #include "rows.cuh"
 
-using namespace embedding_cache;
+using namespace cache;
 
 static int failures = 0;
 
 // Under compute-sanitizer every memory access is instrumented, and the long runs
-// below stretch from minutes to hours. EC_TEST_SCALE=n divides their step counts
+// below stretch from minutes to hours. CACHE_TEST_SCALE=n divides their step counts
 // by n; unset, it is the full run. A scaled run checks the same properties on a
 // shorter history, which is what a race detector needs: it looks at the accesses,
 // and a few steps of them are the same accesses.
 static int scaled(int n) {
   static const int divisor = [] {
-    const char* e = std::getenv("EC_TEST_SCALE");
+    const char* e = std::getenv("CACHE_TEST_SCALE");
     const int v = e ? std::atoi(e) : 1;
     return v > 0 ? v : 1;
   }();

@@ -71,17 +71,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // stand-in for the CUDA runtime and no torch at all — need no special flags.
 //
 // This must sit outside the namespace: an #include inside one would drop every
-// ATen declaration into embedding_cache::.
+// ATen declaration into cache::.
 #if defined(__has_include)
 #if __has_include(<ATen/ATen.h>)
-#define EMBEDDING_CACHE_HAS_TORCH 1
+#define CACHE_HAS_TORCH 1
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #endif
 #endif
 
-namespace embedding_cache {
+namespace cache {
 
 // ---------------------------------------------------------------------------
 // CudaAllocator — cudaMalloc / cudaFree
@@ -99,7 +99,7 @@ class CudaBuffer {
     if (bytes == 0) return;
     const cudaError_t e = cudaMalloc(&data_, bytes);
     if (e != cudaSuccess) {
-      throw std::runtime_error("embedding_cache: cudaMalloc of " +
+      throw std::runtime_error("cache: cudaMalloc of " +
                                std::to_string(bytes) +
                                " bytes failed: " + cudaGetErrorString(e));
     }
@@ -172,7 +172,7 @@ struct CudaAllocator {
 // at::Tensor::record_stream; nothing allocates that way yet, so there is no hook
 // for it here.
 
-#ifdef EMBEDDING_CACHE_HAS_TORCH
+#ifdef CACHE_HAS_TORCH
 
 class TorchBuffer {
  public:
@@ -232,6 +232,6 @@ class TorchAllocator {
   cudaStream_t stream_ = nullptr;
 };
 
-#endif  // EMBEDDING_CACHE_HAS_TORCH
+#endif  // CACHE_HAS_TORCH
 
-}  // namespace embedding_cache
+}  // namespace cache

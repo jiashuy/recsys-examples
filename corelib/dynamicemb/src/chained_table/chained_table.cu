@@ -55,7 +55,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <vector>
 
-#include "embedding_cache/guard.h"
+#include "cache/guard.h"
 
 namespace py = pybind11;
 
@@ -273,7 +273,7 @@ __global__ void place_kernel(
     int64_t *__restrict__ vkeys, int64_t *__restrict__ vrows,
     int64_t *__restrict__ vtabs, int64_t *__restrict__ vscores,
     int32_t *__restrict__ seg_fail, unsigned long long *__restrict__ nfail,
-    embedding_cache::EvictionGuardView guard, int pin_new) {
+    cache::EvictionGuardView guard, int pin_new) {
   if (*abort != 0) return;
 
   constexpr unsigned kFull = 0xffffffffu;
@@ -995,7 +995,7 @@ void chained_place(at::Tensor views, at::Tensor skeys, at::Tensor sscores,
   }
   const int64_t u = seg_bucket.numel();
   if (u == 0) return;
-  embedding_cache::EvictionGuardView guard{
+  cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
       static_cast<int32_t>(guard_num_tables)};
   auto nseg = device_scalar(u, seg_table);
@@ -1265,7 +1265,7 @@ std::vector<at::Tensor> chained_apply(
   auto vtabs = at::empty({n}, o64);
   auto vscores = at::empty({n * num_scores}, o64);
   auto seg_fail = at::zeros({n}, o64.dtype(at::kInt));
-  embedding_cache::EvictionGuardView guard{
+  cache::EvictionGuardView guard{
       reinterpret_cast<const void *>(guard_tables),
       static_cast<int32_t>(guard_num_tables)};
   const TableView *views_d = views_ptr(views);
