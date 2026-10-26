@@ -8,7 +8,6 @@ This document consists of two parts, one is the introduction to the API, which c
 - [DynamicEmbeddingShardingPlanner](#dynamicembeddingshardingplanner)
 - [Sharding planner](#sharding-planner)
 - [DynamicEmbeddingCollectionSharder](#dynamicembeddingcollectionsharder)
-- [DynamicEmbCheckMode](#dynamicembcheckmode)
 - [DynamicEmbInitializerMode](#dynamicembinitializermode)
 - [DynamicEmbInitializerArgs](#dynamicembinitializerargs)
 - [DynamicEmbPoolingMode](#dynamicembpoolingmode)
@@ -159,7 +158,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (`bucket_capacity` must be positive). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (any positive number). **If `bucket_capacity` is not smaller than the per-rank rows** (`MAX_BUCKET_CAPACITY` = `2**63 - 1` always is) the layout is `(1, per_rank_rows)`: one bucket of exactly the shard, nothing added. **Otherwise** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
@@ -199,7 +198,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 
 - **`global_hbm_for_values`**: global HBM byte budget for the table’s values; the planner only splits it across ranks.
-- **`bucket_capacity`**: requested hashtable bucket size in rows (see rules above), or `MAX_BUCKET_CAPACITY` for “single bucket per rank table”.
+- **`bucket_capacity`**: hashtable bucket size in rows (see rules above): any positive number, or `MAX_BUCKET_CAPACITY` for one bucket per rank table.
 - **`initializer_args`**: optional partial bounds for `UNIFORM`; missing bounds are completed as in step 1.
 
 **Downstream (after planning, when modules are built):** the batched embedding path uses **`max_capacity`** from **`DynamicEmbTableOptions`** (e.g. allocation size and consistency checks against TorchREC shard row counts in `_get_dynamicemb_options_per_table` in `batched_dynamicemb_compute_kernel.py`).
@@ -209,7 +208,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 - `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
 - `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
 - `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
-- `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
+- `from dynamicemb import MAX_BUCKET_CAPACITY`
 
 ## DynamicEmbeddingCollectionSharder
 
@@ -218,51 +217,6 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
     ```python
     #How to import
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-    ```
-
-## DynamicEmbCheckMode
-
-When the dynamic embedding table capacity is small, a single feature with a large number of indices may lead to issues where the hashtable cannot insert the indices. Enabling safe check allows you to observe this behavior (the number of times indices cannot be inserted and the number of indices each time) to determine if the dynamic embedding table capacity is set too low.
-
-    ```python
-    #How to import
-    from dynamicemb import DynamicEmbCheckMode
-
-    #API arguments
-    class DynamicEmbCheckMode(enum.IntEnum):
-        """
-        Enumeration for different modes of checking dynamic embedding's insertion behaviors.
-        DynamicEmb uses a hashtable as the backend. If the embedding table capacity is small and the number of indices in a single feature is large,
-        it is easy for too many indices to be allocated to the same hash table bucket in one lookup, resulting in the inability to insert indices into the hashtable.
-        DynamicEmb resolves this issue by setting the lookup results of indices that cannot be inserted to 0.
-        Fortunately, in a hashtable with a large capacity, such insertion failures are very rare and almost never occur.
-        This issue is more frequent in hashtables with small capacities, which can affect training accuracy.
-        Therefore, we do not recommend using dynamic embedding tables for very small embedding tables.
-
-        To prevent this behavior from affecting training without user awareness, DynamicEmb provides a safe check mode.
-        Users can set whether to enable safe check when configuring DynamicEmbTableOptions.
-        Enabling safe check will add some overhead, but it can provide insights into whether the hash table frequently fails to insert indices.
-        If the number of insertion failures is high and the proportion of affected indices is large,
-        it is recommended to either increase the dynamic embedding capacity or avoid using dynamic embedding tables for small embedding tables.
-
-        Attributes
-        ----------
-        ERROR : int
-            When there are indices that can't be inserted successfully:
-                This mode will throw a runtime error indicating how many indices failed to insert.
-                The program will crash.
-        WARNING : int
-            When there are indices that can't be inserted successfully:
-                This mode will give a warning about how many indices failed to insert.
-                The program will continue. For uninserted indices, their embeddings' values will be set to 0.0.
-        IGNORE : int
-            Don't check whether insertion is successful or not, therefore it doesn't bring additional checking overhead.
-            For uninserted indices, their embeddings' values will be set to 0.0 silently.
-        """
-        ERROR = 0
-        WARNING = 1
-        IGNORE = 2
-
     ```
 
 ## DynamicEmbInitializerMode
@@ -844,19 +798,15 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             frequency → older-timestamp evictor). See the "Customized eviction via
             `score_function`" section under `DynamicEmbScoreStrategy`.
         bucket_capacity : int
-            Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
+            Capacity of each bucket in the hash table, and default is 128. A cache sizes its rows in multiples of 1024.
             A key will only be mapped to one bucket. 
             When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key. 
             The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
-        safe_check_mode : DynamicEmbCheckMode
-            Used to check if all keys in the current batch have been successfully inserted into the table.
-            Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
-            Please refer to the API documentation for DynamicEmbCheckMode for more information.
         global_hbm_for_values : int
             Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
             It has different meanings under `caching=True` and  `caching=False`.
                 When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
-                When `caching=True`, it decides the table capacity of the GPU table.
+                When `caching=True`, it decides the number of rows of the GPU cache.
             To match planner row counts and optimizer state width, size the **global** budget with
             ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
             (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
@@ -927,7 +877,6 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]
         ] = DynamicEmbScoreStrategy.TIMESTAMP
         bucket_capacity: int = 128
-        safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
         global_hbm_for_values: int = 0  # in bytes
         external_storage: Storage = None
         index_type: Optional[torch.dtype] = None
@@ -1534,9 +1483,18 @@ The size of the table is finite, but the set of keys during training may be infi
 
 dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch keys from host to device like torchrec. Caching and prefetch work for both sequence mode (`NONE`) and pooling modes (`SUM`/`MEAN`). See `test_prefetch_flush_in_cache` in [test prefetch](./test/test_batched_dynamic_embedding_tables_v2.py) for usage examples.
 
+**What the cache does and does not decide.** The cache holds hot rows on the GPU and keeps a row from being reused while a step in flight is using it. It holds no score and makes no decision about which keys stay in the system: admission, scoring (LRU / LFU / customized) and which key to evict when the table is full all belong to the backing store, and apply to every key of every step, cached or not. When the cache needs a row for a new key it gives up the one that has been idle the longest (first in, first out). See [the cache design](./docs/lightweight_cache_design.md).
+
+A key is inserted into the backing store when it is admitted, and the cache holds a copy of some of the keys the backing store holds. The backing store never evicts a key a step in flight is using; if every key it could evict is in use, inserting a new key fails with an error, so size the backing store (`max_capacity`) with room beyond the cache and the keys in flight.
+
+The cache's row count per table is `init_capacity` rounded up to a multiple of `bucket_capacity` (1024 for a cache), and a step's unique keys must fit in it, together with those of the steps still in flight; otherwise prefetch raises an error naming the table.
+
 ## External storage
 
-dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
+`external_storage` in `DynamicEmbTableOptions` names a class inheriting the `Storage` interface under [types.py](./dynamicemb/types.py). It is the tier **below** the table, whichever layout the table is in (HBM table, host table, or an HBM cache over a host table). The table in front is sized as it is without an external storage (`max_capacity` rows); the external storage holds what the table evicts, with its values, and is asked for a key the table does not have. A key found there is not new: it skips admission and comes back up into the table with the value it had.
+
+Limits to know: dump/load, export, incremental dump and `erase` cover the table only, not the external storage, which persists itself, and a key erased from the table can still be read back from it. A key that has been through the external storage starts its score again when it returns to the table. `HybridStorage` ignores `external_storage`.
+
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
 
 
@@ -1545,7 +1503,6 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
 
 - **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
-- **Cache write-back**: before writing evicted keys back to storage (only `DynamicEmbStorage` uses cache mode; `HybridStorage` does not).
 - **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
 - **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
 
@@ -1565,8 +1522,10 @@ Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](
 
 ## Deterministic mode
 
-When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
+When the backing table evicts keys, it encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
 This mode is enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
+
+The cache itself does not evict by score, so it has nothing to make deterministic: which cache row a key lands in depends on the order threads reach the cache's queue, and does not change any key's value. Under this mode a cache in front of a `DynamicEmbStorage` is driven through `Storage.insert` at eviction instead (the storage's insert cannot report which keys it evicted in this mode, and the cache has to know), so the backing store's scores are not updated for keys that stay cached.
 
 ## Environment Variables
 
@@ -1575,5 +1534,5 @@ The following environment variables control runtime behavior of dynamicemb:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
-| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
+| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores in the backing table. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |

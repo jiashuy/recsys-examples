@@ -65,7 +65,7 @@ as `nt` changes.
 | --------------- | --------- | ------- | ---------------------------------- |
 | `TestGpu`       | 1.0       | False   | Full table in HBM                  |
 | `TestCaching`   | 0.1       | True    | 10% HBM as LRU cache               |
-| `TestNoCaching` | 0.1       | False   | 10% HBM in HybridStorage           |
+| `TestNoCaching` | 0.1       | False   | 10% HBM in hybrid storage          |
 | `TestNoHbm`     | 0.0       | False   | Pure UVM                           |
 
 Default per-config knobs: `num_iterations=100`, `embedding_dim=128`,

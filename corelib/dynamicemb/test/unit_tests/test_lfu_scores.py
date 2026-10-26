@@ -237,7 +237,7 @@ def validate_lfu_scores(
     default=1.0,
     help=(
         "Scale DynamicEmb HBM byte budget vs full table. Values < 1.0 force "
-        "HybridStorage and prefetch StorageMode DEFAULT (_generic_forward_path)."
+        "ChainedHybridStorage and prefetch StorageMode DEFAULT (_generic_forward_path)."
     ),
 )
 @click.option(
@@ -248,7 +248,7 @@ def validate_lfu_scores(
         "tables also carry a timestamp column (physical word 0 = timestamp, word 1 = "
         "frequency). The frequency (word 1) must still equal the true access count -- "
         "this reuses the same validation to prove the extra timestamp word does not "
-        "corrupt LFU semantics. Not supported with caching/HybridStorage (multi-word "
+        "corrupt LFU semantics. Not supported with caching/ChainedHybridStorage (multi-word "
         "checkpoints are a follow-up)."
     ),
 )
@@ -271,7 +271,7 @@ def test_lfu_score_validation(
 
     This test supports:
     - Storage-only (default): HBM-only storage when budget fits (HBM_DIRECT path)
-    - StorageMode DEFAULT: --global-hbm-budget-scale < 1 → HybridStorage
+    - StorageMode DEFAULT: --global-hbm-budget-scale < 1 → ChainedHybridStorage
     - Cache + Storage (--caching): LFU through cache to storage
     """
 
@@ -281,7 +281,7 @@ def test_lfu_score_validation(
     if lru_lfu and (caching or global_hbm_budget_scale < 1.0):
         raise ValueError(
             "--lru-lfu is only supported for storage-only (HBM_DIRECT) LFU; "
-            "caching / HybridStorage multi-word score layouts are a follow-up."
+            "caching / ChainedHybridStorage multi-word score layouts are a follow-up."
         )
 
     if not caching:
@@ -310,7 +310,7 @@ def test_lfu_score_validation(
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
     print(f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)")
     if not caching and global_hbm_budget_scale < 1.0:
-        print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
+        print(f"  - Storage path: expect ChainedHybridStorage (StorageMode DEFAULT)")
 
     # Create model. When --lru-lfu is set, use the compound (TIMESTAMP, LFU) score
     # strategy so LFU tables also carry a timestamp column; eviction is still driven

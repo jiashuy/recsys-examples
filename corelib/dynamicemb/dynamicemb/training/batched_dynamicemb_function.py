@@ -13,29 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum, auto
 from typing import Optional, Tuple
 
 import torch
-from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
-from dynamicemb.key_value_table import (
-    Cache,
-    DynamicEmbCache,
-    DynamicEmbStorage,
-    Storage,
-    _append_evicted,
-    _find_keys,
-    _flat_row_indices_for_value_load,
-    eval_lookup,
-    get_insert_score_arg,
-    load_from_flat,
-    store_to_flat,
-)
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.training.eval_lookup import eval_lookup
+from dynamicemb.storage.chained_storage import ChainedStorage
+from dynamicemb.training.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import CopyMode, MultiTableAdmitter
+from dynamicemb.types import (
+    Cache,
+    CopyMode,
+    MultiTableAdmitter,
+    Storage,
+    counts_to_offsets,
+)
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -190,26 +184,29 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    # Cache mode: where each table starts in the unique arrays, and the node each
+    # key holds (int32, -1 for none), which is what the reference to give back in
+    # the backward is indexed by. ``unique_size_per_table`` is the per-table count
+    # the outstanding-key tally is kept in.
+    unique_offsets: Optional[torch.Tensor] = None
+    cache_nodes: Optional[torch.Tensor] = None
+    unique_size_per_table: Optional[torch.Tensor] = None
 
 
-def _is_hbm_storage(storage: Storage) -> bool:
-    """True if values live in GPU device memory (HBM). Use buffer type, not
-    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
+def _record_stream_of_prefetch_state(state: PrefetchState) -> None:
+    """Tell the allocator the current stream reads what the prefetch allocated.
+
+    The prefetch may run on its own stream, while forward and backward (which
+    runs on the stream of its forward) read these tensors on another. Without the
+    record, freeing the context returns their memory to the prefetch stream's pool,
+    and the next prefetch can overwrite it under a kernel still reading it.
+    ``outstanding_keys_ref`` belongs to the module and is never freed.
     """
-    return (
-        isinstance(storage, DynamicEmbStorage)
-        and storage._state.tables[0].is_device_buffer()
-    )
-
-
-def _storage_find_scores_are_logical_row_indices(storage: Storage) -> bool:
-    """True when ``storage.find``'s score column is NO_EVICTION logical row index, not LFU/timestamp.
-
-    Those values must not be copied into LFU accumulation buffers or reused as cache insert scores.
-    """
-    if isinstance(storage, DynamicEmbStorage):
-        return storage._state.no_eviction_next_index_dev is not None
-    return False
+    stream = torch.cuda.current_stream()
+    for f in fields(state):
+        t = getattr(state, f.name)
+        if isinstance(t, torch.Tensor) and t.is_cuda and f.name != "outstanding_keys_ref":
+            t.record_stream(stream)
 
 
 def _apply_admission(
@@ -303,442 +300,6 @@ def _apply_admission(
         )
 
 
-def _prefetch_cache_path(
-    cache: DynamicEmbCache,
-    storage: Storage,
-    unique_keys: torch.Tensor,
-    unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
-    emb_dtype: torch.dtype,
-    initializer: MultiTableInitializer,
-    evict_strategy: Optional[EvictStrategy],
-    accumulated_frequency: Optional[torch.Tensor],
-    admitter: Optional[MultiTableAdmitter],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Cache prefetch with counter protection and overflow buffer.
-
-    Only admitted keys are inserted into the cache.  Non-admitted keys get
-    slot_indices = -1 and their positions (in the unique_keys array) are
-    returned so the forward pass can lazily initialize their embeddings.
-
-    Returns (slot_indices, non_admitted_positions).
-    """
-    with torch.cuda.nvtx.range("_prefetch_cache_path"):
-        device = unique_keys.device
-        state = cache._state
-        h_num_total = unique_keys.numel()
-
-        if h_num_total == 0:
-            empty = torch.empty(0, dtype=torch.int64, device=device)
-            return empty, None
-
-        # 1. Lookup with overflow fallback
-        with torch.cuda.nvtx.range("op:cache_lookup"):
-            _, founds, cache_indices = cache.lookup(
-                unique_keys,
-                unique_table_ids,
-                lfu_accumulated_frequency=accumulated_frequency,
-            )
-
-        slot_indices = cache_indices.clone()
-
-        # 2. Increment counter for found keys
-        found_slots = cache_indices[founds]
-        if found_slots.numel() > 0:
-            cache.increment_counter(found_slots, unique_table_ids[founds])
-
-        missing_mask = ~founds
-        with torch.cuda.nvtx.range("op:flagged_compact"):
-            h_num_miss, miss_compact_idx, (miss_keys, miss_tids) = flagged_compact(
-                missing_mask, [unique_keys, unique_table_ids]
-            )
-
-        if h_num_miss == 0:
-            return slot_indices, None
-
-        miss_lfu_freq = (
-            accumulated_frequency[miss_compact_idx]
-            if accumulated_frequency is not None
-            else None
-        )
-
-        # 3. Storage lookup for cache-miss keys
-        with torch.cuda.nvtx.range("op:storage_find"):
-            (
-                h_num_new,
-                new_keys,
-                new_indices_in_miss,
-                new_table_ids,
-                _,
-                storage_founds,
-                storage_score_out,
-                storage_values,
-            ) = storage.find(
-                miss_keys,
-                miss_tids,
-                copy_mode=CopyMode.VALUE,
-                lfu_accumulated_frequency=miss_lfu_freq,
-            )
-
-        # 4. Determine which new keys (not in storage) are admitted
-        new_in_miss = ~storage_founds
-        non_admitted_positions: Optional[torch.Tensor] = None
-        keys_to_insert_mask = storage_founds.clone()
-
-        has_new_in_miss = _bool_item(new_in_miss.any())
-        if has_new_in_miss and admitter is not None:
-            new_keys_sub = miss_keys[new_in_miss]
-            new_tids_sub = miss_tids[new_in_miss]
-
-            freq_for_admission = (
-                miss_lfu_freq[new_in_miss] if miss_lfu_freq is not None else None
-            )
-            admit_mask = admitter.admit(new_keys_sub, new_tids_sub, freq_for_admission)
-
-            keys_to_insert_mask[new_in_miss] = admit_mask
-
-            non_admit_miss = ~keys_to_insert_mask
-            if _bool_item(non_admit_miss.any()):
-                non_admitted_positions = miss_compact_idx[non_admit_miss]
-        elif has_new_in_miss:
-            keys_to_insert_mask = torch.ones(
-                h_num_miss, dtype=torch.bool, device=device
-            )
-
-        # 5. Insert only storage-found + admitted-new keys into cache
-        if not _bool_item(keys_to_insert_mask.any()):
-            slot_indices[miss_compact_idx] = -1
-            return slot_indices, non_admitted_positions
-
-        with torch.cuda.nvtx.range("op:flagged_compact"):
-            _, insert_to_miss, (insert_keys, insert_tids) = flagged_compact(
-                keys_to_insert_mask, [miss_keys, miss_tids]
-            )
-        if miss_lfu_freq is not None:
-            # NO_EVICTION backing: scores from find are assign-on-insert row indices, not frequencies.
-            if not _storage_find_scores_are_logical_row_indices(storage):
-                miss_lfu_freq[storage_founds] = storage_score_out[storage_founds]
-            insert_scores = miss_lfu_freq[insert_to_miss]
-        else:
-            insert_scores = None
-
-        with torch.cuda.nvtx.range("op:cache_insert_evict"):
-            (
-                cache_insert_indices,
-                num_evicted,
-                evicted_keys,
-                evicted_indices,
-                evicted_scores,
-                evicted_table_ids,
-            ) = cache.insert_and_evict(insert_keys, insert_tids, insert_scores)
-
-        # 6. Load evicted values before overwriting their slots
-        with torch.cuda.nvtx.range("op:load_from_flat"):
-            evicted_values = load_from_flat(
-                state, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
-            )
-
-        # 7. Store storage-found values to their cache slots
-        is_sf_in_insert = storage_founds[insert_to_miss]
-        if _bool_item(is_sf_in_insert.any()):
-            with torch.cuda.nvtx.range("op:store_to_flat"):
-                store_to_flat(
-                    state,
-                    cache_insert_indices[is_sf_in_insert],
-                    insert_tids[is_sf_in_insert],
-                    storage_values[insert_to_miss[is_sf_in_insert]],
-                )
-
-        # 8. Initialize admitted-new keys in their cache slots
-        is_new_in_insert = ~is_sf_in_insert
-        if _bool_item(is_new_in_insert.any()):
-            n_new_admitted = int(_scalar_item(is_new_in_insert.sum()))
-            init_vals = torch.empty(
-                n_new_admitted, max_val_dim, dtype=emb_dtype, device=device
-            )
-            init_indices = torch.arange(
-                n_new_admitted, dtype=torch.int64, device=device
-            )
-            new_admitted_keys = insert_keys[is_new_in_insert]
-            new_admitted_tids = insert_tids[is_new_in_insert]
-            with torch.cuda.nvtx.range("op:initializer"):
-                initializer(
-                    init_vals[:, :max_emb_dim],
-                    new_admitted_keys,
-                    new_admitted_tids,
-                    init_indices,
-                )
-
-            if max_val_dim != max_emb_dim:
-                state.optimizer.reset_optimizer_states(
-                    init_vals[:, max_emb_dim:],
-                    emb_dims=state.table_emb_dims[insert_tids[is_new_in_insert]],
-                )
-
-            with torch.cuda.nvtx.range("op:store_to_flat"):
-                store_to_flat(
-                    state,
-                    cache_insert_indices[is_new_in_insert],
-                    insert_tids[is_new_in_insert],
-                    init_vals,
-                )
-
-        # 9. Write back evicted to storage
-        if num_evicted > 0:
-            # NO_EVICTION backing: keys already in storage must update the *same* logical
-            # flat row (preserve_existing). New-to-storage keys need atomic row assignment.
-            ev_st = storage._state
-            if getattr(ev_st, "no_eviction_next_index", None) is not None:
-                assert isinstance(storage, DynamicEmbStorage)
-                (
-                    _hm_ev,
-                    _mk_ev,
-                    _mi_ev,
-                    _mt_ev,
-                    _ms_ev,
-                    ev_in_storage,
-                    _so_ev,
-                    _ix_ev,
-                ) = _find_keys(ev_st, evicted_keys, evicted_table_ids)
-                if bool(ev_in_storage.all()):
-                    with torch.cuda.nvtx.range("op:storage_insert"):
-                        storage.insert(
-                            evicted_keys,
-                            evicted_table_ids,
-                            evicted_values,
-                            preserve_existing=True,
-                        )
-                elif bool((~ev_in_storage).all()):
-                    with torch.cuda.nvtx.range("op:storage_insert"):
-                        storage.insert(
-                            evicted_keys,
-                            evicted_table_ids,
-                            evicted_values,
-                            evicted_scores,
-                            preserve_existing=False,
-                        )
-                else:
-                    ex_m = ev_in_storage
-                    nw_m = ~ev_in_storage
-                    if ex_m.any():
-                        with torch.cuda.nvtx.range("op:storage_insert"):
-                            storage.insert(
-                                evicted_keys[ex_m],
-                                evicted_table_ids[ex_m],
-                                evicted_values[ex_m],
-                                preserve_existing=True,
-                            )
-                    if nw_m.any():
-                        with torch.cuda.nvtx.range("op:storage_insert"):
-                            storage.insert(
-                                evicted_keys[nw_m],
-                                evicted_table_ids[nw_m],
-                                evicted_values[nw_m],
-                                evicted_scores[nw_m]
-                                if evicted_scores is not None
-                                else None,
-                                preserve_existing=False,
-                            )
-            else:
-                with torch.cuda.nvtx.range("op:storage_insert"):
-                    storage.insert(
-                        evicted_keys, evicted_table_ids, evicted_values, evicted_scores
-                    )
-
-        # 10. Counter & slot mapping
-        cache.increment_counter(cache_insert_indices, insert_tids)
-        slot_indices[miss_compact_idx[insert_to_miss]] = cache_insert_indices
-
-        # 11. Non-admitted keys get slot_indices = -1
-        if non_admitted_positions is not None:
-            slot_indices[non_admitted_positions] = -1
-
-        return slot_indices, non_admitted_positions
-
-
-def _prefetch_hbm_direct_path(
-    storage: DynamicEmbStorage,
-    unique_keys: torch.Tensor,
-    unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
-    initializer: MultiTableInitializer,
-    evict_strategy: Optional[EvictStrategy],
-    accumulated_frequency: Optional[torch.Tensor],
-    admitter: Optional[MultiTableAdmitter],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """HBM-direct prefetch with counter protection.
-
-    Only admitted keys are inserted.  Non-admitted keys get slot_indices = -1
-    and their positions are returned for lazy initialization at forward time.
-
-    Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The
-    two index spaces are kept apart because they only coincide by accident:
-    ``slot_indices`` addresses the hash table (and the ref counter beside it),
-    ``value_row_indices`` addresses the flat value buffer. For NO_EVICTION they
-    differ -- rows are handed out by a per-table auto-increment counter while
-    slots come from the key's hash, and the key map is sized
-    ``1 / max_load_factor`` times the value buffer, so a slot can point past the
-    end of it. Every other strategy returns the slot tensor itself as the rows,
-    so the caller always gets something it can address values with.
-    """
-    with torch.cuda.nvtx.range("_prefetch_hbm_direct_path"):
-        state = storage._state
-        device = unique_keys.device
-        h_num_total = unique_keys.numel()
-
-        if h_num_total == 0:
-            empty = torch.empty(0, dtype=torch.int64, device=device)
-            return empty, None, empty
-
-        with torch.cuda.nvtx.range("op:storage_find"):
-            (
-                h_num_missing,
-                missing_keys,
-                missing_indices,
-                missing_table_ids,
-                missing_scores,
-                _,
-                score_out,
-                indices,
-            ) = _find_keys(
-                state,
-                unique_keys,
-                unique_table_ids,
-                lfu_accumulated_frequency=accumulated_frequency,
-            )
-
-        found_mask = indices >= 0
-        found_slots = indices[found_mask]
-        if found_slots.numel() > 0:
-            storage.increment_counter(found_slots, unique_table_ids[found_mask])
-
-        # NO_EVICTION stores each key's value row IN its score word, so a lookup
-        # hit yields the row in ``score_out`` -- ``indices`` stays a hash slot and
-        # must not be used to address the value buffer. Every other strategy
-        # addresses values by slot, so ``rows`` is ``indices`` itself and the
-        # writes below reach it for free.
-        is_no_eviction = state.no_eviction_next_index is not None
-        rows = (
-            _flat_row_indices_for_value_load(state, found_mask, score_out, indices)
-            if is_no_eviction
-            else indices
-        )
-
-        if h_num_missing == 0:
-            return indices, None, rows
-
-        # Determine admission for missing keys
-        non_admitted_positions: Optional[torch.Tensor] = None
-
-        if admitter is not None:
-            freq_for_admission = (
-                accumulated_frequency[missing_indices]
-                if accumulated_frequency is not None
-                else None
-            )
-            admit_mask = admitter.admit(
-                missing_keys, missing_table_ids, freq_for_admission
-            )
-
-            admitted_keys = missing_keys[admit_mask]
-            admitted_tids = missing_table_ids[admit_mask]
-            admitted_scores = (
-                missing_scores[admit_mask] if missing_scores is not None else None
-            )
-            admitted_unique_positions = missing_indices[admit_mask]
-
-            non_admit = ~admit_mask
-            if non_admit.any():
-                non_admitted_positions = missing_indices[non_admit]
-        else:
-            admitted_keys = missing_keys
-            admitted_tids = missing_table_ids
-            admitted_scores = missing_scores
-            admitted_unique_positions = missing_indices
-
-        # Initialize and insert admitted keys
-        if admitted_keys.numel() > 0:
-            n_admitted = admitted_keys.numel()
-            init_values = torch.empty(
-                n_admitted, max_val_dim, dtype=state.emb_dtype, device=device
-            )
-            init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
-            with torch.cuda.nvtx.range("op:initializer"):
-                initializer(
-                    init_values[:, :max_emb_dim],
-                    admitted_keys,
-                    admitted_tids,
-                    init_idx,
-                )
-
-            if max_val_dim != max_emb_dim:
-                state.optimizer.reset_optimizer_states(
-                    init_values[:, max_emb_dim:],
-                    emb_dims=state.table_emb_dims[admitted_tids],
-                )
-
-            score_arg = get_insert_score_arg(
-                state, n_admitted, device, admitted_scores, table_ids=admitted_tids
-            )
-            with torch.cuda.nvtx.range("op:storage_insert"):
-                # HBM-direct is a last tier: this insert may evict, and the
-                # victims are dropped here (unlike the cache path, which spills
-                # to storage). Retain them when configured -- this is the
-                # forward-path analogue of the _insert_key_values collection.
-                if EvictedItemMode.RETAIN_KEY in state.evicted_item_mode:
-                    (
-                        new_indices,
-                        num_evicted,
-                        evicted_keys,
-                        evicted_table_ids,
-                    ) = state.key_index_map.insert(
-                        admitted_keys,
-                        admitted_tids,
-                        score_arg,
-                        collect_evicted=True,
-                    )
-                    _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
-                else:
-                    new_indices = state.key_index_map.insert(
-                        admitted_keys,
-                        admitted_tids,
-                        score_arg,
-                    )
-            # The insert returns the hash slot; NO_EVICTION's value row is the
-            # score it just assigned. Keep both: the counter is indexed by slot,
-            # the value buffer by row.
-            new_rows = (
-                score_arg.value.to(torch.int64) if is_no_eviction else new_indices
-            )
-            with torch.cuda.nvtx.range("op:store_to_flat"):
-                store_to_flat(state, new_rows, admitted_tids, init_values)
-
-            inserted_mask = new_indices >= 0
-            if inserted_mask.any():
-                storage.increment_counter(
-                    new_indices[inserted_mask],
-                    admitted_tids[inserted_mask],
-                )
-
-            indices[admitted_unique_positions] = new_indices
-            # Skipped while ``rows`` aliases ``indices``: the write above already
-            # covered it. Testing identity rather than ``is_no_eviction`` keeps
-            # this correct even if ``rows`` ever stops being an alias -- it would
-            # simply be filled explicitly with the same values.
-            if rows is not indices:
-                rows[admitted_unique_positions] = new_rows
-
-        # Non-admitted keys: ensure slot_indices = -1
-        if non_admitted_positions is not None:
-            indices[non_admitted_positions] = -1
-            if rows is not indices:
-                rows[non_admitted_positions] = -1
-
-        return indices, non_admitted_positions, rows
-
-
 def dynamicemb_prefetch(
     indices: torch.Tensor,
     offsets: torch.Tensor,
@@ -750,6 +311,7 @@ def dynamicemb_prefetch(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     admitter: Optional[MultiTableAdmitter] = None,
+    exchange=None,
     outstanding_keys_ref: Optional[torch.Tensor] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
@@ -770,9 +332,6 @@ def dynamicemb_prefetch(
         frequency_counts_int64 = None
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
-
-        if hasattr(storage, "collect_table_sizes"):
-            storage.collect_table_sizes(non_blocking=True)
 
         indices_table_range = get_table_range(offsets, feature_offsets)
         (
@@ -803,50 +362,69 @@ def dynamicemb_prefetch(
         value_row_indices = None
         if caching:
             storage_mode = StorageMode.CACHE
-        elif _is_hbm_storage(storage):
+        elif (
+            isinstance(storage, ChainedStorage)
+            and storage.values.on_device
+        ):
             storage_mode = StorageMode.HBM_DIRECT
         else:
             storage_mode = StorageMode.DEFAULT
 
+        unique_offsets: Optional[torch.Tensor] = None
+        cache_nodes: Optional[torch.Tensor] = None
         if storage_mode == StorageMode.CACHE:
+            # Where each table starts in the unique arrays: the cache is driven
+            # table by table, and the per-table counts are already on the host.
+            unique_offsets = counts_to_offsets(unique_size_per_table, unique_keys.device)
+
             if outstanding_keys_ref is not None:
-                outstanding_keys_ref += num_prefetched_keys
-                cache_capacity = cache._state.capacity
-                outstanding_keys = _scalar_item(outstanding_keys_ref)
-                if outstanding_keys > cache_capacity:
-                    raise RuntimeError(
-                        f"Outstanding prefetched keys "
-                        f"({outstanding_keys}) "
-                        f"exceed cache capacity ({cache_capacity}). "
-                        "Reduce prefetch pipeline depth or increase "
-                        "cache size."
-                    )
+                # A table's rows are all taken once the keys of the steps in flight
+                # outnumber them; that is a capacity error, and clearer here than
+                # a failed allocate.
+                outstanding_keys_ref += unique_size_per_table
+                for t in range(table_num):
+                    cache_capacity = cache.capacity(t)
+                    outstanding_keys = int(outstanding_keys_ref[t])
+                    if outstanding_keys > cache_capacity:
+                        raise RuntimeError(
+                            f"Outstanding prefetched keys of table {t} "
+                            f"({outstanding_keys}) "
+                            f"exceed its cache capacity ({cache_capacity}). "
+                            "Reduce prefetch pipeline depth or increase "
+                            "cache size."
+                        )
+            from dynamicemb.training.chained_prefetch import prefetch_cache_path
+
             (
                 slot_indices,
                 non_admitted_positions,
-            ) = _prefetch_cache_path(
+                cache_nodes,
+            ) = prefetch_cache_path(
                 cache,
                 storage,
+                exchange,
                 unique_keys,
                 unique_table_ids,
+                unique_offsets,
                 max_emb_dim,
                 max_val_dim,
                 emb_dtype,
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admitter,
             )
-            # The cache addresses its own value buffer by cache slot: a cache is
-            # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
-            # at construction), so the two index spaces coincide here.
+            # The cache addresses its own value buffer by node, which is the row.
+            # There is no separate hash slot to tell apart from it: the cache keeps
+            # no ref counter beside a hash table, so the two index spaces coincide.
             value_row_indices = slot_indices
         elif storage_mode == StorageMode.HBM_DIRECT:
+            from dynamicemb.training.chained_prefetch import prefetch_hbm_direct_path
+
             (
                 slot_indices,
                 non_admitted_positions,
                 value_row_indices,
-            ) = _prefetch_hbm_direct_path(
+            ) = prefetch_hbm_direct_path(
                 storage,
                 unique_keys,
                 unique_table_ids,
@@ -855,7 +433,6 @@ def dynamicemb_prefetch(
                 initializer,
                 evict_strat,
                 lfu_accumulated_frequency,
-                admitter,
             )
 
         return PrefetchState(
@@ -871,6 +448,9 @@ def dynamicemb_prefetch(
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
+            unique_offsets=unique_offsets,
+            cache_nodes=cache_nodes,
+            unique_size_per_table=unique_size_per_table,
         )
 
 
@@ -1103,6 +683,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         *args,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
+            _record_stream_of_prefetch_state(prefetch_state)
             max_emb_dim = storage.max_embedding_dim()
             max_val_dim = storage.max_value_dim()
             emb_dtype = storage.embedding_dtype()
@@ -1115,15 +696,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             use_counter = prefetch_state.slot_indices is not None
             if use_counter:
-                state = (
-                    cache._state
+                buffers = (
+                    cache.values
                     if prefetch_state.storage_mode == StorageMode.CACHE
-                    else storage._state
+                    else storage.values
                 )
                 with torch.cuda.nvtx.range("op:load_from_flat"):
-                    unique_embs = load_from_flat(
-                        state,
-                        # Value buffer: address by row, which is the slot for
+                    unique_embs = buffers.load(# Value buffer: address by row, which is the slot for
                         # every strategy except NO_EVICTION.
                         prefetch_state.value_row_indices,
                         prefetch_state.unique_table_ids,
@@ -1223,12 +802,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.persisted_unique_indices = persisted_unique_indices
             ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
             ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
+            ctx.unique_offsets = prefetch_state.unique_offsets
+            ctx.cache_nodes = prefetch_state.cache_nodes
 
             # Recover outstanding count at end of forward so it is decremented
             # even when backward is not run, avoiding overflow.
             if prefetch_state.outstanding_keys_ref is not None:
                 prefetch_state.outstanding_keys_ref -= (
-                    prefetch_state.num_prefetched_keys
+                    prefetch_state.unique_size_per_table
                 )
 
             return output_embs
@@ -1276,54 +857,36 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             with torch.cuda.nvtx.range("DynamicEmbeddingFunction.update"):
                 if ctx.use_counter:
-                    state = (
-                        cache._state
+                    values = (
+                        cache.values
                         if ctx.storage_mode == StorageMode.CACHE
-                        else storage._state
+                        else storage.values
                     )
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
-                        optimizer.fused_update_for_flat_table(
-                            unique_grads.to(ctx.emb_dtype),
-                            # Writes into the value buffer -> rows.
+                        # Writes into the value buffer -> rows.
+                        optimizer.update_rows(
+                            values.layout,
+                            unique_grads,
                             ctx.update_value_rows,
-                            state.table_ptrs_dev,
                             unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
                         )
 
-                    counter_owner = (
-                        cache if ctx.storage_mode == StorageMode.CACHE else storage
-                    )
-
-                    # Ref counter sits beside the hash table -> slots.
-                    counter_owner.decrement_counter(
-                        ctx.slot_indices, ctx.unique_table_ids
-                    )
+                    if ctx.storage_mode == StorageMode.CACHE:
+                        # Give back the reference the prefetch took on each node.
+                        cache.release(ctx.cache_nodes, ctx.unique_offsets)
+                    else:
+                        # Ref counter sits beside the hash table -> slots.
+                        storage.decrement_counter(
+                            ctx.slot_indices, ctx.unique_table_ids
+                        )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    # Per-table embedding dims (on the CUDA device) let the
-                    # padded-buffer kernel place each row's optimizer state at the
-                    # max_emb_dim offset using the row's own width. Provided
-                    # uniformly across storage types via embedding_dims().
-                    table_emb_dims = storage.embedding_dims(on_device=True)
-                    # all_dims_vec4 must reflect per-table dims, not just
-                    # max_emb_dim: a vec4 store on a row whose edim % 4 != 0 would
-                    # run past its m region into v. storage.all_dims_vec4() is the
-                    # per-table-correct flag used by load/store too.
-                    all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
-                        optimizer.update_for_padded_buffer(
+                        optimizer.update_padded(
+                            storage.values.layout,
                             unique_grads,
                             ctx.unique_values,
                             unique_table_ids,
-                            table_emb_dims,
-                            ctx.max_emb_dim,
-                            ctx.max_val_dim,
-                            all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
@@ -1333,7 +896,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         vals_c = ctx.unique_values[pui]
                         # preserve_existing=True → CONST score policy on insert:
                         # refresh embedding/optimizer buffers only; do not overwrite
-                        # table scores (LFU / timestamp / etc.). For HybridStorage,
+                        # table scores (LFU / timestamp / etc.). For the hybrid storage,
                         # the HBM tier uses this on backward; existing scores stay.
                         with torch.cuda.nvtx.range("op:storage_insert"):
                             storage.insert(

@@ -33,13 +33,10 @@ oracle (mirroring test_lru_lfu.py) predicts the exact victim set.
 import numpy as np
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
+from dynamicemb import DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
-from dynamicemb.key_value_table import (
-    DynamicEmbStorage,
-    _append_evicted,
-    _pop_state_evicted_keys,
-)
+from dynamicemb.storage.chained_storage import ChainedStorage
+from dynamicemb.storage.table_state import _append_evicted, _pop_state_evicted_keys
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
@@ -96,7 +93,7 @@ def _insert_collect(table, keys, tids, value, policy, name):
     """Plain insert with collection. Returns (indices, m, evicted_keys[:m],
     evicted_table_ids[:m]) -- the evicted_* buffers are already sliced to the
     number actually evicted."""
-    indices, num_evicted, evicted_keys, evicted_tids = table.insert(
+    indices, num_evicted, evicted_keys, evicted_tids, _slots = table.insert(
         keys,
         tids,
         ScoreArg(name=name, value=value, policy=policy),
@@ -271,35 +268,104 @@ def test_collect_evicted_no_eviction_empty(current_device):
     assert evicted_keys.numel() == 0 and evicted_tids.numel() == 0
 
 
-def test_collect_evicted_determinism_mode_raises(current_device, monkeypatch):
-    """collect_evicted is unsupported under DEMB_DETERMINISM_MODE -> RuntimeError
-    (raised before the deterministic-insert path, so num_scores is irrelevant)."""
-    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
-    device = current_device
-    table = _assign_table(128, bucket_capacity=128)
-    n = 8
+def _fill_then_overflow(table, device, extra):
+    """128 keys at scores 1..128, then `extra` new keys at higher scores: ASSIGN
+    evicts the lowest scores, so the victims are exactly keys 1..extra."""
+    n = 128
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
     scores = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)
-    with pytest.raises(RuntimeError, match="collect_evicted"):
-        table.insert(
-            keys,
-            tids,
-            ScoreArg(name="score1", value=scores, policy=ScorePolicy.ASSIGN),
-            _ir(n, table, device),
-            collect_evicted=True,
+    table.insert(
+        keys, tids, ScoreArg(name="score1", value=scores, policy=ScorePolicy.ASSIGN),
+        _ir(n, table, device),
+    )
+    new_keys = torch.arange(1001, 1001 + extra, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(extra, dtype=torch.int64, device=device)
+    new_scores = (1000 + torch.arange(extra, dtype=torch.int64, device=device)).to(
+        torch.uint64
+    )
+    return table.insert(
+        new_keys,
+        new_tids,
+        ScoreArg(name="score1", value=new_scores, policy=ScorePolicy.ASSIGN),
+        _ir(extra, table, device),
+        collect_evicted=True,
+    )
+
+
+@pytest.mark.parametrize("determinism", [False, True])
+def test_collect_evicted_matches_with_and_without_determinism(
+    current_device, monkeypatch, determinism
+):
+    """Under DEMB_DETERMINISM_MODE the insert goes in waves, and the victims of
+    every wave are still reported: the same set the ordinary insert reports."""
+    if determinism:
+        monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    device = current_device
+    table = _assign_table(128, bucket_capacity=128)
+    extra = 16
+    indices, num_evicted, evicted_keys, evicted_tids, _slots = _fill_then_overflow(
+        table, device, extra
+    )
+    n_ev = int(num_evicted.item())
+    assert n_ev == extra
+    assert sorted(evicted_keys[:n_ev].tolist()) == list(range(1, 1 + extra))
+    assert bool((evicted_tids[:n_ev] == 0).all())
+    assert bool((indices >= 0).all())
+
+
+@pytest.mark.parametrize("kind", ["assign", "lru_lfu"])
+def test_evicted_slots_are_the_slots_the_victims_held(current_device, kind):
+    """evicted_slots[j] is where victim j's row was: the slot it held before the
+    insert, which its inserter took over. Both kernels (AoT and cubin)."""
+    device = current_device
+    if kind == "lru_lfu":
+        table = _lru_lfu_table(128, bucket_capacity=128)
+        name, policy = "frequency", ScorePolicy.LRU_LFU
+        mk = lambda n: torch.ones(n, dtype=torch.uint64, device=device)
+    else:
+        table = _assign_table(128, bucket_capacity=128)
+        name, policy = "score1", ScorePolicy.ASSIGN
+        mk = lambda n: torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(
+            torch.uint64
         )
+    n, extra = 128, 16
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    before = table.insert(
+        keys, tids, ScoreArg(name=name, value=mk(n), policy=policy), _ir(n, table, device)
+    )
+    slot_of = dict(zip(keys.tolist(), before.tolist()))
+
+    new_keys = torch.arange(1001, 1001 + extra, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(extra, dtype=torch.int64, device=device)
+    new_scores = (mk(extra).to(torch.int64) + (100 if kind == "assign" else 0)).to(
+        torch.uint64
+    )
+    indices, num_evicted, evicted_keys, _tids, evicted_slots = table.insert(
+        new_keys,
+        new_tids,
+        ScoreArg(name=name, value=new_scores, policy=policy),
+        _ir(extra, table, device),
+        collect_evicted=True,
+    )
+    m = int(num_evicted.item())
+    assert m == extra
+    for k, slot in zip(evicted_keys[:m].tolist(), evicted_slots[:m].tolist()):
+        assert slot == slot_of[k], f"victim {k} held slot {slot_of[k]}, got {slot}"
+    # and the inserters now sit exactly in those slots
+    assert sorted(indices.tolist()) == sorted(evicted_slots[:m].tolist())
 
 
 # ---------------------------------------------------------------------------
-# Storage-level tests: the end-to-end retain flow through DynamicEmbStorage
+# Storage-level tests: the end-to-end retain flow through ChainedStorage
 # (a last tier). insert() routes to _insert_key_values, which collects into the
 # state's retain buffers; pop_evicted_keys() drains them (unique, per table).
 # ---------------------------------------------------------------------------
 
 
 def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
-    """A single-tier DynamicEmbStorage. init_capacity == max_capacity disables
+    """A single-tier ChainedStorage. init_capacity == max_capacity disables
     rehash growth, so a full bucket evicts (rather than expanding) -- the last-tier
     eviction the retain hook targets. LruLfu score policy + LFU evict strategy
     mirror the validated _lru_lfu_storage fixture."""
@@ -313,7 +379,6 @@ def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
             max_capacity=max_capacity,
             init_capacity=max_capacity,
             bucket_capacity=bucket_capacity,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=LRU_LFU_TS_FIRST,
             evict_strategy=DynamicEmbEvictStrategy.LFU,
@@ -322,7 +387,7 @@ def _retain_storage(dim=8, max_capacity=128, bucket_capacity=128, retain=True):
             ),
         )
     ]
-    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+    return ChainedStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
 
 
 def _storage_insert(storage, keys, dim, device):
@@ -398,7 +463,7 @@ def test_erase_retention_is_per_call_not_per_table(current_device):
 
 
 def test_storage_retain_end_to_end(current_device):
-    """DynamicEmbStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
+    """ChainedStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
     insert evicts; pop returns the unique evicted keys; those keys are gone from the
     table; a second pop is empty (read-and-clear / incremental)."""
     device = current_device
@@ -418,11 +483,8 @@ def test_storage_retain_end_to_end(current_device):
     assert evk.numel() > 0, "a full-bucket overflow must have evicted something"
     assert evk.numel() == len(set(evk.tolist())), "pop must return unique keys"
 
-    name = storage._state.score_policy.name
-    _, founds, _ = storage.key_index_map.lookup(
-        evk, torch.zeros_like(evk), ScoreArg(name=name, policy=ScorePolicy.CONST)
-    )
-    assert not bool(founds.any()), "evicted keys must no longer be in the table"
+    rows = storage.index.lookup(evk, torch.zeros_like(evk))
+    assert bool((rows < 0).all()), "evicted keys must no longer be in the table"
 
     assert (
         storage.pop_evicted_keys(0).numel() == 0

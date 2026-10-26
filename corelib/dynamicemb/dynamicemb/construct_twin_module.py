@@ -26,7 +26,7 @@ import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.key_ownership import owned_key_mask
-from dynamicemb.key_value_table import Storage
+from dynamicemb.types import Storage
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,

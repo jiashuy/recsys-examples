@@ -97,7 +97,6 @@ import torch
 import torch.distributed as dist
 import torchrec
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
@@ -179,7 +178,6 @@ def _constraints(
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.DEBUG
                 ),
-                safe_check_mode=DynamicEmbCheckMode.WARNING,
                 dist_type=dist_type,
             ),
         )

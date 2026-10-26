@@ -20,6 +20,7 @@ from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+from dynamicemb.checkpoint.row_chunk import RowChunk
 
 
 @enum.unique
@@ -150,11 +151,8 @@ OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
 DEMB_TABLE_ALIGN_SIZE = 16
 
-# Per-bucket row alignment for hashtable backends (same as :data:`DEMB_TABLE_ALIGN_SIZE`).
-BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
-
-# Sentinel ``bucket_capacity``: treat the whole per-rank table as one bucket; see
-# :func:`dynamicemb.dynamicemb_config.get_sharded_table_capacity` (per-rank row count).
+# ``bucket_capacity`` that makes the whole per-rank table one bucket; any
+# ``bucket_capacity`` not smaller than the per-rank row count does the same.
 MAX_BUCKET_CAPACITY: int = 2**63 - 1
 
 torch_dtype_to_np_dtype = {
@@ -369,45 +367,91 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         device: torch.device,
         batch_size: int = 65536,
         table_id: int = 0,
-    ) -> Iterator[
-        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
-    ]:
+    ) -> Iterator[RowChunk]:
         pass
 
 
+def counts_to_offsets(counts: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Where each table starts, with the total last, from how many keys each has: an
+    int64 tensor on ``device``."""
+    counts = counts.to(device=device, dtype=torch.int64)
+    return torch.cat([torch.zeros(1, dtype=torch.int64, device=device), torch.cumsum(counts, 0)])
+
+
+@dataclass
+class CacheMetrics:
+    """What a cache did in its last lookup and its last allocation: each call overwrites
+    the figures of the one before."""
+
+    unique_keys: int = 0  # keys the last lookup was asked for
+    hits: int = 0  # of them, how many the cache held
+    allocated: int = 0  # keys the last allocation gave a node
+    evicted: int = 0  # of those, how many took the node of a key that was resident
+
+    @property
+    def misses(self) -> int:
+        return self.unique_keys - self.hits
+
+    @property
+    def hit_rate(self) -> float:
+        return self.hits / self.unique_keys if self.unique_keys > 0 else 0.0
+
+
 class Cache(abc.ABC):
-    @abc.abstractmethod
-    def lookup(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback.
+    """Where the hot rows live on the GPU, and which of them a step is using.
 
-        Returns:
-            score_out: Output scores.
-            founds: Boolean tensor indicating which keys were found.
-            indices: Slot indices (``-1`` for keys not found).
-        """
-        ...
+    A cache holds no score and decides nothing about which keys stay in the
+    system; admission, scoring and eviction of keys belong to the backing store.
+    What the cache does is place a key in a row, keep a row from being reused
+    while a step in flight refers to it, and pick which idle row an incoming key
+    takes. Rows are addressed by *node*: the row of a table's pool.
+
+    Keys come in unique within a table and grouped by table. ``offsets`` is the
+    position at which each table starts, with the total last: an int64 tensor on the
+    device, ``num_tables + 1`` entries, which :func:`counts_to_offsets` makes of the
+    count of each table. It is read by the kernels and never on the host
+
+    """
 
     @abc.abstractmethod
-    def insert_and_evict(
+    def lookup_pin(
+        self, unique_keys: torch.Tensor, offsets: torch.Tensor
+    ) -> torch.Tensor:
+        """The node holding each key, with a reference taken, or ``-1``."""
+
+    @abc.abstractmethod
+    def allocate(
         self,
         keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback.
+        positions: torch.Tensor,
+        offsets: torch.Tensor,
+        nodes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Take a node for each key, evicting an idle one if needed.
 
-        Returns:
-            indices, num_evicted, evicted_keys, evicted_indices,
-            evicted_scores, evicted_table_ids.
+        ``positions`` says where each key's answer goes in ``nodes``, which is
+        written in place. Returns ``(victim_keys, has_victim, new_nodes)``, one
+        entry per key. The nodes come back loading: the caller fills their rows
+        and then calls :meth:`publish`.
         """
-        ...
+
+    @abc.abstractmethod
+    def publish(self, new_nodes: torch.Tensor, offsets: torch.Tensor) -> None:
+        """Make the rows the caller has just written visible as cache hits."""
+
+    @abc.abstractmethod
+    def release(self, nodes: torch.Tensor, offsets: torch.Tensor) -> None:
+        """Give back the reference a step took on each node (``-1`` holds none)."""
+
+    @abc.abstractmethod
+    def find_nodes(
+        self, keys: torch.Tensor, table_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """The node holding each key in its table, or ``-1``. Pins nothing."""
+
+    @abc.abstractmethod
+    def invalidate(self, nodes: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Drop the bindings :meth:`find_nodes` found. Nothing is written back."""
 
     @abc.abstractmethod
     def reset(
@@ -418,8 +462,8 @@ class Cache(abc.ABC):
     @abc.abstractmethod
     def cache_metrics(
         self,
-    ) -> torch.Tensor:
-        pass
+    ) -> Optional["CacheMetrics"]:
+        """What the last lookup and the last allocation did, or ``None`` when not recording."""
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:

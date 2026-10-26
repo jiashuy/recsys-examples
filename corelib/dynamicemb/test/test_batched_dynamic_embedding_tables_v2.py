@@ -33,27 +33,14 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTablesV2,
+from dynamicemb.storage.chained_storage import ChainedHybridStorage, ChainedStorage
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.checkpoint.paths import (
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
-from dynamicemb.dynamicemb_config import (
-    DEBUG_EMB_INITIALIZER_MOD,
-    ScoreStrategy,
-    _sharded_table_bucket_layout,
-)
-from dynamicemb.key_value_table import (
-    DynamicEmbCache,
-    DynamicEmbStorage,
-    DynamicEmbTableState,
-    HybridStorage,
-    Storage,
-    _flat_row_indices_from_slots_and_scores,
-    export_keys_values_iter,
-    load_from_flat,
-    load_from_flat_single_table,
-)
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD, ScoreStrategy
+from dynamicemb.types import Storage
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     DynamicEmbOptimType,
@@ -88,8 +75,6 @@ _STRICT_SINGLE_NUM_EMB = 20_000
 _STRICT_MULTI_NUM_EMB = (20_000, 30_000, 40_000)
 # Same as ``DEBUG_EMB_INITIALIZER_MOD`` / ``debug_init`` (initializer.cu).
 _DEBUG_EMB_MOD = DEBUG_EMB_INITIALIZER_MOD
-# Expansion tests assume key_index_map rehash threshold at load factor 0.5.
-_STRICT_MAX_LOAD_FACTOR = 0.5
 
 
 def _init_capacity_strict(max_capacity: int, bucket_cap: int) -> int:
@@ -133,22 +118,6 @@ def _embedding_configs_for_strict_expansion_test(
     ]
     return configs, names, feature_table_map
 
-
-def _iter_dynamic_emb_table_states(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-) -> List[Tuple[str, DynamicEmbTableState]]:
-    """All table states (cache + backing, or hybrid tiers)."""
-    out: List[Tuple[str, DynamicEmbTableState]] = []
-    cache = bdebt.cache
-    if isinstance(cache, DynamicEmbCache):
-        out.append(("cache", cache._state))
-    st = bdebt.tables
-    if isinstance(st, DynamicEmbStorage):
-        out.append(("storage", st._state))
-    elif isinstance(st, HybridStorage):
-        out.append(("hbm", st.tables[0]))
-        out.append(("host", st.tables[1]))
-    return out
 
 
 def _lfu_per_sample_weights(
@@ -267,586 +236,6 @@ def _iter_compare_batches_multi_three(
         e = min(s + batch_size, c2)
         rows = [(a0, a1b, k) for k in range(s, e)]
         yield pack_triples(rows)
-
-
-def _print_hybrid_hbm_host_sizes(
-    storage: Storage,
-    table_names: List[str],
-    *,
-    phase: str,
-    only_table_id: Optional[int] = None,
-) -> None:
-    """Print ``key_index_map.size()`` (occupied) and ``capacity()`` per tier for Hybrid backing."""
-    if not isinstance(storage, HybridStorage):
-        return
-    hbm_state, host_state = storage.tables
-    kim_h, kim_o = hbm_state.key_index_map, host_state.key_index_map
-    indices = (
-        [only_table_id] if only_table_id is not None else list(range(len(table_names)))
-    )
-    for tid in indices:
-        if tid < 0 or tid >= len(table_names):
-            continue
-        name = table_names[tid]
-        hbm_n, host_n = kim_h.size(tid), kim_o.size(tid)
-        hbm_cap, host_cap = kim_h.capacity(tid), kim_o.capacity(tid)
-        print(
-            f"[bdebt vs stbe] {phase} table {name!r} (table_id={tid}):\n"
-            f"  Hybrid HBM:   size()={hbm_n}, capacity={hbm_cap}\n"
-            f"  Hybrid host:  size()={host_n}, capacity={host_cap}\n"
-            f"  sum size()={hbm_n + host_n}",
-            flush=True,
-        )
-
-
-def _bdebt_storage_entry_count_for_table(
-    storage: Storage, table_id: int
-) -> Tuple[int, str]:
-    """Count occupied slots and capacity in backing storage for one logical table (post-flush)."""
-    if isinstance(storage, HybridStorage):
-        hbm_state, host_state = storage.tables
-        kim_h, kim_o = hbm_state.key_index_map, host_state.key_index_map
-        hbm_n, host_n = kim_h.size(table_id), kim_o.size(table_id)
-        hbm_cap, host_cap = kim_h.capacity(table_id), kim_o.capacity(table_id)
-        total = hbm_n + host_n
-        return total, (
-            f"HybridStorage table_id={table_id}: "
-            f"HBM size={hbm_n}, capacity={hbm_cap}; "
-            f"host size={host_n}, capacity={host_cap}; sum_size={total}"
-        )
-    if isinstance(storage, DynamicEmbStorage):
-        kim = storage.key_index_map
-        n, cap = kim.size(table_id), kim.capacity(table_id)
-        return n, f"DynamicEmbStorage table_id={table_id}: size={n}, capacity={cap}"
-    return -1, f"unknown storage type {type(storage).__name__}"
-
-
-def _kim_occupied_sizes_per_table(km: Any, num_tables: int) -> List[int]:
-    """``key_index_map.size(t)`` per logical table (handles int or 0-dim tensor)."""
-    out: List[int] = []
-    for t in range(num_tables):
-        n_t = km.size(t)
-        out.append(int(n_t.item() if isinstance(n_t, torch.Tensor) else n_t))
-    return out
-
-
-def _kim_capacities_per_table(km: Any, num_tables: int) -> List[int]:
-    """``key_index_map.capacity(t)`` per logical table (handles int or 0-dim tensor)."""
-    out: List[int] = []
-    for t in range(num_tables):
-        c_t = km.capacity(t)
-        out.append(int(c_t.item() if isinstance(c_t, torch.Tensor) else c_t))
-    return out
-
-
-def _print_test_expansion_storage_cache_sizes_after_train_step(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    *,
-    outer_iter: int,
-    batch_index: int,
-) -> None:
-    """Print storage/cache KIM ``size`` and ``capacity`` per table after one forward+backward."""
-    tag = (
-        f"[test_table_expansion_capacity_growth] outer_iter={outer_iter} "
-        f"train_batch={batch_index}"
-    )
-    storage = bdebt.tables
-    if isinstance(storage, DynamicEmbStorage):
-        km = storage.key_index_map
-        nt = storage._state.num_tables
-        sz = _kim_occupied_sizes_per_table(km, nt)
-        cap = _kim_capacities_per_table(km, nt)
-        print(
-            f"{tag} storage KIM size (per table): {sz}, capacity (per table): {cap}",
-            flush=True,
-        )
-    elif isinstance(storage, HybridStorage):
-        hbm, host = storage.tables
-        hkm, okm = hbm.key_index_map, host.key_index_map
-        nt_h, nt_o = hbm.num_tables, host.num_tables
-        hs, os_ = _kim_occupied_sizes_per_table(
-            hkm, nt_h
-        ), _kim_occupied_sizes_per_table(okm, nt_o)
-        hc, oc = _kim_capacities_per_table(hkm, nt_h), _kim_capacities_per_table(
-            okm, nt_o
-        )
-        print(
-            f"{tag} storage HBM KIM size: {hs}, capacity: {hc}; "
-            f"host KIM size: {os_}, capacity: {oc}",
-            flush=True,
-        )
-    else:
-        print(f"{tag} storage type: {type(storage).__name__}", flush=True)
-
-    cache = bdebt.cache
-    if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
-        nt_c = cache._state.num_tables
-        csz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        ccap = _kim_capacities_per_table(ckm, nt_c)
-        print(
-            f"{tag} cache KIM size (per table): {csz}, "
-            f"capacity (per table): {ccap}",
-            flush=True,
-        )
-    else:
-        print(f"{tag} cache: disabled", flush=True)
-
-
-def _stbe_size_capacity_for_table(
-    stbe: SplitTableBatchedEmbeddingBagsCodegen, logical_table_id: int
-) -> Tuple[int, int]:
-    """Static TBE: allocated rows (``size``) and declared ``rows_per_table`` (``capacity``).
-
-    For dense split tables both are the number of embedding rows; ``rows_per_table`` comes
-    from the first feature mapped to ``logical_table_id``.
-    """
-    w = stbe.split_embedding_weights()[logical_table_id]
-    weight_rows = int(w.shape[0])
-    ftm = stbe.feature_table_map
-    try:
-        f_idx = next(i for i, t in enumerate(ftm) if t == logical_table_id)
-        declared = int(stbe.rows_per_table[f_idx].item())
-    except (StopIteration, AttributeError):
-        declared = weight_rows
-    return weight_rows, declared
-
-
-def _dump_bde_stbe_embedding_samples(
-    *,
-    table_name: str,
-    by_key: Dict[int, torch.Tensor],
-    w_stbe: torch.Tensor,
-    cmp_cap: int,
-    max_keys: int = 5,
-) -> None:
-    """Print a few key rows for BDE export vs STBE (debug: single-table + caching)."""
-    candidates = [0, 1, 2, cmp_cap // 2, cmp_cap - 1]
-    seen: List[int] = []
-    for k in candidates:
-        if k in seen or k < 0 or k >= cmp_cap:
-            continue
-        seen.append(k)
-        if len(seen) >= max_keys:
-            break
-    print(
-        f"[bde vs stbe dump] table {table_name!r} sample embeddings "
-        f"(cmp_cap={cmp_cap}, showing up to {len(seen)} keys):",
-        flush=True,
-    )
-    for k in seen:
-        stbe_row = w_stbe[k].tolist()
-        if k in by_key:
-            bde_row = by_key[k].tolist()
-            print(
-                f"  key={k}\n    BDE export: {bde_row}\n    STBE row:   {stbe_row}",
-                flush=True,
-            )
-        else:
-            print(
-                f"  key={k}\n    BDE export: <missing>\n    STBE row:   {stbe_row}",
-                flush=True,
-            )
-
-
-def _assert_cache_export_matches_lookup_embeddings(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    device: torch.device,
-    *,
-    batch_size: int = 65536,
-) -> None:
-    """Check GPU cache: exported (key, slot) rows match ``lookup`` + ``load_from_flat``.
-
-    Uses ``training=False`` on cache state so lookup does not mutate scores.
-    No-op when ``bdebt.cache`` is None.
-    """
-    cache = bdebt.cache
-    if not isinstance(cache, DynamicEmbCache):
-        return
-    state = cache._state
-    saved_training = state.training
-    cache.training = False
-    try:
-        for tid in range(state.num_tables):
-            for keys, emb_exp, _, _ in export_keys_values_iter(
-                state, device, batch_size=batch_size, table_id=tid
-            ):
-                if keys.numel() == 0:
-                    continue
-                tids = torch.full(
-                    (keys.numel(),), tid, dtype=torch.int64, device=keys.device
-                )
-                _, founds, indices = cache.lookup(keys, tids, None)
-                assert bool(
-                    founds.all()
-                ), f"cache table_id={tid}: every exported key must be found via lookup"
-                emb_slots = load_from_flat(
-                    state, indices, tids, copy_mode=CopyMode.EMBEDDING
-                )
-                torch.testing.assert_close(
-                    emb_exp.to(dtype=emb_slots.dtype),
-                    emb_slots,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-    finally:
-        cache.training = saved_training
-
-
-def _assert_storage_export_matches_find_embeddings(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    device: torch.device,
-    *,
-    batch_size: int = 65536,
-) -> None:
-    """After flush/insert into backing ``DynamicEmbStorage``, check key↔embedding consistency.
-
-    For each export batch, ``find(keys)`` must return the same embeddings as
-    ``export_keys_values_iter`` (read-only lookup via ``training=False``).
-    If the table uses ``DynamicEmbInitializerMode.DEBUG``, also checks that both
-    export and find embeddings equal ``key % DEBUG_EMB_INITIALIZER_MOD`` per dim.
-    Skips non-``DynamicEmbStorage`` backends (e.g. ``HybridStorage``).
-    """
-    storage = bdebt.tables
-    if not isinstance(storage, DynamicEmbStorage):
-        return
-    state = storage._state
-    saved_training = state.training
-    storage.training = False
-    try:
-        for tid in range(state.num_tables):
-            debug_table = (
-                state.options_list[tid].initializer_args.mode
-                == DynamicEmbInitializerMode.DEBUG
-            )
-            emb_dim_t = state.table_emb_dims_cpu[tid]
-            for keys, emb_exp, _, _ in storage.export_keys_values(
-                device, batch_size, tid
-            ):
-                if keys.numel() == 0:
-                    continue
-                tids = torch.full(
-                    (keys.numel(),), tid, dtype=torch.int64, device=keys.device
-                )
-                (
-                    h_miss,
-                    _,
-                    _,
-                    _,
-                    _,
-                    founds,
-                    _,
-                    emb_find,
-                ) = storage.find(keys, tids, CopyMode.EMBEDDING)
-                assert h_miss == 0, (
-                    f"storage table_id={tid}: find reports {h_miss} missing keys "
-                    "that export still lists"
-                )
-                assert bool(
-                    founds.all()
-                ), f"storage table_id={tid}: find must locate every exported key"
-                expected_dbg: Optional[torch.Tensor] = None
-                if debug_table:
-                    mod = torch.tensor(
-                        float(DEBUG_EMB_INITIALIZER_MOD),
-                        device=keys.device,
-                        dtype=torch.float32,
-                    )
-                    kf = keys.to(dtype=torch.float32)
-                    expected_dbg = (kf % mod).unsqueeze(1).expand(-1, emb_dim_t)
-                if os.environ.get("DYNAMICEMB_PRINT_STORAGE_EXPORT_FIND") == "1":
-                    ze = emb_exp.to(dtype=emb_find.dtype)
-                    parts = [
-                        "[storage export vs find]",
-                        f"table_id={tid}",
-                        f"batch_n={keys.numel()}",
-                        f"max_abs(exp-find)={(ze - emb_find).abs().max().item()}",
-                    ]
-                    if expected_dbg is not None:
-                        ee32 = emb_exp.to(device=keys.device, dtype=torch.float32)
-                        ef32 = emb_find.to(device=keys.device, dtype=torch.float32)
-                        parts.append(
-                            f"max_abs(exp-key%mod)={(ee32 - expected_dbg).abs().max().item()}"
-                        )
-                        parts.append(
-                            f"max_abs(find-key%mod)={(ef32 - expected_dbg).abs().max().item()}"
-                        )
-                    print(*parts, flush=True)
-
-                torch.testing.assert_close(
-                    emb_exp.to(dtype=emb_find.dtype),
-                    emb_find,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-                torch.testing.assert_close(
-                    emb_find.to(dtype=emb_find.dtype),
-                    expected_dbg,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-                torch.testing.assert_close(
-                    emb_exp.to(dtype=emb_find.dtype),
-                    expected_dbg,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-
-                if debug_table:
-                    assert expected_dbg is not None
-                    torch.testing.assert_close(
-                        emb_exp.to(device=keys.device, dtype=torch.float32),
-                        expected_dbg,
-                        rtol=0.0,
-                        atol=0.0,
-                        msg=lambda m: (
-                            f"storage table_id={tid}: export embedding != key % "
-                            f"{DEBUG_EMB_INITIALIZER_MOD}: {m}"
-                        ),
-                    )
-                    torch.testing.assert_close(
-                        emb_find.to(device=keys.device, dtype=torch.float32),
-                        expected_dbg,
-                        rtol=0.0,
-                        atol=0.0,
-                        msg=lambda m: (
-                            f"storage table_id={tid}: find embedding != key % "
-                            f"{DEBUG_EMB_INITIALIZER_MOD}: {m}"
-                        ),
-                    )
-    finally:
-        storage.training = saved_training
-
-
-def _kim_scan_keys_embeddings_dict(
-    state: DynamicEmbTableState,
-    device: torch.device,
-    *,
-    batch_size: int = 65536,
-) -> Dict[Tuple[int, int], torch.Tensor]:
-    """Scan KIM + value buffer: (table_id, key) -> embedding.
-
-    Does not call ``Storage.export_keys_values`` / ``export_keys_values_iter``;
-    uses ``_batched_export_keys_scores`` and :func:`load_from_flat_single_table` only.
-    """
-    out: Dict[Tuple[int, int], torch.Tensor] = {}
-    score_name = state.score_policy.name
-    for tid in range(state.num_tables):
-        emb_dim_t = state.table_emb_dims_cpu[tid]
-        for (
-            keys,
-            named_scores,
-            indices,
-        ) in state.key_index_map._batched_export_keys_scores(
-            [score_name],
-            state.device,
-            batch_size=batch_size,
-            return_index=True,
-            table_id=tid,
-        ):
-            if keys.numel() == 0:
-                continue
-            scores = named_scores[score_name]
-            flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
-            values = load_from_flat_single_table(state, flat_rows, tid)
-            embeddings = values[:, :emb_dim_t].contiguous().to(device)
-            keys_dev = keys.to(device=device)
-            for i in range(keys.numel()):
-                k_int = int(keys_dev[i].item())
-                out[(tid, k_int)] = embeddings[i].detach().clone()
-    return out
-
-
-def _assert_bdebt_storage_cache_merged_export_matches_lookup(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    device: torch.device,
-    *,
-    batch_size: int = 65536,
-    verify_batch_size: int = 4096,
-) -> None:
-    """No flush: merge storage then cache embeddings into a dict; check vs live lookup/find.
-
-    - Fills a dict from backing ``DynamicEmbStorage`` KIM scan, then overlays cache scan
-      (cache wins on key collision).
-    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``load_from_flat``
-      when present in cache, else ``storage.find`` (embedding column).
-    """
-    storage = bdebt.tables
-    cache = bdebt.cache
-    if not isinstance(storage, DynamicEmbStorage) or not isinstance(
-        cache, DynamicEmbCache
-    ):
-        return
-
-    saved_st = storage.training
-    saved_ca = cache.training
-    storage.training = False
-    cache.training = False
-    try:
-        storage_dict = _kim_scan_keys_embeddings_dict(
-            storage._state, device, batch_size=batch_size
-        )
-        cache_dict = _kim_scan_keys_embeddings_dict(
-            cache._state, device, batch_size=batch_size
-        )
-        merged: Dict[Tuple[int, int], torch.Tensor] = {**storage_dict, **cache_dict}
-
-        for k, v in cache_dict.items():
-            assert k in merged, f"cache key {k} missing from merged dict"
-            torch.testing.assert_close(merged[k], v, rtol=1e-5, atol=1e-5)
-        for k, v in storage_dict.items():
-            if k in cache_dict:
-                torch.testing.assert_close(
-                    merged[k], cache_dict[k], rtol=1e-5, atol=1e-5
-                )
-            else:
-                torch.testing.assert_close(merged[k], v, rtol=1e-5, atol=1e-5)
-
-        st = storage._state
-        ca = cache._state
-        key_type = st.key_index_map.key_type
-        by_tid: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
-        for (tid, k_int), emb in merged.items():
-            by_tid.setdefault(tid, []).append((k_int, emb))
-
-        for tid, pairs in by_tid.items():
-            for s in range(0, len(pairs), verify_batch_size):
-                chunk = pairs[s : s + verify_batch_size]
-                ks = [p[0] for p in chunk]
-                ref = torch.stack([p[1] for p in chunk])
-                key_t = torch.tensor(ks, device=device, dtype=key_type)
-                tid_t = torch.full((len(ks),), tid, dtype=torch.int64, device=device)
-                _, founds_c, ix_c = cache.lookup(key_t, tid_t, None)
-                emb_live = torch.empty_like(ref)
-                if bool(founds_c.any()):
-                    emb_live[founds_c] = load_from_flat(
-                        ca,
-                        ix_c[founds_c],
-                        tid_t[founds_c],
-                        copy_mode=CopyMode.EMBEDDING,
-                    )
-                miss = ~founds_c
-                if bool(miss.any()):
-                    (
-                        h_miss,
-                        _,
-                        _,
-                        _,
-                        _,
-                        sf,
-                        _,
-                        sv,
-                    ) = storage.find(
-                        key_t[miss],
-                        tid_t[miss],
-                        copy_mode=CopyMode.EMBEDDING,
-                    )
-                    assert h_miss == 0, (
-                        f"table_id={tid}: storage.find reports {h_miss} missing "
-                        f"among keys not in cache"
-                    )
-                    assert bool(
-                        sf.all()
-                    ), f"table_id={tid}: storage.find must hit all keys absent from cache"
-                    emb_live[miss] = sv
-                torch.testing.assert_close(ref, emb_live, rtol=1e-5, atol=1e-5)
-    finally:
-        storage.training = saved_st
-        cache.training = saved_ca
-
-
-def _compare_bdebt_export_to_stbe_weights(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    stbe: SplitTableBatchedEmbeddingBagsCodegen,
-    table_names: List[str],
-    cmp_caps: List[int],
-    device: torch.device,
-    *,
-    dump_sample_embeddings: bool = False,
-) -> None:
-    # Match export_keys_values: flush so storage counts reflect the same backing state.
-    bdebt.flush()
-    torch.cuda.synchronize()
-    # Key↔embedding mapping: cache tier (still hot after flush) then backing storage.
-    _assert_cache_export_matches_lookup_embeddings(bdebt, device, batch_size=65536)
-    _assert_storage_export_matches_find_embeddings(bdebt, device, batch_size=65536)
-    _print_hybrid_hbm_host_sizes(
-        bdebt.tables,
-        table_names,
-        phase="Hybrid tier sizes (after flush, before export)",
-    )
-    for tid, name in enumerate(table_names):
-        _, st_detail = _bdebt_storage_entry_count_for_table(bdebt.tables, tid)
-        if bdebt.cache is not None:
-            ckim = bdebt.cache.key_index_map
-            cache_sz, cache_cap = ckim.size(tid), ckim.capacity(tid)
-            cache_line = (
-                f"  Cache:    table_id={tid} size={cache_sz}, capacity={cache_cap}\n"
-            )
-        else:
-            cache_line = "  Cache:    (none)\n"
-        stbe_sz, stbe_cap = _stbe_size_capacity_for_table(stbe, tid)
-        print(
-            f"[bdebt vs stbe] table {name!r} (after flush, before export):\n"
-            f"{cache_line}"
-            f"  Storage:  {st_detail}\n"
-            f"  STBE:     size={stbe_sz}, capacity={stbe_cap} "
-            f"(split_embedding_weights rows={stbe_sz}, rows_per_table={stbe_cap})\n"
-            f"  cmp_cap={cmp_caps[tid]}",
-            flush=True,
-        )
-
-    for tid, name in enumerate(table_names):
-        cmp_cap = cmp_caps[tid]
-        keys_t, emb_t = bdebt.export_keys_values(name, device, batch_size=65536)
-        exported_n = int(keys_t.numel())
-        stbe_sz, stbe_cap = _stbe_size_capacity_for_table(stbe, tid)
-        print(
-            f"[bdebt vs stbe] table {name!r} (after export_keys_values):\n"
-            f"  BDE export: size={exported_n} (unique keys in backing export)\n"
-            f"  STBE:       size={stbe_sz}, capacity={stbe_cap}\n"
-            f"  cmp_cap={cmp_cap}",
-            flush=True,
-        )
-        _print_hybrid_hbm_host_sizes(
-            bdebt.tables,
-            table_names,
-            phase="Hybrid tier sizes (after export_keys_values)",
-            only_table_id=tid,
-        )
-        by_key: Dict[int, torch.Tensor] = {}
-        for i in range(keys_t.numel()):
-            by_key[int(keys_t[i].item())] = emb_t[i].detach().cpu()
-        w = stbe.split_embedding_weights()[tid].detach().cpu()
-        if dump_sample_embeddings:
-            _dump_bde_stbe_embedding_samples(
-                table_name=name,
-                by_key=by_key,
-                w_stbe=w,
-                cmp_cap=cmp_cap,
-                max_keys=5,
-            )
-        for k in range(cmp_cap):
-            assert k in by_key, f"missing key {k} in exported table {name}"
-            torch.testing.assert_close(by_key[k], w[k], rtol=1e-5, atol=1e-5)
-
-
-def _assert_expected_storage_backend(
-    bdebt: BatchedDynamicEmbeddingTablesV2,
-    *,
-    caching: bool,
-    hbm_budget_ratio: Optional[float],
-) -> None:
-    st = bdebt.tables
-    if caching:
-        assert bdebt.cache is not None
-        assert isinstance(st, DynamicEmbStorage)
-    else:
-        assert bdebt.cache is None
-        if hbm_budget_ratio is not None and hbm_budget_ratio < 1.0:
-            assert isinstance(st, HybridStorage)
-        else:
-            assert isinstance(st, DynamicEmbStorage)
 
 
 def _split_table_batched_optimizer_for_compare(opt_type: EmbOptimType) -> EmbOptimType:
@@ -1367,7 +756,7 @@ def init_embedding_tables(stbe, bdet):
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
         )
-        if isinstance(storage, DynamicEmbStorage):
+        if isinstance(storage, ChainedStorage):
             max_emb_dim = storage.max_embedding_dim()
             max_value_dim = storage.max_value_dim()
             values = torch.zeros(
@@ -1419,11 +808,11 @@ def init_embedding_tables(stbe, bdet):
 @pytest.mark.parametrize(
     "caching, PS, local_hbm_for_values",
     [
-        (True, None, 1024),  # Caching + DynamicEmbStorage backend
+        (True, None, 1024),  # Caching + ChainedStorage backend
         (True, PyDictStorage, 1024),  # Caching + PS backend
         (False, None, 1024**3),  # HBM-only
         (False, None, 1024),  # HybridStorage
-        (False, None, 0),  # No HBM budget, no cache -> DynamicEmbStorage (host-only)
+        (False, None, 0),  # No HBM budget, no cache -> ChainedStorage (host-only)
     ],
 )
 @pytest.mark.parametrize(
@@ -1499,18 +888,18 @@ def test_forward_train_eval(
     elif local_hbm_for_values == 1024**3:
         assert bdebt._cache is None, "HBM-only mode should have no cache"
         assert isinstance(
-            bdebt._storage, DynamicEmbStorage
-        ), f"Expected DynamicEmbStorage, got {type(bdebt._storage)}"
+            bdebt._storage, ChainedStorage
+        ), f"Expected ChainedStorage, got {type(bdebt._storage)}"
     elif local_hbm_for_values == 0:
         assert bdebt._cache is None, "Host-only mode should have no cache"
         assert isinstance(
-            bdebt._storage, DynamicEmbStorage
-        ), f"Expected DynamicEmbStorage when local_hbm=0 without cache, got {type(bdebt._storage)}"
+            bdebt._storage, ChainedStorage
+        ), f"Expected ChainedStorage when local_hbm=0 without cache, got {type(bdebt._storage)}"
     else:
-        assert bdebt._cache is None, "HybridStorage mode should have no cache"
+        assert bdebt._cache is None, "ChainedHybridStorage mode should have no cache"
         assert isinstance(
-            bdebt._storage, HybridStorage
-        ), f"Expected HybridStorage, got {type(bdebt._storage)}"
+            bdebt._storage, ChainedHybridStorage
+        ), f"Expected ChainedHybridStorage, got {type(bdebt._storage)}"
 
     """
     feature number = 4, batch size = 2
@@ -1904,7 +1293,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
         cache = bdeb.cache
         if cache is not None:
             metrics = cache.cache_metrics
-            assert metrics[0].item() == metrics[1].item()
+            assert metrics.unique_keys == metrics.hits
 
     with torch.no_grad():
         bdeb.flush()
@@ -1944,7 +1333,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
         cache = bdeb.cache
         if cache is not None:
             metrics = cache.cache_metrics
-            assert metrics[0].item() == metrics[1].item()
+            assert metrics.unique_keys == metrics.hits
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
@@ -1955,113 +1344,6 @@ def random_indices(batch, min_index, max_index):
     while len(result) < batch:
         result.add(random.randint(min_index, max_index))
     return result
-
-
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-    ],
-)
-@pytest.mark.parametrize("caching", [False, True])
-@pytest.mark.parametrize("PS", [None])
-@pytest.mark.parametrize("iteration", [16])
-@pytest.mark.parametrize("batch_size", [2048, 65536])  # ,[])
-def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batch_size):
-    print(
-        f"step in test_deterministic_insert , opt_type = {opt_type} opt_params = {opt_params}"
-    )
-
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    dims = [8]
-    table_names = ["table0"]
-    key_type = torch.int64
-    value_type = torch.float32
-
-    init_capacity = iteration * batch_size
-    max_capacity = init_capacity
-
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        dyn_emb_table_options = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=init_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
-            local_hbm_for_values=init_capacity * dim * 4,
-            external_storage=PS,
-        )
-        dyn_emb_table_options_list.append(dyn_emb_table_options)
-
-    bdebt_x = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=[0],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-
-    bdebt_y = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=[0],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-
-    print(
-        f"Test deterministic insert with batch={batch_size}, iteration={iteration}, capacity={init_capacity}"
-    )
-    os.environ["DEMB_DETERMINISM_MODE"] = "ON"
-
-    for i in range(iteration):
-        indices = torch.tensor(
-            list(random_indices(batch_size, 0, 2**63 - 1)),
-            dtype=key_type,
-            device=device,
-        )
-        offsets = torch.arange(0, batch_size + 1, dtype=key_type, device=device)
-
-        bdebt_x(indices, offsets)
-        bdebt_y(indices, offsets)
-
-        torch.cuda.synchronize()
-
-        storage_x = bdebt_x.tables
-        storage_y = bdebt_y.tables
-        map_x = storage_x.key_index_map
-        map_y = storage_y.key_index_map
-
-        assert torch.equal(map_x.keys_, map_y.keys_)
-
-        print(
-            f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()}), totoal({map_x.capacity()})"
-        )
-        cache_x = bdebt_x.cache
-        cache_y = bdebt_y.cache
-        if cache_x is not None:
-            map_x = cache_x.key_index_map
-            map_y = cache_y.key_index_map
-
-            assert torch.equal(map_x.keys_, map_y.keys_)
-
-            print(
-                f"Iteration {i} passed for deterministic insertion with cache_x's size({map_x.size()}), cache_y's size({map_y.size()}), totoal({map_x.capacity()})"
-            )
-
-    del os.environ["DEMB_DETERMINISM_MODE"]
-    print("all check passed")
 
 
 @pytest.mark.parametrize(
@@ -2264,7 +1546,7 @@ def test_multi_table_mixed_dims_forward_backward(
         **opt_params,
     )
 
-    assert isinstance(bdeb.tables, DynamicEmbStorage)
+    assert isinstance(bdeb.tables, ChainedStorage)
     assert bdeb.tables.num_tables == 3
 
     batch_size = 4
@@ -3167,8 +2449,8 @@ def test_dump_optimizer_states_ckpt_width(
 def test_multi_table_caching_flush(opt_type, opt_params):
     """Multi-table caching mode: prefetch, forward, flush, verify cache metrics.
 
-    ``DynamicEmbCache`` updates ``cache_metrics[0]`` (last lookup unique count) and
-    ``[1]`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
+    ``DynamicEmbCache`` updates ``cache_metrics.unique_keys`` (last lookup unique count) and
+    ``hits`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
     Prefetch calls ``lookup``; training forward with cache loads from flat via
     ``slot_indices`` and does not call ``lookup`` again. The first prefetch is thus
     cold (all misses); a second prefetch on the same keys should record all hits.
@@ -3241,8 +2523,8 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     cache = bdeb.cache
     assert cache is not None
     metrics = cache.cache_metrics
-    assert metrics[0].item() == 4
-    assert metrics[1].item() == 0
+    assert metrics.unique_keys == 4
+    assert metrics.hits == 0
 
     with torch.cuda.stream(prefetch_stream):
         bdeb.prefetch(indices, offsets, forward_stream)
@@ -3253,360 +2535,9 @@ def test_multi_table_caching_flush(opt_type, opt_params):
         _ = embs2.mean()
 
     torch.cuda.synchronize()
-    assert metrics[0].item() == metrics[1].item() == 4
+    assert metrics.unique_keys == metrics.hits == 4
 
     bdeb.flush()
     bdeb.reset_cache_states()
 
     print("test_multi_table_caching_flush passed")
-
-
-@pytest.mark.parametrize(
-    "score_strategy",
-    [
-        DynamicEmbScoreStrategy.TIMESTAMP,
-        DynamicEmbScoreStrategy.LFU,
-        DynamicEmbScoreStrategy.STEP,
-        DynamicEmbScoreStrategy.NO_EVICTION,
-    ],
-)
-@pytest.mark.parametrize(
-    "caching,hbm_budget_ratio",
-    [
-        (True, None),
-        (False, 0.25),
-        (False, 1.0),
-    ],
-)
-@pytest.mark.parametrize("multi_table", [False, True])
-@pytest.mark.parametrize(
-    "optimizer_type,opt_params",
-    [
-        (EmbOptimType.SGD, {}),
-        (
-            EmbOptimType.ADAM,
-            {
-                "weight_decay": 0.06,
-                "eps": 3e-5,
-                "beta1": 0.8,
-                "beta2": 0.888,
-            },
-        ),
-    ],
-)
-def test_table_expansion_capacity_growth(
-    score_strategy: ScoreStrategy,
-    caching: bool,
-    hbm_budget_ratio: Optional[float],
-    multi_table: bool,
-    optimizer_type: EmbOptimType,
-    opt_params: Dict[str, Any],
-) -> None:
-    """Train keys ``0..CMP_CAPACITY-1`` twice vs STBE (half max rows), then export/compare embeddings.
-
-    After each forward pair, runs backward with ``learning_rate=0`` and ``weight_decay=0`` so
-    fused backward/optimizer steps do not move embeddings while still exercising the training path
-    (DEBUG ``key % mod`` pattern preserved for export/compare).
-    """
-    pytest.importorskip("torchrec")
-
-    # HybridStorage (non-caching, partial-HBM: hbm_budget_ratio < 1.0) no longer
-    # supports NO_EVICTION -- it raises at construction. Skip that combination.
-    if (
-        score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
-        and not caching
-        and hbm_budget_ratio < 1.0
-    ):
-        pytest.skip(
-            "HybridStorage (non-caching partial-HBM) does not support NO_EVICTION"
-        )
-
-    assert torch.cuda.is_available()
-    device_id = torch.cuda.current_device()
-    device = torch.device(f"cuda:{device_id}")
-    key_type = torch.int64
-
-    (
-        emb_cfgs,
-        table_names,
-        feature_table_map,
-    ) = _embedding_configs_for_strict_expansion_test(multi_table)
-    memory_ratio = _CACHE_RATIO if caching else float(hbm_budget_ratio)
-
-    table_options: List[DynamicEmbTableOptions] = []
-    user_max_by_table: List[int] = []
-    dims_list: List[int] = []
-    for ec in emb_cfgs:
-        _, bucket_cap = _sharded_table_bucket_layout(
-            ec, _WORLD_SIZE, _BUCKET_CAPACITY_EXP
-        )
-        max_capacity = get_sharded_table_capacity(ec, _WORLD_SIZE, _BUCKET_CAPACITY_EXP)
-        user_max_by_table.append(max_capacity)
-        dims_list.append(_EMB_DIM_EXPANSION)
-        init_capacity = _init_capacity_strict(max_capacity, bucket_cap)
-        value_bytes = get_table_value_bytes(
-            ec, optimizer_type, _WORLD_SIZE, _BUCKET_CAPACITY_EXP
-        )
-        local_hbm = max(1, int(value_bytes * memory_ratio))
-        table_options.append(
-            DynamicEmbTableOptions(
-                dim=_EMB_DIM_EXPANSION,
-                max_capacity=max_capacity,
-                init_capacity=init_capacity,
-                max_load_factor=_STRICT_MAX_LOAD_FACTOR,
-                bucket_capacity=bucket_cap,
-                index_type=key_type,
-                embedding_dtype=torch.float32,
-                device_id=device_id,
-                score_strategy=score_strategy,
-                caching=caching,
-                local_hbm_for_values=local_hbm,
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.DEBUG,
-                ),
-                eval_initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.CONSTANT,
-                    value=0.0,
-                ),
-            )
-        )
-
-    train_opt_params = dict(opt_params)
-    train_opt_params["learning_rate"] = 0.0
-    train_opt_params["weight_decay"] = 0.0
-
-    bdebt = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=table_options,
-        feature_table_map=feature_table_map,
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=optimizer_type,
-        use_index_dedup=True,
-        **train_opt_params,
-    )
-    _assert_expected_storage_backend(
-        bdebt, caching=caching, hbm_budget_ratio=hbm_budget_ratio
-    )
-
-    storage = bdebt.tables
-    if isinstance(storage, DynamicEmbStorage):
-        km = storage.key_index_map
-        nt = storage._state.num_tables
-        storage_sz = _kim_occupied_sizes_per_table(km, nt)
-        storage_caps = _kim_capacities_per_table(km, nt)
-        print(
-            f"[test_table_expansion_capacity_growth] storage KIM size (per table): "
-            f"{storage_sz}, capacity (per table): {storage_caps}",
-            flush=True,
-        )
-    elif isinstance(storage, HybridStorage):
-        hbm, host = storage.tables
-        hkm, okm = hbm.key_index_map, host.key_index_map
-        nt_h, nt_o = hbm.num_tables, host.num_tables
-        h_sz = _kim_occupied_sizes_per_table(hkm, nt_h)
-        o_sz = _kim_occupied_sizes_per_table(okm, nt_o)
-        h_caps = _kim_capacities_per_table(hkm, nt_h)
-        o_caps = _kim_capacities_per_table(okm, nt_o)
-        print(
-            f"[test_table_expansion_capacity_growth] storage HBM KIM size: {h_sz}, "
-            f"capacity: {h_caps}; host KIM size: {o_sz}, capacity: {o_caps}",
-            flush=True,
-        )
-    else:
-        print(
-            f"[test_table_expansion_capacity_growth] storage type: {type(storage).__name__}",
-            flush=True,
-        )
-    cache = bdebt.cache
-    if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
-        nt_c = cache._state.num_tables
-        cache_sz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        cache_caps = _kim_capacities_per_table(ckm, nt_c)
-        print(
-            f"[test_table_expansion_capacity_growth] cache KIM size (per table): "
-            f"{cache_sz}, capacity (per table): {cache_caps}",
-            flush=True,
-        )
-    else:
-        print(
-            "[test_table_expansion_capacity_growth] cache: disabled (no DynamicEmbCache)",
-            flush=True,
-        )
-
-    cmp_caps = [max(1, m // 2) for m in user_max_by_table]
-    stbe_opt = _split_table_batched_optimizer_for_compare(optimizer_type)
-    stbe = create_split_table_batched_embedding(
-        table_names,
-        feature_table_map,
-        stbe_opt,
-        train_opt_params,
-        dims_list,
-        cmp_caps,
-        PoolingMode.NONE,
-        device,
-    )
-    _init_stbe_debug_embedding_weights(stbe)
-
-    stbe_parts: List[str] = []
-    for tid, name in enumerate(table_names):
-        w_rows, rpt = _stbe_size_capacity_for_table(stbe, tid)
-        stbe_parts.append(f"{name!r}:weight_rows={w_rows},rows_per_table={rpt}")
-    print(
-        f"[test_table_expansion_capacity_growth] STBE table size (per logical table): "
-        + "; ".join(stbe_parts),
-        flush=True,
-    )
-
-    bdebt.train()
-    stbe.train()
-    # we need to do backward to unlock the keys in the cache, otherwise overflow buffer will be also full.
-    for i in range(2):
-        if not multi_table:
-            for j, (idx, off) in enumerate(
-                _iter_compare_batches_single(
-                    cmp_caps[0], _EXPANSION_STBE_TRAIN_BATCH, device, key_type
-                )
-            ):
-                res_b = _bdebt_forward_maybe_lfu(
-                    bdebt, score_strategy, idx, off, device
-                )
-                res_s = stbe(idx, off)
-                res_b.mean().backward()
-                res_s.mean().backward()
-                torch.cuda.synchronize()
-                _print_test_expansion_storage_cache_sizes_after_train_step(
-                    bdebt, outer_iter=i, batch_index=j
-                )
-        else:
-            for j, (idx, off) in enumerate(
-                _iter_compare_batches_multi_three(
-                    cmp_caps, _EXPANSION_STBE_TRAIN_BATCH, device, key_type
-                )
-            ):
-                res_b = _bdebt_forward_maybe_lfu(
-                    bdebt, score_strategy, idx, off, device
-                )
-                # Merged storage+cache export (no flush) runs once after the train loop;
-                # see ``_assert_bdebt_storage_cache_merged_export_matches_lookup`` below.
-                res_s = stbe(idx, off)
-                res_b.mean().backward()
-                res_s.mean().backward()
-                torch.cuda.synchronize()
-                _print_test_expansion_storage_cache_sizes_after_train_step(
-                    bdebt, outer_iter=i, batch_index=j
-                )
-        torch.cuda.synchronize()
-
-    if caching:
-        _assert_bdebt_storage_cache_merged_export_matches_lookup(bdebt, device)
-
-    _compare_bdebt_export_to_stbe_weights(
-        bdebt,
-        stbe,
-        table_names,
-        cmp_caps,
-        device,
-        dump_sample_embeddings=(not multi_table and caching),
-    )
-
-
-@pytest.mark.parametrize("load_factor", [0.1, 1.0])
-@pytest.mark.parametrize(
-    "max_capacity",
-    [
-        pytest.param(8_192, id="cap_8k"),
-        pytest.param(1_048_576, id="cap_1M"),
-        pytest.param(64 * 1024 * 1024, id="cap_64M"),
-    ],
-)
-@pytest.mark.parametrize(
-    "score_strategy",
-    [DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU],
-    ids=lambda s: s.name,
-)
-def test_fill_tables(
-    score_strategy: ScoreStrategy,
-    load_factor: float,
-    max_capacity: int,
-) -> None:
-    """
-    ``fill_tables`` timing and correctness across table scales (up to 64M slots
-    requested), load factors, and score strategies (``TIMESTAMP`` / ``LFU``).
-    Physical ``capacity`` may be bucket-aligned above ``max_capacity``.
-
-    Uses ``tolerance=0`` (integer entry target only; no load-factor early exit).
-    ``effective_lf = min(requested_load_factor, 0.95)`` (``fill_tables`` caps at
-    ``0.95``). For ``effective_lf < 0.95`` asserts exact
-    ``size == min(cap, int(effective_lf * cap))``.
-    For ``effective_lf == 0.95`` (e.g. requested ``1.0`` clamped), inserts can evict
-    while ``remaining`` counts batch inserts; assert ``size`` in a loose band vs target.
-
-    At 64M scale, ``dim=1`` keeps HBM footprint modest; smaller capacities use
-    ``dim=8``.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-    dim = 1 if max_capacity >= 16 * 1024 * 1024 else 8
-    local_hbm = max(
-        512 * 1024 * 1024, int(max_capacity * dim * 4 * 1.25) + 64 * 1024 * 1024
-    )
-
-    opt = DynamicEmbTableOptions(
-        dim=dim,
-        max_capacity=max_capacity,
-        index_type=torch.int64,
-        embedding_dtype=torch.float32,
-        device_id=device_id,
-        score_strategy=score_strategy,
-        caching=False,
-        local_hbm_for_values=local_hbm,
-        bucket_capacity=128,
-        initializer_args=DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.NORMAL,
-        ),
-    )
-    m = BatchedDynamicEmbeddingTablesV2(
-        table_options=[opt],
-        table_names=["t0"],
-        device=device,
-        optimizer=EmbOptimType.SGD,
-        learning_rate=0.01,
-    )
-    assert isinstance(m._storage, DynamicEmbStorage)
-    km = m._storage.key_index_map
-
-    fill_tol = 0.0
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    m.fill_tables(load_factor, tolerance=fill_tol)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
-
-    cap0 = km.capacity(0)
-    size0 = km.size(0)
-    size_i = int(size0.item()) if torch.is_tensor(size0) else int(size0)
-    effective_lf = min(load_factor, 0.95)
-    actual_lf = float(size_i) / float(cap0)
-    expected = min(cap0, int(effective_lf * cap0))
-    print(
-        f"\nfill_tables score_strategy={score_strategy.name} load_factor={load_factor} "
-        f"max_capacity(requested)={max_capacity} dim={dim} cap0={cap0} size0={size_i} "
-        f"effective_lf={effective_lf} actual_lf={actual_lf:.6f} expected={expected} "
-        f"tol={fill_tol} time_sec={elapsed:.4f}"
-    )
-    if effective_lf >= 0.95:
-        assert size_i <= cap0
-        assert size_i >= int(0.92 * expected), (
-            f"fill_tables({score_strategy.name}, {load_factor} -> effective {effective_lf}): "
-            f"size={size_i} below 0.92 * int_target={expected} capacity={cap0}"
-        )
-    else:
-        assert size_i == expected, (
-            f"fill_tables({score_strategy.name}, {load_factor} -> effective {effective_lf}): "
-            f"size={size_i} expected={expected} capacity={cap0}"
-        )

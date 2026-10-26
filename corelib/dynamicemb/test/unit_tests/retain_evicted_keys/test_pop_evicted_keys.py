@@ -29,7 +29,6 @@ Plus the module API's per-table filtering.
 import pytest
 import torch
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -66,7 +65,6 @@ def _build_model(
             dim=dim,
             max_capacity=max_capacity,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=LRU_LFU,
             caching=caching,

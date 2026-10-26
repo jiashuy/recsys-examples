@@ -27,13 +27,12 @@ import pytest
 import torch
 import torchrec
 from dynamicemb import (
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import DynamicEmbStorage
+from dynamicemb.storage.chained_storage import ChainedStorage
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.types import BoundsCheckMode
 from torchrec.modules.embedding_configs import PoolingType
@@ -78,7 +77,6 @@ def _make_v2(dims, pooling_mode=DynamicEmbPoolingMode.SUM, lr=LR, device=None):
             embedding_dtype=torch.float32,
             device_id=device,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=DynamicEmbScoreStrategy.STEP,
         )
@@ -127,7 +125,7 @@ def _seed_dynamicemb_from_reference(module, ref):
     written in one shot so the two sides start identical.
     """
     storage = module.tables
-    assert isinstance(storage, DynamicEmbStorage), type(storage)
+    assert isinstance(storage, ChainedStorage), type(storage)
     optimizer = module.optimizer
     max_emb_dim = storage.max_embedding_dim()
     max_value_dim = storage.max_value_dim()

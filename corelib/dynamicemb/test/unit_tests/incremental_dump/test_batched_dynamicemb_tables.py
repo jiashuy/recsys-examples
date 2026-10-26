@@ -20,7 +20,6 @@ import pytest
 import torch
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
-    DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -143,7 +142,6 @@ def test_without_eviction(
             dim=dim,
             max_capacity=num_embeddings[i],
             bucket_capacity=bucket_capacity,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             caching=caching,
@@ -253,7 +251,6 @@ def test_lfu_incremental_dump_retouch(current_device, caching):
             dim=dim,
             max_capacity=BATCH_SIZE_PER_DUMP * 8,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=(
                 DynamicEmbScoreStrategy.TIMESTAMP,

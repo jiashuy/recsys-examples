@@ -292,7 +292,7 @@ def validate_non_admitted_embedding_values(
     default=1.0,
     help=(
         "Scale DynamicEmb HBM byte budget vs full table (after planner: per-rank "
-        "local_hbm). Values < 1.0 force HybridStorage and prefetch StorageMode "
+        "local_hbm). Values < 1.0 force ChainedHybridStorage and prefetch StorageMode "
         "DEFAULT (_generic_forward_path), not HBM_DIRECT."
     ),
 )
@@ -350,8 +350,8 @@ def test_admission_strategy_validation(
 
     This test validates that only keys with frequency >= threshold are stored in tables.
     It supports:
-    - Storage-only (default): HBM-only DynamicEmbStorage when budget fits (HBM_DIRECT)
-    - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use HybridStorage
+    - Storage-only (default): HBM-only ChainedStorage when budget fits (HBM_DIRECT)
+    - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use ChainedHybridStorage
     - Cache + Storage (--caching): admission through cache to storage
     """
 
@@ -385,7 +385,7 @@ def test_admission_strategy_validation(
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
     if not caching and global_hbm_budget_scale < 1.0:
-        print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
+        print(f"  - Storage path: expect ChainedHybridStorage (prefetch StorageMode DEFAULT)")
 
     # Create admission strategy. Without an initializer of its own, a rejected
     # key's row is left to the table initializer.

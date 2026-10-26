@@ -23,13 +23,13 @@ import math
 import numpy as np
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbTableOptions,
     ScoreStrategy,
 )
-from dynamicemb.key_value_table import DynamicEmbStorage, _expand_tables_impl
+from dynamicemb.storage.chained_storage import ChainedStorage
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
@@ -231,10 +231,10 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
 
 
 # ---------------------------------------------------------------------------
-# Storage-level integration: dump/load round-trip and rehash preservation for
+# Storage-level integration: dump/load round-trip for
 # the LruLfu layout (the (TIMESTAMP, LFU) compound score). These exercise the
 # Python glue around the gather/scatter/copy kernels (export_keys_values_iter,
-# _dump_table, _iter_batches_from_files, _load_key_values, _expand_tables_impl).
+# _dump_table, _iter_batches_from_files, _load_key_values).
 # ---------------------------------------------------------------------------
 
 # The compound score in both column orders. The two are equivalent at runtime
@@ -258,29 +258,25 @@ def _lru_lfu_storage(
             device_id=device_id,
             dim=dim,
             max_capacity=max_capacity,
-            # Constructing DynamicEmbStorage directly bypasses the batched layer's
+            # Constructing ChainedStorage directly bypasses the batched layer's
             # planner/_create_score, so set init_capacity and the LFU evict
             # strategy explicitly (batched normally derives these).
             init_capacity=init_capacity if init_capacity is not None else max_capacity,
             bucket_capacity=128,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             evict_strategy=DynamicEmbEvictStrategy.LFU,
             score_function=score_function,
         )
     ]
-    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+    return ChainedStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
 
 
 def _read_score_blocks(storage, keys, tids):
     """Look up keys and gather their full [N, num_scores] score blocks."""
-    name = storage._state.score_policy.name
-    _, founds, idx = storage.key_index_map.lookup(
-        keys, tids, ScoreArg(name=name, policy=ScorePolicy.CONST)
-    )
-    assert torch.all(founds), "all keys must be present"
-    return storage.key_index_map.gather_score_blocks(0, idx)
+    rows = storage.index.lookup(keys, tids)
+    assert torch.all(rows >= 0), "all keys must be present"
+    return storage._state.key_index_map.gather_score_blocks(0, rows)
 
 
 @pytest.mark.parametrize(
@@ -289,7 +285,7 @@ def _read_score_blocks(storage, keys, tids):
     ids=["ts_first", "lfu_first"],
 )
 def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_strategy):
-    """DynamicEmbStorage dump -> load preserves BOTH LruLfu score words
+    """ChainedStorage dump -> load preserves BOTH LruLfu score words
     (timestamp and frequency), not just word 0. The checkpoint stores the two
     columns in the user's configured (logical) order, and load reorders them back
     into the physical device layout, so the round-trip is exact for either order."""
@@ -302,7 +298,9 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_str
     freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)  # varied
 
     src = _lru_lfu_storage(dim=dim, score_strategy=score_strategy)
-    src.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
+    # The chained index takes both words, physical [timestamp, frequency], as a block.
+    block = torch.stack([torch.full_like(freq_ref, 7), freq_ref], dim=1)
+    src.insert(keys, tids, values, scores=block.to(torch.uint64))
 
     # Device layout is always physical [timestamp, frequency] regardless of order.
     blocks_src = _read_score_blocks(src, keys, tids)
@@ -342,35 +340,6 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_str
     assert torch.equal(
         blocks_dst, blocks_src
     ), "dump/load must preserve both score words (timestamp + frequency)"
-
-
-def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
-    """Growing the table (_expand_tables_impl re-hashes keys into more buckets)
-    must preserve both LruLfu score words -- a single-value re-insert would reset
-    the frequency to 0."""
-    device = torch.cuda.current_device()
-    dim = 8
-    bc = 128
-    # Start with a single bucket, leave room to grow.
-    storage = _lru_lfu_storage(dim=dim, max_capacity=8 * bc, init_capacity=bc)
-    n = 80
-    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
-    tids = torch.zeros(n, dtype=torch.int64, device=device)
-    values = torch.randn(n, dim, dtype=torch.float32, device=device)
-    freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
-    storage.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
-
-    before = _read_score_blocks(storage, keys, tids)
-    assert torch.all(before[:, 1] == freq_ref)
-
-    # Rehash: grow the single logical table to 8 buckets; keys re-hash and are
-    # re-inserted, and copy_score_blocks must carry both words across.
-    _expand_tables_impl(storage._state, [True], [8 * bc])
-
-    after = _read_score_blocks(storage, keys, tids)
-    assert torch.equal(
-        after, before
-    ), "rehash must preserve both score words (timestamp + frequency)"
 
 
 # ---------------------------------------------------------------------------
@@ -598,22 +567,6 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
     )
 
 
-def test_lru_lfu_custom_score_function_via_create_table_state(current_device):
-    """Production path: score_strategy=(TIMESTAMP, LFU) + score_function through
-    create_table_state auto-registers the function (numba+nvJitLink) and threads a
-    nonzero score_fn_key to the table; without it the table uses the default
-    evictor (key 0)."""
-    default = _lru_lfu_storage(score_strategy=LRU_LFU_TS_FIRST)
-    assert default.key_index_map.num_scores_ == 2
-    assert default.key_index_map.score_fn_key_ == 0, "no score_function => key 0"
-
-    custom = _lru_lfu_storage(
-        score_strategy=LRU_LFU_TS_FIRST, score_function=_evict_high_freq_first
-    )
-    assert custom.key_index_map.num_scores_ == 2
-    assert custom.key_index_map.score_fn_key_ != 0, "score_function must register a key"
-
-
 def test_score_function_requires_compound(current_device):
     """score_function is only valid for the compound {TIMESTAMP, LFU} strategy."""
     with pytest.raises(ValueError):
@@ -660,94 +613,6 @@ def _lfu_decay_lfu_first(scores, cur_timestamp):
     # (TIMESTAMP, LFU). Indexes BOTH logical words, so it exercises both index
     # remaps (0->physical 1 AND 1->physical 0).
     return math.log(max(scores[0], 1)) + (cur_timestamp - scores[1]) * math.log(0.9)
-
-
-def test_lru_lfu_custom_score_function_batched_v2(current_device):
-    """End-to-end through BatchedDynamicEmbeddingTablesV2 with the compound
-    (LFU, TIMESTAMP) strategy (logical order != physical) + a custom score_function
-    that indexes BOTH logical words. Covers: the batched _create_score ->
-    create_table_state -> register_score_function wiring, and the logical->physical
-    remap of BOTH score indices under LFU-first. A whole-set oracle then verifies
-    the kernel evicts exactly the decayed-LFU-predicted set."""
-    from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-
-    device = torch.cuda.current_device()
-    bc = 128
-    opts = [
-        DynamicEmbTableOptions(
-            dim=8,
-            max_capacity=bc,
-            init_capacity=bc,
-            index_type=torch.int64,
-            embedding_dtype=torch.float32,
-            device_id=device,
-            bucket_capacity=bc,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
-            local_hbm_for_values=1024**3,
-            score_strategy=LRU_LFU_LFU_FIRST,  # logical != physical
-            score_function=_lfu_decay_lfu_first,
-        )
-    ]
-    bdebt = BatchedDynamicEmbeddingTablesV2(
-        table_names=["t0"], table_options=opts, feature_table_map=[0]
-    )
-    table = bdebt._storage.key_index_map
-    assert table.num_scores_ == 2
-    assert (
-        table.score_fn_key_ != 0
-    ), "batched (LFU,TIMESTAMP)+score_function must auto-register a nonzero key"
-    sname = table.score_names_[0]
-
-    def _sa(value, policy=ScorePolicy.LRU_LFU):
-        return ScoreArg(name=sname, value=value, policy=policy)
-
-    n = 90
-    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
-    tids = torch.zeros(n, dtype=torch.int64, device=device)
-    ones = torch.ones(n, dtype=torch.uint64, device=device)
-    ir = torch.empty(n, dtype=table.result_type, device=device).fill_(
-        InsertResult.INIT.value
-    )
-    idx = table.insert(keys, tids, _sa(ones), ir)
-
-    for i in range(n):
-        reps = 1 + (i * 7) % 5
-        one, one_tid, one_val = keys[i : i + 1], tids[i : i + 1], ones[i : i + 1]
-        for _ in range(reps):
-            table.lookup(one, one_tid, _sa(one_val))
-        torch.cuda.synchronize()
-
-    blk = table.gather_score_blocks(0, idx).cpu().numpy()
-    ts = blk[:, 0].astype(np.uint64)
-    freq = blk[:, 1].astype(np.float64)
-
-    n_new = 60
-    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
-    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
-    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
-    ir2 = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
-        InsertResult.INIT.value
-    )
-    _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
-        new_keys, new_tids, _sa(new_freq), ir2
-    )
-    m = int(num_evicted)
-    assert m == n + n_new - bc, "eviction count must be occupied + new - capacity"
-
-    # Same physical oracle as the (TIMESTAMP, LFU) case: a correct remap makes the
-    # LFU-first function compute the identical physical decayed-LFU score.
-    gamma = 0.9
-    recency = (ts - ts.min()).astype(np.float64)
-    rank = np.log(np.maximum(freq, 1.0)) + recency * (-math.log(gamma))
-    order = np.argsort(rank, kind="stable")
-    assert rank[order[m]] - rank[order[m - 1]] > 1e-6, "eviction boundary must not tie"
-    keys_cpu = keys.cpu().numpy()
-    predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
-    assert actual == predicted, (
-        "batched (LFU,TIMESTAMP) custom eviction must match the physical decayed-LFU "
-        "oracle (proves both logical->physical index remaps are correct)"
-    )
 
 
 def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
