@@ -56,17 +56,20 @@
 - 优化器的输入有两种：直接作用于存储里的行（行号加基址），或作用于已经读出的补齐缓冲；两种都用同一个布局对象描述，不再用 7 个散参数。
 - **一行的初始化 = initializer 填 embedding + `optimizer.init_states` 填状态**。初始状态归优化器。
 
-### 2.3 initializer、预初始化与 `RowAllocator`【已确定，待实现】
+### 2.3 initializer、预初始化与 `RowAllocator`【分配器、1:1 映射、预初始化（选项）已实现；默认路径未切换】
 
-- **不再支持 debug 初始化**（`debug_init` 那种按 key 取值的）。因此初始化只依赖行，不依赖 key，可以预先做。
-- initializer 是一套算法，输入是 `MixedDimBuffers`（的某些行）。
-- **预初始化**：创建表时不再逐个分配时初始化。`RowAllocator` 持有"干净行"和"脏行"两个栈：
-  - 新建表时只初始化一个前缀（一个水位），不是整张表（100GB 的 host 表一次初始化要很久）；
-  - `take(n)` 保证返回的行已初始化，干净行不够时按块补；
-  - 被淘汰释放的行进脏栈，攒到一定数量批量重新初始化。
-- **1:1 映射**：`RowAllocator` 支持传入 key 到 row 的 1:1 映射（key 就是行号）。配合 `bucket_capacity` 设到最大（整张表一个桶，容量等于行数），没有淘汰，DynamicEmb 和 TorchRec 的表在行的层面一一对应，可以逐行直接对比。
-- **`MixedDimBuffers` 的 set 接口**：按表设置一张表的 value（把 TorchRec 的权重灌进来）。表名由 `BatchedDynamicEmbeddingTablesV2` 处理：它提供一个按表名的 `set` 接口，把表名换成下标再调用 `MixedDimBuffers`；`MixedDimBuffers` 自己不记表名。
-- **和索引的关系**：现在空闲行栈在 `ChainedTables` 里，commit 的 kernel 直接从栈上取行。抽成独立的 `RowAllocator` 需要 commit 改成向它要行，会动 C++，所以放在最后。
+**已实现：**
+
+- **`RowAllocator`**（`storage/row_allocator.py`）：一张表的行由它分配。每表一个空闲行栈和栈顶，`take(skeys, stids, tstart)` 给排好序的待放 key 取行，`release` 还行，`grow` 扩容，`free_rows`、`row_capacity_of` 查询。索引（`ChainedTables`）只管把 key 放进槽，行从分配器取；公开方法（`release_rows`、`free_rows`、`row_capacity_of`）保持不变。C++ 一侧，`PoolView` 与 `TableView` 分开，`row_pool_take` 是单独入口，`chained_apply` 只负责放 key；仍然只有一次主机同步。以后换分配行的方式（FIFO、热窗口等）只改这个模块和它的 kernel。
+- **1:1 映射**：`DynamicEmbTableOptions.identity_row_mapping=True`。key 就是行号，要求单桶（`bucket_capacity` 不小于每个 rank 的行数），不淘汰，key 必须在 `[0, capacity)` 内，否则抛 `ValueError` 且什么也不写入；不支持 hybrid 存储。可以和普通表混在一个索引里（每表一个标志）。
+- **预初始化**：`DynamicEmbTableOptions.preinitialize_rows=True`（默认 `False`，`identity_row_mapping` 隐含它）。分配器分三部分管理行：干净行（已初始化，在栈上）、脏行（被释放，还留着旧值）、水位之后从没发出过的行。一步需要的干净行不够时，按块（默认 65536 行）初始化，先用脏行，再用新行；初始化由模块的 initializer 加 `optimizer.init_states` 完成，key 的位置传行号。identity 表在构建模块时整张表初始化。缓存路径里新 key 不再在缓存里就地初始化，而是在存储提交之后从它那一行读到缓存（从下一层来的值仍然覆盖）；HBM 直连路径只写下一层带来的值。debug 初始化只能用于 identity 表（那里 key 就是行）。不支持 hybrid 存储。
+
+**没有做的：**
+
+- **把预初始化变成唯一路径**：仓库里有 10 多个测试（pooled/sequence 的前向反向、table_row_wise 等）用 debug 初始化（`key % 100000`）和 TorchRec 对照，要先迁移到 identity 映射加 `MixedDimBuffers.set`，再翻默认值、删掉旧的就地初始化。所以现在是选项，默认关，现有路径与测试都不变。
+- **`MixedDimBuffers.set`**：按表设置一张表的 value（把 TorchRec 的权重灌进来）。表名由 `BatchedDynamicEmbeddingTablesV2` 处理：它提供一个按表名的 `set` 接口，把表名换成下标再调用 `MixedDimBuffers`；`MixedDimBuffers` 自己不记表名。
+- **脏行的重新初始化**现在在需要时同步做，没有放到另一个 stream 上异步做。
+- **分配策略**：评估（见 `host_row_exchange_exploration.md`）显示，按首次出现的顺序紧凑分配行、不先复用回收行（FIFO），在那个 benchmark 里能把 swap 从 6.28 ms 降到 2.73 ms，但该收益依赖 benchmark 重放同样的批次，真实从空表开始的表没有这个收益，所以没有做；做的话在 `RowAllocator` 里改栈的取放顺序。
 
 ### 2.4 准入（admitter）【调用点已并入存储】
 
@@ -147,7 +150,7 @@ PS、Hybrid、retain evicted keys 统一成接口相同的不同后端。它们�
 3. score 组件：先把 Python 侧收拢，kernel 接口不动
 4. `lower` 和 `EvictionSink`：拆 `ChainedStorage` 的第一刀
 5. checkpoint 三层
-6. `RowAllocator` 与预初始化、1:1 映射
+6. `RowAllocator`、预初始化（选项）、1:1 映射【已实现】；预初始化成为唯一路径、`MixedDimBuffers.set` 未做
 
 ## 四、待讨论
 
