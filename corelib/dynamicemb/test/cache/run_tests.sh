@@ -8,9 +8,10 @@
 # of each operation instead of two — but it does mean there is no longer a way
 # to check this tree without a device.
 #
-# What they cover: structure and protocol, one thread per operation. What they
-# still do not cover: the bucket lock under contention, which wants many threads
-# on one bucket and belongs in a test of its own.
+# What they cover: the value types (test_node_state.cpp), structure and protocol of the
+# map, one thread per operation (test_hashmap.cu), and the placement kernels under
+# contention on a device (gpu/test_gpu.cu). Not the bucket lock under contention, which
+# wants many threads on one bucket and belongs in a test of its own.
 #
 # Usage:  ./run_tests.sh [output-dir]
 set -euo pipefail
@@ -88,7 +89,11 @@ if ! command -v "$NVCC" >/dev/null 2>&1; then
   echo "CUDA toolkit. The .cpp tests above ran and are not a substitute." >&2
   exit "$status"
 fi
-for src in "$here"/test_*.cu; do
+# gpu/test_gpu.cu is the one that contends and races: many threads on one node, a release
+# overlapping an allocate, a pipeline of steps. CACHE_TEST_SCALE=n divides its step
+# counts by n; unset it is the full run. The sanitizer runs (racecheck, memcheck,
+# synccheck) are not here, they take long: see gpu/eos_job.sh.
+for src in "$here"/test_*.cu "$here"/gpu/test_*.cu; do
   name="$(basename "$src" .cu)"
   printf '=== %s ===\n' "$name"
   "$NVCC" "${flags[@]}" "$src" "${deps[@]}" -o "$out/$name"

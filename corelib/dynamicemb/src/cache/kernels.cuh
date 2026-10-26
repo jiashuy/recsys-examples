@@ -19,9 +19,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The bookkeeping kernels: which key lives in which node.
 //
 // Everything here decides *placement*. Nothing here moves an embedding row —
-// rows.cuh does, and none of this needs it. That split is deliberate rather than
-// incidental: placement is where all the concurrency is, and it can be run,
-// raced and checked on a device with a single integer standing in for a row.
+// the caller does, with the node id as the row number, and none of this needs it.
+// That split is deliberate rather than incidental: placement is where all the
+// concurrency is, and it can be run, raced and checked on a device with a single
+// integer standing in for a row.
 //
 // ---------------------------------------------------------------------------
 // Launch order
@@ -30,8 +31,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   lookup_pin          which keys are already resident, and hold them
 //   ---- allocate ----
 //   allocate            take a node per miss, and rebind it to the new key
-//   writeback, fill, publish   in rows.cuh: victim rows out, rows with a history in,
-//                       new keys' rows initialised by the caller in between
+//   (the caller)        victim rows out, rows with a history in, new keys' rows
+//                       initialised, in between
+//   publish_nodes       LOADING -> RESIDENT
 //   ---- forward, backward ----
 //   release             give the references back, and re-queue what went idle
 //
@@ -41,12 +43,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //                       (this and the next two are launched over every table at once)
 //   ---- backing insert ----
 //   find_nodes          which of the evicted keys are cached
-//   fetch_rows          in rows.cuh: takes the latest values off those nodes
+//   (the caller)        takes the latest values off those nodes
 //
 // A checkpoint, with the pipeline drained:
 //
 //   resident_slots      one slot per resident node, shaped like an eviction's
-//   writeback           in rows.cuh, unchanged: the copy is the same
+//   (the caller)        writes those rows back
 //   invalidate          drop those bindings; the node is empty, nothing to write back
 //
 // Two boundaries here are correctness requirements rather than launch-
@@ -101,7 +103,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace cache {
 
 // ---------------------------------------------------------------------------
-// What allocate hands to the row-moving kernels
+// What allocate hands to whatever moves the rows
 // ---------------------------------------------------------------------------
 //
 // One per miss. The node has already been rebound by the time this is read, so
@@ -343,10 +345,10 @@ __global__ void invalidate_kernel(const MapT* tables,
 // ---------------------------------------------------------------------------
 //
 // Writing every resident row back, for a checkpoint or any time the backing has to
-// hold the latest of everything. The copy is writeback_kernel's and is not
-// repeated: this builds what that takes for an eviction, one slot per resident
-// node with the node's own key as the victim, and the caller looks those keys up
-// in the backing for their row numbers exactly as it does for real victims.
+// hold the latest of everything. The copy is the caller's: this builds what a
+// write-back takes for an eviction, one slot per resident node with the node's
+// own key as the victim, and the caller looks those keys up in the backing for
+// their row numbers exactly as it does for real victims.
 //
 // Every resident node is written, whatever its references. A hot key that never
 // leaves the cache is the one whose backing copy is furthest behind, and a filter
@@ -398,9 +400,7 @@ __global__ void init_nodes_kernel(NodeT* nodes, int64_t n) {
   }
 }
 
-// LOADING -> RESIDENT for a list of nodes, after their rows are written. The same
-// as rows.cuh's publish_kernel, for a caller that holds node ids rather than the
-// slots allocate produced.
+// LOADING -> RESIDENT for a list of nodes, after their rows are written.
 template <typename MapT>
 __global__ void publish_nodes_kernel(const MapT* maps, const int64_t* offsets,
                                      const typename MapT::NodeId* node_ids) {

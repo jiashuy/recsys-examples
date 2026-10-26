@@ -653,7 +653,7 @@ flush(checkpoint)：
 
 成本：最坏情况整个缓存都要写，即 `C_t × D_t` 的 D2H。4M node × 1536 B ≈ 6 GB，按 20 GB/s 约 300 ms。
 
-**实现。** `resident_slots_kernel` 为每个 RESIDENT 节点生成一个槽位，节点自己的 key 当作受害者，格式与淘汰产生的槽位一致；调用方像对真正的受害者一样去 backing 查这些 key 的行号，然后直接交给 `writeback_kernel`，写回的拷贝不重复实现。同一个 kernel 数出仍持有引用的节点数（`referenced`），排空之后它必须为零，这就是上面的 Step 2。节点不论有没有引用都会被写，测试里专门核对了带着引用 flush 时被持有的 key 在 backing 里是最新的。
+**实现。** `resident_slots_kernel` 为每个 RESIDENT 节点生成一个槽位，节点自己的 key 当作受害者，格式与淘汰产生的槽位一致；调用方像对真正的受害者一样去 backing 查这些 key 的行号，再把行写回（现在由 `RowExchange` 和存储一侧做；原先 `rows.cuh` 里的 `writeback_kernel`、`fill_kernel`、`publish_kernel` 已随旧的搬行设计删除）。同一个 kernel 数出仍持有引用的节点数（`referenced`），排空之后它必须为零，这就是上面的 Step 2。节点不论有没有引用都会被写，带着引用 flush 时被持有的 key 在 backing 里是最新的，这一点现在由模块级的测试（`test_ps_tier.py`、`test_chained_prefetch.py`）核对。
 
 ### 9.6 崩溃一致性
 
