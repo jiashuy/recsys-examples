@@ -788,6 +788,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _create_cache_storage(self) -> None:
         self._cache: Optional[Cache] = None
+        self._external_storage: Optional[Storage] = None
         self._caching = any(option.caching for option in self._dynamicemb_options)
 
         for option in self._dynamicemb_options:
@@ -832,15 +833,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
-                # NO_EVICTION is incompatible with cache overflow (see create_table_state).
-                # Match HybridStorage: GPU cache uses TIMESTAMP/LRU; backing keeps NO_EVICTION.
-                if (
-                    self._dynamicemb_options[0].score_strategy
-                    == DynamicEmbScoreStrategy.NO_EVICTION
-                ):
-                    for cache_option in cache_options:
-                        cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
-                        cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
+                # The cache ranks by timestamp only; the backing storage is the
+                # full set and owns every key's score (and NO_EVICTION, which
+                # cache overflow rejects, see create_table_state).
+                for cache_option in cache_options:
+                    cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                    cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
 
                 self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
@@ -848,11 +846,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
                 PS = storage_options[0].external_storage
-                self._storage = (
-                    PS(storage_options, self._optimizer)
-                    if PS
-                    else DynamicEmbStorage(storage_options, self._optimizer)
-                )
+                self._storage = DynamicEmbStorage(storage_options, self._optimizer)
+                if PS:
+                    # The PS sits below the storage: the storage owns scores and
+                    # the freshest values, the PS only holds what it evicted.
+                    self._external_storage = PS(storage_options, self._optimizer)
                 self._storage_layout = (
                     StorageLayout.CACHING_PS if PS else StorageLayout.CACHING
                 )
@@ -1368,6 +1366,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 outstanding_keys_ref=self._prefetch_outstanding_keys
                 if self._cache is not None
                 else None,
+                external_storage=self._external_storage,
             )
         )
         self._update_score()

@@ -4017,7 +4017,7 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
                 if bool(in_backing.all()):
                     storage.insert(keys, tid, values, preserve_existing=True)
                 elif bool((~in_backing).all()):
-                    storage.insert(keys, tid, values, scores, preserve_existing=False)
+                    storage.insert(keys, tid, values, preserve_existing=False)
                 else:
                     ex_b = in_backing
                     nw_b = ~in_backing
@@ -4033,9 +4033,20 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
                             keys[nw_b],
                             tid[nw_b],
                             values[nw_b],
-                            scores[nw_b],
                             preserve_existing=False,
                         )
+            elif isinstance(storage, DynamicEmbStorage):
+                # The cache only holds timestamps; storage's score is the one
+                # that counts. A key it has keeps its score, one it lacks gets
+                # storage's own default rather than the cache's.
+                in_st = _find_keys(storage._state, keys, tid, const_lookup=True)[5]
+                if in_st.any():
+                    storage.insert(
+                        keys[in_st], tid[in_st], values[in_st], preserve_existing=True
+                    )
+                if not in_st.all():
+                    gone = ~in_st
+                    storage.insert(keys[gone], tid[gone], values[gone])
             else:
                 storage.insert(keys, tid, values, scores)
 
