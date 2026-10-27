@@ -29,6 +29,8 @@ from dynamicemb.key_value_table import (
     _find_keys,
     _flat_row_indices_for_value_load,
     _insert_and_evict_keys,
+    _select,
+    _write_back_evicted,
     eval_lookup,
     get_insert_score_arg,
     load_from_flat,
@@ -294,12 +296,6 @@ def _apply_admission(
         )
 
 
-def _select(values: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs -- without the
-    copy when ``rows`` is every row in order."""
-    return values if rows.numel() == values.size(0) else values[rows]
-
-
 def _load_storage_values(
     storage: DynamicEmbStorage,
     in_storage: torch.Tensor,
@@ -399,49 +395,6 @@ def _insert_into_storage(
     store_to_flat(st, slots, table_ids, values)
     if num_evicted > 0:
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
-
-
-def _write_back_evicted(
-    storage: DynamicEmbStorage,
-    next_tier: Optional[Storage],
-    keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    values: torch.Tensor,
-) -> None:
-    """Return what the cache evicted to the tier below it.
-
-    A key still in storage keeps its score, so only the value moves. One storage
-    has evicted since goes to ``next_tier``; with none it is dropped, kept as an
-    evicted key when storage retains them.
-    """
-    st = storage._state
-    in_storage = _find_keys(st, keys, table_ids, const_lookup=True)[5]
-    with torch.cuda.nvtx.range("op:flagged_compact"):
-        num_present, present, (present_keys, present_tids) = flagged_compact(
-            in_storage, [keys, table_ids]
-        )
-    with torch.cuda.nvtx.range("op:storage_insert"):
-        if num_present > 0:
-            storage.insert(
-                present_keys,
-                present_tids,
-                _select(values, present),
-                preserve_existing=True,
-            )
-        if num_present == keys.numel():
-            return
-        if num_present == 0:
-            gone_keys, gone_tids, gone_values = keys, table_ids, values
-        else:
-            with torch.cuda.nvtx.range("op:flagged_compact"):
-                _, gone, (gone_keys, gone_tids) = flagged_compact(
-                    ~in_storage, [keys, table_ids]
-                )
-            gone_values = values[gone]
-        if next_tier is not None:
-            next_tier.insert(gone_keys, gone_tids, gone_values)
-        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
-            _append_evicted(st, gone_keys, gone_tids, torch.tensor(gone_keys.numel()))
 
 
 def _prefetch_cache_path(

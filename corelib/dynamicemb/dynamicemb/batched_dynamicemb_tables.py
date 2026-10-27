@@ -1145,7 +1145,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def flush(self) -> None:
         if self._caching and self._cache is not None:
-            flush_cache(self._cache, self._storage)
+            flush_cache(self._cache, self._storage, self._external_storage)
 
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
@@ -1850,7 +1850,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"got {type(storage).__name__}"
             )
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
-            flush_cache(self._cache, storage)
+            flush_cache(self._cache, storage, self._external_storage)
         res = DeltaDumpResult()
         # One reference timestamp for the whole call: the age baseline for the
         # dumped timestamp score columns, and the returned current_score.
@@ -2052,10 +2052,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # After planning, so a rejected delta leaves the model exactly as it
             # was. Pushing dirty cache entries down first makes the storage copy
             # this replay is about to overwrite the authoritative one.
-            flush_cache(self._cache, storage)
-            # Flushing can grow and rehash the backing table. Revalidate the
-            # source slots after that layout-changing side effect, before any
-            # replay writes use the original plan.
+            flush_cache(self._cache, storage, self._external_storage)
+            # Flushing writes values only, but revalidate the source slots anyway
+            # before any replay writes use the original plan.
             plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()
