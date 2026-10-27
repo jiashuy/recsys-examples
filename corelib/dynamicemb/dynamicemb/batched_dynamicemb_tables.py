@@ -1270,6 +1270,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if not self.training:
+            if self._external_storage is not None:
+                raise RuntimeError(
+                    "Evaluation does not read external_storage: a key spilled to "
+                    "it would be treated as missing. Train with external_storage "
+                    "unset, or do not call eval() on this module."
+                )
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
             if isinstance(self._cache, DynamicEmbCache):
