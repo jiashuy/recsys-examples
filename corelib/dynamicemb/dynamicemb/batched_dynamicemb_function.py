@@ -299,35 +299,21 @@ def _select(rows: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
     return rows if selected.numel() == rows.size(0) else rows[selected]
 
 
-def _lookup_storage(
+def _load_storage_values(
     storage: DynamicEmbStorage,
-    unique_keys: torch.Tensor,
-    unique_table_ids: torch.Tensor,
-    accumulated_frequency: Optional[torch.Tensor],
-    miss_pos: torch.Tensor,
+    in_storage: torch.Tensor,
+    scores: torch.Tensor,
+    slots: torch.Tensor,
     miss_tids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Look every key up in ``storage``; load values for the cache misses.
+) -> torch.Tensor:
+    """Values of the misses, from the rows a key-only storage lookup found.
 
-    Storage is the only place scores live, so the key-only lookup covers *all*
-    keys (hits included) and updates their scores there without moving a value.
-    Returns ``(in_storage, values)`` over the misses (``miss_pos`` are their
-    positions in ``unique_keys``). A miss storage lacks has a -1 row, which the
-    load skips: its ``values`` row is left unwritten.
+    A miss storage lacks has a -1 row, which the load skips: its row is left
+    unwritten.
     """
     st = storage._state
-    (_, _, _, _, _, founds, scores, slots) = _find_keys(
-        st,
-        unique_keys,
-        unique_table_ids,
-        lfu_accumulated_frequency=accumulated_frequency,
-    )
-    in_storage = founds[miss_pos]
-    rows = _flat_row_indices_for_value_load(
-        st, in_storage, scores[miss_pos], slots[miss_pos]
-    )
-    values = load_from_flat(st, rows, miss_tids, copy_mode=CopyMode.VALUE)
-    return in_storage, values
+    rows = _flat_row_indices_for_value_load(st, in_storage, scores, slots)
+    return load_from_flat(st, rows, miss_tids, copy_mode=CopyMode.VALUE)
 
 
 def _lookup_next_tier(
@@ -420,30 +406,36 @@ def _write_back_evicted(
 ) -> None:
     """Return what the cache evicted to the tier below it.
 
-    A key still in storage keeps its score, so only the value moves; one
-    storage has since evicted goes on to ``next_tier``.
+    A key still in storage keeps its score, so only the value moves. One storage
+    has evicted since goes to ``next_tier``; with none it is dropped, kept as an
+    evicted key when storage retains them.
     """
+    st = storage._state
+    in_storage = _find_keys(st, keys, table_ids, const_lookup=True)[5]
+    present = in_storage.nonzero().flatten()
     with torch.cuda.nvtx.range("op:storage_insert"):
-        if next_tier is None:
-            # Storage is the full set: every evicted key is still in it.
-            storage.insert(keys, table_ids, values, preserve_existing=True)
-            return
-        in_storage = _find_keys(storage._state, keys, table_ids, const_lookup=True)[5]
-        if _bool_item(in_storage.any()):
+        if present.numel() > 0:
             storage.insert(
-                keys[in_storage],
-                table_ids[in_storage],
-                values[in_storage],
+                _select(keys, present),
+                _select(table_ids, present),
+                _select(values, present),
                 preserve_existing=True,
             )
-        if not _bool_item(in_storage.all()):
-            gone = ~in_storage
+        if present.numel() == keys.numel():
+            return
+        gone = ~in_storage
+        if next_tier is not None:
             next_tier.insert(keys[gone], table_ids[gone], values[gone])
+        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
+            gone_keys = keys[gone]
+            _append_evicted(
+                st, gone_keys, table_ids[gone], torch.tensor(gone_keys.numel())
+            )
 
 
 def _prefetch_cache_path(
     cache: DynamicEmbCache,
-    storage: Storage,
+    storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
     max_emb_dim: int,
@@ -457,8 +449,9 @@ def _prefetch_cache_path(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Cache prefetch with counter protection and overflow buffer.
 
-    ``storage`` is the tier that owns scores and the freshest values; the cache
-    above it ranks by timestamp only. When ``external_storage`` is given (a
+    ``storage`` is the tier that owns every key's score; the cache above it
+    ranks by timestamp only, and holds the freshest value of a key until it is
+    written back. When ``external_storage`` is given (a
     score-less store below ``storage``, e.g. a PS) it holds the keys ``storage`` has
     evicted: keys missing from ``storage`` are fetched from it, and what
     ``storage`` evicts is spilled to it.
@@ -490,7 +483,18 @@ def _prefetch_cache_path(
         if found_slots.numel() > 0:
             cache.increment_counter(found_slots, unique_table_ids[founds])
 
-        # 2. The misses
+        # 2. Storage is the only place scores live: a key-only lookup of *every*
+        # key -- hits included, and even when nothing missed -- updates its score
+        # there without moving a value. The cache only ranks by timestamp.
+        with torch.cuda.nvtx.range("op:storage_find"):
+            (_, _, _, _, _, st_founds, st_scores, st_slots) = _find_keys(
+                storage._state,
+                unique_keys,
+                unique_table_ids,
+                lfu_accumulated_frequency=accumulated_frequency,
+            )
+
+        # 3. The misses
         with torch.cuda.nvtx.range("op:flagged_compact"):
             h_num_miss, miss_pos, (miss_keys, miss_tids) = flagged_compact(
                 ~founds, [unique_keys, unique_table_ids]
@@ -503,22 +507,17 @@ def _prefetch_cache_path(
             else None
         )
 
-        # 3. Where each miss lives: storage, the tier below it, or nowhere (new).
-        # ``values`` holds the first two's rows; new ones are filled in at 5.
-        with torch.cuda.nvtx.range("op:storage_find"):
-            in_storage, values = _lookup_storage(
-                storage,
-                unique_keys,
-                unique_table_ids,
-                accumulated_frequency,
-                miss_pos,
-                miss_tids,
-            )
+        # 4. Where each miss lives: storage, the tier below it, or nowhere (new).
+        # ``values`` holds the first two's rows; new ones are filled in at 6.
+        in_storage = st_founds[miss_pos]
+        values = _load_storage_values(
+            storage, in_storage, st_scores[miss_pos], st_slots[miss_pos], miss_tids
+        )
         in_next = _lookup_next_tier(
             external_storage, miss_keys, miss_tids, in_storage, values
         )
 
-        # 4. Admit the new ones (a key from the tier below was admitted before)
+        # 5. Admit the new ones (a key from the tier below was admitted before)
         is_new = ~(in_storage | in_next)
         admitted = is_new.clone()
         non_admitted_positions: Optional[torch.Tensor] = None
@@ -540,7 +539,7 @@ def _prefetch_cache_path(
         if into_cache.numel() == 0:
             return slot_indices, non_admitted_positions
 
-        # 5. Initialize the admitted-new rows, and put everything storage lacks
+        # 6. Initialize the admitted-new rows, and put everything storage lacks
         # into it -- with its score -- before the cache sees it.
         new = admitted.nonzero().flatten()
         if new.numel() > 0:
@@ -565,7 +564,7 @@ def _prefetch_cache_path(
                     _select(miss_freq, into_storage) if miss_freq is not None else None,
                 )
 
-        # 6. Bring the keys into the cache, ranked by timestamp only
+        # 7. Bring the keys into the cache, ranked by timestamp only
         cache_tids = _select(miss_tids, into_cache)
         with torch.cuda.nvtx.range("op:cache_insert_evict"):
             (
@@ -577,7 +576,7 @@ def _prefetch_cache_path(
                 evicted_tids,
             ) = cache.insert_and_evict(_select(miss_keys, into_cache), cache_tids, None)
 
-        # 7. What it evicted: read before the slots are overwritten, then write back
+        # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):
             evicted_values = load_from_flat(
                 state, evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
@@ -589,7 +588,7 @@ def _prefetch_cache_path(
                 storage, external_storage, evicted_keys, evicted_tids, evicted_values
             )
 
-        # 8. Counter & slot mapping
+        # 9. Counter & slot mapping
         cache.increment_counter(cache_slots, cache_tids)
         slot_indices[_select(miss_pos, into_cache)] = cache_slots
         return slot_indices, non_admitted_positions
