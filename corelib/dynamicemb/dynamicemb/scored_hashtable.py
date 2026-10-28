@@ -654,13 +654,18 @@ class LinearBucketTable(ScoredHashTable):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score: ScoreArg,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_slots: bool = False,
+    ) -> Tuple:
         """
         Lookup keys in the table. Score is optional input for Assign/Accumulate policies.
         Args:
             table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
+            return_slots: also return the hash slots as a fourth element. For a
+                table that stores rows ``indices`` are rows, but the reference
+                counters sit beside the hash table and are keyed by slot.
         Returns:
-            (score_out, founds, indices): score tensor (int64), found mask, indices.
+            (score_out, founds, indices): score tensor (int64), found mask, indices;
+            plus ``slots`` when asked.
         """
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
@@ -675,6 +680,8 @@ class LinearBucketTable(ScoredHashTable):
             policy,
             num_scores=num_scores,
         )
+        if return_slots:
+            return score_out, founds, self._rows_of(indices, table_ids, False), indices
         return score_out, founds, self._rows_of(indices, table_ids, False)
 
     def insert(
@@ -685,6 +692,7 @@ class LinearBucketTable(ScoredHashTable):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         collect_evicted: bool = False,
+        return_slots: bool = False,
     ):
         """
         Keys have to be unique.
@@ -696,6 +704,8 @@ class LinearBucketTable(ScoredHashTable):
             evicted_* tensors are sized at the batch upper bound (slice to
             ``num_evicted``). Used by the last-tier retain-evicted-keys path.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
+        With ``return_slots`` the hash slots follow as the last element of what is
+        returned (they are the indices unless the table stores rows).
         """
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
@@ -709,11 +719,9 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            return self._rows_of(
-                self._deterministic_insert(keys, table_ids, score_value, policy),
-                table_ids,
-                True,
-            )
+            slots = self._deterministic_insert(keys, table_ids, score_value, policy)
+            rows = self._rows_of(slots, table_ids, True)
+            return (rows, slots) if return_slots else rows
 
         if collect_evicted:
             indices, *rest = table_insert_collect_evicted(
@@ -731,7 +739,8 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores=num_scores,
                 score_fn_key=self.score_fn_key_,
             )
-            return (self._rows_of(indices, table_ids, True), *rest)
+            rows = self._rows_of(indices, table_ids, True)
+            return (rows, *rest, indices) if return_slots else (rows, *rest)
 
         indices = table_insert(
             self.table_storage_,
@@ -748,7 +757,8 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
         )
-        return self._rows_of(indices, table_ids, True)
+        rows = self._rows_of(indices, table_ids, True)
+        return (rows, indices) if return_slots else rows
 
     def insert_and_evict(
         self,

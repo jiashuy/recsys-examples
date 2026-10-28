@@ -1400,17 +1400,14 @@ def _find_keys(
     lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     *,
     const_lookup: bool = False,
-) -> Tuple[
-    int,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Key-only find: lookup in hash table, return missing info + slot indices."""
+    return_slots: bool = False,
+) -> Tuple:
+    """Key-only find: lookup in hash table, return missing info + indices.
+
+    The indices are value rows for a table that stores them, hash slots otherwise.
+    With ``return_slots`` the hash slots follow as a ninth element: the reference
+    counters are keyed by slot.
+    """
     if unique_keys.dtype != state.key_index_map.key_type:
         unique_keys = unique_keys.to(state.key_index_map.key_type)
 
@@ -1433,12 +1430,19 @@ def _find_keys(
             torch.empty(batch, dtype=torch.bool, device=device),
             torch.empty(batch, dtype=torch.int64, device=device),
             torch.empty(batch, dtype=torch.int64, device=device),
+            *((torch.empty(batch, dtype=torch.int64, device=device),) * return_slots),
         )
 
     km = state.key_index_map
+    slots = None
     if getattr(km, "enable_overflow_", False):
         score_out, founds, indices = km.lookup_with_overflow(
             unique_keys, table_ids, score_arg
+        )
+        slots = indices  # a cache keeps slot == row
+    elif return_slots:
+        score_out, founds, indices, slots = km.lookup(
+            unique_keys, table_ids, score_arg, return_slots=True
         )
     else:
         score_out, founds, indices = km.lookup(unique_keys, table_ids, score_arg)
@@ -1462,6 +1466,7 @@ def _find_keys(
         founds,
         score_out,
         indices,
+        *((slots,) * return_slots),
     )
 
 

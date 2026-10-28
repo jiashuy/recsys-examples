@@ -621,8 +621,9 @@ def _prefetch_hbm_direct_path(
     differ -- rows are handed out by a per-table auto-increment counter while
     slots come from the key's hash, and the key map is sized
     ``1 / max_load_factor`` times the value buffer, so a slot can point past the
-    end of it. Every other strategy returns the slot tensor itself as the rows,
-    so the caller always gets something it can address values with.
+    end of it -- and so they do for a table that stores a row per key. Any other
+    table returns the slot tensor itself as the rows, so the caller always gets
+    something it can address values with.
     """
     with torch.cuda.nvtx.range("_prefetch_hbm_direct_path"):
         state = storage._state
@@ -643,15 +644,20 @@ def _prefetch_hbm_direct_path(
                 _,
                 score_out,
                 indices,
+                slot_indices,
             ) = _find_keys(
                 state,
                 unique_keys,
                 unique_table_ids,
                 lfu_accumulated_frequency=accumulated_frequency,
+                return_slots=True,
             )
 
-        found_mask = indices >= 0
-        found_slots = indices[found_mask]
+        # ``indices`` are rows for a table that stores them, hash slots otherwise,
+        # and ``slot_indices`` the hash slots either way (the same tensor when the
+        # row is the slot). The ref counter is keyed by slot.
+        found_mask = slot_indices >= 0
+        found_slots = slot_indices[found_mask]
         if found_slots.numel() > 0:
             storage.increment_counter(found_slots, unique_table_ids[found_mask])
 
@@ -668,7 +674,7 @@ def _prefetch_hbm_direct_path(
         )
 
         if h_num_missing == 0:
-            return indices, None, rows
+            return slot_indices, None, rows
 
         # Determine admission for missing keys
         non_admitted_positions: Optional[torch.Tensor] = None
@@ -734,50 +740,54 @@ def _prefetch_hbm_direct_path(
                         num_evicted,
                         evicted_keys,
                         evicted_table_ids,
+                        new_slots,
                     ) = state.key_index_map.insert(
                         admitted_keys,
                         admitted_tids,
                         score_arg,
                         collect_evicted=True,
+                        return_slots=True,
                     )
                     _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
                 else:
-                    new_indices = state.key_index_map.insert(
+                    new_indices, new_slots = state.key_index_map.insert(
                         admitted_keys,
                         admitted_tids,
                         score_arg,
+                        return_slots=True,
                     )
-            # The insert returns the hash slot; NO_EVICTION's value row is the
-            # score it just assigned. Keep both: the counter is indexed by slot,
-            # the value buffer by row.
+            # The insert returns rows for a table that stores them and hash slots
+            # otherwise, and always the slots as well; NO_EVICTION's value row is
+            # the score it just assigned. Keep both: the counter is indexed by
+            # slot, the value buffer by row.
             new_rows = (
                 score_arg.value.to(torch.int64) if is_no_eviction else new_indices
             )
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(state, new_rows, admitted_tids, init_values)
 
-            inserted_mask = new_indices >= 0
+            inserted_mask = new_slots >= 0
             if inserted_mask.any():
                 storage.increment_counter(
-                    new_indices[inserted_mask],
+                    new_slots[inserted_mask],
                     admitted_tids[inserted_mask],
                 )
 
-            indices[admitted_unique_positions] = new_indices
-            # Skipped while ``rows`` aliases ``indices``: the write above already
-            # covered it. Testing identity rather than ``is_no_eviction`` keeps
-            # this correct even if ``rows`` ever stops being an alias -- it would
-            # simply be filled explicitly with the same values.
-            if rows is not indices:
+            slot_indices[admitted_unique_positions] = new_slots
+            # Skipped while ``rows`` aliases ``slot_indices``: the write above
+            # already covered it. Testing identity rather than a flag keeps this
+            # correct whenever ``rows`` is a separate tensor (NO_EVICTION, or a
+            # table that stores rows): it is then filled explicitly.
+            if rows is not slot_indices:
                 rows[admitted_unique_positions] = new_rows
 
         # Non-admitted keys: ensure slot_indices = -1
         if non_admitted_positions is not None:
-            indices[non_admitted_positions] = -1
-            if rows is not indices:
+            slot_indices[non_admitted_positions] = -1
+            if rows is not slot_indices:
                 rows[non_admitted_positions] = -1
 
-        return indices, non_admitted_positions, rows
+        return slot_indices, non_admitted_positions, rows
 
 
 def dynamicemb_prefetch(
