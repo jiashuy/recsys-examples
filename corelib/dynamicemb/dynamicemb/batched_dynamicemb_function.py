@@ -48,6 +48,7 @@ from dynamicemb_extensions import (
     get_table_range,
     reduce_grads,
     segmented_unique_cuda,
+    select_insert_failed_values,
 )
 
 
@@ -397,6 +398,11 @@ def _insert_into_storage(
         evicted_values = load_from_flat(
             st, evicted_slots, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
+        # A key the storage refused (e.g. its bucket is full and the score does
+        # not beat any stored one) comes back as an "evicted" row with a negative
+        # slot: load_from_flat left its value unwritten, so take the key's own
+        # input value instead, as HybridStorage.insert does.
+        select_insert_failed_values(evicted_slots, values, evicted_values)
     store_to_flat(st, slots, table_ids, values)
     if num_evicted > 0:
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
@@ -554,7 +560,7 @@ def _prefetch_cache_path(
                     external_storage,
                     st_keys,
                     st_tids,
-                    _select(values, into_storage),
+                    _select(values, into_storage, num_st == values.size(0)),
                     st_freq,
                 )
 
@@ -575,7 +581,12 @@ def _prefetch_cache_path(
                 state, evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
             )
         with torch.cuda.nvtx.range("op:store_to_flat"):
-            store_to_flat(state, cache_slots, cache_tids, _select(values, into_cache))
+            store_to_flat(
+                state,
+                cache_slots,
+                cache_tids,
+                _select(values, into_cache, num_cache == values.size(0)),
+            )
         if num_evicted > 0:
             _write_back_evicted(
                 storage, external_storage, evicted_keys, evicted_tids, evicted_values

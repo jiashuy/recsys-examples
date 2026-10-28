@@ -3901,10 +3901,15 @@ class HybridStorage(Storage):
 # ---------------------------------------------------------------------------
 
 
-def _select(values: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs -- without the
-    copy when ``rows`` is every row in order."""
-    return values if rows.numel() == values.size(0) else values[rows]
+def _select(values: torch.Tensor, rows: torch.Tensor, all_rows: bool) -> torch.Tensor:
+    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs.
+
+    ``all_rows`` says the caller's mask kept every row; ``flagged_compact`` emits
+    its index in ascending order, so ``rows`` is then the identity and the gather
+    is skipped. The row count alone cannot say that: an index of the same length
+    may still permute the rows.
+    """
+    return values if all_rows else values[rows]
 
 
 def _write_back_evicted(
@@ -3931,7 +3936,7 @@ def _write_back_evicted(
             storage.insert(
                 present_keys,
                 present_tids,
-                _select(values, present),
+                _select(values, present, num_present == keys.numel()),
                 preserve_existing=True,
             )
         if num_present == keys.numel():
