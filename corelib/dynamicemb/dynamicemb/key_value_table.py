@@ -735,6 +735,9 @@ def _expand_tables_impl(
         # Preserve the eviction routing (default Lex or custom score_function)
         # across rehash.
         score_fn_key=state.key_index_map.score_fn_key_,
+        # And whether a key keeps a value row of its own: the expansion below
+        # carries rows when it does, and moves values by slot when it does not.
+        use_rows=state.key_index_map.use_rows_,
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:
