@@ -1750,6 +1750,17 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
         del os.environ["DEMB_DETERMINISM_MODE"]
 
 
+def _unique_table_keys(indices, offsets, feature_table_map):
+    """The unique (table, key) pairs a batch looks up, over all its features."""
+    batch_size = (offsets.numel() - 1) // len(feature_table_map)
+    idx, off = indices.tolist(), offsets.tolist()
+    pairs = set()
+    for feature, table in enumerate(feature_table_map):
+        begin, end = off[feature * batch_size], off[(feature + 1) * batch_size]
+        pairs.update((table, key) for key in idx[begin:end])
+    return pairs
+
+
 @pytest.mark.parametrize(
     "opt_type,opt_params",
     [
@@ -1876,6 +1887,11 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     ).to(key_type)
     offsetsB = torch.tensor([0, 2, 3, 5, 6, 6, 9, 11, 12], device=device).to(key_type)
 
+    # What a prefetch looks the cache up with: the unique (table, key) pairs of
+    # the batch. The cache holds all of them at once, so nothing is evicted.
+    keys_A = _unique_table_keys(indicesA, offsetsA, feature_table_map)
+    keys_B = _unique_table_keys(indicesB, offsetsB, feature_table_map)
+
     # stream capture will bring a cudaMalloc.
     with torch.cuda.stream(forward_stream):
         indicesB + 1
@@ -1905,11 +1921,11 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
 
         cache = bdeb.cache
         if cache is not None:
-            # Prefetch is what looks the cache up, and it starts cold, so only
-            # the bookkeeping can be checked: every lookup is counted.
+            # Prefetch is the only thing that looks the cache up, and a cold
+            # cache holds none of A's keys; cache_metrics reports the last lookup.
             metrics = cache.cache_metrics
-            assert metrics[0].item() > 0
-            assert metrics[1].item() <= metrics[0].item()
+            assert metrics[0].item() == len(keys_A)
+            assert metrics[1].item() == 0
 
     with torch.no_grad():
         bdeb.flush()
@@ -1948,11 +1964,11 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
 
         cache = bdeb.cache
         if cache is not None:
-            # Prefetch is what looks the cache up, and it starts cold, so only
-            # the bookkeeping can be checked: every lookup is counted.
+            # The last prefetch is B; the cache holds A and nothing else, so
+            # only the keys B shares with A hit.
             metrics = cache.cache_metrics
-            assert metrics[0].item() > 0
-            assert metrics[1].item() <= metrics[0].item()
+            assert metrics[0].item() == len(keys_B)
+            assert metrics[1].item() == len(keys_A & keys_B)
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
