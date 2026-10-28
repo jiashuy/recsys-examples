@@ -996,3 +996,31 @@ def test_replay_removes_a_key_the_source_evicted_for_one_it_then_erased(
     assert torch.equal(dst_kim.keys_, src_kim.keys_)
     assert torch.equal(dst_kim.rows_, src_kim.rows_)
     assert torch.equal(dst_kim.bucket_sizes, src_kim.bucket_sizes)
+
+
+def test_an_unretained_erase_taints_only_its_own_table(current_device):
+    """One storage holds several logical tables, and an erase that was not
+    retained spoils the table it was on, not the others: a delta of the other
+    table still replays."""
+    device = torch.device(f"cuda:{current_device}")
+    src = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+    dst = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+
+    keys = list(range(1001, 1101))
+    indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) * 2 + 1, dtype=torch.int64, device=device)
+    src(indices, offsets)
+    torch.cuda.synchronize()
+
+    # Erase from t_0 only, without retaining it.
+    src._storage.erase_keys(0, torch.tensor(keys[:1], dtype=torch.int64, device=device))
+
+    delta = src.incremental_dump({"t_0": 0, "t_1": 0})
+    assert [m["erase_untracked"] for m in delta.meta] == [True, False]
+
+    with pytest.raises(ValueError, match="erased keys without retaining"):
+        dst.replay_increment(delta)
+
+    only_t1 = src.incremental_dump({"t_1": 0})
+    assert only_t1.meta[0]["erase_untracked"] is False
+    assert dst.replay_increment(only_t1)["t_1"].upserted == len(keys)

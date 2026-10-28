@@ -18,7 +18,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch  # usort:skip
@@ -455,11 +455,13 @@ class DynamicEmbTableState:
     # recreates those slots, including for keys it never held.
     erased_slot_chunks: List[torch.Tensor] = field(default_factory=list)
     erased_slot_tid_chunks: List[torch.Tensor] = field(default_factory=list)
-    # Set once a table that stores rows has erased keys without retaining them:
+    # The logical tables that stored rows and erased keys without retaining them:
     # those slots were left reclaimed with their rows and nothing reports them,
-    # so no delta from this table can be replayed exactly any more. Sticky -- a
-    # replica built from earlier deltas cannot be brought back in line.
-    erase_untracked: bool = False
+    # so no delta from such a table can be replayed exactly any more. Sticky -- a
+    # replica built from earlier deltas cannot be brought back in line. Per
+    # table: the state covers every logical table of a storage, and one table's
+    # untracked erase says nothing about the others.
+    erase_untracked_tables: Set[int] = field(default_factory=set)
 
 
 def create_table_state(
@@ -2459,7 +2461,7 @@ def _erase_state_keys(
         and state.key_index_map.use_rows_
         and EvictedItemMode.RETAIN_KEY not in mode
     ):
-        state.erase_untracked = True
+        state.erase_untracked_tables.add(table_id)
     return num_removed
 
 
@@ -3173,7 +3175,7 @@ class DynamicEmbStorage(Storage):
         A table that stores a row per key leaves each erased slot reclaimed with
         its row, and only a retained erase (``RETAIN_KEY``) lets an incremental
         dump tell a replica to recreate it. Erasing without it is allowed, but
-        marks the table (:attr:`erase_untracked`): a delta dumped from it can no
+        marks the table (:meth:`erase_untracked`): a delta dumped from it can no
         longer be replayed exactly, and ``replay_increment`` refuses one.
         ``from_replay`` is for a replica applying a delta's removals, which are
         not this table's own to report.
@@ -3182,11 +3184,10 @@ class DynamicEmbStorage(Storage):
             self._state, table_id, keys, mode, track_untracked=not from_replay
         )
 
-    @property
-    def erase_untracked(self) -> bool:
-        """Whether keys were erased without being retained (see
-        ``DynamicEmbTableState.erase_untracked``); sticky."""
-        return self._state.erase_untracked
+    def erase_untracked(self, table_id: int) -> bool:
+        """Whether keys of ``table_id`` were erased without being retained (see
+        ``DynamicEmbTableState.erase_untracked_tables``); sticky."""
+        return table_id in self._state.erase_untracked_tables
 
     def restore_reclaimed_slots(self, table_id: int, slot_index: Tensor) -> None:
         """Recreate the reclaimed slots a delta reports, with their rows.

@@ -1942,7 +1942,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "row_capacity": self._row_capacity_of(storage, table_id),
                     "num_rows": num_rows,
                     "erased_slot_index": erased_slot_index,
-                    "erase_untracked": bool(getattr(storage, "erase_untracked", False)),
+                    "erase_untracked": self._erase_untracked_of(storage, table_id),
                     "bucket_capacity": self._bucket_capacity_of(storage),
                     "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
@@ -2433,6 +2433,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if pg is not None:
             out = _all_gather_evicted_keys(out, pg)
         return out.cpu()
+
+    @staticmethod
+    def _erase_untracked_of(
+        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+    ) -> bool:
+        """Whether ``table_id`` erased keys without retaining them -- tracked per
+        logical table, so one table's untracked erase does not taint another's
+        delta. ``HybridStorage`` does not store rows, so never."""
+        if isinstance(storage, DynamicEmbStorage):
+            return storage.erase_untracked(table_id)
+        return False
 
     @staticmethod
     def _num_rows_of(
