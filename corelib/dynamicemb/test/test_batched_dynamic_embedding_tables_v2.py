@@ -3703,3 +3703,28 @@ def test_caching_ps_spills_storage_evictions():
 
     assert ps.size() > 0, "storage evictions never reached the PS"
     torch.testing.assert_close(lookup(first), ref)
+
+
+def test_caching_ps_rejects_no_eviction():
+    """NO_EVICTION storage expands instead of evicting, so a PS below it is refused."""
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.NO_EVICTION,
+        caching=True,
+        local_hbm_for_values=1024,
+        external_storage=PyDictStorage,
+    )
+    with pytest.raises(NotImplementedError):
+        BatchedDynamicEmbeddingTablesV2(
+            table_names=["t0"],
+            table_options=[options],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            optimizer=EmbOptimType.SGD,
+            use_index_dedup=True,
+            learning_rate=0.1,
+        )

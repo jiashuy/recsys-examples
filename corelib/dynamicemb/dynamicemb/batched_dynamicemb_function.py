@@ -379,6 +379,11 @@ def _insert_into_storage(
     if next_tier is None:
         storage.insert(keys, table_ids, values, scores)
         return
+    # NO_EVICTION is deliberately not handled below: its storage never evicts
+    # (it expands instead), so there is nothing to spill, and ``evicted_slots``
+    # are hash slots rather than value rows (NO_EVICTION keeps the row in the
+    # score), so loading by them would read the wrong rows. The tables module
+    # rejects NO_EVICTION together with an ``external_storage``.
     st = storage._state
     (
         slots,

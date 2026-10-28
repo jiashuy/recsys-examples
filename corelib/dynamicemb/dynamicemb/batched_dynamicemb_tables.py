@@ -846,6 +846,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
                 PS = storage_options[0].external_storage
+                if (
+                    PS
+                    and storage_options[0].score_strategy
+                    == DynamicEmbScoreStrategy.NO_EVICTION
+                ):
+                    # NO_EVICTION storage never evicts (it expands instead), so
+                    # nothing would ever spill to the PS; see _insert_into_storage.
+                    raise NotImplementedError(
+                        "NO_EVICTION is not supported with external_storage: the "
+                        "storage expands instead of evicting, so a PS below it "
+                        "would never be used."
+                    )
                 self._storage = DynamicEmbStorage(storage_options, self._optimizer)
                 if PS:
                     # The PS sits below the storage: the storage owns scores and
