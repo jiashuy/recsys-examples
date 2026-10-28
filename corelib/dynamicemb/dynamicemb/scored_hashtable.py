@@ -851,6 +851,10 @@ class LinearBucketTable(ScoredHashTable):
         )
         score_value, policy = self._parse_score(score)
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            # The deterministic helper reads and writes one score word per key.
+            assert (
+                self.num_scores_ == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             slots = self._deterministic_insert(keys, table_ids, score_value, policy)
         else:
             slots = table_insert(
