@@ -1854,6 +1854,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
+            _all_gather_by_rank,
         )
 
         # A table-row-wise kernel exists only on its shard group's ranks, so a
@@ -1909,13 +1910,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # Always drained: recording an erase is the erase call's decision,
             # so there is no table setting to gate on here.
             er = self._drain_retained(storage, "pop_erased_keys", True, table_id, pg)
-            # Local to this rank, like ``num_rows``: a slot belongs to the rank's
-            # own table, and the gathered keys do not say which rank held them.
-            erased_slot_index = (
-                storage.pop_erased_slot_index(table_id).cpu()
-                if self._num_rows_of(storage, table_id) is not None
-                else None
-            )
+            # What a rank hands out and erases belongs to its own table, while the
+            # per-key columns are gathered across ranks and handed to every
+            # receiver. So these go out by source rank, and a receiver picks its
+            # own entry (see ``_for_this_rank``).
+            local_num_rows = self._num_rows_of(storage, table_id)
+            if local_num_rows is None:
+                num_rows, erased_slot_index = None, None
+            else:
+                num_rows = [
+                    int(t.item())
+                    for t in _all_gather_by_rank(
+                        torch.tensor([local_num_rows], dtype=torch.int64), pg
+                    )
+                ]
+                erased_slot_index = _all_gather_by_rank(
+                    storage.pop_erased_slot_index(table_id), pg
+                )
             res.table_names.append(table_name)
             res.keys.append(keys_cat)
             res.values.append(values_cat)
@@ -1929,7 +1940,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "slot_index": slot_index,
                     "current_capacity": self._capacity_of(storage, table_id),
                     "row_capacity": self._row_capacity_of(storage, table_id),
-                    "num_rows": self._num_rows_of(storage, table_id),
+                    "num_rows": num_rows,
                     "erased_slot_index": erased_slot_index,
                     "erase_untracked": bool(getattr(storage, "erase_untracked", False)),
                     "bucket_capacity": self._bucket_capacity_of(storage),
@@ -2095,6 +2106,27 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ts = device_timestamp()
         return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}
 
+    def _for_this_rank(self, entries: Optional[List], table_name: str):
+        """This rank's entry of a field a delta carries by source rank.
+
+        The dump gathers the per-key columns across the group, so every receiver
+        holds all of them, while a field such as the row counter belongs to one
+        source rank's table. A gathered delta has one entry per rank, and this
+        rank takes its own, the one that dumped the keys it owns; one that was
+        not gathered has a single entry, this rank's.
+        """
+        if entries is None:
+            return None
+        if len(entries) == self._shard_world_size:
+            return entries[self._shard_index]
+        if len(entries) == 1:
+            return entries[0]
+        raise ValueError(
+            f"replay_increment: delta for table '{table_name}' carries "
+            f"{len(entries)} per-rank entries, but this module has "
+            f"{self._shard_world_size} ranks."
+        )
+
     def _plan_replay(
         self,
         delta: "DeltaDumpResult",
@@ -2153,8 +2185,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 erased_keys=delta.erased_keys[i],
                 evicted_keys=delta.evicted_keys[i],
                 current_score=meta.get("current_score"),
-                num_rows=meta.get("num_rows"),
-                erased_slot_index=meta.get("erased_slot_index"),
+                num_rows=self._for_this_rank(meta.get("num_rows"), table_name),
+                erased_slot_index=self._for_this_rank(
+                    meta.get("erased_slot_index"), table_name
+                ),
             )
             self._check_delta_shapes(job, content, storage)
 

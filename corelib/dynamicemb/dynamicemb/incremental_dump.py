@@ -96,24 +96,29 @@ class DeltaDumpResult:
                 by ``replay_increment``. For NO_EVICTION tables, and for tables
                 that store a row per key, it packs the key slot (high 32 bits)
                 and value row (low 32 bits) into one int64.
-            meta[i]["erased_slot_index"]: Optional[torch.Tensor] -- for a table that
-                stores a row per key, the packed slot (high 32 bits) and row (low
-                32) of every slot an explicit erase left reclaimed since the last
-                dump, one per slot. A reclaimed slot keeps its row, so a replica
-                recreates these, after the removals and before the upserts, to
-                end up with the same rows as the source (the upserts then
-                overwrite any slot another key took). Local to the rank that
-                produced the delta, like ``num_rows``. Only complete if the erases
-                were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
+            meta[i]["erased_slot_index"]: Optional[List[torch.Tensor]] -- for a table
+                that stores a row per key, the packed slot (high 32 bits) and row
+                (low 32) of every slot an explicit erase left reclaimed since the
+                last dump, one per slot. A reclaimed slot keeps its row, so a
+                replica recreates these, after the removals and before the
+                upserts, to end up with the same rows as the source (the upserts
+                then overwrite any slot another key took). One entry per source
+                rank of the dumping group, in rank order -- the slots belong to
+                that rank's own table, and the per-key columns are gathered across
+                ranks, so a receiver picks the entry of its own shard index (a
+                single entry when the dump was not gathered). Only complete if the
+                erases were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
                 ``erase_untracked``.
             meta[i]["erase_untracked"]:  bool -- the table erased keys without
                 retaining them, so ``erased_slot_index`` misses the slots they
                 left and the delta cannot be replayed exactly. Sticky.
                 ``replay_increment`` refuses such a delta.
-            meta[i]["num_rows"]:         Optional[int] -- for a table that stores a
-                row per key, how many value rows the source had handed out (its
-                row counter); ``None`` where the row is the slot. The delta names
-                only the rows that changed, so replay takes the counter from here.
+            meta[i]["num_rows"]:         Optional[List[int]] -- for a table that stores
+                a row per key, how many value rows each source rank had handed out
+                (its row counter), in rank order and picked by the receiver like
+                ``erased_slot_index``; ``None`` where the row is the slot. The delta
+                names only the rows that changed, so replay takes the counter from
+                here.
             meta[i]["current_capacity"]: int  -- key-map slots for this table.
                 The modulus for choosing a home bucket, so it decides whether a
                 slot means the same thing in two tables.
@@ -688,6 +693,37 @@ def _all_gather_evicted_keys(
     if not parts:
         return keys[:0].cpu()
     return torch.unique(torch.cat(parts)).cpu()
+
+
+def _all_gather_by_rank(
+    tensor: torch.Tensor, pg: Optional[dist.ProcessGroup]
+) -> List[torch.Tensor]:
+    """All-gather a variable-length 1-D tensor within ``pg``, keeping each rank's
+    part apart: entry ``r`` is what rank ``r`` of the group contributed, on host.
+
+    For what the receiver has to pick *its own* share of, unlike
+    :func:`_all_gather_evicted_keys`, which merges the ranks into one set.
+    Without a multi-rank group the result is just ``[tensor]``.
+    """
+    if pg is None or not dist.is_initialized() or dist.get_world_size(pg) <= 1:
+        return [tensor.cpu()]
+    world_size = dist.get_world_size(pg)
+    device = torch.device("cuda", torch.cuda.current_device())
+    tensor = tensor.to(device)
+    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.int64)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size, group=pg)
+    sizes = [int(s.item()) for s in size_list]
+    max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
+    padded = torch.zeros(max_size, dtype=tensor.dtype, device=device)
+    if tensor.numel() > 0:
+        padded[: tensor.numel()] = tensor
+    gathered = [
+        torch.zeros(max_size, dtype=tensor.dtype, device=device)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(gathered, padded, group=pg)
+    return [g[:sz].cpu() for g, sz in zip(gathered, sizes)]
 
 
 def _pop_retained_keys(

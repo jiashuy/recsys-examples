@@ -193,8 +193,10 @@ def test_replay_round_trip(current_device, score_strategy):
 
     # A table that stores a row per key reports its row counter as metadata, and
     # the replica adopts it rather than inferring it from the rows it was sent.
+    # By source rank (one rank here), picked by the receiver.
     num_rows = delta.meta[0]["num_rows"]
     if num_rows is not None:
+        (num_rows,) = num_rows
         assert num_rows == len(keys) + len(erased)
         assert dst._storage.key_index_map.num_rows(0) == num_rows
         # ... and recreates the slots the erased keys left, with their rows, so
@@ -900,7 +902,8 @@ def test_replay_add_erase_add_in_one_window(current_device):
     # row it left are exactly where B now lives (``slot_index`` packs both).
     assert delta.erased_keys[0].tolist() == [3001]
     slot_of = dict(zip(delta.keys[0].tolist(), delta.meta[0]["slot_index"].tolist()))
-    assert delta.meta[0]["erased_slot_index"].tolist() == [slot_of[3002]]
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.tolist() == [slot_of[3002]]
 
     assert dst.replay_increment(delta)[TABLE_NAME].upserted == 16
     replayed = dump_all(dst)
@@ -925,7 +928,8 @@ def test_replay_recreates_a_reclaimed_slot_for_a_key_it_never_held(current_devic
     delta = dump_all(src)
     # A is reported as erased, and no live key took the slot it left.
     assert delta.erased_keys[0].tolist() == [3001]
-    assert delta.meta[0]["erased_slot_index"].numel() == 1
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.numel() == 1
     assert 3001 not in delta.keys[0].tolist()
     dst.replay_increment(delta)
 
@@ -950,7 +954,8 @@ def test_an_unretained_erase_makes_the_delta_unreplayable(current_device):
     src._storage.erase_keys(0, torch.tensor([2001], dtype=torch.int64, device=device))
     delta = dump_all(src)
     assert delta.meta[0]["erase_untracked"] is True
-    assert delta.meta[0]["erased_slot_index"].numel() == 0
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.numel() == 0
 
     before = dump_all(dst).keys[0].numel()
     with pytest.raises(ValueError, match="erased keys without retaining"):
