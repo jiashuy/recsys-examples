@@ -164,3 +164,41 @@ def test_rehash_carries_rows_and_reclaimed_slots(erased):
     all_rows = fresh_rows.tolist() + live_rows.tolist()
     assert len(all_rows) == len(set(all_rows))
     assert max(all_rows) < new.num_rows(0)
+
+
+def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
+    # One bucket with 8 live keys. The two states a slot can be in when a replica
+    # restores it, after its own erase of the key it held has run:
+    #  - empty: the replica never held the erased key. The slot becomes reclaimed
+    #    and takes the row.
+    #  - reclaimed: it did hold it, and the erase left the slot reclaimed with
+    #    the row it had. Restoring changes nothing.
+    # A different row on a reclaimed slot, or a live key in the slot, is asserted
+    # on the device, which cannot be exercised in-process.
+    table = _table(BUCKET)
+    keys = _keys(0, 8)
+    tids, score = _args(table, keys)
+    rows = table.insert(keys, tids, score)
+    key_col = table.keys_.view(torch.int64)[0]
+    size = int(table.bucket_sizes.sum())
+
+    def pack(slot, row):
+        return torch.tensor([(slot << 32) | row], dtype=torch.int64, device="cuda")
+
+    # Empty: a slot nobody ever held.
+    empty = int((key_col == -1).nonzero()[0])
+    table.restore_reclaimed_slots(pack(empty, 100), 0)
+    assert int(key_col[empty]) == -2 and int(table.rows_[empty]) == 100
+    assert int(table.bucket_sizes.sum()) == size, "reclaimed slots are not counted"
+
+    # Reclaimed: a real erase, which changes the key but leaves the row behind.
+    victim = keys[:1]
+    victim_slot = int((key_col == int(victim)).nonzero()[0])
+    victim_row = int(rows[0])
+    assert int(table.rows_[victim_slot]) == victim_row
+    assert int(table.erase(victim, tids[:1], return_indices=True)) >= 0
+    assert int(key_col[victim_slot]) == -2
+    assert int(table.rows_[victim_slot]) == victim_row, "erase must keep the row"
+    table.restore_reclaimed_slots(pack(victim_slot, victim_row), 0)
+    assert int(key_col[victim_slot]) == -2
+    assert int(table.rows_[victim_slot]) == victim_row

@@ -93,8 +93,27 @@ class DeltaDumpResult:
                 threshold.
             meta[i]["slot_index"]:       torch.Tensor -- int64 host tensor aligned
                 with ``keys[i]``; the storage slot each dumped key occupies, used
-                by ``replay_increment``. For NO_EVICTION tables it packs the key
-                slot (high 32 bits) and value row (low 32 bits) into one int64.
+                by ``replay_increment``. For NO_EVICTION tables, and for tables
+                that store a row per key, it packs the key slot (high 32 bits)
+                and value row (low 32 bits) into one int64.
+            meta[i]["erased_slot_index"]: Optional[torch.Tensor] -- for a table that
+                stores a row per key, the packed slot (high 32 bits) and row (low
+                32) of every slot an explicit erase left reclaimed since the last
+                dump, one per slot. A reclaimed slot keeps its row, so a replica
+                recreates these, after the removals and before the upserts, to
+                end up with the same rows as the source (the upserts then
+                overwrite any slot another key took). Local to the rank that
+                produced the delta, like ``num_rows``. Only complete if the erases
+                were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
+                ``erase_untracked``.
+            meta[i]["erase_untracked"]:  bool -- the table erased keys without
+                retaining them, so ``erased_slot_index`` misses the slots they
+                left and the delta cannot be replayed exactly. Sticky.
+                ``replay_increment`` refuses such a delta.
+            meta[i]["num_rows"]:         Optional[int] -- for a table that stores a
+                row per key, how many value rows the source had handed out (its
+                row counter); ``None`` where the row is the slot. The delta names
+                only the rows that changed, so replay takes the counter from here.
             meta[i]["current_capacity"]: int  -- key-map slots for this table.
                 The modulus for choosing a home bucket, so it decides whether a
                 slot means the same thing in two tables.

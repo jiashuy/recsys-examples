@@ -198,6 +198,13 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                 at::Tensor carried, int64_t bkt_begin,
                                 int64_t bkt_end, int64_t bucket_capacity);
 
+// Restore the reclaimed slots a dump's packed `slot << 32 | row` names, owning
+// their rows, on a replica; a slot holding a live key is asserted against (see
+// table_rows.cu).
+void table_restore_reclaimed_slots(at::Tensor keys, at::Tensor rows,
+                                   at::Tensor slot_index, int64_t bkt_begin,
+                                   int64_t bkt_end, int64_t bucket_capacity);
+
 at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
                                      at::Tensor table_ids);
 

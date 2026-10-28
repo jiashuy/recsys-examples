@@ -449,6 +449,17 @@ class DynamicEmbTableState:
     evicted_tid_chunks: List[torch.Tensor] = field(default_factory=list)
     erased_key_chunks: List[torch.Tensor] = field(default_factory=list)
     erased_tid_chunks: List[torch.Tensor] = field(default_factory=list)
+    # A table that stores a row per key also records where each erased key sat:
+    # the packed ``slot << 32 | row`` of the slot it left reclaimed. A reclaimed
+    # slot keeps its row, and a replica can only keep the same rows if it
+    # recreates those slots, including for keys it never held.
+    erased_slot_chunks: List[torch.Tensor] = field(default_factory=list)
+    erased_slot_tid_chunks: List[torch.Tensor] = field(default_factory=list)
+    # Set once a table that stores rows has erased keys without retaining them:
+    # those slots were left reclaimed with their rows and nothing reports them,
+    # so no delta from this table can be replayed exactly any more. Sticky -- a
+    # replica built from earlier deltas cannot be brought back in line.
+    erase_untracked: bool = False
 
 
 def create_table_state(
@@ -456,7 +467,19 @@ def create_table_state(
     optimizer: BaseDynamicEmbeddingOptimizer,
     enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
+    use_rows: bool = False,
 ) -> DynamicEmbTableState:
+    """Build the key map and value buffers for a group of tables.
+
+    ``use_rows`` stores a value row per key (see ``LinearBucketTable``) instead
+    of using the hash slot as the row, which lets an expansion keep every value
+    where it is. It is for tables that grow and keep their keys, so it cannot be
+    combined with ``enable_overflow`` (a cache keeps slot == row).
+
+    NO_EVICTION is not compatible with it *yet*, only because it still keeps its
+    row in the score word and is wired that way throughout; it is the case this
+    column is meant to replace, not one it conflicts with.
+    """
     if not options:
         raise ValueError("options must be non-empty")
 
@@ -467,6 +490,14 @@ def create_table_state(
     ):
         raise ValueError(
             "enable_overflow is not supported when score_strategy is NO_EVICTION"
+        )
+    if use_rows and (
+        enable_overflow
+        or base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+    ):
+        raise ValueError(
+            "use_rows is not supported with enable_overflow, nor (yet) with "
+            "NO_EVICTION, which still keeps its row in the score"
         )
     num_tables = len(options)
 
@@ -521,6 +552,7 @@ def create_table_state(
         device=device,
         enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
+        use_rows=use_rows,
     )
     capacity = key_index_map.capacity()
 
@@ -731,7 +763,8 @@ def _expand_tables_impl(
         for (
             keys,
             named_scores,
-            indices,
+            src_rows,
+            src_slots,
         ) in old_key_index_map._batched_export_keys_scores(
             [state.score_policy.name],
             device,
@@ -739,37 +772,48 @@ def _expand_tables_impl(
             thresholds=None,
             batch_size=65536,
             return_index=True,
+            return_slots=True,
         ):
             if keys.numel() == 0:
                 continue
-            assert indices is not None, "return_index=True requires indices"
+            assert src_slots is not None, "return_slots=True requires slots"
             scores_batch = named_scores[state.score_policy.name].to(torch.uint64)
-            src_indices = indices
 
             score_arg = ScoreArg(
                 name=state.score_policy.name,
                 value=scores_batch,
                 policy=ScorePolicy.ASSIGN,
             )
-            tid_tensor = torch.full(
-                (keys.numel(),), table_id, dtype=torch.int64, device=device
-            )
-            dst_indices = new_key_index_map.insert(keys, tid_tensor, score_arg)
+            if new_key_index_map.use_rows_:
+                # The key keeps the row its value sits in, so the value stays put.
+                dst_slots = new_key_index_map.insert_carrying_rows(
+                    keys, table_id, score_arg, src_rows
+                )
+            else:
+                tid_tensor = torch.full(
+                    (keys.numel(),), table_id, dtype=torch.int64, device=device
+                )
+                dst_slots = new_key_index_map.insert(keys, tid_tensor, score_arg)
             # Single-value re-insert above only restores the leading score word.
             # For multi-word layouts (LruLfu: timestamp + frequency) copy the
             # whole score block so the frequency (and exact timestamp) survive
             # rehash; otherwise LFU eviction would see all frequencies reset to 0.
             if new_key_index_map.num_scores_ > 1:
                 new_key_index_map.copy_score_blocks_from(
-                    old_key_index_map, table_id, src_indices, dst_indices
+                    old_key_index_map, table_id, src_slots, dst_slots
                 )
-            new_key_index_map._ref_counter[dst_indices].copy_(
-                old_key_index_map._ref_counter[src_indices]
+            new_key_index_map._ref_counter[dst_slots].copy_(
+                old_key_index_map._ref_counter[src_slots]
             )
 
-            if state.no_eviction_next_index is None:
-                values_batch = load_from_flat_single_table(state, src_indices, table_id)
-                dst_values_list.append((dst_indices, table_id, values_batch))
+            if state.no_eviction_next_index is None and not new_key_index_map.use_rows_:
+                # Value row == hash slot: the value has to follow its key.
+                values_batch = load_from_flat_single_table(state, src_slots, table_id)
+                dst_values_list.append((dst_slots, table_id, values_batch))
+
+        if new_key_index_map.use_rows_:
+            # Reclaimed (erased) slots still own their rows; keep them too.
+            new_key_index_map.carry_rows_from(old_key_index_map, table_id)
 
         for dst_indices, table_id, values_batch in dst_values_list:
             store_to_flat_single_table(state, dst_indices, table_id, values_batch)
@@ -929,6 +973,15 @@ def _flat_row_indices_for_value_load(
     )
 
 
+def _row_differs_from_slot(state: DynamicEmbTableState) -> bool:
+    """Whether a key's value row is not its hash slot: NO_EVICTION keeps the row
+    in the score, a ``use_rows`` table in its own column. A dumped ``slot_index``
+    then has to carry both."""
+    return state.no_eviction_next_index is not None or getattr(
+        state.key_index_map, "use_rows_", False
+    )
+
+
 def _flat_row_indices_from_slots_and_scores(
     state: DynamicEmbTableState,
     slot_indices: torch.Tensor,
@@ -936,8 +989,9 @@ def _flat_row_indices_from_slots_and_scores(
 ) -> torch.Tensor:
     """Flat-buffer row indices for load/store after export or incremental_dump.
 
-    NO_EVICTION tables use stored score as logical flat row; otherwise slot index
-    is the flat row (e.g. TIMESTAMP / LFU).
+    NO_EVICTION tables use stored score as logical flat row; otherwise the index
+    is the flat row -- a ``use_rows`` table already reports rows, any other
+    reports slots, which are the rows.
     """
     if state.no_eviction_next_index is not None:
         return stored_scores.to(device=state.device, dtype=torch.int64)
@@ -955,9 +1009,10 @@ def _encode_slot_index(
     Single-tier storage (``tier is None``):
       - normal policies: the key_index_map slot IS the value flat row, so the
         single slot value locates both key and value -> return the slot as-is.
-      - NO_EVICTION: key slot and value row are independent (row == score,
-        auto-increment), so pack both into one int64: high 32 bits = key slot,
-        low 32 bits = value row (tables are small, < 2^32; asserted).
+      - NO_EVICTION, or a table that stores its rows (``use_rows``): key slot
+        and value row are independent, so pack both into one int64: high 32
+        bits = key slot, low 32 bits = value row (tables are small, < 2^32;
+        asserted).
 
     HybridStorage (``tier in {0, 1}``, called once per tier, HBM=0 / host=1):
       layout ``bit 63 = tier | bits 0..62 = key_slot``. HybridStorage does NOT
@@ -974,13 +1029,13 @@ def _encode_slot_index(
         if int(tier):
             return slot_indices | (torch.ones_like(slot_indices) << 63)
         return slot_indices
-    if state.no_eviction_next_index is None:
+    if not _row_differs_from_slot(state):
         return slot_indices  # key slot == value row
     flat_rows = flat_rows.to(device=state.device, dtype=torch.int64)
     if slot_indices.numel() > 0:
         assert int(slot_indices.max()) < (1 << 32) and int(flat_rows.max()) < (
             1 << 32
-        ), "NO_EVICTION slot/row exceeds 32 bits; cannot pack into int64 slot_index"
+        ), "slot/row exceeds 32 bits; cannot pack into int64 slot_index"
     return (slot_indices << 32) | flat_rows
 
 
@@ -1435,12 +1490,14 @@ def _append_erased(
     state: DynamicEmbTableState,
     keys: torch.Tensor,
     table_id: int,
+    slot_index: Optional[torch.Tensor] = None,
 ) -> None:
     """Append an explicit erase's keys to the state's erased-key buffer.
 
     Unlike :func:`_append_evicted` there is no count to read back: the caller has
     already masked the keys down to the ones the erase actually removed, so this
-    costs no extra device sync.
+    costs no extra device sync. ``slot_index`` is the packed slot and row each
+    erased key left behind, for a table that stores rows.
     """
     if keys.numel() == 0:
         return
@@ -1448,6 +1505,13 @@ def _append_erased(
     state.erased_tid_chunks.append(
         torch.full((keys.numel(),), table_id, dtype=torch.int64, device=keys.device)
     )
+    if slot_index is not None:
+        state.erased_slot_chunks.append(slot_index.clone())
+        state.erased_slot_tid_chunks.append(
+            torch.full(
+                (slot_index.numel(),), table_id, dtype=torch.int64, device=keys.device
+            )
+        )
 
 
 def _pop_chunked_keys(
@@ -1455,6 +1519,7 @@ def _pop_chunked_keys(
     tid_chunks: List[torch.Tensor],
     table_id: int,
     state: DynamicEmbTableState,
+    dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
     """Drain one table's rows out of a (key, table_id) chunk buffer.
 
@@ -1467,7 +1532,11 @@ def _pop_chunked_keys(
         # (== the table's index_type, which may be int32/uint32), so a hardcoded
         # int64 here would make callers that concat/compare across empty and
         # non-empty pops hit a dtype mismatch.
-        empty = torch.empty(0, dtype=state.key_index_map.key_type, device=state.device)
+        empty = torch.empty(
+            0,
+            dtype=state.key_index_map.key_type if dtype is None else dtype,
+            device=state.device,
+        )
         return empty, [], []
     keys = torch.cat(key_chunks)
     tids = torch.cat(tid_chunks)
@@ -1491,6 +1560,22 @@ def _pop_state_erased_keys(state: DynamicEmbTableState, table_id: int) -> torch.
     """Pop (return + clear) the unique keys an explicit erase removed."""
     out, state.erased_key_chunks, state.erased_tid_chunks = _pop_chunked_keys(
         state.erased_key_chunks, state.erased_tid_chunks, table_id, state
+    )
+    return out
+
+
+def _pop_state_erased_slot_index(
+    state: DynamicEmbTableState, table_id: int
+) -> torch.Tensor:
+    """Pop (return + clear) the packed slot/row each explicit erase left behind,
+    one per slot: a slot erased, refilled and erased again is one reclaimed slot
+    with one row, however many keys passed through it."""
+    out, state.erased_slot_chunks, state.erased_slot_tid_chunks = _pop_chunked_keys(
+        state.erased_slot_chunks,
+        state.erased_slot_tid_chunks,
+        table_id,
+        state,
+        dtype=torch.int64,
     )
     return out
 
@@ -1607,11 +1692,13 @@ def export_keys_values_iter(
         keys,
         named_scores,
         indices,
+        slots,
     ) in state.key_index_map._batched_export_keys_scores(
         [state.score_policy.name],
         state.device,
         batch_size=batch_size,
         return_index=True,
+        return_slots=True,
         table_id=table_id,
     ):
         scores = named_scores[state.score_policy.name]
@@ -1627,7 +1714,9 @@ def export_keys_values_iter(
         # restore them exactly. Gather the full [N, num_scores] block at the
         # exported slots; single-score tables keep the [N] shape unchanged.
         if state.key_index_map.num_scores_ > 1:
-            out_scores = state.key_index_map.gather_score_blocks(table_id, indices)
+            # Score blocks are keyed by slot; ``indices`` are rows for a table
+            # that stores them.
+            out_scores = state.key_index_map.gather_score_blocks(table_id, slots)
             # Reorder the physical device layout into the user's configured
             # (logical) score-column order so both the checkpoint and callers of
             # export_keys_values see scores in the order they configured. Identity
@@ -2060,8 +2149,12 @@ def _load_key_values(
             policy=state.score_policy.policy,
         )
         indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
+        # The score blocks are keyed by slot, the values by row (the same thing
+        # unless the table stores rows).
         state.key_index_map.scatter_score_blocks(
-            table_id, indices, scores.to(SCORE_TYPE).contiguous()
+            table_id,
+            state.key_index_map.slots_of(keys, tid_tensor),
+            scores.to(SCORE_TYPE).contiguous(),
         )
         store_to_flat_single_table(state, indices, table_id, values)
         return
@@ -2219,9 +2312,9 @@ def _replay_at_slots(
         return 0
     tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
 
-    if state.no_eviction_next_index is not None:
-        # NO_EVICTION packs key slot (high 32) and value row (low 32); every
-        # other strategy uses one index for both.
+    if _row_differs_from_slot(state):
+        # NO_EVICTION and ``use_rows`` tables pack key slot (high 32) and value
+        # row (low 32); every other strategy uses one index for both.
         key_slots = (slot_index >> 32) & 0xFFFFFFFF
         value_rows = slot_index & 0xFFFFFFFF
     else:
@@ -2253,6 +2346,12 @@ def _replay_at_slots(
             "table concurrently with the replay. Replaying past either would "
             "silently drop those keys."
         )
+
+    if state.key_index_map.use_rows_:
+        # The key now sits at the source's slot; make it own the source's row.
+        # The row counter is set by the caller from the delta's metadata -- the
+        # rows named here are only the ones that changed.
+        state.key_index_map.set_rows(key_slots, table_id, value_rows)
 
     _replay_write_values(
         state, table_id, value_rows, embeddings, optimizer_states, same_key, content
@@ -2309,6 +2408,7 @@ def _erase_state_keys(
     table_id: int,
     keys: torch.Tensor,
     mode: EvictedItemMode = EvictedItemMode.DISCARD,
+    track_untracked: bool = True,
 ) -> int:
     """Erase keys from one table state. Returns how many were actually present.
 
@@ -2319,6 +2419,10 @@ def _erase_state_keys(
     *mode* is this call's, not the table's: retaining an erase costs only a copy
     of keys already in hand, so there is nothing to configure up front and each
     caller can decide whether its removals are worth reporting.
+
+    A table that stores rows leaves each erased slot reclaimed with its row, which
+    only a retained erase reports (see ``erase_untracked``). ``track_untracked``
+    is off for a replica applying a delta's removals, which are not its own.
     """
     n = keys.numel()
     if n == 0:
@@ -2332,8 +2436,23 @@ def _erase_state_keys(
         # Only the keys that were really there: a caller may name keys this
         # table never held, and reporting those as removed would make a replica
         # replay removals that never happened.
-        _append_erased(state, keys[removed], table_id)
-    return int(removed.sum().item())
+        slot_index = None
+        if state.key_index_map.use_rows_:
+            # The slot stays reclaimed with its row; record both so a replica can
+            # recreate it, packed the way a dumped slot_index is.
+            slots = indices[removed]
+            rows = state.key_index_map._rows_of(slots, tids[removed], False)
+            slot_index = (slots << 32) | rows
+        _append_erased(state, keys[removed], table_id, slot_index)
+    num_removed = int(removed.sum().item())
+    if (
+        track_untracked
+        and num_removed > 0
+        and state.key_index_map.use_rows_
+        and EvictedItemMode.RETAIN_KEY not in mode
+    ):
+        state.erase_untracked = True
+    return num_removed
 
 
 # ---------------------------------------------------------------------------
@@ -2485,6 +2604,9 @@ class DynamicEmbStorage(Storage):
             # DynamicEmbStorage is always a last tier (single tier or the backing
             # store under a cache), so it honors evicted_item_mode.
             evicted_item_mode=options[0].evicted_item_mode,
+            # Every key keeps its own value row, so a rehash never moves values.
+            # NO_EVICTION still keeps its row in the score.
+            use_rows=options[0].score_strategy != DynamicEmbScoreStrategy.NO_EVICTION,
         )
 
     @property
@@ -2649,6 +2771,12 @@ class DynamicEmbStorage(Storage):
         things downstream: an eviction is reproduced by whoever takes the slot,
         an erase leaves the slot to nobody and has to be replayed as a removal."""
         return _pop_state_erased_keys(self._state, table_id)
+
+    def pop_erased_slot_index(self, table_id: int) -> torch.Tensor:
+        """Return + clear the packed ``slot << 32 | row`` of each slot an explicit
+        erase left reclaimed in ``table_id`` (empty unless the table stores
+        rows)."""
+        return _pop_state_erased_slot_index(self._state, table_id)
 
     # -- Storage interface --
 
@@ -2870,10 +2998,13 @@ class DynamicEmbStorage(Storage):
         all_opts: List[Optional[Tensor]] = []
         all_scores: List[Tensor] = []
         for s in states_to_dump:
-            keys, named_scores, indices = s.key_index_map.incremental_dump(
+            # ``indices`` are the rows of a ``use_rows`` table, hash slots
+            # otherwise; the packed slot_index and the score blocks need slots.
+            keys, named_scores, indices, slots = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
                 pg=pg,
                 return_index=True,
+                return_slots=True,
                 table_id=table_id,
             )
             scores_batch = named_scores[s.incremental_score_name]
@@ -2883,10 +3014,8 @@ class DynamicEmbStorage(Storage):
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value, opt = _split_value_row(s, table_id, values)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
-            slot = _encode_slot_index(s, indices, flat_rows)
-            score_block = _dump_score_block(
-                s, table_id, indices, scores_batch, timestamp
-            )
+            slot = _encode_slot_index(s, slots, flat_rows)
+            score_block = _dump_score_block(s, table_id, slots, scores_batch, timestamp)
             if not do_multi_rank_gather:
                 value = value.cpu()
                 key = key.cpu() if key.is_cuda else key
@@ -3026,13 +3155,42 @@ class DynamicEmbStorage(Storage):
         table_id: int,
         keys: Tensor,
         mode: EvictedItemMode = EvictedItemMode.DISCARD,
+        from_replay: bool = False,
     ) -> int:
         """Erase keys from the table (used to replay a delta's removals).
 
         Returns how many of them were actually present. *mode* decides whether
         the keys actually removed are recorded for :meth:`pop_erased_keys`.
+
+        A table that stores a row per key leaves each erased slot reclaimed with
+        its row, and only a retained erase (``RETAIN_KEY``) lets an incremental
+        dump tell a replica to recreate it. Erasing without it is allowed, but
+        marks the table (:attr:`erase_untracked`): a delta dumped from it can no
+        longer be replayed exactly, and ``replay_increment`` refuses one.
+        ``from_replay`` is for a replica applying a delta's removals, which are
+        not this table's own to report.
         """
-        return _erase_state_keys(self._state, table_id, keys, mode)
+        return _erase_state_keys(
+            self._state, table_id, keys, mode, track_untracked=not from_replay
+        )
+
+    @property
+    def erase_untracked(self) -> bool:
+        """Whether keys were erased without being retained (see
+        ``DynamicEmbTableState.erase_untracked``); sticky."""
+        return self._state.erase_untracked
+
+    def restore_reclaimed_slots(self, table_id: int, slot_index: Tensor) -> None:
+        """Recreate the reclaimed slots a delta reports, with their rows.
+
+        ``slot_index`` is what :meth:`pop_erased_slot_index` packed on the
+        source. Applied after the delta's removals and before its upserts, so a
+        slot an erased key left and another key then took ends up holding that
+        key, while one nobody took stays reclaimed with its row.
+        """
+        self._state.key_index_map.restore_reclaimed_slots(
+            slot_index.to(device=self._state.device, dtype=torch.int64), table_id
+        )
 
     # -- Export --
 
@@ -3651,6 +3809,7 @@ class HybridStorage(Storage):
         table_id: int,
         keys: Tensor,
         mode: EvictedItemMode = EvictedItemMode.DISCARD,
+        from_replay: bool = False,
     ) -> int:
         """Erase keys from both tiers (a key may live in either).
 

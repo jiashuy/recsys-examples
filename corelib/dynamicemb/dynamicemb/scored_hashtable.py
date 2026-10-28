@@ -42,6 +42,7 @@ from dynamicemb_extensions import (
     table_lookup,
     table_partition,
     table_place_reclaimed_rows,
+    table_restore_reclaimed_slots,
     table_resolve_rows,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
@@ -599,6 +600,26 @@ class LinearBucketTable(ScoredHashTable):
             evicted_table_ids,
         )
 
+    def slots_of(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
+        """The hash slots ``keys`` sit in (``-1`` where absent), whatever
+        ``use_rows`` is.
+
+        :meth:`lookup` and :meth:`insert` report rows for a table that stores
+        them. State that is keyed by slot -- the score blocks, the reference
+        counters -- needs the slot instead, and this is how to get it.
+        """
+        _, _, slots = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+            num_scores=self.num_scores_,
+        )
+        return slots
+
     def num_rows(self, table_id: int) -> int:
         """Rows handed out so far for ``table_id``: rows ``[0, num_rows)`` are
         the ones values may live in."""
@@ -846,6 +867,36 @@ class LinearBucketTable(ScoredHashTable):
             int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_
         )
         self.rows_[base + slots] = rows.to(torch.int32)
+
+    def restore_reclaimed_slots(self, slot_index: torch.Tensor, table_id: int) -> None:
+        """Leave the slots a dump's packed ``slot << 32 | row`` names reclaimed,
+        owning their rows.
+
+        What an erase leaves behind, recreated for a replica that never held the
+        erased key. A slot that is empty or already reclaimed becomes reclaimed
+        with the row; one that holds a live key is an error (asserted on the
+        device), since a replay removes the erased keys before it calls this.
+        Reclaimed slots are not counted in ``bucket_sizes``, so nothing else
+        changes.
+        """
+        assert self.use_rows_
+        b0 = int(self.table_bucket_offsets_cpu_[table_id].item())
+        b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
+        table_restore_reclaimed_slots(
+            self.keys_.view(torch.int64),
+            self.rows_,
+            slot_index,
+            b0,
+            b1,
+            self.bucket_capacity_,
+        )
+
+    def reserve_rows(self, table_id: int, num_rows: int) -> None:
+        """Make sure rows ``[0, num_rows)`` of ``table_id`` count as handed out,
+        so a later insert cannot allocate one that a replay restored."""
+        assert self.use_rows_
+        counter = self.row_counters_[table_id]
+        self.row_counters_[table_id] = torch.clamp(counter, min=num_rows)
 
     def carry_rows_from(self, other: "LinearBucketTable", table_id: int) -> None:
         """Finish a rehash of ``table_id`` from ``other``, after its live keys
@@ -1403,7 +1454,8 @@ class LinearBucketTable(ScoredHashTable):
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
         return_index: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        return_slots: bool = False,
+    ) -> Tuple:
         """
         Dump incremental keys and scores into cpu tensors.
 
@@ -1412,12 +1464,16 @@ class LinearBucketTable(ScoredHashTable):
             table_id (int): the logical table to dump.
             batch_size (int): the batch size when scan the table.
             pg (Optional[dist.ProcessGroup]): process group.
-            return_index: whether return the index or not.
+            return_index: whether return the index or not (rows when the table
+                ``use_rows``, hash slots otherwise).
+            return_slots: also return the hash slots, as a fourth element; the
+                score blocks and a replay are keyed by slot.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
             out_indices (Optional[torch.Tensor]): output tensors of indices.
+            out_slots (torch.Tensor): only with ``return_slots``.
         """
 
         out_keys: torch.Tensor
@@ -1487,25 +1543,35 @@ class LinearBucketTable(ScoredHashTable):
             if return_index
             else None
         )
+        out_slots = (
+            torch.empty(total_matched, dtype=self.index_type, device="cpu")
+            if return_slots
+            else None
+        )
         for score_name in out_scores.keys():
             out_scores[score_name] = torch.empty(
                 total_matched, dtype=SCORE_TYPE, device="cpu"
             )
 
         out_offset = 0
-        for keys, named_scores, indices in self._batched_export_keys_scores(
+        for keys, named_scores, indices, *slots in self._batched_export_keys_scores(
             scores,
             self.device,
             table_id,
             thresholds,
             batch_size,
             return_index=return_index,
+            return_slots=return_slots,
         ):
             h_count = keys.numel()
             out_keys[out_offset : out_offset + h_count].copy_(keys, non_blocking=True)
             if indices is not None:
                 out_indices[out_offset : out_offset + h_count].copy_(
                     indices, non_blocking=True
+                )
+            if return_slots:
+                out_slots[out_offset : out_offset + h_count].copy_(
+                    slots[0], non_blocking=True
                 )
             for score_name in out_scores.keys():
                 out_scores[score_name][out_offset : out_offset + h_count].copy_(
@@ -1518,6 +1584,8 @@ class LinearBucketTable(ScoredHashTable):
             total_matched == out_offset
         ), "Dumped keys number mismatched with the expected count."
 
+        if return_slots:
+            return out_keys, out_scores, out_indices, out_slots
         return out_keys, out_scores, out_indices
 
     def reset(self) -> None:

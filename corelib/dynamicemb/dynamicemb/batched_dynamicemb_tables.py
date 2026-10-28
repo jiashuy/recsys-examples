@@ -548,6 +548,12 @@ class _ReplayJob:
     # The source's score bookkeeping, adopted before writing so a restored key
     # lands on the scale the replica will later threshold against.
     current_score: Optional[int]
+    # How many value rows the source had handed out (its row counter), for a
+    # table that stores a row per key; ``None`` for one whose row is its slot.
+    num_rows: Optional[int] = None
+    # The packed slot/row of each slot an erase left reclaimed since the last
+    # dump, for such a table.
+    erased_slot_index: Optional[Tensor] = None
 
 
 class BatchedDynamicEmbeddingTablesV2(nn.Module):
@@ -1827,7 +1833,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table). ``values[i]`` is embeddings only, with the rest of each stored
         row in ``optimizer_states[i]`` and every score word in ``scores[i]``;
         ``meta[i]`` carries current_score / slot_index / current_capacity /
-        row_capacity / bucket_capacity / num_scores / world_size /
+        row_capacity / num_rows / bucket_capacity / num_scores / world_size /
         table_options; ``evicted_keys[i]`` is the keys this table
         retained since the last dump -- evictions and explicit erases under
         ``RETAIN_KEY`` -- and ``erased_keys[i]`` the keys an explicit erase
@@ -1903,6 +1909,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # Always drained: recording an erase is the erase call's decision,
             # so there is no table setting to gate on here.
             er = self._drain_retained(storage, "pop_erased_keys", True, table_id, pg)
+            # Local to this rank, like ``num_rows``: a slot belongs to the rank's
+            # own table, and the gathered keys do not say which rank held them.
+            erased_slot_index = (
+                storage.pop_erased_slot_index(table_id).cpu()
+                if self._num_rows_of(storage, table_id) is not None
+                else None
+            )
             res.table_names.append(table_name)
             res.keys.append(keys_cat)
             res.values.append(values_cat)
@@ -1916,6 +1929,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "slot_index": slot_index,
                     "current_capacity": self._capacity_of(storage, table_id),
                     "row_capacity": self._row_capacity_of(storage, table_id),
+                    "num_rows": self._num_rows_of(storage, table_id),
+                    "erased_slot_index": erased_slot_index,
+                    "erase_untracked": bool(getattr(storage, "erase_untracked", False)),
                     "bucket_capacity": self._bucket_capacity_of(storage),
                     "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
@@ -1972,6 +1988,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._bucket_capacity_of(storage),
             ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
+            # Whether a key's row is stored apart from its slot decides how a
+            # ``slot_index`` is packed, so the two sides must agree on it.
+            (
+                "stores_rows",
+                meta.get("num_rows") is not None,
+                self._num_rows_of(storage, table_id) is not None,
+            ),
             ("world_size", meta.get("world_size"), self._shard_world_size),
             # Configured order, not physical layout -- see the note above.
             (
@@ -2098,6 +2121,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             table_id = self._table_names.index(table_name)
             meta = delta.meta[i]
 
+            if meta.get("erase_untracked"):
+                raise ValueError(
+                    f"replay_increment: the source of table '{table_name}' erased "
+                    "keys without retaining them (erase_keys without "
+                    "EvictedItemMode.RETAIN_KEY). Each erase left a reclaimed slot "
+                    "that keeps its row, and nothing reports it, so this delta "
+                    "cannot reproduce the source's rows. Retain the erases from "
+                    "the start and rebuild the replica from deltas."
+                )
+
             slot_index = meta.get("slot_index")
             if slot_index is None:
                 raise ValueError(
@@ -2120,6 +2153,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 erased_keys=delta.erased_keys[i],
                 evicted_keys=delta.evicted_keys[i],
                 current_score=meta.get("current_score"),
+                num_rows=meta.get("num_rows"),
+                erased_slot_index=meta.get("erased_slot_index"),
             )
             self._check_delta_shapes(job, content, storage)
 
@@ -2260,7 +2295,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # replica replay what it already received. A model that is itself a
             # dump source for someone further down would want the opposite --
             # say so when that case turns up.
-            stats.erased = storage.erase_keys(job.table_id, erased)
+            stats.erased = storage.erase_keys(job.table_id, erased, from_replay=True)
+
+        # After the removals and before the upserts. A slot an erased key left
+        # and a later key took (add A, erase A, add B) is overwritten by B's
+        # upsert below; one nobody took stays reclaimed with its row, which is
+        # what keeps this replica's rows the same as the source's.
+        if job.erased_slot_index is not None and job.erased_slot_index.numel() > 0:
+            storage.restore_reclaimed_slots(job.table_id, job.erased_slot_index)
 
         # Before writing, so a restored key lands on the same scale the replica
         # will later threshold its own incremental_dump against. Timestamp-based
@@ -2286,6 +2328,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 timestamp=ts,
             )
         )
+        if job.num_rows is not None:
+            # Rows are restored verbatim, so the counter has to cover every row
+            # the source had handed out, not just the ones this delta names.
+            storage.key_index_map.reserve_rows(job.table_id, job.num_rows)
         self._invalidate_cache(job.table_id, keys, erased, evicted)
         return stats
 
@@ -2353,6 +2399,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if pg is not None:
             out = _all_gather_evicted_keys(out, pg)
         return out.cpu()
+
+    @staticmethod
+    def _num_rows_of(
+        storage: Union[DynamicEmbStorage, HybridStorage], table_id: int
+    ) -> Optional[int]:
+        """Rows handed out so far for one logical table, for a storage that
+        stores a row per key; ``None`` where the row is the hash slot.
+
+        Replay needs it as metadata: the delta only carries the keys that
+        changed, so the rows it names say nothing about how many rows the source
+        had allocated, and a replica whose counter fell short would hand a later
+        insert a row that is already in use.
+        """
+        if isinstance(storage, DynamicEmbStorage) and storage.key_index_map.use_rows_:
+            return storage.key_index_map.num_rows(table_id)
+        return None
 
     @staticmethod
     def _row_capacity_of(

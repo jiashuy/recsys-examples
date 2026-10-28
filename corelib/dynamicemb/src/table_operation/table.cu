@@ -219,6 +219,13 @@ void bind_table_operation(py::module &m) {
         py::arg("keys"), py::arg("rows"), py::arg("carried"),
         py::arg("bkt_begin"), py::arg("bkt_end"), py::arg("bucket_capacity"));
 
+  m.def("table_restore_reclaimed_slots",
+        &dyn_emb::table_restore_reclaimed_slots,
+        "restore the reclaimed slots named by packed (slot << 32 | row), "
+        "owning their rows, on a replica",
+        py::arg("keys"), py::arg("rows"), py::arg("slot_index"),
+        py::arg("bkt_begin"), py::arg("bkt_end"), py::arg("bucket_capacity"));
+
   m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
         "Assign per-table monotonic scores via atomicAdd on "
         "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",

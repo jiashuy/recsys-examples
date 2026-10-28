@@ -216,4 +216,77 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+
+// Leaves the slots named by `slot_index` (packed `slot << 32 | row`, the form a
+// dump carries) reclaimed and owning their rows: what an erase leaves behind,
+// recreated for a replica that never held the erased key. An empty slot is
+// claimed by CAS, becomes reclaimed and takes the row. A slot that already is
+// reclaimed must already own that same row. A slot holding a live key is an
+// error. All three are asserted on the device: a replay removes the erased keys
+// first and writes the upserts after, so at this point no live key can be there
+// unless the replica's layout differs from the source's or something else is
+// writing to it. Reclaimed slots are not counted in bucket_sizes, so nothing
+// else changes. The slots of one call must be distinct -- the erased slots are
+// de-duplicated when they are popped, since a slot erased, refilled and erased
+// again is still one reclaimed slot with one row.
+__global__ void restore_reclaimed_slots_kernel(
+    int64_t *__restrict__ keys, int64_t key_stride, int32_t *__restrict__ rows,
+    int64_t const *__restrict__ slot_index, int64_t n, int64_t bkt_begin,
+    int64_t num_slots, int64_t bucket_capacity) {
+  for (int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       j < n; j += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int64_t packed = slot_index[j];
+    int64_t slot = (packed >> 32) & 0xFFFFFFFF;
+    int32_t row = static_cast<int32_t>(packed & 0xFFFFFFFF);
+    CUDA_KERNEL_ASSERT(slot < num_slots);
+    int64_t bucket = bkt_begin + slot / bucket_capacity;
+    int64_t iter = slot % bucket_capacity;
+    int64_t *key = keys + bucket * key_stride + iter;
+    unsigned long long old =
+        atomicCAS(reinterpret_cast<unsigned long long *>(key),
+                  static_cast<unsigned long long>(kEmptyKey),
+                  static_cast<unsigned long long>(kReclaimedKey));
+    // `old` is what the slot held before the CAS. Two values are legal, and
+    // both leave the slot reclaimed:
+    //  - Empty: the CAS just claimed it. The replica never held the erased key
+    //    (it was added and erased within one window, so no earlier delta
+    //    carried it), so its own erase had nothing to remove and the slot stayed
+    //    empty. It has no row yet, so the row is written here.
+    //  - Reclaimed: the CAS did nothing, the slot already was. The replica held
+    //    the key, and its erase, which ran just before, left the slot reclaimed
+    //    with the row that key's replay gave it -- the source's. An erase only
+    //    changes the key, never the row, so there is nothing to write, and a
+    //    row that differs means the replica has diverged: asserted, not
+    //    overwritten, so the divergence is not hidden.
+    // Anything else is a live or a locked key, which a replay that removed the
+    // erased keys first cannot meet.
+    int64_t flat = bucket * bucket_capacity + iter;
+    if (static_cast<int64_t>(old) == kEmptyKey) {
+      rows[flat] = row;
+    } else {
+      CUDA_KERNEL_ASSERT(static_cast<int64_t>(old) == kReclaimedKey);
+      CUDA_KERNEL_ASSERT(rows[flat] == row);
+    }
+  }
+}
+
+void table_restore_reclaimed_slots(at::Tensor keys, at::Tensor rows,
+                                   at::Tensor slot_index, int64_t bkt_begin,
+                                   int64_t bkt_end, int64_t bucket_capacity) {
+  check_keys_view(keys);
+  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
+  TORCH_CHECK(slot_index.is_cuda() && slot_index.scalar_type() == at::kLong);
+  int64_t n = slot_index.numel();
+  if (n == 0)
+    return;
+  constexpr int BLOCK = 256;
+  int64_t grid = std::min<int64_t>((n + BLOCK - 1) / BLOCK, 1 << 20);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  restore_reclaimed_slots_kernel<<<grid, BLOCK, 0, stream>>>(
+      keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int32_t>(),
+      slot_index.data_ptr<int64_t>(), n, bkt_begin,
+      (bkt_end - bkt_begin) * bucket_capacity, bucket_capacity);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace dyn_emb
