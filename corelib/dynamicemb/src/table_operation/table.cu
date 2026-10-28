@@ -199,6 +199,26 @@ void bind_table_operation(py::module &m) {
         py::arg("overflow_output_offsets") = py::none(),
         py::arg("overflow_bucket_capacity") = 0);
 
+  m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
+        "map table-relative hash slots to the value rows they own, "
+        "allocating the next row of the table for a slot without one when "
+        "allocate is set",
+        py::arg("rows"), py::arg("row_counters"),
+        py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("slots"), py::arg("table_ids"), py::arg("allocate"));
+
+  m.def("table_collect_reclaimed_rows", &dyn_emb::table_collect_reclaimed_rows,
+        "rows owned by the reclaimed slots of a bucket range; num_rows is "
+        "how many there are",
+        py::arg("keys"), py::arg("rows"), py::arg("bkt_begin"),
+        py::arg("bkt_end"), py::arg("bucket_capacity"), py::arg("num_rows"));
+
+  m.def("table_place_reclaimed_rows", &dyn_emb::table_place_reclaimed_rows,
+        "place carried rows into free slots of a bucket range, marking the "
+        "slots reclaimed",
+        py::arg("keys"), py::arg("rows"), py::arg("carried"),
+        py::arg("bkt_begin"), py::arg("bkt_end"), py::arg("bucket_capacity"));
+
   m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
         "Assign per-table monotonic scores via atomicAdd on "
         "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",

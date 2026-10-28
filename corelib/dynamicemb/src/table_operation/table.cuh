@@ -178,6 +178,26 @@ void table_update_counter_with_layout(
     c10::optional<at::Tensor> overflow_output_offsets,
     int64_t overflow_bucket_capacity);
 
+// Resolve table-relative hash slots to the value rows they own, taking the
+// next row of the slot's table for a slot that has none yet when `allocate`.
+at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
+                              at::Tensor table_bucket_offsets,
+                              int64_t bucket_capacity, at::Tensor slots,
+                              at::Tensor table_ids, bool allocate);
+
+// Rehash support. table_collect_reclaimed_rows returns the rows owned by the
+// reclaimed slots of buckets [bkt_begin, bkt_end) as int32[num_rows], where
+// num_rows is how many there are (the table's row counter minus its live
+// keys). table_place_reclaimed_rows then gives each of those rows a free slot
+// of the (new) table's bucket range, marking the slot reclaimed.
+at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
+                                        int64_t bkt_begin, int64_t bkt_end,
+                                        int64_t bucket_capacity,
+                                        int64_t num_rows);
+void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
+                                at::Tensor carried, int64_t bkt_begin,
+                                int64_t bkt_end, int64_t bucket_capacity);
+
 at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
                                      at::Tensor table_ids);
 
