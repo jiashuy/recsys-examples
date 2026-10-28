@@ -199,11 +199,15 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                 int64_t bkt_end, int64_t bucket_capacity);
 
 // Restore the reclaimed slots a dump's packed `slot << 32 | row` names, owning
-// their rows, on a replica; a slot holding a live key is asserted against (see
-// table_rows.cu).
-void table_restore_reclaimed_slots(at::Tensor keys, at::Tensor rows,
-                                   at::Tensor slot_index, int64_t bkt_begin,
-                                   int64_t bkt_end, int64_t bucket_capacity);
+// their rows, on a replica: an empty slot becomes reclaimed with the row, a
+// reclaimed one must already own it, and a live key still in the slot is erased
+// first (see table_rows.cu).
+void table_restore_reclaimed_slots(at::Tensor table_storage,
+                                   at::Tensor table_bucket_offsets,
+                                   int64_t bucket_capacity,
+                                   at::Tensor bucket_sizes, at::Tensor rows,
+                                   at::Tensor slot_index, int64_t table_id,
+                                   int64_t num_scores, torch::Dtype key_dtype);
 
 at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
                                      at::Tensor table_ids);

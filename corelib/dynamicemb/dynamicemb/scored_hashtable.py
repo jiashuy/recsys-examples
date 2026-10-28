@@ -887,22 +887,24 @@ class LinearBucketTable(ScoredHashTable):
         owning their rows.
 
         What an erase leaves behind, recreated for a replica that never held the
-        erased key. A slot that is empty or already reclaimed becomes reclaimed
-        with the row; one that holds a live key is an error (asserted on the
-        device), since a replay removes the erased keys before it calls this.
-        Reclaimed slots are not counted in ``bucket_sizes``, so nothing else
-        changes.
+        erased key. A slot that is empty becomes reclaimed with the row; one that
+        already is reclaimed must own that row (asserted on the device); one that
+        still holds a key -- the source evicted it with a key it then erased, so
+        nothing in the delta overwrites it -- has that key erased, with
+        ``bucket_sizes`` fixed, and then owns the row like the others.
+        Reclaimed slots are not counted in ``bucket_sizes``.
         """
         assert self.use_rows_
-        b0 = int(self.table_bucket_offsets_cpu_[table_id].item())
-        b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
         table_restore_reclaimed_slots(
-            self.keys_.view(torch.int64),
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
             self.rows_,
             slot_index,
-            b0,
-            b1,
-            self.bucket_capacity_,
+            table_id,
+            self.num_scores_,
+            self.key_type_,
         )
 
     def reserve_rows(self, table_id: int, num_rows: int) -> None:

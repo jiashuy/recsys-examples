@@ -960,3 +960,34 @@ def test_an_unretained_erase_makes_the_delta_unreplayable(current_device):
     # Sticky: later deltas stay unreplayable.
     touch(src, [3001], device, backward=True)
     assert dump_all(src).meta[0]["erase_untracked"] is True
+
+
+def test_replay_removes_a_key_the_source_evicted_for_one_it_then_erased(
+    current_device,
+):
+    """B evicts A at the source and is erased before the next dump. The delta
+    holds neither (no live key took the slot), only B's erase; the replica never
+    held B, yet still holds A in the slot the source now has reclaimed. Replay has
+    to remove A, or the replica keeps a key the source no longer has."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2017)), device, backward=True)  # all 16 slots
+    dst.replay_increment(dump_all(src))
+
+    touch(src, [3001], device, backward=True)  # B evicts one of them: A
+    _erase(src, [3001], device)
+
+    delta = dump_all(src)
+    assert delta.erased_keys[0].tolist() == [3001]
+    assert delta.keys[0].numel() == 15, "A was evicted, B erased"
+    dst.replay_increment(delta)
+
+    replayed = dump_all(dst)
+    assert set(replayed.keys[0].tolist()) == set(delta.keys[0].tolist())
+    assert_rows_accounted_for(dst)
+    # The replica's table ends up identical to the source's, not just the same
+    # keys: A's slot is reclaimed with its row, and the bucket count dropped.
+    src_kim, dst_kim = src._storage.key_index_map, dst._storage.key_index_map
+    assert torch.equal(dst_kim.keys_, src_kim.keys_)
+    assert torch.equal(dst_kim.rows_, src_kim.rows_)
+    assert torch.equal(dst_kim.bucket_sizes, src_kim.bucket_sizes)

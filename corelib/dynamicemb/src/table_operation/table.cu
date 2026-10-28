@@ -222,9 +222,11 @@ void bind_table_operation(py::module &m) {
   m.def("table_restore_reclaimed_slots",
         &dyn_emb::table_restore_reclaimed_slots,
         "restore the reclaimed slots named by packed (slot << 32 | row), "
-        "owning their rows, on a replica",
-        py::arg("keys"), py::arg("rows"), py::arg("slot_index"),
-        py::arg("bkt_begin"), py::arg("bkt_end"), py::arg("bucket_capacity"));
+        "owning their rows, on a replica; a live key still in a slot is erased",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("rows"),
+        py::arg("slot_index"), py::arg("table_id"), py::arg("num_scores"),
+        py::arg("key_dtype"));
 
   m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
         "Assign per-table monotonic scores via atomicAdd on "
