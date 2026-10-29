@@ -1973,6 +1973,15 @@ def _validate_load_meta(
     )
 
 
+# Placeholder frequency delta for load placement of multi-word (LruLfu) tables.
+# A new slot starts at frequency 0, so placed keys would rank lowest and a later
+# key of the same batch could evict them. Placing with a large frequency keeps the
+# batch's own keys out of the victim set; scatter_score_blocks then overwrites
+# both words with the checkpoint's values. Kept below 2**63 (SCORE_TYPE is int64
+# and device scores are cast to int64) with headroom against uint64 wrap-around.
+_LOAD_PLACEMENT_FREQ = 1 << 62
+
+
 def _load_key_values(
     state: DynamicEmbTableState,
     keys: torch.Tensor,
@@ -2032,9 +2041,10 @@ def _load_key_values(
     # Multi-word score layouts (LruLfu: timestamp + frequency) cannot be restored
     # by a single-value insert (which only writes word 0). Place the keys, then
     # scatter the full [N, num_scores] block. Placement uses the table's own
-    # policy with a zero frequency delta so that a full bucket evicts through the
-    # ranked LruLfu evictor (honoring a custom score_function); the scatter then
-    # overwrites both words.
+    # policy so that a full bucket evicts through the ranked LruLfu evictor
+    # (honoring a custom score_function). The frequency delta is
+    # _LOAD_PLACEMENT_FREQ so keys placed earlier in the batch are not the first
+    # victims of later ones; the scatter then overwrites both words.
     num_scores = state.key_index_map.num_scores_
     if num_scores > 1:
         # Validate the score-block shape before scatter_score_blocks writes it
@@ -2056,7 +2066,12 @@ def _load_key_values(
         )
         place_arg = ScoreArg(
             name=state.score_policy.name,
-            value=torch.zeros(keys.numel(), dtype=SCORE_TYPE, device=keys.device),
+            value=torch.full(
+                (keys.numel(),),
+                _LOAD_PLACEMENT_FREQ,
+                dtype=SCORE_TYPE,
+                device=keys.device,
+            ),
             policy=state.score_policy.policy,
         )
         indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
