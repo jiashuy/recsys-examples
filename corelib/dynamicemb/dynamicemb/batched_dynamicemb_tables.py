@@ -54,6 +54,7 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
+    has_no_eviction,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -840,8 +841,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
                 # The cache ranks by timestamp only; the backing storage is the
-                # full set and owns every key's score (and NO_EVICTION, which
-                # cache overflow rejects, see create_table_state).
+                # full set and owns every key's score (and the no-eviction mode,
+                # which cache overflow rejects, see create_table_state).
                 for cache_option in cache_options:
                     cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
                     cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
@@ -852,11 +853,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
                 PS = storage_options[0].external_storage
-                if (
-                    PS
-                    and storage_options[0].score_strategy
-                    == DynamicEmbScoreStrategy.NO_EVICTION
-                ):
+                if PS and has_no_eviction(storage_options[0].score_strategy):
                     # NO_EVICTION storage never evicts (it expands instead), so
                     # nothing would ever spill to the PS; see _insert_into_storage.
                     raise NotImplementedError(
@@ -915,13 +912,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
-                    # HybridStorage does not support NO_EVICTION: its slot_index
-                    # packs only a tier bit + key_slot (which assumes key_slot ==
-                    # value_row); NO_EVICTION's independent value row breaks that.
-                    if (
-                        self._dynamicemb_options[0].score_strategy
-                        == DynamicEmbScoreStrategy.NO_EVICTION
-                    ):
+                    # HybridStorage does not support NO_EVICTION yet: its tiers
+                    # still use the hash slot as the value row, and its
+                    # slot_index packs only a tier bit and the key slot.
+                    if has_no_eviction(self._dynamicemb_options[0].score_strategy):
                         raise ValueError(
                             "NO_EVICTION is not supported with HybridStorage "
                             "(non-caching partial-HBM storage). Use caching=True "
@@ -1847,10 +1841,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
           timestamp crosses the threshold (i.e. touched/changed since the reference
           time) are dumped. Use the value returned by :meth:`get_score` as the
           reference threshold.
-        - Strategies without a timestamp column (e.g. ``STEP``, single ``LFU``,
-          ``NO_EVICTION``) instead threshold on the absolute score value: items whose
+        - Strategies without a timestamp column (e.g. ``STEP``, single ``LFU``)
+          instead threshold on the absolute score value: items whose
           score is not less than the threshold are dumped. This is not a time-based
           increment.
+        - Tables whose strategy contains ``NO_EVICTION`` are refused with
+          ``NotImplementedError``.
         """
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
@@ -1886,6 +1882,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
                 continue
             table_id = self._table_names.index(table_name)
+            option = self._dynamicemb_options[table_id]
+            self._refuse_no_eviction(option, table_name, "incremental_dump")
             (
                 keys_cat,
                 values_cat,
@@ -1893,7 +1891,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 opt_states,
                 scores,
             ) = storage.incremental_dump(table_id, threshold, pg, timestamp=ts)
-            option = self._dynamicemb_options[table_id]
             if score_strategy_has_timestamp_column(option.score_strategy):
                 current_score = ts
             else:
@@ -2106,6 +2103,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ts = device_timestamp()
         return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}
 
+    @staticmethod
+    def _refuse_no_eviction(
+        option: DynamicEmbTableOptions, table_name: str, what: str
+    ) -> None:
+        """Incremental dump and replay are not offered for a table that never
+        evicts. Alone it has no timestamp column to take increments by, and such
+        a table is small; with CUSTOMIZED its score is the user's, who erases keys
+        by it on their own, so there is nothing for a delta to follow."""
+        if has_no_eviction(option.score_strategy):
+            raise NotImplementedError(
+                f"{what} is not supported for table '{table_name}': its "
+                f"score_strategy {option.score_strategy} never evicts, and "
+                "incremental dump and replay do not cover such tables."
+            )
+
     def _for_this_rank(self, entries: Optional[List], table_name: str):
         """This rank's entry of a field a delta carries by source rank.
 
@@ -2151,6 +2163,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
                 continue
             table_id = self._table_names.index(table_name)
+            self._refuse_no_eviction(
+                self._dynamicemb_options[table_id], table_name, "replay_increment"
+            )
             meta = delta.meta[i]
 
             if meta.get("erase_untracked"):
@@ -2474,12 +2489,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         is bounded by.
 
         The two coincide everywhere except NO_EVICTION, where the key map is
-        deliberately ``1 / max_load_factor`` times the value buffer -- and
-        rounding that up to a whole number of buckets makes the map's capacity
-        non-injective in the buffer's. With ``bucket_capacity=128``, an
-        ``init_capacity`` of 100 and of 128 both give a 256-slot key map while
-        leaving 100 and 128 rows: equal on :meth:`_capacity_of`, and a source
-        row of 127 written past the end of a 100-row target. Per tier rather
+        deliberately twice the value buffer: the buffer is exactly half the
+        bucket-rounded map. Still a different number from the map's capacity,
+        and the one a row write is bounded by. Per tier rather
         than summed, since ``slot_index`` routes each key to one tier and a
         matching total would say nothing about either.
 

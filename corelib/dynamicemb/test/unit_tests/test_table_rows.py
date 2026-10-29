@@ -202,3 +202,47 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     table.restore_reclaimed_slots(pack(victim_slot, victim_row), 0)
     assert int(key_col[victim_slot]) == -2
     assert int(table.rows_[victim_slot]) == victim_row
+
+
+def test_row_limit_is_asserted_on_the_device():
+    """A table told its value buffer has four rows must refuse to hand out a fifth,
+    not leave a key whose row is past the buffer. The assert kills the CUDA context,
+    so it runs in a process of its own."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import torch
+        from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
+        from dynamicemb_extensions import ScorePolicy
+
+        table = get_scored_table(
+            capacity=[256], bucket_capacity=16, key_type=torch.int64,
+            score_specs=[ScoreSpec(name="score", policy=ScorePolicy.ASSIGN)],
+            use_rows=True,
+        )
+        keys = torch.arange(0, 8, dtype=torch.int64, device="cuda")
+        tids = torch.zeros(8, dtype=torch.int64, device="cuda")
+        score = ScoreArg(
+            name="score", value=torch.ones(8, dtype=torch.uint64, device="cuda"),
+            policy=ScorePolicy.ASSIGN,
+        )
+        table.set_row_limits([4])
+        table.insert(keys, tids, score)
+        torch.cuda.synchronize()
+        """
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert run.returncode != 0
+    assert "row_limits" in run.stderr, run.stderr[-2000:]
+
+
+def test_row_limit_defaults_to_the_table_capacity():
+    table = _table([256, 512])
+    assert table.row_limits_.tolist() == [256, 512]
+    table.set_row_limits([100, 200])
+    assert table.row_limits_.tolist() == [100, 200]

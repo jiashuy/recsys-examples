@@ -459,9 +459,16 @@ class LinearBucketTable(ScoredHashTable):
             self.row_counters_ = torch.zeros(
                 self.num_tables_, dtype=torch.int32, device=self.device
             )
+            # Rows a table's value buffer has. A slot is never more than one row
+            # of its own, so the table's capacity is the most that can be handed
+            # out; a buffer that is smaller says so through ``set_row_limits``.
+            self.row_limits_ = torch.tensor(
+                self.per_table_capacity_, dtype=torch.int32, device=self.device
+            )
         else:
             self.rows_ = None
             self.row_counters_ = None
+            self.row_limits_ = None
 
         # Overflow buffer & counter
         self.enable_overflow_ = enable_overflow
@@ -568,6 +575,7 @@ class LinearBucketTable(ScoredHashTable):
         return table_resolve_rows(
             self.rows_,
             self.row_counters_,
+            self.row_limits_,
             self.table_bucket_offsets_,
             self.bucket_capacity_,
             slots,
@@ -619,6 +627,18 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=self.num_scores_,
         )
         return slots
+
+    def set_row_limits(self, limits: List[int]) -> None:
+        """Tell the table how many rows each table's value buffer has.
+
+        Allocating a row at or past its table's limit is asserted on the device
+        (no host sync), so a caller that sizes the buffer wrongly fails loudly
+        instead of writing past it. Call again whenever a buffer grows.
+        """
+        assert self.use_rows_ and len(limits) == self.num_tables_
+        self.row_limits_.copy_(
+            torch.tensor(limits, dtype=torch.int32), non_blocking=False
+        )
 
     def num_rows(self, table_id: int) -> int:
         """Rows handed out so far for ``table_id``: rows ``[0, num_rows)`` are

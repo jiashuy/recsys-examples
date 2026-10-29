@@ -59,7 +59,7 @@ class DeltaDumpResult:
         an **age** (``meta[i]["current_score"] - score``) rather than a raw
         timestamp, because ``%globaltimer`` is per device and resets across
         boots; a consumer rebases them onto its own clock. Every other column
-        (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is carried verbatim.
+        (LFU frequency, STEP, CUSTOMIZED) is carried verbatim.
     evicted_keys : List[Optional[torch.Tensor]]
         Per-table keys on host (keys only, no value/score) that the table
         **evicted** to make room since the last ``incremental_dump``. ``None``
@@ -93,9 +93,9 @@ class DeltaDumpResult:
                 threshold.
             meta[i]["slot_index"]:       torch.Tensor -- int64 host tensor aligned
                 with ``keys[i]``; the storage slot each dumped key occupies, used
-                by ``replay_increment``. For NO_EVICTION tables, and for tables
-                that store a row per key, it packs the key slot (high 32 bits)
-                and value row (low 32 bits) into one int64.
+                by ``replay_increment``. For tables that store a row per key it
+                packs the key slot (high 32 bits) and value row (low 32 bits)
+                into one int64.
             meta[i]["erased_slot_index"]: Optional[List[torch.Tensor]] -- for a table
                 that stores a row per key, the packed slot (high 32 bits) and row
                 (low 32) of every slot an explicit erase left reclaimed since the
@@ -126,7 +126,7 @@ class DeltaDumpResult:
                 storage tier. A second bound: ``current_capacity`` says where a
                 key may sit, this says how far a row write may reach. The two
                 coincide except under NO_EVICTION, whose key map is deliberately
-                larger than its value buffer.
+                twice the size of its value buffer.
             meta[i]["bucket_capacity"]:  int  -- slots per hash bucket; replay
                 compares it to decide whether the source slots are usable.
             meta[i]["num_scores"]:       int  -- score words per key; part of the
@@ -508,7 +508,7 @@ def replay_increment(
     Recover by rebuilding from a full checkpoint, or by fixing the target and
     replaying the same delta again. Replaying it twice restores the same keys,
     the same embeddings and the same optimizer states, and carries LFU
-    frequencies, ``STEP``, ``CUSTOMIZED`` and ``NO_EVICTION`` row numbers through
+    frequencies, ``STEP`` and ``CUSTOMIZED`` scores through
     unchanged. What does not repeat is a **timestamp** column: the delta stores
     it as an age, and each replay turns that back into a score against the clock
     it reads when it runs (see :class:`ReplayContent`). So a module that was
@@ -533,8 +533,7 @@ def replay_increment(
     inserted here, so the replica orders its own future evictions by when it
     received a key rather than by how the source ranked it -- the two can evict
     in different orders, but never hold a wrong embedding for a key they share.
-    (NO_EVICTION is unaffected either way: its score word is a value row, not a
-    score, and is restored exactly.)
+    (NO_EVICTION alone keeps no score, so there is nothing to order.)
 
     **Sharding.** The target must be sharded across the same number of ranks as
     the source: ``meta["world_size"]`` is compared with this model's, and a

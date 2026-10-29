@@ -21,8 +21,13 @@ namespace dyn_emb {
 // row. Negative entries are not slots and pass through (see below). Anything
 // else must be a slot of the table's main region, and, unless `allocate`, one
 // that already owns a row; both are asserted on the device.
+//
+// A new row must also lie below `row_limits[table]`, the rows the table's value
+// buffer has: handing out one past it would make every later read and write of
+// that key run off the buffer, so it is asserted here, where it is first known.
 __global__ void table_resolve_rows_kernel(
     int32_t *__restrict__ rows, int32_t *__restrict__ row_counters,
+    int32_t const *__restrict__ row_limits,
     int64_t const *__restrict__ table_bucket_offsets, int64_t bucket_capacity,
     int64_t const *__restrict__ slots, int64_t const *__restrict__ table_ids,
     int64_t *__restrict__ out, int64_t n, bool allocate) {
@@ -53,6 +58,7 @@ __global__ void table_resolve_rows_kernel(
       if (allocate) {
         // Keys in one batch are unique, so no other thread touches this slot.
         row = atomicAdd(row_counters + tid, 1);
+        CUDA_KERNEL_ASSERT(row < row_limits[tid]);
         rows[flat] = row;
       }
     }
@@ -61,11 +67,14 @@ __global__ void table_resolve_rows_kernel(
 }
 
 at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
+                              at::Tensor row_limits,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate) {
   TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
   TORCH_CHECK(row_counters.is_cuda() && row_counters.scalar_type() == at::kInt);
+  TORCH_CHECK(row_limits.is_cuda() && row_limits.scalar_type() == at::kInt &&
+              row_limits.numel() == row_counters.numel());
   TORCH_CHECK(slots.is_cuda() && slots.scalar_type() == at::kLong);
   TORCH_CHECK(table_ids.is_cuda() && table_ids.scalar_type() == at::kLong);
   TORCH_CHECK(slots.numel() == table_ids.numel());
@@ -77,6 +86,7 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   table_resolve_rows_kernel<<<(n + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
       rows.data_ptr<int32_t>(), row_counters.data_ptr<int32_t>(),
+      row_limits.data_ptr<int32_t>(),
       table_bucket_offsets.data_ptr<int64_t>(), bucket_capacity,
       slots.data_ptr<int64_t>(), table_ids.data_ptr<int64_t>(),
       out.data_ptr<int64_t>(), n, allocate);

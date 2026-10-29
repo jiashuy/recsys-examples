@@ -179,8 +179,10 @@ void table_update_counter_with_layout(
     int64_t overflow_bucket_capacity);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
-// next row of the slot's table for a slot that has none yet when `allocate`.
+// next row of the slot's table for a slot that has none yet when `allocate`;
+// a row at or past the table's `row_limits` entry is asserted on the device.
 at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
+                              at::Tensor row_limits,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate);
@@ -208,8 +210,5 @@ void table_restore_reclaimed_slots(at::Tensor table_storage,
                                    at::Tensor bucket_sizes, at::Tensor rows,
                                    at::Tensor slot_index, int64_t table_id,
                                    int64_t num_scores, torch::Dtype key_dtype);
-
-at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
-                                     at::Tensor table_ids);
 
 } // namespace dyn_emb

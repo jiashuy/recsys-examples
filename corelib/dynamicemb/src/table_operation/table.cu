@@ -202,8 +202,8 @@ void bind_table_operation(py::module &m) {
   m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
         "map table-relative hash slots to the value rows they own, "
         "allocating the next row of the table for a slot without one when "
-        "allocate is set",
-        py::arg("rows"), py::arg("row_counters"),
+        "allocate is set (asserting it is below the table's row limit)",
+        py::arg("rows"), py::arg("row_counters"), py::arg("row_limits"),
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
         py::arg("slots"), py::arg("table_ids"), py::arg("allocate"));
 
@@ -227,11 +227,6 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("rows"),
         py::arg("slot_index"), py::arg("table_id"), py::arg("num_scores"),
         py::arg("key_dtype"));
-
-  m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
-        "Assign per-table monotonic scores via atomicAdd on "
-        "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",
-        py::arg("no_eviction_next_index_dev"), py::arg("table_ids"));
 
   // --- LruLfu eviction JIT (see jit_link.h) ---
   m.def(

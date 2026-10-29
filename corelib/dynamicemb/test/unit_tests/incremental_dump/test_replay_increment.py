@@ -161,9 +161,6 @@ def assert_rows_accounted_for(model, table_id: int = 0) -> None:
         DynamicEmbScoreStrategy.STEP,
         DynamicEmbScoreStrategy.LFU,
         (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU),
-        # NO_EVICTION exercises the packed slot_index (key slot in the high 32
-        # bits, value row in the low 32) and the auto-increment row counter.
-        DynamicEmbScoreStrategy.NO_EVICTION,
     ],
 )
 def test_replay_round_trip(current_device, score_strategy):
@@ -1024,3 +1021,27 @@ def test_an_unretained_erase_taints_only_its_own_table(current_device):
     only_t1 = src.incremental_dump({"t_1": 0})
     assert only_t1.meta[0]["erase_untracked"] is False
     assert dst.replay_increment(only_t1)["t_1"].upserted == len(keys)
+
+
+@pytest.mark.parametrize(
+    "score_strategy",
+    [
+        DynamicEmbScoreStrategy.NO_EVICTION,
+        (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
+    ],
+)
+def test_no_eviction_tables_refuse_incremental_dump(current_device, score_strategy):
+    """A table that never evicts has no timestamp to take a delta by, and its
+    erased keys are the user's to manage, so neither dump nor replay applies."""
+    device = torch.device(f"cuda:{current_device}")
+    model = make_model(current_device, score_strategy=score_strategy)
+    touch(model, list(range(1, 33)), device)
+    source = make_model(current_device)
+    touch(source, list(range(1, 33)), device)
+    delta = dump_all(source)
+
+    with pytest.raises(NotImplementedError, match="incremental_dump"):
+        dump_all(model)
+
+    with pytest.raises(NotImplementedError, match="replay_increment"):
+        model.replay_increment(delta)
