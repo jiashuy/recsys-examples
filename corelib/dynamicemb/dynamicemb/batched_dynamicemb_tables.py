@@ -1848,8 +1848,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
           instead threshold on the absolute score value: items whose
           score is not less than the threshold are dumped. This is not a time-based
           increment.
-        - Tables whose strategy contains ``NO_EVICTION`` are refused with
-          ``NotImplementedError``.
+        - Tables whose strategy contains ``NO_EVICTION`` are skipped with a
+          ``UserWarning``: they have no timestamp to take a delta by, and their
+          erased keys are the user's to manage. They are absent from the result.
         """
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
@@ -1886,7 +1887,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
             table_id = self._table_names.index(table_name)
             option = self._dynamicemb_options[table_id]
-            self._refuse_no_eviction(option, table_name, "incremental_dump")
+            if has_no_eviction(option.score_strategy):
+                # Nothing is dumped, so nothing is drained either: the retained
+                # key buffers of the tables that are dumped are untouched by it.
+                warnings.warn(
+                    f"incremental_dump: table '{table_name}' is skipped. Its "
+                    f"score_strategy {option.score_strategy} never evicts, and "
+                    "incremental dump does not cover such tables.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
             (
                 keys_cat,
                 values_cat,
@@ -2127,10 +2138,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def _refuse_no_eviction(
         option: DynamicEmbTableOptions, table_name: str, what: str
     ) -> None:
-        """Incremental dump and replay are not offered for a table that never
-        evicts. Alone it has no timestamp column to take increments by, and such
-        a table is small; with CUSTOMIZED its score is the user's, who erases keys
-        by it on their own, so there is nothing for a delta to follow."""
+        """Replay is not offered for a table that never evicts (incremental dump
+        skips it). Alone it has no timestamp column to take increments by, and
+        such a table is small; with CUSTOMIZED its score is the user's, who
+        erases keys by it on their own, so there is nothing for a delta to
+        follow."""
         if has_no_eviction(option.score_strategy):
             raise NotImplementedError(
                 f"{what} is not supported for table '{table_name}': its "

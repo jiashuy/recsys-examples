@@ -125,9 +125,7 @@ class DeltaDumpResult:
                 slot means the same thing in two tables.
             meta[i]["row_capacity"]:     Tuple[int, ...] -- value-buffer rows per
                 storage tier. A second bound: ``current_capacity`` says where a
-                key may sit, this says how far a row write may reach. The two
-                coincide except under NO_EVICTION, whose key map is deliberately
-                twice the size of its value buffer.
+                key may sit, this says how far a row write may reach.
             meta[i]["bucket_capacity"]:  int  -- slots per hash bucket; replay
                 compares it to decide whether the source slots are usable.
             meta[i]["num_scores"]:       int  -- score words per key; part of the
@@ -358,6 +356,11 @@ def incremental_dump(
     keys (for retain-enabled tables) and meta (see :class:`DeltaDumpResult`). An
     empty dict if the model has no dynamic embedding tables.
 
+    A table whose ``score_strategy`` contains ``NO_EVICTION`` (alone, or as
+    ``(NO_EVICTION, CUSTOMIZED)``) is skipped with a ``UserWarning`` and is absent
+    from the result: it has no timestamp to take a delta by, and its erased keys
+    are the user's to manage. Skipping drains nothing from it.
+
     Args:
         model(nn.Module):The model containing dynamic embedding tables.
          score_threshold(Uinon[int, Dict[str, Dict[str, int]]]):
@@ -542,7 +545,6 @@ def replay_increment(
     inserted here, so the replica orders its own future evictions by when it
     received a key rather than by how the source ranked it -- the two can evict
     in different orders, but never hold a wrong embedding for a key they share.
-    (NO_EVICTION alone keeps no score, so there is nothing to order.)
 
     **Sharding.** The target must be sharded across the same number of ranks as
     the source: ``meta["world_size"]`` is compared with this model's, and a

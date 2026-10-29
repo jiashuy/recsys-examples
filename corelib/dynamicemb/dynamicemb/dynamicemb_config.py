@@ -293,7 +293,7 @@ def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
     tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
     has no ordering to preserve). A multi-element tuple must form a supported
-    compound set (currently only ``{TIMESTAMP, LFU}``) and is returned as a tuple.
+    compound set (``{TIMESTAMP, LFU}`` or ``{NO_EVICTION, CUSTOMIZED}``) and is returned as a tuple.
 
     Raises
     ------

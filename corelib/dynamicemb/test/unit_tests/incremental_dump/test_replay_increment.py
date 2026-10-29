@@ -1030,9 +1030,12 @@ def test_an_unretained_erase_taints_only_its_own_table(current_device):
         (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
     ],
 )
-def test_no_eviction_tables_refuse_incremental_dump(current_device, score_strategy):
+def test_no_eviction_tables_are_skipped_by_dump_and_refuse_replay(
+    current_device, score_strategy
+):
     """A table that never evicts has no timestamp to take a delta by, and its
-    erased keys are the user's to manage, so neither dump nor replay applies."""
+    erased keys are the user's to manage. A dump skips it, with a warning and
+    without draining anything, and replay does not write into it."""
     device = torch.device(f"cuda:{current_device}")
     model = make_model(current_device, score_strategy=score_strategy)
     touch(model, list(range(1, 33)), device)
@@ -1040,8 +1043,9 @@ def test_no_eviction_tables_refuse_incremental_dump(current_device, score_strate
     touch(source, list(range(1, 33)), device)
     delta = dump_all(source)
 
-    with pytest.raises(NotImplementedError, match="incremental_dump"):
-        dump_all(model)
+    with pytest.warns(UserWarning, match="NO_EVICTION|never evicts"):
+        skipped = dump_all(model)
+    assert skipped.table_names == []
 
     with pytest.raises(NotImplementedError, match="replay_increment"):
         model.replay_increment(delta)
