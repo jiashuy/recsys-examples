@@ -1725,6 +1725,52 @@ def _dump_table(
         fopt_states.close()
 
 
+def _resolve_shard(
+    shard_index: Optional[int], num_shards: Optional[int]
+) -> Tuple[int, int]:
+    """The table's own shard geometry, or the global rank and world size (the
+    row-wise answer) when either half is left ``None``."""
+    if num_shards is None or shard_index is None:
+        num_shards = dist.get_world_size() if dist.is_initialized() else 1
+        shard_index = dist.get_rank() if dist.is_initialized() else 0
+    return shard_index, num_shards
+
+
+def _count_owned_keys(
+    emb_key_path: str,
+    device: torch.device,
+    dist_type: str,
+    batch_size: int = 65536,
+    shard_index: Optional[int] = None,
+    num_shards: Optional[int] = None,
+) -> int:
+    """How many of a checkpoint file's keys this rank keeps.
+
+    Reads only the key file, with the filter :func:`_iter_batches_from_files`
+    applies. A checkpoint can hold many ranks' keys while a rank keeps only its
+    own share, so the file's size is not what a rank has to make room for.
+    """
+    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
+    shard_index, num_shards = _resolve_shard(shard_index, num_shards)
+    if num_shards <= 1:
+        return num_keys
+    owned = 0
+    with open(emb_key_path, "rb") as fkey:
+        for start in range(0, num_keys, batch_size):
+            n = min(num_keys - start, batch_size)
+            keys = torch.tensor(
+                np.frombuffer(
+                    fkey.read(KEY_TYPE.itemsize * n),
+                    dtype=torch_dtype_to_np_dtype[KEY_TYPE],
+                ),
+                dtype=KEY_TYPE,
+                device=device,
+            )
+            mask = owned_key_mask(keys, shard_index, num_shards, dist_type)
+            owned += int(mask.sum().item()) if mask is not None else n
+    return owned
+
+
 def _iter_batches_from_files(
     emb_key_path: str,
     embedding_file_path: str,
@@ -1781,9 +1827,7 @@ def _iter_batches_from_files(
     fopt = open(opt_file_path, "rb") if opt_file_path else None
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
 
-    if num_shards is None or shard_index is None:
-        num_shards = dist.get_world_size() if dist.is_initialized() else 1
-        shard_index = dist.get_rank() if dist.is_initialized() else 0
+    shard_index, num_shards = _resolve_shard(shard_index, num_shards)
 
     try:
         for start in range(0, num_keys, batch_size):
@@ -2812,14 +2856,22 @@ class DynamicEmbStorage(Storage):
         unique_size_per_table = torch.zeros(
             self._state.num_tables, dtype=torch.int64, device=torch.device("cpu")
         )
-        # Every key in the file may be a new one. The count has to be the keys
-        # themselves: expand_if_need adds it to what the table holds and sizes the
-        # table for that total, so passing only the part that overflows the value
-        # buffer would undercount the keys it has to fit.
-        unique_size_per_table[table_id] = params.num_keys
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # Every key this rank keeps may be a new one. The count has to be those
+        # keys themselves: expand_if_need adds it to what the table holds and sizes
+        # the table for that total, so passing only the part that overflows the
+        # value buffer would undercount the keys it has to fit. And only this
+        # rank's: the file can hold other ranks' keys too, and a table that never
+        # evicts has no max_capacity to stop it growing for all of them.
+        unique_size_per_table[table_id] = _count_owned_keys(
+            emb_key_path,
+            device,
+            params.dist_type,
+            shard_index=shard_index,
+            num_shards=num_shards,
+        )
         self.expand_if_need(unique_size_per_table)
 
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
         num_scores = self._state.key_index_map.num_scores_
         # The checkpoint stores multi-word scores in the user's configured
         # (logical) order; reorder each batch back into the physical device layout

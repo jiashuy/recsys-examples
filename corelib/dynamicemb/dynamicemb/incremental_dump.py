@@ -110,7 +110,8 @@ class DeltaDumpResult:
                 erases were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
                 ``erase_untracked``.
             meta[i]["erase_untracked"]:  bool -- the table erased keys without
-                retaining them, so ``erased_slot_index`` misses the slots they
+                retaining them (on any rank of the dumping group), so
+                ``erased_slot_index`` misses the slots they
                 left and the delta cannot be replayed exactly. Sticky.
                 ``replay_increment`` refuses such a delta.
             meta[i]["num_rows"]:         Optional[List[int]] -- for a table that stores
@@ -494,6 +495,14 @@ def replay_increment(
     only once it has matched the delta's ``meta`` (capacity, bucket capacity,
     score layout, dim, dist_type, world size). A table whose metadata does not
     match is never written: it raises :class:`ValueError` instead.
+
+    **The source growing ends the delta chain.** A target's capacity does not
+    change on its own, so once the source table expands (rehash) its capacity no
+    longer matches the target's, and every delta dumped from then on is rejected
+    for it. Slots, and the rows that erased keys left reclaimed, name positions in
+    the layout they were taken from; a layout that was rebuilt cannot be followed
+    by replaying writes into the old one. Rebuild the target from a full
+    checkpoint of the grown source, and replay what comes after it.
 
     That check covers every table a module holds before the module writes any of
     them, so a rejection leaves the module as it was. It does not span a

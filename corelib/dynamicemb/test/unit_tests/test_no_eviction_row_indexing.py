@@ -52,7 +52,9 @@ def current_device():
     return torch.cuda.current_device()
 
 
-def build_model(current_device: int, max_capacity: int, init_capacity=None):
+def build_model(
+    current_device: int, max_capacity: int, init_capacity=None, **options_kwargs
+):
     options = DynamicEmbTableOptions(
         index_type=torch.int64,
         embedding_dtype=torch.float32,
@@ -60,6 +62,7 @@ def build_model(current_device: int, max_capacity: int, init_capacity=None):
         dim=DIM,
         max_capacity=max_capacity,
         init_capacity=init_capacity,
+        **options_kwargs,
         bucket_capacity=128,
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
         local_hbm_for_values=1024**3,
@@ -441,8 +444,20 @@ def test_no_eviction_alone_keeps_no_score(current_device):
     assert state.key_index_map.use_rows_
 
 
-def test_no_eviction_with_customized_keeps_the_customized_score(current_device):
-    """``(NO_EVICTION, CUSTOMIZED)`` never evicts and scores like CUSTOMIZED."""
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
+        (DynamicEmbScoreStrategy.CUSTOMIZED, DynamicEmbScoreStrategy.NO_EVICTION),
+    ],
+)
+def test_no_eviction_with_customized_keeps_the_customized_score(
+    current_device, strategy
+):
+    """``(NO_EVICTION, CUSTOMIZED)``, in either order, never evicts and scores like
+    CUSTOMIZED: the user sets the score before a forward and the keys it touches
+    take it."""
+    from dynamicemb.scored_hashtable import ScoreArg
     from dynamicemb_extensions import ScorePolicy
 
     device = torch.device(f"cuda:{current_device}")
@@ -455,10 +470,7 @@ def test_no_eviction_with_customized_keeps_the_customized_score(current_device):
         bucket_capacity=128,
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
         local_hbm_for_values=1024**3,
-        score_strategy=(
-            DynamicEmbScoreStrategy.NO_EVICTION,
-            DynamicEmbScoreStrategy.CUSTOMIZED,
-        ),
+        score_strategy=strategy,
         caching=False,
         initializer_args=DynamicEmbInitializerArgs(
             mode=DynamicEmbInitializerMode.DEBUG
@@ -478,8 +490,23 @@ def test_no_eviction_with_customized_keeps_the_customized_score(current_device):
     assert state.key_index_map.num_scores_ == 1
 
     keys = list(range(1001, 1301))
+    key_tensor = torch.tensor(keys, dtype=torch.int64, device=device)
+    tids = torch.zeros_like(key_tensor)
+    read_only = ScoreArg(
+        name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+    )
+
+    def stored_scores():
+        scores, founds, _ = state.key_index_map.lookup(key_tensor, tids, read_only)
+        assert bool(founds.all())
+        return scores
+
+    model.set_score({TABLE: 7})
     assert_debug_values(lookup(model, keys, device), keys)  # insert
+    assert (stored_scores() == 7).all()
+    model.set_score({TABLE: 9})
     assert_debug_values(lookup(model, keys, device), keys)  # all resident
+    assert (stored_scores() == 9).all()
     assert next_row_counter(model) == len(keys)
 
 
@@ -616,3 +643,57 @@ def test_load_expands_for_every_key_in_the_checkpoint(
     assert next_row_counter(target) == num_keys
     assert next_row_counter(target) <= state.tables[0].shape[0]
     assert_debug_values(lookup(target, keys, device), keys)
+
+
+def test_load_reserves_room_only_for_the_keys_this_rank_keeps(current_device):
+    """A checkpoint that holds every rank's keys is read whole by each rank, which
+    keeps its own share. The table has to be sized for that share: a table that
+    never evicts has no max_capacity to stop it growing for the whole file."""
+    from dynamicemb.key_ownership import owned_key_mask
+
+    device = torch.device(f"cuda:{current_device}")
+    num_shards, shard_index = 8, 3
+    keys = list(range(30001, 30001 + 4000))
+
+    # Round-robin ownership, named rather than left to the default: consecutive
+    # keys then fall on consecutive shards, so each of the 8 owns exactly 500 of
+    # the 4000. A checkpoint is only loaded into a table of the same dist_type.
+    source = build_model(
+        current_device,
+        max_capacity=65536 * 2,
+        init_capacity=4096,
+        dist_type="roundrobin",
+    )
+    assert_debug_values(lookup(source, keys, device), keys)
+
+    with tempfile.TemporaryDirectory() as save_dir:
+        source.dump(save_dir)
+        torch.cuda.synchronize()
+
+        target = build_model(
+            current_device,
+            max_capacity=65536 * 2,
+            init_capacity=1024,
+            dist_type="roundrobin",
+        )
+        state = target._storage._state
+        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (2048, 1024)
+        # This module is one rank of a larger group as far as the load is concerned.
+        original = (target._shard_index, target._num_shards)
+        target._shard_index, target._num_shards = shard_index, num_shards
+        try:
+            target.load(save_dir)
+        finally:
+            target._shard_index, target._num_shards = original
+        torch.cuda.synchronize()
+
+    key_tensor = torch.tensor(keys, dtype=torch.int64, device=device)
+    mask = owned_key_mask(key_tensor, shard_index, num_shards, "roundrobin")
+    mine = key_tensor[mask].tolist()
+    # 500 fit the 1024 rows the table has, so it has no reason to grow.
+    assert len(mine) == 500
+
+    assert next_row_counter(target) == len(mine)
+    assert state.key_index_map.capacity(0) == 2048, "grew for keys it does not keep"
+    assert state.tables[0].shape[0] == 1024
+    assert_debug_values(lookup(target, mine, device), mine)

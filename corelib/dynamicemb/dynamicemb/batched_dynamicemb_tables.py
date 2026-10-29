@@ -54,6 +54,7 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
+    get_score_part,
     has_no_eviction,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
@@ -1403,10 +1404,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if table_score == 0:
                 raise ValueError(f"Can't set table's score to 0.")
             index = self._table_names.index(table_name)
+            # The score part, so that (NO_EVICTION, CUSTOMIZED) -- in either order --
+            # takes a user score like CUSTOMIZED does.
             assert (
-                self._dynamicemb_options[index].score_strategy
+                get_score_part(self._dynamicemb_options[index].score_strategy)
                 == DynamicEmbScoreStrategy.CUSTOMIZED
-            ), "Can only set score for table whose score_strategy is DynamicEmbScoreStrategy.CUSTOMIZED."
+            ), "Can only set score for table whose score_strategy is DynamicEmbScoreStrategy.CUSTOMIZED (alone, or with NO_EVICTION)."
 
             if table_name in self._scores and self._scores[table_name] > table_score:
                 if warning_for_cstm_score():
@@ -1914,6 +1917,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             local_num_rows = self._num_rows_of(storage, table_id)
             if local_num_rows is None:
                 num_rows, erased_slot_index = None, None
+                erase_untracked = False
             else:
                 num_rows = [
                     int(t.item())
@@ -1923,6 +1927,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 ]
                 erased_slot_index = _all_gather_by_rank(
                     storage.pop_erased_slot_index(table_id), pg
+                )
+                # One rank's untracked erase spoils the delta for every receiver,
+                # whichever rank's copy of it gets shipped: the flag is the group's,
+                # not this rank's.
+                erase_untracked = any(
+                    bool(t.item())
+                    for t in _all_gather_by_rank(
+                        torch.tensor(
+                            [self._erase_untracked_of(storage, table_id)],
+                            dtype=torch.int64,
+                        ),
+                        pg,
+                    )
                 )
             res.table_names.append(table_name)
             res.keys.append(keys_cat)
@@ -1939,7 +1956,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "row_capacity": self._row_capacity_of(storage, table_id),
                     "num_rows": num_rows,
                     "erased_slot_index": erased_slot_index,
-                    "erase_untracked": self._erase_untracked_of(storage, table_id),
+                    "erase_untracked": erase_untracked,
                     "bucket_capacity": self._bucket_capacity_of(storage),
                     "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
@@ -2031,7 +2048,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         row it held in the source table, so the target ends up layout-identical
         to it. Only a table that matches the delta's metadata is replayed; one
         that does not is rejected with a ``ValueError`` rather than written some
-        other way -- see :meth:`_replay_compatibility`.
+        other way -- see :meth:`_replay_compatibility`. Capacity is part of that
+        match and a target's never changes by itself, so once the source expands
+        (rehash) its deltas are rejected until the target is rebuilt from a full
+        checkpoint.
 
         The key and its embedding always travel; *content* selects what comes
         along, and defaults to both, i.e. the replica ends up holding what the
