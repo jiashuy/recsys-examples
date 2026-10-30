@@ -26,8 +26,8 @@ namespace dyn_emb {
 // buffer has: handing out one past it would make every later read and write of
 // that key run off the buffer, so it is asserted here, where it is first known.
 __global__ void table_resolve_rows_kernel(
-    int32_t *__restrict__ rows, int32_t *__restrict__ row_counters,
-    int32_t const *__restrict__ row_limits,
+    int64_t *__restrict__ rows, int64_t *__restrict__ row_counters,
+    int64_t const *__restrict__ row_limits,
     int64_t const *__restrict__ table_bucket_offsets, int64_t bucket_capacity,
     int64_t const *__restrict__ slots, int64_t const *__restrict__ table_ids,
     int64_t *__restrict__ out, int64_t n, bool allocate) {
@@ -50,14 +50,15 @@ __global__ void table_resolve_rows_kernel(
     // owns rows has no overflow.
     CUDA_KERNEL_ASSERT(slot < main_capacity);
     int64_t flat = bkt_begin * bucket_capacity + slot;
-    int32_t row = rows[flat];
+    int64_t row = rows[flat];
     if (row < 0) {
       // Without `allocate` the slot's key was placed earlier, so it owns a row;
       // finding none means a path put a key here without going through rows.
       CUDA_KERNEL_ASSERT(allocate);
       if (allocate) {
         // Keys in one batch are unique, so no other thread touches this slot.
-        row = atomicAdd(row_counters + tid, 1);
+        row = static_cast<int64_t>(atomicAdd(
+            reinterpret_cast<unsigned long long *>(row_counters + tid), 1ull));
         CUDA_KERNEL_ASSERT(row < row_limits[tid]);
         rows[flat] = row;
       }
@@ -71,9 +72,9 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate) {
-  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
-  TORCH_CHECK(row_counters.is_cuda() && row_counters.scalar_type() == at::kInt);
-  TORCH_CHECK(row_limits.is_cuda() && row_limits.scalar_type() == at::kInt &&
+  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
+  TORCH_CHECK(row_counters.is_cuda() && row_counters.scalar_type() == at::kLong);
+  TORCH_CHECK(row_limits.is_cuda() && row_limits.scalar_type() == at::kLong &&
               row_limits.numel() == row_counters.numel());
   TORCH_CHECK(slots.is_cuda() && slots.scalar_type() == at::kLong);
   TORCH_CHECK(table_ids.is_cuda() && table_ids.scalar_type() == at::kLong);
@@ -85,8 +86,8 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
   constexpr int BLOCK = 256;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   table_resolve_rows_kernel<<<(n + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
-      rows.data_ptr<int32_t>(), row_counters.data_ptr<int32_t>(),
-      row_limits.data_ptr<int32_t>(),
+      rows.data_ptr<int64_t>(), row_counters.data_ptr<int64_t>(),
+      row_limits.data_ptr<int64_t>(),
       table_bucket_offsets.data_ptr<int64_t>(), bucket_capacity,
       slots.data_ptr<int64_t>(), table_ids.data_ptr<int64_t>(),
       out.data_ptr<int64_t>(), n, allocate);
@@ -116,19 +117,20 @@ constexpr int64_t kReclaimedKey = static_cast<int64_t>(0xFFFFFFFFFFFFFFFEull);
 // flat per slot.
 __global__ void collect_reclaimed_rows_kernel(
     int64_t const *__restrict__ keys, int64_t key_stride,
-    int32_t const *__restrict__ rows, int64_t bkt_begin, int64_t num_slots,
-    int64_t bucket_capacity, int32_t *__restrict__ out, int64_t num_rows,
-    int32_t *__restrict__ counter) {
+    int64_t const *__restrict__ rows, int64_t bkt_begin, int64_t num_slots,
+    int64_t bucket_capacity, int64_t *__restrict__ out, int64_t num_rows,
+    int64_t *__restrict__ counter) {
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < num_slots; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int64_t bucket = bkt_begin + i / bucket_capacity;
     int64_t iter = i % bucket_capacity;
     if (keys[bucket * key_stride + iter] != kReclaimedKey)
       continue;
-    int32_t row = rows[bucket * bucket_capacity + iter];
+    int64_t row = rows[bucket * bucket_capacity + iter];
     if (row < 0)
       continue;
-    int32_t pos = atomicAdd(counter, 1);
+    int64_t pos = static_cast<int64_t>(
+        atomicAdd(reinterpret_cast<unsigned long long *>(counter), 1ull));
     CUDA_KERNEL_ASSERT(pos < num_rows);
     out[pos] = row;
   }
@@ -140,8 +142,8 @@ __global__ void collect_reclaimed_rows_kernel(
 // reclaimed. Linear probing fills the same set of slots whatever the order the
 // threads claim them in, so the key layout does not depend on scheduling.
 __global__ void place_reclaimed_rows_kernel(
-    int64_t *__restrict__ keys, int64_t key_stride, int32_t *__restrict__ rows,
-    int32_t const *__restrict__ carried, int64_t n, int64_t bkt_begin,
+    int64_t *__restrict__ keys, int64_t key_stride, int64_t *__restrict__ rows,
+    int64_t const *__restrict__ carried, int64_t n, int64_t bkt_begin,
     int64_t num_slots, int64_t bucket_capacity) {
   for (int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        j < n; j += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -151,9 +153,11 @@ __global__ void place_reclaimed_rows_kernel(
     // Spreading the starts keeps the reclaimed slots from piling into the first
     // buckets -- a reclaimed slot is only reused once a bucket has no empty
     // slot left, while its neighbours still do -- and keeps the threads from
-    // all CASing the same few slots. The product stays below 2^63 while n is
-    // within int32 and the region within 2^32 slots.
-    int64_t start = (j * num_slots) / n;
+    // all CASing the same few slots. The product stays below 2^64 while n and
+    // the region are within 2^32 slots, so it is taken unsigned.
+    int64_t start = static_cast<int64_t>(
+        (static_cast<uint64_t>(j) * static_cast<uint64_t>(num_slots)) /
+        static_cast<uint64_t>(n));
     bool placed = false;
     for (int64_t k = 0; k < num_slots && !placed; ++k) {
       int64_t i = start + k;
@@ -188,7 +192,7 @@ at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                         int64_t bucket_capacity,
                                         int64_t num_rows) {
   check_keys_view(keys);
-  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
+  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
   TORCH_CHECK(num_rows > 0, "nothing to collect: the caller knows the count");
   int64_t num_slots = (bkt_end - bkt_begin) * bucket_capacity;
   // Slots not filled (the caller's count was too high) stay -1.
@@ -199,9 +203,9 @@ at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
     int64_t grid = std::min<int64_t>((num_slots + BLOCK - 1) / BLOCK, 1 << 20);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     collect_reclaimed_rows_kernel<<<grid, BLOCK, 0, stream>>>(
-        keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int32_t>(),
-        bkt_begin, num_slots, bucket_capacity, out.data_ptr<int32_t>(),
-        num_rows, counter.data_ptr<int32_t>());
+        keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int64_t>(),
+        bkt_begin, num_slots, bucket_capacity, out.data_ptr<int64_t>(),
+        num_rows, counter.data_ptr<int64_t>());
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return out;
@@ -211,8 +215,8 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                 at::Tensor carried, int64_t bkt_begin,
                                 int64_t bkt_end, int64_t bucket_capacity) {
   check_keys_view(keys);
-  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
-  TORCH_CHECK(carried.is_cuda() && carried.scalar_type() == at::kInt);
+  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
+  TORCH_CHECK(carried.is_cuda() && carried.scalar_type() == at::kLong);
   int64_t n = carried.numel();
   int64_t num_slots = (bkt_end - bkt_begin) * bucket_capacity;
   if (n == 0)
@@ -222,14 +226,14 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
   int64_t grid = std::min<int64_t>((n + BLOCK - 1) / BLOCK, 1 << 20);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   place_reclaimed_rows_kernel<<<grid, BLOCK, 0, stream>>>(
-      keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int32_t>(),
-      carried.data_ptr<int32_t>(), n, bkt_begin, num_slots, bucket_capacity);
+      keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int64_t>(),
+      carried.data_ptr<int64_t>(), n, bkt_begin, num_slots, bucket_capacity);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 
-// Leaves the slots named by `slot_index` (packed `slot << 32 | row`, the form a
-// dump carries) reclaimed and owning their rows: what an erase leaves behind,
+// Leaves the slots named by `slot_index` ([batch, 2] int64: slot, row -- the
+// form a dump carries) reclaimed and owning their rows: what an erase leaves behind,
 // recreated for a replica that never held the erased key. Per slot, by what it
 // holds before:
 //  - Empty: the replica never held the erased key (it was added and erased
@@ -253,7 +257,7 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
 template <typename Table>
 __global__ void restore_reclaimed_slots_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
-    int *__restrict__ bucket_sizes, int32_t *__restrict__ rows,
+    int *__restrict__ bucket_sizes, int64_t *__restrict__ rows,
     int64_t const *__restrict__ slot_index, int64_t batch, int64_t table_id) {
 
   using KeyType = typename Table::KeyType;
@@ -267,9 +271,8 @@ __global__ void restore_reclaimed_slots_kernel(
 
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < batch; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    int64_t packed = slot_index[i];
-    int64_t slot = (packed >> 32) & 0xFFFFFFFF;
-    int32_t row = static_cast<int32_t>(packed & 0xFFFFFFFF);
+    int64_t slot = slot_index[2 * i];
+    int64_t row = slot_index[2 * i + 1];
     CUDA_KERNEL_ASSERT(slot < table_cap);
 
     int64_t bucket_id = bkt_begin + slot / bc;
@@ -310,9 +313,11 @@ void table_restore_reclaimed_slots(at::Tensor table_storage,
                                    at::Tensor bucket_sizes, at::Tensor rows,
                                    at::Tensor slot_index, int64_t table_id,
                                    int64_t num_scores, torch::Dtype key_dtype) {
-  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kInt);
+  TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
   TORCH_CHECK(slot_index.is_cuda() && slot_index.scalar_type() == at::kLong);
-  int64_t n = slot_index.numel();
+  TORCH_CHECK(slot_index.dim() == 2 && slot_index.size(1) == 2 &&
+              slot_index.is_contiguous());
+  int64_t n = slot_index.size(0);
   if (n == 0)
     return;
 
@@ -335,7 +340,7 @@ void table_restore_reclaimed_slots(at::Tensor table_storage,
 
     restore_reclaimed_slots_kernel<Table><<<grid, BLOCK, 0, stream>>>(
         table, table_bucket_offsets.data_ptr<int64_t>(),
-        get_pointer<int>(bucket_sizes), rows.data_ptr<int32_t>(),
+        get_pointer<int>(bucket_sizes), rows.data_ptr<int64_t>(),
         slot_index.data_ptr<int64_t>(), n, table_id);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();

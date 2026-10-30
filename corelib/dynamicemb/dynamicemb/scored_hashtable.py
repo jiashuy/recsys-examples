@@ -447,23 +447,23 @@ class LinearBucketTable(ScoredHashTable):
             self.num_buckets_, dtype=torch.int32, device=self.device
         )
 
-        # Value rows: one int32 per slot, -1 until a key first occupies it.
+        # Value rows: one int64 per slot, -1 until a key first occupies it.
         self.use_rows_ = use_rows
         if self.use_rows_:
             assert (
                 not enable_overflow
             ), "use_rows is for storage tables; a cache (overflow) keeps slot == row."
             self.rows_ = torch.full(
-                (self.capacity_,), -1, dtype=torch.int32, device=self.device
+                (self.capacity_,), -1, dtype=torch.int64, device=self.device
             )
             self.row_counters_ = torch.zeros(
-                self.num_tables_, dtype=torch.int32, device=self.device
+                self.num_tables_, dtype=torch.int64, device=self.device
             )
             # Rows a table's value buffer has. A slot is never more than one row
             # of its own, so the table's capacity is the most that can be handed
             # out; a buffer that is smaller says so through ``set_row_limits``.
             self.row_limits_ = torch.tensor(
-                self.per_table_capacity_, dtype=torch.int32, device=self.device
+                self.per_table_capacity_, dtype=torch.int64, device=self.device
             )
         else:
             self.rows_ = None
@@ -637,7 +637,7 @@ class LinearBucketTable(ScoredHashTable):
         """
         assert self.use_rows_ and len(limits) == self.num_tables_
         self.row_limits_.copy_(
-            torch.tensor(limits, dtype=torch.int32), non_blocking=False
+            torch.tensor(limits, dtype=torch.int64), non_blocking=False
         )
 
     def num_rows(self, table_id: int) -> int:
@@ -900,10 +900,10 @@ class LinearBucketTable(ScoredHashTable):
         base = (
             int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_
         )
-        self.rows_[base + slots] = rows.to(torch.int32)
+        self.rows_[base + slots] = rows.to(torch.int64)
 
     def restore_reclaimed_slots(self, slot_index: torch.Tensor, table_id: int) -> None:
-        """Leave the slots a dump's packed ``slot << 32 | row`` names reclaimed,
+        """Leave the slots a dump's ``[n, 2]`` (slot, row) int64 names reclaimed,
         owning their rows.
 
         What an erase leaves behind, recreated for a replica that never held the

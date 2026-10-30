@@ -94,11 +94,9 @@ class DeltaDumpResult:
             meta[i]["slot_index"]:       torch.Tensor -- int64 host tensor aligned
                 with ``keys[i]``; the storage slot each dumped key occupies, used
                 by ``replay_increment``. For tables that store a row per key it
-                packs the key slot (high 32 bits) and value row (low 32 bits)
-                into one int64.
+                is an ``[N, 2]`` int64 tensor: key slot, value row.
             meta[i]["erased_slot_index"]: Optional[List[torch.Tensor]] -- for a table
-                that stores a row per key, the packed slot (high 32 bits) and row
-                (low 32) of every slot an explicit erase left reclaimed since the
+                that stores a row per key, the ``[M, 2]`` (slot, row) of every slot an explicit erase left reclaimed since the
                 last dump, one per slot. A reclaimed slot keeps its row, so a
                 replica recreates these, after the removals and before the
                 upserts, to end up with the same rows as the source (the upserts
@@ -708,8 +706,8 @@ def _all_gather_evicted_keys(
 def _all_gather_by_rank(
     tensor: torch.Tensor, pg: Optional[dist.ProcessGroup]
 ) -> List[torch.Tensor]:
-    """All-gather a variable-length 1-D tensor within ``pg``, keeping each rank's
-    part apart: entry ``r`` is what rank ``r`` of the group contributed, on host.
+    """All-gather a variable-length tensor (any trailing dims) within ``pg``, keeping
+    each rank's part apart: entry ``r`` is what rank ``r`` of the group contributed, on host.
 
     For what the receiver has to pick *its own* share of, unlike
     :func:`_all_gather_evicted_keys`, which merges the ranks into one set.
@@ -720,16 +718,17 @@ def _all_gather_by_rank(
     world_size = dist.get_world_size(pg)
     device = torch.device("cuda", torch.cuda.current_device())
     tensor = tensor.to(device)
-    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.int64)
+    local_size = torch.tensor([tensor.size(0)], device=device, dtype=torch.int64)
     size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
     dist.all_gather(size_list, local_size, group=pg)
     sizes = [int(s.item()) for s in size_list]
     max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
-    padded = torch.zeros(max_size, dtype=tensor.dtype, device=device)
-    if tensor.numel() > 0:
-        padded[: tensor.numel()] = tensor
+    shape = (max_size,) + tuple(tensor.shape[1:])
+    padded = torch.zeros(shape, dtype=tensor.dtype, device=device)
+    if tensor.size(0) > 0:
+        padded[: tensor.size(0)] = tensor
     gathered = [
-        torch.zeros(max_size, dtype=tensor.dtype, device=device)
+        torch.zeros(shape, dtype=tensor.dtype, device=device)
         for _ in range(world_size)
     ]
     dist.all_gather(gathered, padded, group=pg)

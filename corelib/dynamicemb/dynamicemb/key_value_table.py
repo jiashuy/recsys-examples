@@ -451,7 +451,7 @@ class DynamicEmbTableState:
     erased_key_chunks: List[torch.Tensor] = field(default_factory=list)
     erased_tid_chunks: List[torch.Tensor] = field(default_factory=list)
     # A table that stores a row per key also records where each erased key sat:
-    # the packed ``slot << 32 | row`` of the slot it left reclaimed. A reclaimed
+    # the (slot, row) pair of the slot it left reclaimed. A reclaimed
     # slot keeps its row, and a replica can only keep the same rows if it
     # recreates those slots, including for keys it never held.
     erased_slot_chunks: List[torch.Tensor] = field(default_factory=list)
@@ -971,8 +971,8 @@ def _encode_slot_index(
       - normal policies: the key_index_map slot IS the value flat row, so the
         single slot value locates both key and value -> return the slot as-is.
       - a table that stores its rows (``use_rows``): key slot and value row are
-        independent, so pack both into one int64: high 32 bits = key slot, low
-        32 bits = value row (tables are small, < 2^32; asserted).
+        independent, so ``slot_index`` is an ``[N, 2]`` int64 tensor, column 0 =
+        key slot, column 1 = value row.
 
     HybridStorage (``tier in {0, 1}``, called once per tier, HBM=0 / host=1):
       layout ``bit 63 = tier | bits 0..62 = key_slot``. HybridStorage does NOT
@@ -992,11 +992,7 @@ def _encode_slot_index(
     if not _row_differs_from_slot(state):
         return slot_indices  # key slot == value row
     flat_rows = flat_rows.to(device=state.device, dtype=torch.int64)
-    if slot_indices.numel() > 0:
-        assert int(slot_indices.max()) < (1 << 32) and int(flat_rows.max()) < (
-            1 << 32
-        ), "slot/row exceeds 32 bits; cannot pack into int64 slot_index"
-    return (slot_indices << 32) | flat_rows
+    return torch.stack([slot_indices, flat_rows], dim=1)
 
 
 def _fresh_score_block(
@@ -1435,7 +1431,7 @@ def _append_erased(
 
     Unlike :func:`_append_evicted` there is no count to read back: the caller has
     already masked the keys down to the ones the erase actually removed, so this
-    costs no extra device sync. ``slot_index`` is the packed slot and row each
+    costs no extra device sync. ``slot_index`` is the ``[M, 2]`` (slot, row) each
     erased key left behind, for a table that stores rows.
     """
     if keys.numel() == 0:
@@ -1448,7 +1444,7 @@ def _append_erased(
         state.erased_slot_chunks.append(slot_index.clone())
         state.erased_slot_tid_chunks.append(
             torch.full(
-                (slot_index.numel(),), table_id, dtype=torch.int64, device=keys.device
+                (slot_index.size(0),), table_id, dtype=torch.int64, device=keys.device
             )
         )
 
@@ -1480,7 +1476,7 @@ def _pop_chunked_keys(
     keys = torch.cat(key_chunks)
     tids = torch.cat(tid_chunks)
     mask = tids == table_id
-    out = torch.unique(keys[mask])
+    out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)
     keep = ~mask
     if bool(keep.any()):
         return out, [keys[keep]], [tids[keep]]
@@ -1506,7 +1502,7 @@ def _pop_state_erased_keys(state: DynamicEmbTableState, table_id: int) -> torch.
 def _pop_state_erased_slot_index(
     state: DynamicEmbTableState, table_id: int
 ) -> torch.Tensor:
-    """Pop (return + clear) the packed slot/row each explicit erase left behind,
+    """Pop (return + clear) the (slot, row) pair each explicit erase left behind,
     one per slot: a slot erased, refilled and erased again is one reclaimed slot
     with one row, however many keys passed through it."""
     out, state.erased_slot_chunks, state.erased_slot_tid_chunks = _pop_chunked_keys(
@@ -1516,7 +1512,7 @@ def _pop_state_erased_slot_index(
         state,
         dtype=torch.int64,
     )
-    return out
+    return out.reshape(-1, 2)
 
 
 def _insert_key_values(
@@ -2270,10 +2266,10 @@ def _replay_at_slots(
     tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
 
     if _row_differs_from_slot(state):
-        # ``use_rows`` tables pack key slot (high 32) and value row (low 32);
-        # every other table uses one index for both.
-        key_slots = (slot_index >> 32) & 0xFFFFFFFF
-        value_rows = slot_index & 0xFFFFFFFF
+        # ``use_rows`` tables carry (key slot, value row) as ``[n, 2]``; every
+        # other table uses one index for both.
+        key_slots = slot_index[:, 0].contiguous()
+        value_rows = slot_index[:, 1].contiguous()
     else:
         key_slots = slot_index
         value_rows = slot_index
@@ -2386,10 +2382,10 @@ def _erase_state_keys(
         slot_index = None
         if state.key_index_map.use_rows_:
             # The slot stays reclaimed with its row; record both so a replica can
-            # recreate it, packed the way a dumped slot_index is.
+            # recreate it, laid out the way a dumped slot_index is.
             slots = indices[removed]
             rows = state.key_index_map._rows_of(slots, tids[removed], False)
-            slot_index = (slots << 32) | rows
+            slot_index = torch.stack([slots, rows], dim=1)
         _append_erased(state, keys[removed], table_id, slot_index)
     num_removed = int(removed.sum().item())
     if (
@@ -2717,7 +2713,7 @@ class DynamicEmbStorage(Storage):
         return _pop_state_erased_keys(self._state, table_id)
 
     def pop_erased_slot_index(self, table_id: int) -> torch.Tensor:
-        """Return + clear the packed ``slot << 32 | row`` of each slot an explicit
+        """Return + clear the ``[M, 2]`` (slot, row) of each slot an explicit
         erase left reclaimed in ``table_id`` (empty unless the table stores
         rows)."""
         return _pop_state_erased_slot_index(self._state, table_id)
@@ -2924,7 +2920,8 @@ class DynamicEmbStorage(Storage):
         column-aligned. ``values`` is embeddings only and ``optimizer_states``
         the rest of the same row (``None`` when the optimizer keeps no per-row
         state), so concatenating the two reproduces the stored row.
-        ``slot_index`` is the packed key-slot/value-row used by replay (see
+        ``slot_index`` is the key-slot/value-row used by replay, ``[N, 2]`` for a
+        table that stores rows (see
         :func:`_encode_slot_index`). ``scores`` is the ``[N, num_scores]`` block
         in logical column order with timestamp columns held as an age relative
         to *timestamp*, which defaults to this device's clock."""
@@ -2948,7 +2945,7 @@ class DynamicEmbStorage(Storage):
         all_scores: List[Tensor] = []
         for s in states_to_dump:
             # ``indices`` are the rows of a ``use_rows`` table, hash slots
-            # otherwise; the packed slot_index and the score blocks need slots.
+            # otherwise; the (slot, row) slot_index and the score blocks need slots.
             keys, named_scores, indices, slots = s.key_index_map.incremental_dump(
                 {s.incremental_score_name: threshold},
                 pg=pg,
@@ -2996,7 +2993,11 @@ class DynamicEmbStorage(Storage):
             dev = device_for_gather if do_multi_rank_gather else "cpu"
             keys_cat = torch.empty(0, dtype=torch.int64, device=dev)
             values_cat = torch.empty(0, emb_dim_t, dtype=state.emb_dtype, device=dev)
-            slots_cat = torch.empty(0, dtype=torch.int64, device=dev)
+            slots_cat = torch.empty(
+                (0, 2) if _row_differs_from_slot(state) else (0,),
+                dtype=torch.int64,
+                device=dev,
+            )
             scores_cat = torch.empty(0, num_scores, dtype=SCORE_TYPE, device=dev)
             opts_cat = (
                 torch.empty(0, opt_dim_t, dtype=state.emb_dtype, device=dev)
@@ -3049,7 +3050,8 @@ class DynamicEmbStorage(Storage):
             keys / values / optimizer_states / scores: the delta's columns for
                 this table, row aligned. The last two may be ``None`` when
                 *content* does not ask for them.
-            slot_index: the source's packed key-slot/value-row.
+            slot_index: the source's key-slot/value-row (``[n, 2]`` for a table that
+                stores rows).
             insert_score: the score a restored key gets in every non-recency
                 score word when *content* omits ``SCORE``.
             content: which parts of each row to write; see
@@ -3129,10 +3131,11 @@ class DynamicEmbStorage(Storage):
     def restore_reclaimed_slots(self, table_id: int, slot_index: Tensor) -> None:
         """Recreate the reclaimed slots a delta reports, with their rows.
 
-        ``slot_index`` is what :meth:`pop_erased_slot_index` packed on the
-        source. Applied after the delta's removals and before its upserts, so a
-        slot an erased key left and another key then took ends up holding that
-        key, while one nobody took stays reclaimed with its row.
+        ``slot_index`` is the ``[M, 2]`` (slot, row) that
+        :meth:`pop_erased_slot_index` returned on the source. Applied after the
+        delta's removals and before its upserts, so a slot an erased key left and
+        another key then took ends up holding that key, while one nobody took
+        stays reclaimed with its row.
         """
         self._state.key_index_map.restore_reclaimed_slots(
             slot_index.to(device=self._state.device, dtype=torch.int64), table_id

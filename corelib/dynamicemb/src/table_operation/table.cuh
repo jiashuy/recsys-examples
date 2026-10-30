@@ -188,7 +188,7 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor table_ids, bool allocate);
 
 // Rehash support. table_collect_reclaimed_rows returns the rows owned by the
-// reclaimed slots of buckets [bkt_begin, bkt_end) as int32[num_rows], where
+// reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where
 // num_rows is how many there are (the table's row counter minus its live
 // keys). table_place_reclaimed_rows then gives each of those rows a free slot
 // of the (new) table's bucket range, marking the slot reclaimed.
@@ -200,7 +200,7 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                 at::Tensor carried, int64_t bkt_begin,
                                 int64_t bkt_end, int64_t bucket_capacity);
 
-// Restore the reclaimed slots a dump's packed `slot << 32 | row` names, owning
+// Restore the reclaimed slots a dump's [n, 2] (slot, row) int64 names, owning
 // their rows, on a replica: an empty slot becomes reclaimed with the row, a
 // reclaimed one must already own it, and a live key still in the slot is erased
 // first (see table_rows.cu).

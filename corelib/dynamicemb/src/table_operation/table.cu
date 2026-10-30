@@ -221,7 +221,7 @@ void bind_table_operation(py::module &m) {
 
   m.def("table_restore_reclaimed_slots",
         &dyn_emb::table_restore_reclaimed_slots,
-        "restore the reclaimed slots named by packed (slot << 32 | row), "
+        "restore the reclaimed slots named by [n, 2] (slot, row), "
         "owning their rows, on a replica; a live key still in a slot is erased",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("rows"),

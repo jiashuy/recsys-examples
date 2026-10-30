@@ -553,7 +553,7 @@ class _ReplayJob:
     # How many value rows the source had handed out (its row counter), for a
     # table that stores a row per key; ``None`` for one whose row is its slot.
     num_rows: Optional[int] = None
-    # The packed slot/row of each slot an erase left reclaimed since the last
+    # The ``[M, 2]`` (slot, row) of each slot an erase left reclaimed since the last
     # dump, for such a table.
     erased_slot_index: Optional[Tensor] = None
 
@@ -2025,7 +2025,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ),
             ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
             # Whether a key's row is stored apart from its slot decides how a
-            # ``slot_index`` is packed, so the two sides must agree on it.
+            # ``slot_index`` is ``[n, 2]`` for such a table, so the two sides must
+            # agree on it.
             (
                 "stores_rows",
                 meta.get("num_rows") is not None,
@@ -2267,7 +2268,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         option = self._dynamicemb_options[job.table_id]
         n = job.keys.numel()
 
-        rows = {"values": job.values.size(0), "slot_index": job.slot_index.numel()}
+        rows = {"values": job.values.size(0), "slot_index": job.slot_index.size(0)}
         if job.optimizer_states is not None:
             rows["optimizer_states"] = job.optimizer_states.size(0)
         if job.scores is not None:

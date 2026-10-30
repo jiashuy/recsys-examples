@@ -183,13 +183,19 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     size = int(table.bucket_sizes.sum())
 
     def pack(slot, row):
-        return torch.tensor([(slot << 32) | row], dtype=torch.int64, device="cuda")
+        return torch.tensor([[slot, row]], dtype=torch.int64, device="cuda")
 
     # Empty: a slot nobody ever held.
     empty = int((key_col == -1).nonzero()[0])
     table.restore_reclaimed_slots(pack(empty, 100), 0)
     assert int(key_col[empty]) == -2 and int(table.rows_[empty]) == 100
     assert int(table.bucket_sizes.sum()) == size, "reclaimed slots are not counted"
+
+    # A row is a full int64: one past 2^32 survives the round trip.
+    empty2 = int((key_col == -1).nonzero()[0])
+    big_row = (1 << 33) + 5
+    table.restore_reclaimed_slots(pack(empty2, big_row), 0)
+    assert int(key_col[empty2]) == -2 and int(table.rows_[empty2]) == big_row
 
     # Reclaimed: a real erase, which changes the key but leaves the row behind.
     victim = keys[:1]

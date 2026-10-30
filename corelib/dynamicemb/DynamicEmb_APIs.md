@@ -1116,14 +1116,14 @@ The meaning of the threshold depends on the table's `score_strategy`:
                 - ``"slot_index": torch.Tensor`` -- int64 host tensor aligned with
                   ``keys``; the storage slot each dumped key occupies (for
                   ``replay_increment``). A storage keeps a value row per key,
-                  apart from the slot, so it packs the key slot (high 32 bits)
-                  and the value row (low 32 bits).
+                  apart from the slot, so it is an ``[N, 2]`` int64 tensor: the key
+                  slot and the value row.
                 - ``"num_rows": List[int]`` -- how many value rows each source
                   rank had handed out, in rank order; the receiver picks the entry
                   of its own shard. A delta names only the rows that changed, so
                   replay takes the row counter from here.
                 - ``"erased_slot_index": List[torch.Tensor]`` -- per source rank,
-                  the packed slot and row of every slot a retained erase left
+                  the ``[M, 2]`` int64 (slot, row) of every slot a retained erase left
                   reclaimed since the last dump (an erased slot keeps its row), so a
                   replica can recreate them. Only complete if the erases were
                   retained (`RETAIN_KEY`); see ``erase_untracked``.
