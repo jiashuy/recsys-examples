@@ -57,7 +57,8 @@ __global__ void table_resolve_rows_kernel(
       CUDA_KERNEL_ASSERT(allocate);
       if (allocate) {
         // Keys in one batch are unique, so no other thread touches this slot.
-        row = static_cast<int64_t>(atomicAdd(
+        // ::atomicAdd: dyn_emb has its own overloads that hide the 64-bit one.
+        row = static_cast<int64_t>(::atomicAdd(
             reinterpret_cast<unsigned long long *>(row_counters + tid), 1ull));
         CUDA_KERNEL_ASSERT(row < row_limits[tid]);
         rows[flat] = row;
@@ -130,7 +131,7 @@ __global__ void collect_reclaimed_rows_kernel(
     if (row < 0)
       continue;
     int64_t pos = static_cast<int64_t>(
-        atomicAdd(reinterpret_cast<unsigned long long *>(counter), 1ull));
+        ::atomicAdd(reinterpret_cast<unsigned long long *>(counter), 1ull));
     CUDA_KERNEL_ASSERT(pos < num_rows);
     out[pos] = row;
   }
