@@ -926,7 +926,7 @@ def test_replay_recreates_a_reclaimed_slot_for_a_key_it_never_held(current_devic
     # A is reported as erased, and no live key took the slot it left.
     assert delta.erased_keys[0].tolist() == [3001]
     (erased_slots,) = delta.meta[0]["erased_slot_index"]
-    assert erased_slots.numel() == 1
+    assert erased_slots.shape == (1, 2)  # one erased slot: (slot, row)
     assert 3001 not in delta.keys[0].tolist()
     dst.replay_increment(delta)
 
@@ -952,7 +952,7 @@ def test_an_unretained_erase_makes_the_delta_unreplayable(current_device):
     delta = dump_all(src)
     assert delta.meta[0]["erase_untracked"] is True
     (erased_slots,) = delta.meta[0]["erased_slot_index"]
-    assert erased_slots.numel() == 0
+    assert erased_slots.shape == (0, 2)
 
     before = dump_all(dst).keys[0].numel()
     with pytest.raises(ValueError, match="erased keys without retaining"):
